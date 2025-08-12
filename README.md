@@ -1,190 +1,180 @@
-# PDF2EPUB 使用手册 | [English](README_en.md)
 
-PDF2EPUB 是一个强大的工具，可以将 PDF 书籍转换为 EPUB 格式，并可以将 EPUB 书籍从一种语言翻译成另一种语言。该工具利用 Google Gemini API 进行 PDF 解析和翻译，并使用 S3 兼容存储来保存和同步文件。
+# pdf2epub
 
-## [推荐] 使用 GitHub Actions 运行
+将外语的学术学籍或者纵排日语书籍的扫描件转换成epub格式，保留完备的目录、注音、脚注、插图、表格（公式待支持）等信息，具备完备的链接跳转功能，使其尽可能接近出版社原epub的排版。
 
-**由于中国大陆无法直接访问 Google Gemini API，强烈建议使用 GitHub Actions 进行自动化处理。**
+## 技术优势
+经测试，本项目效果远强于各大商业软件的直接转换效果，同时因为其基于OCR的特性，不会因出版社更新DRM机制而失效。
 
-1. Fork 本仓库到你的 GitHub 账户
+### Demo
+转换前：http://biopolitics.kom.uni.st/Michel%20Foucault/The%20Foucault%20Reader%20(149)/The%20Foucault%20Reader%20-%20Michel%20Foucault.pdf
+转换后：https://raw.githubusercontent.com/shensheibot/pdf2epub/main/example.epub
 
-2. 转到分叉仓库的 `Setting` 选项卡
+## 局限性
+因为其复杂性和对多模态LLM的依赖，转换速度较慢并有可能会因为LLM的审核原因失败。建议使用多家不同LLM提供商混合使用。
 
-3. 转到 `Secrets and variables - Actions` 选项卡
+对于纵排日语，需要扫描文件的质量较高且为*白底*。
 
-4. 添加一个名为 `CONFIG` 的新密钥，内容为你的完整 `config.yaml` 文件内容（参考下方配置说明）
+因为逐页进行转换，要求书的新章节*新起一页*，否则章节的最后部分可能会被顺延到下一章节。如果扫描件是每两页一扫描的pdf，建议拆分成单页pdf再操作。
 
-5. 在 GitHub 仓库页面，转到 Actions 选项卡
+## 思路：
+1. **breakdown**：使用具有极大上下文的 gemini 解出全书基于pdf页数的目录结构
+2. **markdown ocr**：对于非纵排日语，使用mistral-OCR将每页转换成带有插图的markdown。
+3. **markdown ocr (jp)**: 对于纵排日语，使用多模态LLM将每页转换成markdown，使用cloudvision的版面分析工具解出插图。
+4. **polish**: 使用LLM建立正确的链接跳转，消除OCR错误、多余的页眉页脚、页间分隔符、空白页，整理跨页的标题等级等。
+5. **epub**: 将markdown和图片打包为epub格式。
 
-6. 选择要运行的工作流：
-   - `Convert pdf to epub` - 将 PDF 转换为 EPUB
-   - `Translate EPUB` - 翻译 EPUB 文件
 
-7. 点击 "Run workflow" 按钮启动处理
+## 推荐LLM：
 
-8. 处理完成后，结果将保存在你配置的 S3 存储中
+无审核压力：gemini-2.5-pro
 
-### 设置 S3 兼容存储
+有审核压力：claude-sonnet-4-20250514
 
-#### 选项 1：Backblaze B2（推荐）
+## 安装
 
-如果没有美国信用卡，可以在 [Backblaze](https://www.backblaze.com/) 获取免费的 10GB 存储空间：
-
-1. 注册 Backblaze 账户
-2. 在 [我的设置](https://secure.backblaze.com/account_settings.htm) 里面启用 B2 云存储
-3. 在 [应用密钥](https://secure.backblaze.com/app_keys.htm) 页面生成新的主应用程序密钥（可以记录 keyID 和 applicationKey，但不会用到）
-4. 创建一个 S3 存储桶，例如命名为 `translator`
-5. 记录下 Endpoint，前面加上 `https://` 后就是之后要用到的 `s3_endpoint`
-6. 添加新的应用程序密钥，选择允许访问所有（all）存储桶
-7. 记录下 keyID（对应配置中的 `s3_access_key_id`）和 applicationKey（对应配置中的 `s3_secret_access_key`）
-
-#### 选项 2：Cloudflare R2
-
-如果有美国信用卡，可以在 [Cloudflare](https://developers.cloudflare.com/r2/) 获取免费的 10GB 存储空间：
-
-1. 登录 Cloudflare 账户
-2. 转到 R2 - Manage R2 API Tokens - Create API Token
-3. 允许读写权限
-4. 记下 access key、secret key 和 endpoint（完整的 URL，包括 https://）
-5. 创建一个 S3 存储桶，例如命名为 `book`
-
-### 获取 Google API 密钥
-
-1. 访问 [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. 创建一个 API 密钥
-3. 将密钥复制到配置文件中的 `google_api_key` 字段
-
-### 配置文件说明
-
-创建一个 `config.yaml` 文件，填入以下信息：
-
-```yaml
-title: 书籍原始标题
-target_title: 书籍翻译后的标题
-author: 作者名
-google_api_key: 你的Google API密钥
-model: gemini-2.5-pro-preview-03-25 or gemini-2.5-flash-preview-04-17
-target_language: Chinese
-source_language: English
-s3_access_key_id: 你的S3访问密钥ID
-s3_secret_access_key: 你的S3访问密钥
-s3_bucket_name: 你的S3存储桶名称
-s3_endpoint: 你的S3端点URL
-num_retries: 3  # API调用失败时的重试次数
-max_backoff_seconds: 30  # 重试时的最大退避时间（秒）
-previous_content_limit: 0  # 设置翻译时使用的前文上下文字符数（0表示不使用上下文，可减少Token消耗）
-max_continuation_attempts: 3  # HTML响应不完整时的最大继续尝试次数
-```
-
-## 本地运行
-
-如果你能够直接访问 Google Gemini API，也可以在本地运行：
-
-### 系统要求
-
+### 依赖要求
 - Python 3.11+
-- Poetry（依赖管理）
-- Google Gemini API 密钥
-- S3 兼容存储（可选，用于文件同步和备份）
+- Poetry (包管理器)
+- Google Cloud Vision API 账户（用于日语纵排书籍的插图检测）
 
 ### 安装步骤
 
-1. 克隆仓库：
+1. 克隆仓库
 
+2. 安装 Poetry（如果未安装）
 ```bash
-git clone https://github.com/yourusername/pdf2epub.git
-cd pdf2epub
+curl -sSL https://install.python-poetry.org | python3 -
 ```
 
-2. 使用 Poetry 安装依赖：
-
+3. 安装项目依赖
 ```bash
-pip install poetry
 poetry install
 ```
 
-3. 复制示例配置文件：
-
+4. 配置 API 密钥
 ```bash
 cp config.yaml.example config.yaml
+# 编辑 config.yaml 填入你的 API 密钥
 ```
 
-4. 编辑 `config.yaml` 文件，填入必要信息
+5. （仅日语纵排书籍）配置 Google Cloud Vision
+   - 在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 创建服务账户
+   - 下载 JSON 密钥文件
+   - 保存为项目根目录的 `sa-keys.json`
 
-### 使用方法
+## 使用方法
 
-1. 将 PDF 文件放在 `output/书名/input.pdf` 路径下
+### 1. 配置文件设置
 
-2. 运行 PDF 结构分析：
+首先在 `config.yaml` 里配置以下信息：
 
+```yaml
+# 书籍信息
+title: 书名
+author: 作者名
+
+# API 密钥
+google_api_key: your-google-api-key
+anthropic_api_key: your-anthropic-api-key  # 可选，作为备选
+
+# OCR 模型配置（按顺序尝试）
+ocr_models:
+  - provider: gemini
+    model: gemini-2.5-pro
+    max_retries: 1
+  - provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_retries: 2
+```
+
+### 2. 基本工作流程
+
+#### 步骤 1: 分析 PDF 结构
 ```bash
-python src/breakdown.py -c config.yaml -i output/书名/input.pdf
+poetry run python src/breakdown.py -i input.pdf
 ```
+生成 `output/{book_title}/book_structure.json`
 
-3. 生成 EPUB：
+#### 步骤 2: OCR 转换
 
+**对于横排文本（学术书籍等）：**
 ```bash
-python src/generate_epub.py --input output/书名/input.pdf --config config.yaml
+poetry run python src/ocr_chapters.py
 ```
 
-4. 翻译 EPUB（可选）：
-
+**对于纵排日语书籍：**
 ```bash
-python src/translate_epub.py --input output/书名/input.epub --config config.yaml
+poetry run python src/ocr_chapters_jp.py
 ```
 
-## 功能特点
+参数说明：
+- `--resume`: 从上次中断处继续
+- `--max-workers N`: 设置并行处理线程数（默认4）
 
-- 将 PDF 书籍转换为 EPUB 格式
-- 翻译 EPUB 书籍（支持多种语言）
-- 自动提取和处理书籍结构（目录、章节等）
-- 保留原始格式和图片
-- 支持大型 PDF 文件的压缩
-- 使用 S3 兼容存储进行文件同步和备份
-- 支持 GitHub Actions 自动化处理
+#### 步骤 3: 内容润色
+```bash
+poetry run python src/polish_ocr_markdown.py
+```
+- 自动建立链接跳转
+- 修正 OCR 错误
+- 去除页眉页脚
+- 整理章节标题
 
-## 文件路径格式
+#### 步骤 4: 生成 EPUB
+```bash
+poetry run python src/generate_epub.py
+```
+最终 EPUB 文件保存在 `output/{book_title}/output.epub`
 
-处理后的文件将按以下结构组织：
+### 3. 高级配置
 
+#### 多模型自动切换
+系统支持在模型失败或触发安全审核时自动切换：
+
+```yaml
+polish_models:
+  - provider: gemini
+    model: gemini-2.5-pro
+    max_retries: 1  # 瞬时错误重试次数
+  - provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_retries: 2
+```
+
+#### OCR 优化设置
+```yaml
+ocr_settings:
+  zoom_factor: 1.5  # 提高图像质量（1.0-3.0）
+  max_workers: 8    # 增加并行数
+  illustration_padding: 30  # 插图检测边距
+```
+
+### 4. 故障排除
+
+#### OCR 失败
+- 检查 API 配额
+- 降低 `max_workers` 减少并发
+- 使用 `--resume` 从失败处继续
+
+#### 审核问题
+- 配置多个模型提供商
+- Gemini 被阻止时会自动切换到 Anthropic
+
+#### 内存不足
+- 减少 `max_workers`
+- 降低 `zoom_factor`
+
+### 5. 输出结构
 ```
 output/
-└── 书名/
-    ├── input.pdf             # 原始PDF文件
-    ├── book_structure.json   # 书籍结构数据
-    ├── 书名.epub             # 生成的EPUB文件
-    ├── 翻译后书名.epub       # 翻译后的EPUB文件（如果进行了翻译）
-    ├── generation_progress.json  # EPUB生成进度
-    ├── translation_progress.json # 翻译进度
-    ├── extract/              # EPUB提取的内容
-    ├── translated/           # 翻译后的内容
-    └── epub/                 # EPUB构建文件
-```
-
-## 配置说明
-
-根据你的需求，某些配置项可能是可选的：
-
-- 如果只进行 PDF 到 EPUB 的转换（不翻译）：
-  - 不需要设置 `target_title`、`target_language`、`source_language`
-  
-- 如果只进行 EPUB 翻译（不从 PDF 生成 EPUB）：
-  - 所有配置项都需要设置
-
-## 注意事项
-
-- 目前只推荐使用 gemini-2.5-pro 或 gemini-2.5-flash 模型，因为只有这个模型能将 PDF 直接转换为 HTML
-- 书名中不要加特殊符号，以避免文件路径问题
-- PDF 文件大小限制为 45MB，超过此限制的文件将被自动压缩
-- 处理大型 PDF 可能需要较长时间，请耐心等待
-- 翻译过程可能会因为 API 限制而暂时失败，系统会自动重试
-- **目前 EPUB 生成功能主要在日文书籍上进行了测试**，其他语言可能需要调整
-- **推荐使用 Calibre 进行格式转换**：由于 Gemini 生成的 HTML 可能不完全符合标准，建议在输入前和输出后使用 Calibre 进行格式转换，以确保最佳兼容性
-
-## 贡献
-
-欢迎提交 Pull Request 或创建 Issue 来改进这个项目。
-
-## 支持开发者
-
-不用打钱也不用点星星，请广泛传播并立即关注知乎用户 [甚谁](https://www.zhihu.com/people/sakuraayane_justice) 谢谢喵
+└── {book_title}/
+    ├── book_structure.json    # 书籍结构
+    ├── ocr_markdown/          # OCR 原始结果
+    │   ├── chapter_1.md
+    │   └── ...
+    ├── polished_markdown/     # 润色后内容
+    │   ├── chapter_1.md
+    │   └── ...
+    ├── images/                # 提取的插图
+    └── output.epub           # 最终 EPUB

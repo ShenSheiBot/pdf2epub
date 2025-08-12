@@ -1,267 +1,358 @@
-import time
-import functools
+"""
+Refactored network utilities using tenacity for cleaner retry logic.
+"""
+
+import base64
 import httpx
 from loguru import logger
+from typing import Optional, Dict, Any, Union, List
+from typing import Any as Any  # Explicit for backward compatibility
 from google.genai.types import (
     GenerateContentConfig,
     HarmBlockThreshold,
     HarmCategory,
-    SafetySetting,
-    HttpOptions,
+    SafetySetting
 )
-
-# Set Gemini API timeout to 60 minutes (in milliseconds)
-GEMINI_TIMEOUT = 60 * 60 * 1000  # 60 minutes
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
 
 
-def setup_genai_client(api_key):
-    """
-    Setup Google Generative AI API client with the provided key and extended timeout.
+# Define transient errors that should trigger retries
+def is_transient_gemini_error(exception: Exception) -> bool:
+    """Check if a Gemini API error is transient and should be retried."""
+    # Don't retry content safety blocks - these should fail fast
+    error_str = str(exception).lower()
+    if any(term in error_str for term in ['prohibited', 'safety', 'blocked', 'harmful']):
+        return False
     
-    Args:
-        api_key (str): The API key for Gemini
-        
-    Returns:
-        genai.Client: The configured Gemini client
-    """
-    from google import genai
-    return genai.Client(
-        api_key=api_key,
-        http_options=HttpOptions(timeout=GEMINI_TIMEOUT)
+    # Retry network and rate limit errors
+    if isinstance(exception, (httpx.TimeoutException, httpx.ConnectError, ConnectionError)):
+        return True
+    
+    # Check for specific error codes
+    transient_keywords = [
+        'rate_limit', '429', 'quota',
+        'timeout', 'unavailable', '503',
+        'internal', '500', '502', '504',
+        'resource_exhausted', 'overloaded'
+    ]
+    
+    return any(keyword in error_str for keyword in transient_keywords)
+
+
+def is_transient_anthropic_error(exception: Exception) -> bool:
+    """Check if an Anthropic API error is transient and should be retried."""
+    error_str = str(exception).lower()
+    
+    # Don't retry content blocks
+    if any(term in error_str for term in ['content_policy', 'unsafe', 'violation']):
+        return False
+    
+    # Retry rate limits and server errors
+    if '429' in error_str or 'rate' in error_str:
+        return True
+    
+    if any(code in error_str for code in ['500', '502', '503', '504']):
+        return True
+    
+    if isinstance(exception, (TimeoutError, ConnectionError, httpx.TimeoutException)):
+        return True
+    
+    return False
+
+
+class GeminiClient:
+    """Wrapper for Gemini API with smart retry logic."""
+    
+    def __init__(self, api_key: str):
+        """Initialize Gemini client."""
+        from google import genai
+        self.client = genai.Client(api_key=api_key)
+    
+    @retry(
+        retry=retry_if_exception(is_transient_gemini_error),
+        wait=wait_random_exponential(multiplier=1, max=30),
+        stop=stop_after_attempt(5),
+        reraise=True
     )
-
-
-def get_default_generation_config(temperature=0.1):
-    """
-    Returns a default GenerateContentConfig with safety settings set to BLOCK_NONE.
-    
-    Args:
-        temperature (float): The temperature to use for generation
+    def generate_content(
+        self,
+        model: str,
+        contents: Any,
+        config: Optional[GenerateContentConfig] = None,
+        operation_name: str = "Gemini API call"
+    ) -> Any:
+        """Generate content with automatic retry for transient errors."""
+        logger.info(f"Calling Gemini API for {operation_name}")
         
-    Returns:
-        GenerateContentConfig: The default generation config
-    """
-    return GenerateContentConfig(
-        temperature=temperature,
-        safety_settings=[
-            SafetySetting(
-                category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=HarmBlockThreshold.BLOCK_NONE,
-            ),
-            SafetySetting(
-                category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=HarmBlockThreshold.BLOCK_NONE,
-            ),
-            SafetySetting(
-                category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=HarmBlockThreshold.BLOCK_NONE,
-            ),
-            SafetySetting(
-                category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=HarmBlockThreshold.BLOCK_NONE,
-            ),
-        ],
+        if config is None:
+            config = self.get_default_config()
+        
+        response = self.client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config
+        )
+        
+        if not response or not response.text:
+            raise ValueError(f"Empty response from Gemini for {operation_name}")
+        
+        return response
+    
+    @retry(
+        retry=retry_if_exception(is_transient_gemini_error),
+        wait=wait_random_exponential(multiplier=1, max=30),
+        stop=stop_after_attempt(5),
+        reraise=True
     )
+    def generate_content_stream(
+        self,
+        model: str,
+        contents: Any,
+        config: Optional[GenerateContentConfig] = None,
+        operation_name: str = "Gemini API call"
+    ) -> str:
+        """Generate content with streaming and automatic retry."""
+        logger.info(f"Streaming from Gemini API for {operation_name}")
+        
+        if config is None:
+            config = self.get_default_config()
+        
+        # Stream and aggregate response
+        stream_response = self.client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=config
+        )
+        
+        aggregated_text = ""
+        chunk_count = 0
+        
+        for chunk in stream_response:
+            chunk_count += 1
+            if hasattr(chunk, 'text') and chunk.text:
+                aggregated_text += chunk.text
+                
+                # Log progress periodically
+                if len(aggregated_text) % 2000 < 10:
+                    estimated_tokens = len(aggregated_text) // 4
+                    logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
+            
+            # Check for early termination
+            if hasattr(chunk, 'candidates') and chunk.candidates:
+                for candidate in chunk.candidates:
+                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                        reason = str(candidate.finish_reason)
+                        if any(term in reason for term in ['PROHIBITED', 'SAFETY', 'BLOCKED']):
+                            raise ValueError(f"Content blocked: {reason}")
+        
+        if not aggregated_text:
+            raise ValueError(f"Empty stream response for {operation_name}")
+        
+        logger.info(f"Streamed {len(aggregated_text)} chars ({chunk_count} chunks) for {operation_name}")
+        return aggregated_text
+    
+    @staticmethod
+    def get_default_config(temperature: float = 0.1) -> GenerateContentConfig:
+        """Get default generation config."""
+        return GenerateContentConfig(
+            temperature=temperature,
+            top_p=0.95,
+            top_k=20,
+            candidate_count=1,
+            max_output_tokens=65536,
+            stop_sequences=None,
+            safety_settings=[
+                SafetySetting(
+                    category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    threshold=HarmBlockThreshold.BLOCK_NONE,
+                ),
+                SafetySetting(
+                    category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    threshold=HarmBlockThreshold.BLOCK_NONE,
+                ),
+                SafetySetting(
+                    category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    threshold=HarmBlockThreshold.BLOCK_NONE,
+                ),
+                SafetySetting(
+                    category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    threshold=HarmBlockThreshold.BLOCK_NONE,
+                ),
+            ],
+        )
 
 
-def retry_with_exponential_backoff(max_retries=3, max_backoff=30):
+class AnthropicClient:
+    """Wrapper for Anthropic API with smart retry logic."""
+    
+    def __init__(self, api_key: str, base_url: Optional[str] = None):
+        """Initialize Anthropic client."""
+        import anthropic
+        if base_url:
+            self.client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
+        else:
+            self.client = anthropic.Anthropic(api_key=api_key)
+    
+    @retry(
+        retry=retry_if_exception(is_transient_anthropic_error),
+        wait=wait_random_exponential(multiplier=1, max=30),
+        stop=stop_after_attempt(5),
+        reraise=True
+    )
+    def generate_content(
+        self,
+        prompt: Union[str, List[Dict]],
+        model: str = "claude-sonnet-4-20250514",
+        max_tokens: int = 8192,
+        temperature: float = 0.1,
+        operation_name: str = "Anthropic API call"
+    ) -> str:
+        """Generate content with automatic retry for transient errors."""
+        logger.info(f"Calling Anthropic API for {operation_name}")
+        
+        # Process content for images
+        content = self._process_content(prompt)
+        
+        # Create message with streaming
+        stream = self.client.messages.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True
+        )
+        
+        # Aggregate streamed response
+        response_text = ""
+        for event in stream:
+            if event.type == "content_block_delta":
+                if hasattr(event.delta, 'text'):
+                    response_text += event.delta.text
+        
+        if not response_text:
+            raise ValueError(f"Empty response from Anthropic for {operation_name}")
+        
+        logger.info(f"Received {len(response_text)} chars from Anthropic for {operation_name}")
+        return response_text
+    
+    def _process_content(self, prompt: Union[str, List[Dict]]) -> Union[str, List[Dict]]:
+        """Process content to handle images properly."""
+        if isinstance(prompt, str):
+            return prompt
+        
+        if isinstance(prompt, list):
+            processed = []
+            for part in prompt:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        processed.append(part)
+                    elif part.get("type") == "image":
+                        # Check if already in Anthropic format
+                        if "source" in part and isinstance(part["source"], dict):
+                            # Already formatted correctly, just pass through
+                            processed.append(part)
+                        else:
+                            # Convert image bytes to base64
+                            image_data = part.get("data")
+                            mime_type = part.get("mime_type", "image/png")
+                            
+                            if isinstance(image_data, bytes):
+                                base64_data = base64.b64encode(image_data).decode('utf-8')
+                            else:
+                                base64_data = image_data
+                            
+                            processed.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime_type,
+                                    "data": base64_data
+                                }
+                            })
+                    else:
+                        processed.append(part)
+                else:
+                    processed.append(part)
+            return processed
+        
+        return prompt
+
+
+def generate_with_fallback(
+    prompt: Union[str, List[Dict]],
+    gemini_client: Optional[GeminiClient] = None,
+    anthropic_client: Optional[AnthropicClient] = None,
+    gemini_model: str = "gemini-2.5-pro",
+    anthropic_model: str = "claude-sonnet-4-20250514",
+    operation_name: str = "API call",
+    prefer_anthropic: bool = False
+) -> str:
     """
-    Decorator that retries the decorated function with exponential backoff
-    when network-related exceptions occur.
+    Generate content with fallback between Gemini and Anthropic.
     
     Args:
-        max_retries (int): Maximum number of retry attempts
-        max_backoff (int): Maximum backoff time in seconds
+        prompt: The prompt (string or list of content parts)
+        gemini_client: Optional Gemini client
+        anthropic_client: Optional Anthropic client
+        gemini_model: Gemini model to use
+        anthropic_model: Anthropic model to use
+        operation_name: Name for logging
+        prefer_anthropic: If True, try Anthropic first
         
     Returns:
-        The decorated function
+        Generated text
     """
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            retry_count = 0
-            result = None
-            
-            while result is None and retry_count < max_retries:
-                try:
-                    if retry_count > 0:
-                        # Calculate exponential backoff with jitter
-                        backoff_time = min(2 ** retry_count + (0.1 * retry_count), max_backoff)
-                        logger.warning(f"Retry attempt {retry_count} for {func.__name__}. Waiting {backoff_time:.2f}s...")
-                        time.sleep(backoff_time)
-                    
-                    # Call the original function
-                    result = func(*args, **kwargs)
-                    
-                except httpx.RemoteProtocolError as e:
-                    logger.error(f"RemoteProtocolError during {func.__name__}: {e}")
-                    retry_count += 1
-                    continue
-                    
-                except httpx.ReadTimeout as e:
-                    logger.error(f"ReadTimeout during {func.__name__}: {e}")
-                    retry_count += 1
-                    continue
-                    
-                except httpx.ConnectTimeout as e:
-                    logger.error(f"ConnectTimeout during {func.__name__}: {e}")
-                    retry_count += 1
-                    continue
-                    
-                except httpx.HTTPError as e:
-                    logger.error(f"HTTPError during {func.__name__}: {e}")
-                    retry_count += 1
-                    continue
-                    
-                except Exception as e:
-                    logger.error(f"Unexpected error during {func.__name__}: {e}")
-                    retry_count += 1
-                    continue
-                
-                # If we got here with no result, increment retry counter
-                if result is None:
-                    retry_count += 1
-            
-            if result is None:
-                raise ValueError(f"Failed to execute {func.__name__} after {max_retries} attempts")
-                
-            return result
-        
-        return wrapper
-    
-    return decorator
-
-
-def generate_content_with_retry(client, model, contents, config=None, max_retries=3, max_backoff=30, operation_name="API call", use_streaming=True):
-    """
-    Helper function to generate content with retry logic for network-related exceptions.
-    Supports both streaming and non-streaming modes.
-    
-    Args:
-        client: The Gemini API client
-        model: The model to use for generation
-        contents: The contents to generate from
-        config: The generation config (if None, uses default config)
-        max_retries: Maximum number of retry attempts
-        max_backoff: Maximum backoff time in seconds
-        operation_name: Name of the operation for logging purposes
-        use_streaming: Whether to use streaming mode (default: True)
-        
-    Returns:
-        In non-streaming mode: The complete generated content response
-        In streaming mode: A response object with aggregated text from the stream
-    """
-    retry_count = 0
-    response = None
-    
-    # Use default config if none provided
-    if config is None:
-        config = get_default_generation_config()
-    
-    while response is None and retry_count < max_retries:
+    if prefer_anthropic and anthropic_client:
         try:
-            if retry_count > 0:
-                # Calculate exponential backoff with jitter
-                backoff_time = min(2 ** retry_count + (0.1 * retry_count), max_backoff)
-                logger.warning(f"Retry attempt {retry_count} for {operation_name}. Waiting {backoff_time:.2f}s...")
-                time.sleep(backoff_time)
-            
-            if use_streaming:
-                # Use streaming mode
-                logger.info(f"Using streaming mode for {operation_name}")
-                
-                # Create a response-like object to store the aggregated content
-                class AggregatedResponse:
-                    def __init__(self):
-                        self.text = ""
-                        self.parts = []
-                
-                aggregated_response = AggregatedResponse()
-                
-                # Generate content with streaming
-                stream_response = client.models.generate_content_stream(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
-                
-                # Process the stream
-                for chunk in stream_response:
-                    if chunk.text:
-                        aggregated_response.text += chunk.text
-                        # Log progress periodically (every 500 chars)
-                        if len(aggregated_response.text) % 500 < 10:
-                            logger.debug(f"Streaming progress for {operation_name}: {len(aggregated_response.text)} chars received")
-                
-                response = aggregated_response
-                logger.info(f"Streaming complete for {operation_name}: {len(response.text)} total chars")
-            else:
-                # Use non-streaming mode (original behavior)
-                logger.info(f"Using non-streaming mode for {operation_name}")
-                response = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
-            
-        except httpx.RemoteProtocolError as e:
-            logger.error(f"RemoteProtocolError during {operation_name}: {e}")
-            retry_count += 1
-            continue
-            
-        except httpx.ReadTimeout as e:
-            logger.error(f"ReadTimeout during {operation_name}: {e}")
-            retry_count += 1
-            continue
-            
-        except httpx.ConnectTimeout as e:
-            logger.error(f"ConnectTimeout during {operation_name}: {e}")
-            retry_count += 1
-            continue
-            
-        except httpx.HTTPError as e:
-            logger.error(f"HTTPError during {operation_name}: {e}")
-            retry_count += 1
-            continue
-            
+            return anthropic_client.generate_content(
+                prompt=prompt,
+                model=anthropic_model,
+                operation_name=f"{operation_name} (Anthropic)"
+            )
         except Exception as e:
-            logger.error(f"Unexpected error during {operation_name}: {e}")
-            retry_count += 1
-            continue
-        
-        # If we got here with no response, increment retry counter
-        if response is None:
-            retry_count += 1
+            if not is_transient_anthropic_error(e):
+                logger.warning(f"Anthropic failed with non-transient error: {e}")
+                if gemini_client:
+                    logger.info("Falling back to Gemini")
+                else:
+                    raise
     
-    if response is None:
-        raise ValueError(f"Failed to execute {operation_name} after {max_retries} attempts")
-        
-    return response
-
-
-def generate_content_with_retry_non_streaming(client, model, contents, config=None, max_retries=3, max_backoff=30, operation_name="API call"):
-    """
-    Legacy non-streaming version of generate_content_with_retry for backward compatibility.
+    if gemini_client:
+        try:
+            # Convert prompt format for Gemini if needed
+            if isinstance(prompt, list):
+                # Gemini expects different format
+                contents = []
+                for part in prompt:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        contents.append({"text": part["text"]})
+                    else:
+                        contents.append(part)
+            else:
+                contents = prompt
+            
+            response = gemini_client.generate_content_stream(
+                model=gemini_model,
+                contents=contents,
+                operation_name=f"{operation_name} (Gemini)"
+            )
+            return response
+        except Exception as e:
+            if not is_transient_gemini_error(e) and anthropic_client and not prefer_anthropic:
+                logger.warning(f"Gemini failed with non-transient error: {e}")
+                logger.info("Falling back to Anthropic")
+                return anthropic_client.generate_content(
+                    prompt=prompt,
+                    model=anthropic_model,
+                    operation_name=f"{operation_name} (Anthropic)"
+                )
+            raise
     
-    Args:
-        client: The Gemini API client
-        model: The model to use for generation
-        contents: The contents to generate from
-        config: The generation config (if None, uses default config)
-        max_retries: Maximum number of retry attempts
-        max_backoff: Maximum backoff time in seconds
-        operation_name: Name of the operation for logging purposes
-        
-    Returns:
-        The generated content response
-    """
-    return generate_content_with_retry(
-        client=client,
-        model=model,
-        contents=contents,
-        config=config,
-        max_retries=max_retries,
-        max_backoff=max_backoff,
-        operation_name=operation_name,
-        use_streaming=False
-    )
+    if anthropic_client and not prefer_anthropic:
+        return anthropic_client.generate_content(
+            prompt=prompt,
+            model=anthropic_model,
+            operation_name=f"{operation_name} (Anthropic)"
+        )
+    
+    raise ValueError("No API clients available")

@@ -1,15 +1,61 @@
-title: The Shock Doctrine
-target_title: 休克理论
-author: Naomi Klein
-google_api_key: example_api_key
-model: gemini-2.5-pro-preview-03-25
-target_language: Chinese
-source_language: English
-s3_access_key_id: example_access_key_id
-s3_secret_access_key: example_secret_access_key
-s3_bucket_name: example_bucket_name
-s3_endpoint: https://example.com
+# Book Information
+title: Your Book Title Here
+author: Author Name
+
+# API Keys
+anthropic_api_key: your-anthropic-api-key-here
+anthropic_base_url: https://api.anthropic.com  # Optional: custom base URL
+google_api_key: your-google-api-key-here
+
+# S3/Cloud Storage Configuration (Optional - for backup)
+s3_access_key_id: your-s3-access-key
+s3_secret_access_key: your-s3-secret-key
+s3_bucket_name: your-bucket-name
+s3_endpoint: https://s3.amazonaws.com  # Or your S3-compatible endpoint
+
+# Translation Settings
+target_language: English  # Target language for translation
+source_language: Japanese  # Source language
+
+# General Settings
 num_retries: 3
 max_backoff_seconds: 30
-previous_content_limit: 0
-max_continuation_attempts: 3
+max_concurrent_workers: 8  # Maximum number of concurrent API calls (adjust based on your API rate limits)
+
+# Polish model configuration
+# Models are tried in order until one succeeds
+# If a model triggers safety errors, all models from that provider are skipped
+polish_models:
+  - provider: gemini
+    model: gemini-2.5-pro
+    max_retries: 1  # Number of retries for transient errors (not safety blocks)
+  - provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_retries: 2  # Number of retries for transient errors
+
+# OCR Configuration for Japanese text processing
+ocr_settings:
+  zoom_factor: 1.0  # Image extraction quality (1.0-3.0, higher = better quality but slower)
+  max_workers: 4  # Number of parallel processing threads
+  page_retry_backoff: 2  # Initial backoff in seconds for page retries
+  
+  # Illustration detection settings
+  illustration_padding: 25  # Pixels to pad around text regions when whiting out
+  trim_step_percent: 0.02  # Step size for border trimming (0.01-0.1)
+  min_black_pixels: 200  # Minimum non-white pixels to consider as content
+
+# OCR model configuration
+# Models are tried in order until one succeeds
+# If a model triggers safety errors, all models from that provider are skipped
+ocr_models:
+  - provider: gemini
+    model: gemini-2.5-pro
+    max_retries: 1  # Number of retries for transient errors (not safety blocks)
+  - provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_retries: 2  # Number of retries for transient errors
+
+# Google Cloud Vision API (for illustration detection in Japanese OCR)
+# Create service account key at: https://console.cloud.google.com/apis/credentials
+# Save the JSON key file as sa-keys.json in the project root
+service_account_key_path: sa-keys.json  # Path to Google Cloud service account key

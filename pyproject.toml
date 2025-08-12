@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pdf2epub"
-version = "0.1.0"
+version = "0.2.0"
 description = ""
 authors = ["ShenSheiBot <shensheibot@protonmail.com>"]
 readme = "README.md"
@@ -19,6 +19,13 @@ pymupdf = "^1.25.4"
 pillow = "^11.1.0"
 boto3 = "^1.38.2"
 loguru = "^0.7.3"
+markdown = "^3.8.2"
+tiktoken = "^0.11.0"
+regex = "^2024.0.0"
+anthropic = "^0.62.0"
+tenacity = "^9.1.2"
+numpy = "^2.3.2"
+google-cloud-vision = "^3.10.2"
 
 
 [build-system]

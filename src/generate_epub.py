@@ -1,55 +1,45 @@
+#!/usr/bin/env python3
+"""
+Generate EPUB from polished markdown files.
+Version 3 - Simplified without progress tracking, with automatic cleanup.
+"""
+
 import json
 import os
 import uuid
 import shutil
-import fitz  # PyMuPDF
 import yaml
 import zipfile
 import re
 import argparse
-import time
-from io import BytesIO
+import fitz  # PyMuPDF for cover extraction
 from datetime import datetime
 from pathlib import Path
+from io import BytesIO
 from PIL import Image
-from google import genai
-import httpx
-from utils.network_utils import generate_content_with_retry, get_default_generation_config
-from utils.html_utils import clean_html_response
-from google.genai.types import (
-    GenerateContentConfig,
-    HarmBlockThreshold,
-    HarmCategory,
-    Part,
-    SafetySetting,
-)
 from loguru import logger
 from utils.logging_config import configure_logging
-
+from markdown_to_html import convert_markdown_to_html
 
 # Configure logger
 logger = configure_logging()
 
 
-def load_config():
-    """Load configuration from config.yaml file."""
-    with open("config.yaml", "r", encoding="utf-8") as file:
+def load_config(config_path="config.yaml"):
+    """Load configuration from config file."""
+    with open(config_path, "r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
     return config
-
-
-def setup_genai_api(api_key):
-    """Setup Google Generative AI API with the provided key."""
-    from utils.network_utils import setup_genai_client
-    return setup_genai_client(api_key)
 
 
 def load_book_structure(book_title):
     """Load the book structure JSON file."""
     structure_path = Path("output") / Path(book_title) / "book_structure.json"
-    with open(structure_path, "r", encoding="utf-8") as file:
-        structure = json.load(file)
-    return structure
+    if structure_path.exists():
+        with open(structure_path, "r", encoding="utf-8") as file:
+            structure = json.load(file)
+        return structure
+    return None
 
 
 def ensure_directory(directory_path):
@@ -57,727 +47,217 @@ def ensure_directory(directory_path):
     Path(directory_path).mkdir(parents=True, exist_ok=True)
 
 
-def get_pdf_page_count(pdf_path):
-    """Get the total number of pages in a PDF file."""
-    with fitz.open(pdf_path) as pdf:
-        return len(pdf)
+def cleanup_old_files(epub_dir):
+    """Clean up old intermediate files from previous generations."""
+    if epub_dir.exists():
+        logger.info(f"Cleaning up old files in {epub_dir}")
+        shutil.rmtree(epub_dir)
+        logger.info("Old files cleaned up")
 
 
-def save_generation_progress(progress_file, progress_data):
-    """Save generation progress to a JSON file."""
-    with open(progress_file, "w", encoding="utf-8") as f:
-        json.dump(progress_data, f, indent=2)
-
-
-def load_generation_progress(progress_file, structure=None):
-    """Load generation progress from a JSON file."""
-    if Path(progress_file).exists():
-        with open(progress_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+def copy_chapter_images(source_dir, dest_dir):
+    """Copy all chapter images from source to destination directory."""
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp'}
+    images_copied = 0
     
-    # Initialize with default values
-    progress = {
-        "cover_extracted": False,
-        "cover_html_created": False,
-        "stylesheet_created": False,
-        "toc_ncx_created": False,
-        "toc_html_created": False,
-        "container_xml_created": False,
-        "mimetype_created": False,
-        "content_opf_created": False,
-        "processed_chapters": [],
-        "last_processed_chapter_index": -1,
-        "cover_image_filename": "",
-        "chapter_titles": [],
-    }
+    # Look for images in the parent directory of polished_markdown (usually 'images' folder)
+    images_source = source_dir.parent / "images"
+    if images_source.exists():
+        for img_file in images_source.iterdir():
+            if img_file.suffix.lower() in image_extensions:
+                dest_path = dest_dir / img_file.name
+                shutil.copy2(img_file, dest_path)
+                images_copied += 1
+                logger.debug(f"Copied image: {img_file.name}")
     
-    # If structure is provided, initialize chapters with generated: false
-    if structure:
-        progress["chapters"] = []
-        for i, chapter in enumerate(structure["chapters"], 1):
-            progress["chapters"].append({
-                "index": i,
-                "title": chapter["title"],
-                "generated": False
-            })
+    # Also look for images in the polished_markdown directory itself
+    for img_file in source_dir.iterdir():
+        if img_file.suffix.lower() in image_extensions:
+            dest_path = dest_dir / img_file.name
+            shutil.copy2(img_file, dest_path)
+            images_copied += 1
+            logger.debug(f"Copied image: {img_file.name}")
     
-    return progress
-
-
-def clean_unused_images(epub_dir):
-    """Remove images that aren't referenced in any HTML file."""
-    logger.info("Cleaning unused images...")
-    # Get all image files
-    all_images = set()
-    for img_path in Path(epub_dir).glob("images/*.*"):
-        all_images.add(img_path.name)
+    if images_copied > 0:
+        logger.success(f"Copied {images_copied} images to EPUB")
     
-    # Find referenced images in all HTML files
-    referenced_images = set()
-    for html_file in Path(epub_dir).glob("**/*.html"):
-        with open(html_file, "r", encoding="utf-8") as f:
-            content = f.read()
-            # Find all image references
-            img_refs = re.findall(r'<img src="\.\.\/images\/([^"]+)"', content)
-            referenced_images.update(img_refs)
-    
-    # Add cover image to referenced images (it's always used)
-    cover_path = Path(epub_dir) / "content.opf"
-    if cover_path.exists():
-        with open(cover_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            cover_match = re.search(r'<item href="([^"]+)" id="cover"', content)
-            if cover_match and not cover_match.group(1).startswith("images/"):
-                # If it's a direct reference to the cover image
-                referenced_images.add(cover_match.group(1))
-    
-    # Also check titlepage.xhtml for cover image references
-    cover_page_path = Path(epub_dir) / "titlepage.xhtml"
-    if cover_page_path.exists():
-        with open(cover_page_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            cover_matches = re.findall(r'xlink:href="([^"]+)"', content)
-            referenced_images.update(cover_matches)
-    
-    # Find unused images
-    unused_images = all_images - referenced_images
-    
-    # Remove unused images
-    for img_name in unused_images:
-        img_path = Path(epub_dir) / "images" / img_name
-        try:
-            os.remove(img_path)
-            logger.debug(f"Removed unused image: {img_name}")
-        except Exception as e:
-            logger.error(f"Error removing {img_name}: {e}")
-    
-    logger.info(f"Removed {len(unused_images)} unused images.")
-
-
-def create_toc_ncx(structure, book_title, book_uuid, output_path):
-    """Create the toc.ncx file for EPUB navigation."""
-    # Start building the NCX content
-    ncx_content = f"""<?xml version='1.0' encoding='utf-8'?>
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1" xml:lang="jpn">
-  <head>
-    <meta content="{book_uuid}" name="dtb:uid"/>
-    <meta content="2" name="dtb:depth"/>
-    <meta content="calibre (4.23.0)" name="dtb:generator"/>
-    <meta content="0" name="dtb:totalPageCount"/>
-    <meta content="0" name="dtb:maxPageNumber"/>
-  </head>
-  <docTitle>
-    <text>{book_title}</text>
-  </docTitle>
-  <navMap>
-    <navPoint class="chapter" id="cover" playOrder="1">
-      <navLabel>
-        <text>表紙</text>
-      </navLabel>
-      <content src="titlepage.xhtml"/>
-    </navPoint>
-    <navPoint class="chapter" id="toc" playOrder="2">
-      <navLabel>
-        <text>目次</text>
-      </navLabel>
-      <content src="text/toc.html"/>
-    </navPoint>"""
-
-    # Add chapters to the NCX
-    play_order = 3
-    for i, chapter in enumerate(structure["chapters"], 1):
-        chapter_id = f"chapter_{i}"
-        chapter_filename = f"chapter_{i}.html"
-
-        ncx_content += f"""
-    <navPoint class="chapter" id="{chapter_id}" playOrder="{play_order}">
-      <navLabel>
-        <text>{chapter['title']}</text>
-      </navLabel>
-      <content src="text/{chapter_filename}"/>
-    </navPoint>"""
-        play_order += 1
-
-    # Close the NCX file
-    ncx_content += """
-  </navMap>
-</ncx>"""
-
-    # Write the NCX file
-    with open(output_path, "w", encoding="utf-8") as ncx_file:
-        ncx_file.write(ncx_content)
-
-    logger.info(f"Created toc.ncx at {output_path}")
+    return images_copied
 
 
 def extract_cover_image(pdf_path, output_dir):
-    """Extract the cover image from the PDF."""
-    doc = fitz.open(pdf_path)
-    cover_page = doc[0]  # First page is the cover
-
-    # Get list of image objects in the cover page
-    image_list = cover_page.get_images(full=True)
-
-    # If no images found, save the whole page as an image
-    if not image_list:
-        pix = cover_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # Higher resolution
-        image_path = os.path.join(output_dir, "cover.jpeg")
-        pix.save(image_path)
-        return "cover.jpeg"
-
-    # Otherwise, extract the largest image as the cover
-    largest_image = None
-    max_size = 0
-
-    for img_index, img in enumerate(image_list):
-        xref = img[0]
-        base_image = doc.extract_image(xref)
-        image_bytes = base_image["image"]
-        image_ext = base_image["ext"]
-        width = base_image["width"]
-        height = base_image["height"]
-
-        image_size = width * height
-        if image_size > max_size:
-            max_size = image_size
-            largest_image = (img_index, image_bytes, image_ext)
-
-    if largest_image:
-        img_index, image_bytes, image_ext = largest_image
-        # Always save as JPEG for better compatibility
-        if image_ext.lower() != "jpeg" and image_ext.lower() != "jpg":
-            # Convert to JPEG if it's not already
-            img = Image.open(BytesIO(image_bytes))
-            img_buffer = BytesIO()
-            img.convert("RGB").save(img_buffer, format="JPEG", quality=95)
-            image_bytes = img_buffer.getvalue()
-            image_ext = "jpeg"
-
-        image_filename = f"cover.{image_ext}"
-        image_path = os.path.join(output_dir, image_filename)
-
-        with open(image_path, "wb") as img_file:
-            img_file.write(image_bytes)
-
-        return image_filename
-
-    return None
+    """Extract the first page of the PDF as the cover image."""
+    try:
+        pdf_doc = fitz.open(pdf_path)
+        first_page = pdf_doc[0]
+        
+        # Render page at high resolution
+        mat = fitz.Matrix(2.0, 2.0)  # 2x scaling for better quality
+        pix = first_page.get_pixmap(matrix=mat, alpha=False)
+        
+        # Convert to PIL Image
+        img_data = pix.tobytes("png")
+        img = Image.open(BytesIO(img_data))
+        
+        # Save as cover.jpg (EPUB standard prefers JPEG for covers)
+        cover_path = output_dir / "cover.jpg"
+        img.convert("RGB").save(cover_path, "JPEG", quality=90)
+        
+        pdf_doc.close()
+        
+        logger.success(f"Extracted cover image: {cover_path}")
+        return "cover.jpg"
+        
+    except Exception as e:
+        logger.error(f"Failed to extract cover: {e}")
+        return None
 
 
-def extract_images_from_pdf_page(pdf_doc, page_num, images_dir, chapter_index, base_counter=1):
-    """Extract meaningful images from a specific PDF page with improved filtering."""
-    page = pdf_doc[page_num]
-    image_list = page.get_images(full=True)
-    extracted_images = []
+def convert_markdown_to_chapter_html(markdown_path, output_path, chapter_title, chapter_index=None, subchapter_info=None):
+    """Convert a markdown file to HTML chapter format with proper anchors for subchapters.
     
-    counter = base_counter
-    for img_index, img in enumerate(image_list):
-        xref = img[0]
-        base_image = pdf_doc.extract_image(xref)
+    Args:
+        subchapter_info: List of tuples (subchapter_index, subchapter_title) or list of titles
+    """
+    try:
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            markdown_content = f.read()
         
-        # More aggressively filter small images and better detect full-page text
-        width = base_image["width"]
-        height = base_image["height"]
+        # Convert markdown to HTML (just the body content, not a full document)
+        html_content = convert_markdown_to_html(markdown_content, standalone=False)
         
-        # Skip very small images (likely icons or decorations)
-        if width < 100 or height < 100:
-            continue
-        
-        # Skip images that are likely full-page text
-        # This heuristic looks at image dimensions compared to page dimensions
-        page_width, page_height = page.rect.width, page.rect.height
-        if (width > 0.9 * page_width and height > 0.9 * page_height):
-            # This might be a full page scan - skip unless it's actually an image
-            continue
+        # Add/update anchors to subchapter headings if we have the info
+        if chapter_index and subchapter_info:
+            # Handle both formats: list of titles or list of (index, title) tuples
+            if subchapter_info and isinstance(subchapter_info[0], tuple):
+                subchapters = subchapter_info
+            else:
+                # Convert simple list to tuples with indices
+                subchapters = [(j, title) for j, title in enumerate(subchapter_info, 1)]
             
-        image_bytes = base_image["image"]
-        image_ext = base_image["ext"]
+            for j, sub_title in subchapters:
+                # Look for headings that might already have IDs from markdown conversion
+                # Try different heading levels (h2, h3, h4)
+                anchor_added = False
+                for h_level in ['h2', 'h3', 'h4']:
+                    if anchor_added:
+                        break
+                    
+                    # First, try to find heading with existing ID and replace the ID
+                    # The markdown converter creates IDs like id="madness-and-civilization"
+                    pattern = f'<{h_level}[^>]*id="[^"]*"[^>]*>([^<]*{re.escape(sub_title)}[^<]*)</{h_level}>'
+                    if re.search(pattern, html_content, flags=re.IGNORECASE):
+                        # Replace the existing ID
+                        replacement = f'<{h_level} id="{chapter_index}-{j}">\\1</{h_level}>'
+                        html_content = re.sub(pattern, replacement, html_content, count=1, flags=re.IGNORECASE)
+                        anchor_added = True
+                        logger.debug(f"Replaced anchor with #{chapter_index}-{j} for '{sub_title}'")
+                        break
+                    
+                    # If exact match fails, try fuzzy matching
+                    # Look for headings with similar text
+                    import difflib
+                    heading_pattern = f'<{h_level}[^>]*id="([^"]*)"[^>]*>([^<]+)</{h_level}>'
+                    for match in re.finditer(heading_pattern, html_content):
+                        heading_id = match.group(1)
+                        heading_text = match.group(2)
+                        similarity = difflib.SequenceMatcher(None, sub_title.lower(), heading_text.lower()).ratio()
+                        if similarity > 0.8:  # 80% similarity threshold
+                            # Replace this heading's ID
+                            old_heading = match.group(0)
+                            new_heading = f'<{h_level} id="{chapter_index}-{j}">{heading_text}</{h_level}>'
+                            html_content = html_content.replace(old_heading, new_heading, 1)
+                            anchor_added = True
+                            logger.debug(f"Replaced anchor with #{chapter_index}-{j} for '{sub_title}' (fuzzy matched to '{heading_text}')")
+                            break
+                    
+                    if anchor_added:
+                        break
+                    
+                    # If no existing ID, try to find heading without ID
+                    escaped_title = re.escape(sub_title)
+                    pattern = f'<{h_level}>({escaped_title})</{h_level}>'
+                    replacement = f'<{h_level} id="{chapter_index}-{j}">\\1</{h_level}>'
+                    new_content = re.sub(pattern, replacement, html_content, count=1, flags=re.IGNORECASE)
+                    if new_content != html_content:
+                        html_content = new_content
+                        anchor_added = True
+                        logger.debug(f"Added anchor #{chapter_index}-{j} to '{sub_title}'")
+                        break
+                
+                if not anchor_added:
+                    # Try a more flexible match (handle minor variations)
+                    # Look for any heading that contains key words from the title
+                    for h_level in ['h2', 'h3', 'h4']:
+                        # Try to match heading with existing ID first
+                        pattern = f'<{h_level}[^>]*id="[^"]*"[^>]*>[^<]*</{h_level}>'
+                        matches = re.finditer(pattern, html_content, flags=re.IGNORECASE)
+                        for match in matches:
+                            heading_text = match.group(0)
+                            # Check if this heading contains the key words from sub_title
+                            key_words = sub_title.upper().replace('AND', '').replace('THE', '').replace('OF', '').split()
+                            if all(word in heading_text.upper() for word in key_words[:2] if len(word) > 3):
+                                # Replace this heading's ID
+                                new_heading = re.sub(r'id="[^"]*"', f'id="{chapter_index}-{j}"', heading_text)
+                                html_content = html_content.replace(heading_text, new_heading)
+                                logger.debug(f"Updated anchor to #{chapter_index}-{j} for approximate match of '{sub_title}'")
+                                anchor_added = True
+                                break
+                        if anchor_added:
+                            break
         
-        # Convert to JPEG for compatibility
-        if image_ext.lower() not in ["jpeg", "jpg"]:
-            try:
-                img_obj = Image.open(BytesIO(image_bytes))
-                img_buffer = BytesIO()
-                img_obj.convert("RGB").save(img_buffer, format="JPEG", quality=95)
-                image_bytes = img_buffer.getvalue()
-                image_ext = "jpg"
-            except Exception as e:
-                logger.error(f"Error converting image: {e}")
-                continue
+        # Create full HTML document
+        html_doc = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <title>{chapter_title}</title>
+    <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
+</head>
+<body>
+    {html_content}
+</body>
+</html>"""
         
-        image_filename = f"chapter_{chapter_index}_img_{counter}.{image_ext}"
-        image_path = os.path.join(images_dir, image_filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_doc)
         
-        with open(image_path, "wb") as img_file:
-            img_file.write(image_bytes)
+        logger.success(f"Converted {markdown_path.name} to HTML")
+        return True
         
-        extracted_images.append({
-            "filename": image_filename,
-            "path": image_path,
-            "page": page_num,
-            "width": width,
-            "height": height
-        })
-        
-        counter += 1
-    
-    return extracted_images, counter
+    except Exception as e:
+        logger.error(f"Failed to convert {markdown_path}: {e}")
+        return False
 
 
 def create_cover_html(cover_image_filename, book_title, output_path):
-    """Create XHTML file for the cover."""
-    # Get image dimensions
-    try:
-        with Image.open(Path(output_path).parent / cover_image_filename) as img:
-            width, height = img.size
-    except Exception:
-        width, height = 600, 800  # Default dimensions if unable to get actual size
-
-    cover_html = f"""<?xml version='1.0' encoding='utf-8'?>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ja">
-    <head>
-        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
-        <meta name="calibre:cover" content="true"/>
-        <title>Cover</title>
-        <style type="text/css" title="override_css">
-            @page {{padding: 0pt; margin:0pt}}
-            body {{ text-align: center; padding:0pt; margin: 0pt; }}
-        </style>
-    </head>
-    <body>
-        <div>
-            <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="100%" height="100%" viewBox="0 0 {width} {height}" preserveAspectRatio="none">
-                <image width="{width}" height="{height}" xlink:href="{cover_image_filename}"/>
-            </svg>
-        </div>
-    </body>
+    """Create the cover HTML page."""
+    cover_html = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <title>Cover</title>
+    <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
+</head>
+<body>
+    <div class="cover">
+        <img src="../images/{cover_image_filename}" alt="{book_title} Cover" />
+    </div>
+</body>
 </html>"""
-
-    with open(output_path, "w", encoding="utf-8") as html_file:
-        html_file.write(cover_html)
-
-    logger.info(f"Created cover XHTML at {output_path}")
-
-
-def create_toc_html(structure, book_title, output_path, client, pdf_path, config):
-    """Create HTML file for the table of contents using Gemini."""
-    # Get TOC page range from the structure
-    toc_start = structure["table_of_contents"]["start_page"]
-    toc_end = structure["table_of_contents"]["end_page"]
     
-    # Extract only the TOC pages from the PDF
-    with fitz.open(pdf_path) as full_pdf:
-        # Create a new PDF with just the TOC pages
-        toc_pdf = fitz.open()
-        for page_num in range(toc_start - 1, toc_end):  # Convert to 0-based indexing
-            if page_num < len(full_pdf):  # Ensure we don't go out of bounds
-                toc_pdf.insert_pdf(full_pdf, from_page=page_num, to_page=page_num)
-        
-        # Save to a temporary file
-        temp_pdf_path = Path(output_path).parent / "temp_toc.pdf"
-        toc_pdf.save(temp_pdf_path)
-        toc_pdf.close()
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(cover_html)
     
-    # Load only the TOC PDF
-    with open(temp_pdf_path, "rb") as f:
-        pdf_data = f.read()
-    
-    prompt = f"""
-    Create an HTML file for the table of contents of this book "{book_title}".
-    The PDF provided contains only the table of contents pages.
-    
-    The HTML should include:
-    1. A clear title "目次" (Table of Contents)
-    2. A well-formatted list of all chapters and subchapters with their original titles in Japanese
-    3. Each entry should link to the appropriate chapter in the format:
-       - All chapters must link to "chapter_X.html" (where X is the chapter number)
-       - Do NOT use any other naming formats (like introduction.html, i.e., introduction should be chapter 1)
-
-    Please format the HTML to be clean, well-structured, and with appropriate CSS styling.
-    
-    Return only the complete HTML code without any other commentary.
-    """
-    
-    # Create parts for the multimodal input - text and PDF data
-    parts = [
-        prompt,
-        Part.from_bytes(data=pdf_data, mime_type="application/pdf"),
-    ]
-    
-    # Get model from config with fallback
-    model = config.get("model", "gemini-2.5-pro-preview-03-25")
-    
-    # Get number of retries from config
-    num_retries = config.get("num_retries", 3)
-    max_backoff = config.get("max_backoff_seconds", 30)
-    
-    # Get default generation config
-    generation_config = get_default_generation_config(temperature=0.1)
-    generation_config.response_mime_type = "application/xml"
-    
-    response = generate_content_with_retry(
-        client=client,
-        model=model,
-        contents=parts,
-        config=generation_config,
-        max_retries=num_retries,
-        max_backoff=max_backoff,
-        operation_name="TOC HTML generation",
-        use_streaming=True
-    )
-    
-    # Clean the HTML response
-    html_content = clean_html_response(response.text)
-    
-    if html_content is None:
-        raise ValueError(f"Failed to generate TOC HTML after {num_retries} attempts")
-    
-    # Write the HTML to the output file
-    with open(output_path, "w", encoding="utf-8") as html_file:
-        html_file.write(html_content)
-    
-    # Clean up temporary PDF
-    try:
-        os.remove(temp_pdf_path)
-    except Exception as e:
-        logger.warning(f"Could not remove temporary TOC PDF: {e}")
-    
-    logger.info(f"Created TOC HTML at {output_path}")
-
-
-def create_chapter_html(
-    chapter,
-    structure,
-    chapter_index,
-    book_title,
-    output_path,
-    client,
-    pdf_path,
-    images_dir,
-    previous_chapters,
-    config,
-):
-    """Create HTML file for a chapter using Gemini with simplified image handling."""
-    # Get chapter page range with buffer (3 pages before and after)
-    start_page = max(1, chapter["start_page"] - 3)  # Don't go below page 1
-    end_page = min(chapter["end_page"] + 3, get_pdf_page_count(pdf_path))  # Don't exceed PDF length
-    
-    # Original chapter bounds for the prompt
-    actual_start = chapter["start_page"]
-    actual_end = chapter["end_page"]
-    chapter_title = chapter["title"]
-
-    # Extract only the pages we need from the PDF
-    with fitz.open(pdf_path) as full_pdf:
-        # Create a new PDF with just the chapter pages plus buffer
-        chapter_pdf = fitz.open()
-        for page_num in range(start_page - 1, end_page):  # Convert to 0-based indexing
-            if page_num < len(full_pdf):  # Ensure we don't go out of bounds
-                chapter_pdf.insert_pdf(full_pdf, from_page=page_num, to_page=page_num)
-        
-        # Save to a temporary file
-        temp_pdf_path = Path(output_path).parent / f"temp_chapter_{chapter_index}.pdf"
-        chapter_pdf.save(temp_pdf_path)
-        chapter_pdf.close()
-    
-    # Load only the chapter PDF
-    with open(temp_pdf_path, "rb") as f:
-        pdf_data = f.read()
-
-    prompt = f"""
-    Convert the chapter "{chapter_title}" from the book "{book_title}" into clean HTML format.
-    
-    The PDF contains pages {start_page} to {end_page}, but you should focus on translating ONLY 
-    the actual chapter content (pages {actual_start} to {actual_end} in the original PDF).
-    
-    Create a clean, well-formatted HTML with proper heading structure and preserve all original Japanese text.
-    """"""
-    IMPORTANT FOR IMAGES:
-    - When you encounter an important image, diagram, or illustration, insert an image placeholder like this:
-      <div class="image-placeholder" id="img1" data-page="{actual_relative_page}" data-description="Brief description of the image"></div>
-    - The data-page attribute should be the page number RELATIVE to the start of the chapter (0 = first page, 1 = second page, etc.)
-    - Only include placeholders for meaningful images (photos, diagrams, illustrations) - NOT for decorative elements or text-only pages
-    - Include a brief description of what the image shows in the data-description attribute
-    Other requirements:
-    - Keep all original text formatting and structure
-    - Preserve all footnotes and move them to the end of the chapter with proper links
-    - Use the following CSS stylesheet (already defined at ../stylesheet.css):
-    ```
-    @namespace h "http://www.w3.org/1999/xhtml";
-    body {
-        font-family: "Hiragino Mincho ProN", "MS Mincho", serif;
-        line-height: 1.8;
-        max-width: 800px;
-        margin: 2em auto;
-        padding: 0 1em;
-        background-color: #fdfdfd;
-        color: #333;
-    }
-    h1 {
-        text-align: center;
-        margin-top: 1em;
-        margin-bottom: 2em;
-        font-weight: bold;
-        font-size: 2em;
-        border-bottom: 2px solid #ccc;
-        padding-bottom: 0.5em;
-    }
-    h2 {
-        font-size: 1.5em;
-        font-weight: bold;
-        margin-top: 2.5em;
-        margin-bottom: 1em;
-        border-bottom: 1px solid #ddd;
-        padding-bottom: 0.3em;
-    }
-    h3 {
-        font-size: 1.2em;
-        font-weight: bold;
-        margin-top: 2em;
-        margin-bottom: 0.8em;
-    }
-    p {
-        margin-bottom: 1.2em;
-        text-indent: 1em; /* Add indentation for paragraphs */
-        text-align: justify;
-    }
-    .image-placeholder {
-        width: 100%;
-        height: 200px; /* Adjust height as needed */
-        background-color: #eee;
-        border: 1px dashed #ccc;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        margin: 1.5em 0;
-        font-style: italic;
-        color: #888;
-    }
-    .image-placeholder::before {
-        content: "Image Placeholder (ID: " attr(id) ")";
-    }
-    .footnotes {
-        margin-top: 4em;
-        padding-top: 1em;
-        border-top: 1px solid #ccc;
-        font-size: 0.9em;
-    }
-    .footnotes h2 {
-        font-size: 1.2em;
-        border-bottom: none;
-        margin-bottom: 1em;
-    }
-    .footnotes ol {
-        padding-left: 1.5em;
-        list-style-type: decimal;
-    }
-    .footnote-item {
-        margin-bottom: 0.8em;
-        line-height: 1.6;
-    }
-    .footnote-item p {
-            text-indent: 0; /* No indent for footnote paragraphs if needed */
-            margin-bottom: 0.5em;
-    }
-    sup {
-        font-size: 0.8em;
-        vertical-align: super;
-    }
-    sup a {
-        text-decoration: none;
-        color: #0066cc;
-    }
-    sup a:hover {
-        text-decoration: underline;
-    }
-    .footnote-item a[href^="#fnref"] {
-        text-decoration: none;
-        color: #0066cc;
-        margin-left: 0.3em;
-    }
-    .footnote-item a[href^="#fnref"]:hover {
-        text-decoration: underline;
-    }
-    /* Specific formatting from text */
-    .inline-note { /* For things like ビルドゥングスロマン */
-        font-size: 0.85em;
-    }
-    ```
-    
-    Return ONLY the HTML content without any other commentary.
-    """
-
-    # Create parts for the multimodal input - text and PDF data
-    parts = [
-        prompt,
-        Part.from_bytes(data=pdf_data, mime_type="application/pdf"),
-    ]
-
-    # Get model from config with fallback
-    model = config.get("model", "gemini-2.5-pro-preview-03-25")
-    
-    # Get number of retries from config
-    num_retries = config.get("num_retries", 3)
-    max_backoff = config.get("max_backoff_seconds", 30)
-    
-    # Get default generation config
-    generation_config = get_default_generation_config(temperature=0.1)
-    generation_config.response_mime_type = "application/xml"
-    
-    response = generate_content_with_retry(
-        client=client,
-        model=model,
-        contents=parts,
-        config=generation_config,
-        max_retries=num_retries,
-        max_backoff=max_backoff,
-        operation_name=f"Chapter {chapter_index} HTML generation",
-        use_streaming=True
-    )
-    
-    # Clean the HTML response
-    html_content = clean_html_response(response.text)
-    
-    if html_content is None:
-        raise ValueError(f"Failed to generate chapter {chapter_index} HTML after {num_retries} attempts")
-    
-    # Process image placeholders
-    with fitz.open(temp_pdf_path) as chapter_pdf:
-        image_counter = 1
-        
-        # Find all image placeholders in the HTML
-        placeholder_matches = re.finditer(r'<div class="image-placeholder" id="([^"]+)" data-page="(\d+)" data-description="([^"]+)"></div>', html_content)
-        
-        for match in placeholder_matches:
-            # img_id = match.group(1)
-            relative_page = int(match.group(2))
-            description = match.group(3)
-            
-            # Calculate the actual page in the PDF
-            actual_page = min(relative_page, len(chapter_pdf) - 1)
-            
-            # Extract images from this page
-            extracted_images, _ = extract_images_from_pdf_page(
-                chapter_pdf, actual_page, images_dir, chapter_index, image_counter
-            )
-            
-            # If images were found, replace the placeholder with an actual image tag
-            if extracted_images:
-                img = extracted_images[0]  # Use the first extracted image
-                img_tag = f'<img src="../images/{img["filename"]}" alt="{description}" class="chapter-image" />'
-                placeholder = match.group(0)
-                html_content = html_content.replace(placeholder, img_tag)
-                image_counter += 1
-
-    # Write the HTML to the output file
-    with open(output_path, "w", encoding="utf-8") as html_file:
-        html_file.write(html_content)
-    
-    # Clean up temporary PDF
-    try:
-        os.remove(temp_pdf_path)
-    except Exception as e:
-        logger.warning(f"Could not remove temporary PDF: {e}")
-
-    logger.info(f"Created Chapter {chapter_index} HTML at {output_path}")
-    return chapter_title
-
-
-def create_container_xml(output_path):
-    """Create the META-INF/container.xml file."""
-    container_xml = """<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-   <rootfiles>
-      <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
-   </rootfiles>
-</container>"""
-
-    with open(output_path, "w", encoding="utf-8") as xml_file:
-        xml_file.write(container_xml)
-
-
-def create_mimetype(output_path):
-    """Create the mimetype file."""
-    with open(output_path, "w", encoding="utf-8") as mimetype_file:
-        mimetype_file.write("application/epub+zip")
-
-
-def create_content_opf(
-    book_title, book_uuid, author, chapters, cover_filename, output_path, epub_dir
-):
-    """Create the content.opf file."""
-    # Get current timestamp in ISO format
-    timestamp = datetime.now().isoformat(timespec="seconds")
-
-    # Start building the OPF content
-    opf_content = f"""<?xml version='1.0' encoding='utf-8'?>
-<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uuid_id" version="2.0">
-  <metadata xmlns:calibre="http://calibre.kovidgoyal.net/2009/metadata" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:opf="http://www.idpf.org/2007/opf" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-    <dc:date>{timestamp}</dc:date>
-    <dc:title>{book_title}</dc:title>
-    <dc:identifier id="uuid_id" opf:scheme="uuid">{book_uuid}</dc:identifier>
-    <dc:identifier opf:scheme="calibre">{book_uuid}</dc:identifier>
-    <dc:language>ja</dc:language>
-    <dc:contributor opf:role="bkp">calibre (4.23.0) [https://calibre-ebook.com]</dc:contributor>
-    <meta name="calibre:title_sort" content="{book_title}"/>
-    <meta name="cover" content="cover"/>
-    <dc:creator opf:file-as="{author}" opf:role="aut">{author}</dc:creator>
-    <meta name="calibre:timestamp" content="{timestamp}+00:00"/>
-  </metadata>
-  <manifest>
-    <item href="{cover_filename}" id="cover" media-type="image/jpeg"/>
-    <item href="titlepage.xhtml" id="titlepage" media-type="application/xhtml+xml"/>
-    <item href="text/toc.html" id="toc" media-type="application/xhtml+xml"/>
-"""
-
-    # Add chapters to manifest
-    for i in range(1, len(chapters) + 1):
-        opf_content += f'    <item href="text/chapter_{i}.html" id="chapter_{i}" media-type="application/xhtml+xml"/>\n'
-
-    # Add images to manifest
-    image_id = 1
-    for image_file in Path(epub_dir).glob("images/*.jpg"):
-        opf_content += f'    <item href="images/{image_file.name}" id="img_{image_id}" media-type="image/jpeg"/>\n'
-        image_id += 1
-
-    for image_file in Path(epub_dir).glob("images/*.jpeg"):
-        opf_content += f'    <item href="images/{image_file.name}" id="img_{image_id}" media-type="image/jpeg"/>\n'
-        image_id += 1
-
-    for image_file in Path(epub_dir).glob("images/*.png"):
-        opf_content += f'    <item href="images/{image_file.name}" id="img_{image_id}" media-type="image/png"/>\n'
-        image_id += 1
-
-    # Add remaining required items
-    opf_content += """    <item href="stylesheet.css" id="css" media-type="text/css"/>
-    <item href="toc.ncx" id="ncx" media-type="application/x-dtbncx+xml"/>
-  </manifest>
-  <spine toc="ncx" page-progression-direction="rtl">
-    <itemref idref="titlepage"/>
-    <itemref idref="toc"/>
-"""
-
-    # Add chapters to spine
-    for i in range(1, len(chapters) + 1):
-        opf_content += f'    <itemref idref="chapter_{i}"/>\n'
-
-    # Close spine and add guide
-    opf_content += """  </spine>
-  <guide>
-    <reference href="text/toc.html" title="目次" type="toc"/>
-    <reference href="titlepage.xhtml" title="Cover" type="cover"/>
-    <reference href="text/chapter_1.html" title="Start" type="text"/>
-  </guide>
-</package>"""
-
-    # Write the OPF file
-    with open(output_path, "w", encoding="utf-8") as opf_file:
-        opf_file.write(opf_content)
+    logger.success(f"Created cover HTML: {output_path}")
 
 
 def create_stylesheet(output_path):
-    """Create a basic CSS stylesheet."""
-    css_content = """@namespace h "http://www.w3.org/1999/xhtml";
+    """Create the CSS stylesheet for the EPUB."""
+    css_content = """/* Enhanced EPUB Stylesheet */
+@namespace h "http://www.w3.org/1999/xhtml";
+
 body {
     font-family: "Hiragino Mincho ProN", "MS Mincho", serif;
     line-height: 1.8;
@@ -786,7 +266,9 @@ body {
     padding: 0 1em;
     background-color: #fdfdfd;
     color: #333;
+    text-align: justify;
 }
+
 h1 {
     text-align: center;
     margin-top: 1em;
@@ -795,7 +277,9 @@ h1 {
     font-size: 2em;
     border-bottom: 2px solid #ccc;
     padding-bottom: 0.5em;
+    page-break-before: always;
 }
+
 h2 {
     font-size: 1.5em;
     font-weight: bold;
@@ -804,344 +288,919 @@ h2 {
     border-bottom: 1px solid #ddd;
     padding-bottom: 0.3em;
 }
+
 h3 {
     font-size: 1.2em;
     font-weight: bold;
     margin-top: 2em;
     margin-bottom: 0.8em;
 }
+
+h4 {
+    font-size: 1.1em;
+    font-weight: bold;
+    margin-top: 1.5em;
+    margin-bottom: 0.6em;
+}
+
 p {
     margin-bottom: 1.2em;
-    text-indent: 1em; /* Add indentation for paragraphs */
+    text-indent: 1em;
     text-align: justify;
 }
-.image-placeholder {
-    width: 100%;
-    height: 200px; /* Adjust height as needed */
-    background-color: #eee;
-    border: 1px dashed #ccc;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: 1.5em 0;
+
+/* No indent after headings or block elements */
+h1 + p,
+h2 + p,
+h3 + p,
+h4 + p,
+blockquote + p,
+ul + p,
+ol + p,
+pre + p {
+    text-indent: 0;
+}
+
+blockquote {
+    margin: 1.5em 2em;
+    padding-left: 1em;
+    border-left: 3px solid #ddd;
     font-style: italic;
-    color: #888;
+    color: #555;
 }
-.image-placeholder::before {
-    content: "Image Placeholder (ID: " attr(id) ")";
-}
-.footnotes {
-    margin-top: 4em;
-    padding-top: 1em;
-    border-top: 1px solid #ccc;
+
+code {
+    font-family: "Courier New", monospace;
     font-size: 0.9em;
+    background-color: #f4f4f4;
+    padding: 0.2em 0.4em;
+    border-radius: 3px;
 }
-.footnotes h2 {
-    font-size: 1.2em;
-    border-bottom: none;
-    margin-bottom: 1em;
+
+pre {
+    font-family: "Courier New", monospace;
+    font-size: 0.9em;
+    background-color: #f4f4f4;
+    padding: 1em;
+    border-radius: 5px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    margin: 1em 0;
 }
-.footnotes ol {
-    padding-left: 1.5em;
-    list-style-type: decimal;
+
+pre code {
+    background-color: transparent;
+    padding: 0;
 }
-.footnote-item {
-    margin-bottom: 0.8em;
-    line-height: 1.6;
+
+ul, ol {
+    margin: 1em 0;
+    padding-left: 2em;
 }
-.footnote-item p {
-        text-indent: 0; /* No indent for footnote paragraphs if needed */
-        margin-bottom: 0.5em;
+
+li {
+    margin: 0.5em 0;
 }
+
+/* Links */
+a {
+    color: #0066cc;
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+/* Tables */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1.5em 0;
+}
+
+th, td {
+    border: 1px solid #ddd;
+    padding: 0.5em;
+    text-align: left;
+}
+
+th {
+    background-color: #f4f4f4;
+    font-weight: bold;
+}
+
+/* Images */
+img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 1.5em auto;
+}
+
+/* Superscript and subscript */
+sup, sub {
+    font-size: 0.8em;
+    line-height: 0;
+}
+
+sup {
+    vertical-align: super;
+}
+
+sub {
+    vertical-align: sub;
+}
+
+/* Horizontal rules */
+hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin: 2em 0;
+}
+
+.cover {
+    text-align: center;
+    page-break-after: always;
+}
+
+.cover img {
+    max-width: 100%;
+    height: auto;
+}
+
+.toc {
+    page-break-after: always;
+}
+
+.toc ul {
+    list-style-type: none;
+    padding-left: 0;
+}
+
+.toc li {
+    margin: 0.5em 0;
+}
+
+.toc a {
+    text-decoration: none;
+    color: #000;
+}
+
+/* Footnote references in text */
 sup {
     font-size: 0.8em;
     vertical-align: super;
 }
-sup a {
+
+sup a, .footnote-ref {
     text-decoration: none;
     color: #0066cc;
 }
-sup a:hover {
+
+sup a:hover, .footnote-ref:hover {
     text-decoration: underline;
 }
-.footnote-item a[href^="#fnref"] {
+
+/* Footnote section at end of chapter */
+.footnote, .footnotes {
+    margin-top: 2em;
+    padding-top: 0.5em;
+    border-top: none;  /* Remove top border since Notes h2 already has bottom border */
+    font-size: 0.9em;
+}
+
+/* Keep the Notes h2 border for visual separation */
+.footnote h2, .footnotes h2 {
+    font-size: 1.2em;
+    border-bottom: 1px solid #ddd;  /* Use same style as regular h2 */
+    padding-bottom: 0.3em;
+    margin-top: 0;
+    margin-bottom: 0.8em;
+}
+
+/* Hide the hr element in footnote sections */
+.footnote hr, .footnotes hr {
+    display: none;
+}
+
+.footnote ol, .footnotes ol {
+    padding-left: 1.5em;
+    list-style-type: decimal;
+    margin-top: 0;
+}
+
+.footnote li, .footnotes li, .footnote-item {
+    margin-bottom: 0.8em;
+    line-height: 1.6;
+}
+
+.footnote-item p {
+    text-indent: 0;
+    margin-bottom: 0.5em;
+}
+
+.footnote-backref, .footnote-item a[href^="#fnref"] {
     text-decoration: none;
     color: #0066cc;
     margin-left: 0.3em;
 }
-.footnote-item a[href^="#fnref"]:hover {
-    text-decoration: underline;
-}
-/* Specific formatting from text */
-.inline-note { /* For things like ビルドゥングスロマン */
-    font-size: 0.85em;
-}"""
 
-    with open(output_path, "w", encoding="utf-8") as css_file:
-        css_file.write(css_content)
+.footnote-backref:hover, .footnote-item a[href^="#fnref"]:hover {
+    text-decoration: underline;
+}"""
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(css_content)
+    
+    logger.success(f"Created stylesheet: {output_path}")
+
+
+def create_toc_ncx(structure, book_title, book_uuid, output_path, parts_info=None, subchapter_locations=None):
+    """Create the NCX table of contents file.
+    
+    Args:
+        subchapter_locations: Dict mapping (chapter_idx, subchapter_idx) to part number
+    """
+    ncx_content = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="{book_uuid}"/>
+    <meta name="dtb:depth" content="2"/>
+    <meta name="dtb:totalPageCount" content="0"/>
+    <meta name="dtb:maxPageNumber" content="0"/>
+  </head>
+  <docTitle>
+    <text>{book_title}</text>
+  </docTitle>
+  <navMap>
+    <navPoint id="navpoint-toc" playOrder="1">
+      <navLabel>
+        <text>Table of Contents</text>
+      </navLabel>
+      <content src="text/toc.html"/>
+    </navPoint>"""
+    
+    play_order = 2
+    for i, chapter in enumerate(structure["chapters"], 1):
+        chapter_title = chapter["title"]
+        # Check if this chapter has parts
+        chapter_key = str(i)
+        if parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
+            # Multi-part chapter - link to first part
+            chapter_file = f"chapter_{i}.part1.html"
+        else:
+            # Single file chapter
+            chapter_file = f"chapter_{i}.html"
+        
+        ncx_content += f"""
+    <navPoint id="navpoint-{i}" playOrder="{play_order}">
+      <navLabel>
+        <text>{chapter_title}</text>
+      </navLabel>
+      <content src="text/{chapter_file}"/>"""
+        
+        # Add subchapters if they exist
+        if "subchapters" in chapter and chapter["subchapters"]:
+            for j, subchapter in enumerate(chapter["subchapters"], 1):
+                play_order += 1
+                sub_title = subchapter["title"]
+                
+                # Determine which part contains this subchapter
+                if subchapter_locations and (i, j) in subchapter_locations:
+                    part_num = subchapter_locations[(i, j)]
+                    if part_num and part_num > 1:
+                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
+                    else:
+                        sub_chapter_file = chapter_file
+                else:
+                    # Default to main chapter file (or part1 for multi-part)
+                    sub_chapter_file = chapter_file
+                
+                ncx_content += f"""
+      <navPoint id="navpoint-{i}-{j}" playOrder="{play_order}">
+        <navLabel>
+          <text>{sub_title}</text>
+        </navLabel>
+        <content src="text/{sub_chapter_file}#{i}-{j}"/>
+      </navPoint>"""
+        
+        ncx_content += """
+    </navPoint>"""
+        play_order += 1
+    
+    ncx_content += """
+  </navMap>
+</ncx>"""
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(ncx_content)
+    
+    logger.success(f"Created NCX TOC: {output_path}")
+
+
+def create_toc_html(structure, book_title, output_path, parts_info=None, subchapter_locations=None):
+    """Create the HTML table of contents.
+    
+    Args:
+        subchapter_locations: Dict mapping (chapter_idx, subchapter_idx) to part number
+    """
+    toc_html = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <title>Table of Contents</title>
+    <style type="text/css">
+        body {{
+            font-family: Georgia, "Times New Roman", serif;
+            line-height: 1.8;
+            margin: 2em auto;
+            max-width: 800px;
+            padding: 0 1em;
+            background-color: #fdfdfd;
+            color: #333;
+        }}
+        h1 {{
+            text-align: center;
+            margin-bottom: 1.5em;
+            color: #222;
+            border-bottom: 3px solid #4a5568;
+            padding-bottom: 0.5em;
+            font-weight: bold;
+            font-size: 2em;
+        }}
+        .toc {{
+            margin: 0;
+            padding: 0;
+        }}
+        .toc > ul {{
+            list-style-type: none;
+            padding-left: 0;
+            margin: 0;
+        }}
+        .toc > ul > li {{
+            margin-bottom: 1.5em;
+            padding-left: 1.5em;
+            border-left: 4px solid #e2e8f0;
+            transition: border-color 0.3s ease;
+        }}
+        .toc > ul > li:hover {{
+            border-left-color: #4a5568;
+        }}
+        .toc a {{
+            text-decoration: none;
+            color: #2563eb;
+            font-weight: 600;
+            font-size: 1.1em;
+            display: block;
+            transition: color 0.2s ease;
+        }}
+        .toc a:hover {{
+            color: #1d4ed8;
+            text-decoration: underline;
+        }}
+        .chapter-number {{
+            display: inline-block;
+            min-width: 2em;
+            margin-right: 0.5em;
+            font-weight: bold;
+            color: #555;
+        }}
+        /* Nested subchapters */
+        .toc ul ul {{
+            list-style-type: none;
+            padding-left: 2em;
+            margin-top: 0.5em;
+            margin-bottom: 0;
+        }}
+        .toc ul ul li {{
+            margin-bottom: 0.4em;
+            padding-left: 1em;
+            border-left: 2px solid #cbd5e1;
+            transition: border-color 0.3s ease;
+        }}
+        .toc ul ul li:hover {{
+            border-left-color: #64748b;
+        }}
+        .toc ul ul a {{
+            font-size: 0.95em;
+            font-weight: normal;
+            color: #475569;
+        }}
+        .toc ul ul a:hover {{
+            color: #1e293b;
+        }}
+        /* Part labels */
+        .part-label {{
+            font-size: 0.85em;
+            color: #64748b;
+            font-style: italic;
+            margin-left: 0.5em;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Table of Contents</h1>
+    <div class="toc">
+        <ul>"""
+    
+    for i, chapter in enumerate(structure["chapters"], 1):
+        chapter_title = chapter["title"]
+        # Check if this chapter has parts
+        chapter_key = str(i)
+        if parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
+            # Multi-part chapter - link to first part
+            chapter_file = f"chapter_{i}.part1.html"
+        else:
+            # Single file chapter
+            chapter_file = f"chapter_{i}.html"
+        
+        toc_html += f"""
+            <li>
+                <a href="{chapter_file}">{chapter_title}</a>"""
+        
+        # Add subchapters if they exist
+        if "subchapters" in chapter and chapter["subchapters"]:
+            toc_html += """
+                <ul>"""
+            for j, subchapter in enumerate(chapter["subchapters"], 1):
+                sub_title = subchapter["title"]
+                # Determine which part contains this subchapter
+                if subchapter_locations and (i, j) in subchapter_locations:
+                    part_num = subchapter_locations[(i, j)]
+                    if part_num and part_num > 1:
+                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
+                    else:
+                        sub_chapter_file = chapter_file
+                else:
+                    # Default to main chapter file (or part1 for multi-part)
+                    sub_chapter_file = chapter_file
+                
+                toc_html += f"""
+                    <li><a href="{sub_chapter_file}#{i}-{j}">{sub_title}</a></li>"""
+            toc_html += """
+                </ul>"""
+        
+        toc_html += """
+            </li>"""
+    
+    toc_html += """
+        </ul>
+    </div>
+</body>
+</html>"""
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(toc_html)
+    
+    logger.success(f"Created HTML TOC: {output_path}")
+
+
+def create_container_xml(output_path):
+    """Create the container.xml file for the EPUB."""
+    container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+    <rootfiles>
+        <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+    </rootfiles>
+</container>"""
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(container_xml)
+    
+    logger.success(f"Created container.xml: {output_path}")
+
+
+def create_mimetype(output_path):
+    """Create the mimetype file for the EPUB."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("application/epub+zip")
+    
+    logger.success(f"Created mimetype: {output_path}")
+
+
+def create_content_opf(structure, book_title, author, book_uuid, output_path, has_cover=False, all_html_files=None, images_dir=None):
+    """Create the content.opf file."""
+    current_date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    
+    # If all_html_files not provided, fallback to old behavior
+    if not all_html_files:
+        all_html_files = [(i, None, f"chapter_{i}.html") for i in range(1, len(structure["chapters"]) + 1)]
+    
+    # Check if front_matter and back_matter exist
+    has_front_matter = (output_path.parent / "text" / "front_matter.html").exists()
+    has_back_matter = (output_path.parent / "text" / "back_matter.html").exists()
+    
+    opf_content = f"""<?xml version="1.0" encoding="utf-8"?>
+<package version="2.0" unique-identifier="BookId" xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>{book_title}</dc:title>
+    <dc:creator opf:role="aut">{author}</dc:creator>
+    <dc:language>en</dc:language>
+    <dc:identifier id="BookId" opf:scheme="UUID">{book_uuid}</dc:identifier>
+    <dc:date>{current_date}</dc:date>
+    <meta name="generator" content="PDF2EPUB v3"/>"""
+    
+    if has_cover:
+        opf_content += """
+    <meta name="cover" content="cover-image"/>"""
+    
+    opf_content += """
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="stylesheet" href="stylesheet.css" media-type="text/css"/>"""
+    
+    if has_cover:
+        opf_content += """
+    <item id="cover" href="text/cover.html" media-type="application/xhtml+xml"/>
+    <item id="cover-image" href="images/cover.jpg" media-type="image/jpeg"/>"""
+    
+    if has_front_matter:
+        opf_content += """
+    <item id="front_matter" href="text/front_matter.html" media-type="application/xhtml+xml"/>"""
+    
+    opf_content += """
+    <item id="toc" href="text/toc.html" media-type="application/xhtml+xml"/>"""
+    
+    # Add all HTML files to manifest
+    for chapter_idx, part_num, html_filename in sorted(all_html_files):
+        if part_num is None:
+            item_id = f"chapter_{chapter_idx}"
+        else:
+            item_id = f"chapter_{chapter_idx}_part{part_num}"
+        opf_content += f"""
+    <item id="{item_id}" href="text/{html_filename}" media-type="application/xhtml+xml"/>"""
+    
+    if has_back_matter:
+        opf_content += """
+    <item id="back_matter" href="text/back_matter.html" media-type="application/xhtml+xml"/>"""
+    
+    # Add all images to manifest (except cover which is already added)
+    if images_dir and images_dir.exists():
+        image_extensions = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.webp': 'image/webp'
+        }
+        
+        for img_file in sorted(images_dir.iterdir()):
+            if img_file.suffix.lower() in image_extensions and img_file.name != "cover.jpg":
+                media_type = image_extensions[img_file.suffix.lower()]
+                item_id = img_file.stem.replace(' ', '_').replace('-', '_')
+                opf_content += f"""
+    <item id="{item_id}" href="images/{img_file.name}" media-type="{media_type}"/>"""
+    
+    opf_content += """
+  </manifest>
+  <spine toc="ncx">"""
+    
+    if has_cover:
+        opf_content += """
+    <itemref idref="cover" linear="no"/>"""
+    
+    if has_front_matter:
+        opf_content += """
+    <itemref idref="front_matter"/>"""
+    
+    opf_content += """
+    <itemref idref="toc"/>"""
+    
+    # Add all HTML files to spine (reading order)
+    for chapter_idx, part_num, html_filename in sorted(all_html_files):
+        if part_num is None:
+            item_id = f"chapter_{chapter_idx}"
+        else:
+            item_id = f"chapter_{chapter_idx}_part{part_num}"
+        opf_content += f"""
+    <itemref idref="{item_id}"/>"""
+    
+    if has_back_matter:
+        opf_content += """
+    <itemref idref="back_matter"/>"""
+    
+    opf_content += """
+  </spine>
+</package>"""
+    
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(opf_content)
+    
+    logger.success(f"Created content.opf: {output_path}")
 
 
 def create_epub(book_title, epub_dir):
-    """Create an EPUB file by zipping the contents."""
-    output_epub = Path("output") / Path(book_title) / f"{book_title}.epub"
-
-    # Create a temporary zip file
-    temp_zip = Path("output") / Path(book_title) / "temp.zip"
-
-    # Create the EPUB zip file
-    with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-        # First add the mimetype file (must be uncompressed)
-        zipf.write(epub_dir / "mimetype", "mimetype", compress_type=zipfile.ZIP_STORED)
-
+    """Create the final EPUB file from the directory structure."""
+    epub_path = Path("output") / book_title / f"{book_title}.epub"
+    
+    # Create EPUB file
+    with zipfile.ZipFile(epub_path, 'w', zipfile.ZIP_DEFLATED) as epub:
+        # Add mimetype first (uncompressed as per EPUB spec)
+        epub.write(epub_dir / "mimetype", "mimetype", compress_type=zipfile.ZIP_STORED)
+        
         # Add all other files
-        for folder_name, subfolders, filenames in os.walk(epub_dir):
-            folder_path = Path(folder_name)
-            relative_path = folder_path.relative_to(epub_dir)
-
-            # Skip mimetype as it's already added
-            if str(relative_path) == "." and "mimetype" in filenames:
-                filenames.remove("mimetype")
-
-            # Add all files in the current folder
-            for filename in filenames:
-                file_path = folder_path / filename
-                arcname = Path(relative_path) / filename
-                zipf.write(file_path, arcname)
-
-    # Rename the zip file to epub
-    shutil.move(temp_zip, output_epub)
-    logger.success(f"Created EPUB at {output_epub}")
-    return output_epub
+        for root, dirs, files in os.walk(epub_dir):
+            for file in files:
+                if file == "mimetype":
+                    continue
+                file_path = Path(root) / file
+                arcname = file_path.relative_to(epub_dir)
+                epub.write(file_path, arcname)
+    
+    logger.success(f"Created EPUB: {epub_path}")
+    return epub_path
 
 
 def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Generate EPUB from PDF")
-    parser.add_argument("--input", "-i", required=True, help="Path to input PDF file")
-    parser.add_argument("--resume", "-r", action="store_true", help="Resume previous generation if available")
-    parser.add_argument(
-        "--config",
-        "-c",
-        default="config.yaml",
-        help="Path to config file (default: config.yaml)",
-    )
+    parser = argparse.ArgumentParser(description="Generate EPUB from polished markdown files")
+    parser.add_argument("-c", "--config", default="config.yaml", help="Path to config file")
+    parser.add_argument("-i", "--input", help="Path to PDF file for cover extraction")
+    
     args = parser.parse_args()
-
+    
     # Load configuration
-    with open(args.config, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    api_key = config.get("google_api_key")
+    config = load_config(args.config)
     book_title = config.get("title")
-    author = config.get("author")
-
-    # Check if API key exists
-    if not api_key:
-        raise ValueError("Google API key not found in config.yaml")
-        
-    # Check if title exists
+    author = config.get("author", "Unknown Author")
+    
     if not book_title:
-        # Fallback to PDF filename if title not in config
-        book_title = Path(args.input).stem
-        logger.warning(f"No title found in config, using PDF filename: {book_title}")
-
-    # Setup Gemini API
-    client = setup_genai_api(api_key)
-
+        logger.error("Book title not found in config.yaml")
+        return
+    
     # Load book structure
     structure = load_book_structure(book_title)
-
-    # Define output directories
-    epub_dir = Path("output") / Path(book_title) / "epub"
-    images_dir = epub_dir / "images"
-    text_dir = epub_dir / "text"
-    meta_inf_dir = epub_dir / "META-INF"
-    progress_file = Path("output") / Path(book_title) / "generation_progress.json"
-
-    # Check if we're resuming a previous generation
-    resuming = epub_dir.exists() and progress_file.exists()
-    progress = None
-
-    if resuming:
-        logger.info("Found existing generation. Attempting to resume...")
-        progress = load_generation_progress(progress_file)
-        # Generate a UUID for the book (use the same one if resuming)
-        book_uuid = progress.get("book_uuid", str(uuid.uuid4()))
-    else:
-        # Start fresh
-        logger.info("Starting new EPUB generation...")
-        # Generate a UUID for the book
-        book_uuid = str(uuid.uuid4())
-        # Initialize progress tracking with structure
-        progress = load_generation_progress(progress_file, structure)
-        progress["book_uuid"] = book_uuid
-
-    # Ensure directories exist
-    ensure_directory(epub_dir)
-    ensure_directory(images_dir)
-    ensure_directory(text_dir)
-    ensure_directory(meta_inf_dir)
-
-    # Path to the PDF file
-    pdf_path = Path(args.input)
-
-    # Create the mimetype file if not already done
-    if not progress["mimetype_created"]:
-        create_mimetype(epub_dir / "mimetype")
-        progress["mimetype_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping mimetype creation (already done)")
-
-    # Create the container.xml file if not already done
-    if not progress["container_xml_created"]:
-        create_container_xml(meta_inf_dir / "container.xml")
-        progress["container_xml_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping container.xml creation (already done)")
-
-    # Extract and save the cover image if not already done
-    cover_image_filename = progress["cover_image_filename"]
-    if not progress["cover_extracted"]:
-        cover_image_filename = extract_cover_image(pdf_path, epub_dir)
-        progress["cover_image_filename"] = cover_image_filename
-        progress["cover_extracted"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info(f"Skipping cover extraction (already done): {cover_image_filename}")
-
-    # Create the titlepage XHTML if not already done
-    if not progress["cover_html_created"]:
-        create_cover_html(cover_image_filename, book_title, epub_dir / "titlepage.xhtml")
-        progress["cover_html_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping cover HTML creation (already done)")
-
-    # Create the stylesheet if not already done
-    if not progress["stylesheet_created"]:
-        create_stylesheet(epub_dir / "stylesheet.css")
-        progress["stylesheet_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping stylesheet creation (already done)")
-
-    # Create the toc.ncx file if not already done
-    if not progress["toc_ncx_created"]:
-        create_toc_ncx(structure, book_title, book_uuid, epub_dir / "toc.ncx")
-        progress["toc_ncx_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping toc.ncx creation (already done)")
-
-    # Create HTML for the table of contents if not already done
-    toc_html_path = text_dir / "toc.html"
-    if not progress["toc_html_created"]:
-        create_toc_html(structure, book_title, toc_html_path, client, pdf_path, config)
-        progress["toc_html_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping TOC HTML creation (already done)")
-
-    # Process each chapter
-    previous_chapters = []
-    chapter_titles = progress["chapter_titles"]
+    if not structure:
+        logger.error(f"Book structure not found for {book_title}")
+        return
     
-    # Ensure chapters array exists in progress
-    if "chapters" not in progress:
-        progress["chapters"] = []
-        for i, chapter in enumerate(structure["chapters"], 1):
-            progress["chapters"].append({
-                "index": i,
-                "title": chapter["title"],
-                "generated": False
-            })
-        save_generation_progress(progress_file, progress)
-
-    for i, chapter in enumerate(structure["chapters"], 1):
-        # Check if chapter is already processed
-        chapter_processed = False
-        if i <= progress["last_processed_chapter_index"]:
-            # For backward compatibility
-            chapter_processed = True
-        elif "chapters" in progress:
-            # Find the chapter in the chapters array
-            for ch in progress["chapters"]:
-                if ch["index"] == i and ch["generated"]:
-                    chapter_processed = True
-                    break
+    # Check if polished markdown exists
+    polished_dir = Path("output") / book_title / "polished_markdown"
+    if not polished_dir.exists():
+        logger.error(f"Polished markdown directory not found: {polished_dir}")
+        logger.info("Please run polish_ocr_markdown.py first")
+        return
+    
+    # Setup paths
+    epub_dir = Path("output") / book_title / "epub"
+    text_dir = epub_dir / "text"
+    images_dir = epub_dir / "images"
+    meta_inf_dir = epub_dir / "META-INF"
+    
+    # Clean up old files from previous generations
+    cleanup_old_files(epub_dir)
+    
+    # Create directories
+    ensure_directory(epub_dir)
+    ensure_directory(text_dir)
+    ensure_directory(images_dir)
+    ensure_directory(meta_inf_dir)
+    
+    # Generate UUID for the book
+    book_uuid = str(uuid.uuid4())
+    
+    # Extract cover image
+    cover_filename = ""
+    has_cover = False
+    
+    # Determine PDF path
+    if args.input:
+        pdf_path = Path(args.input)
+    else:
+        # Check for input_original.pdf first, then fall back to input.pdf
+        pdf_original_path = Path("output") / book_title / "input_original.pdf"
+        pdf_path = Path("output") / book_title / "input.pdf"
         
-        if chapter_processed:
-            logger.info(f"Skipping chapter {i} (already processed)")
-            # Load the chapter content for context
-            chapter_html_path = text_dir / f"chapter_{i}.html"
-            if chapter_html_path.exists():
-                with open(chapter_html_path, "r", encoding="utf-8") as f:
-                    chapter_content = f.read()
-                    previous_chapters.append(chapter_content)
-            continue
-
-        chapter_html_path = text_dir / f"chapter_{i}.html"
-        chapter_title = create_chapter_html(
-            chapter,
-            structure,
-            i,
-            book_title,
-            chapter_html_path,
-            client,
-            pdf_path,
-            images_dir,
-            previous_chapters,
-            config,
-        )
-        
-        # Update progress
-        if len(chapter_titles) < i:
-            chapter_titles.append(chapter_title)
+        if pdf_original_path.exists():
+            pdf_path = pdf_original_path
+            logger.info(f"Using original PDF for cover extraction: {pdf_path}")
+        elif pdf_path.exists():
+            logger.info(f"Using PDF for cover extraction: {pdf_path}")
         else:
-            chapter_titles[i - 1] = chapter_title
-            
-        progress["chapter_titles"] = chapter_titles
-        progress["last_processed_chapter_index"] = i
+            logger.warning(f"No PDF file found for cover extraction. Looked for: {pdf_original_path} and {pdf_path}")
+            pdf_path = None
+    
+    if pdf_path and pdf_path.exists():
+        cover_filename = extract_cover_image(pdf_path, images_dir)
+        if cover_filename:
+            has_cover = True
+            logger.info(f"Cover extracted from {pdf_path}")
+            # Create cover HTML
+            create_cover_html(cover_filename, book_title, text_dir / "cover.html")
+        else:
+            logger.warning(f"Failed to extract cover from {pdf_path}")
+    else:
+        logger.warning(f"PDF file not found for cover extraction: {pdf_path}")
+    
+    # Create stylesheet
+    create_stylesheet(epub_dir / "stylesheet.css")
+    
+    # Create mimetype file
+    create_mimetype(epub_dir / "mimetype")
+    
+    # Create container.xml
+    create_container_xml(meta_inf_dir / "container.xml")
+    
+    # Copy all chapter images to EPUB images directory
+    copy_chapter_images(polished_dir, images_dir)
+    
+    # Load polish progress to get parts info for TOC generation
+    polish_progress_file = polished_dir / "polish_progress.json"
+    parts_info_for_toc = {}
+    if polish_progress_file.exists():
+        with open(polish_progress_file, 'r') as f:
+            polish_progress = json.load(f)
+            # Support both old and new format
+            if "parts_info" in polish_progress:
+                parts_info_for_toc = {k: v["total_parts"] for k, v in polish_progress["parts_info"].items() if v.get("is_complete", False)}
+            else:
+                parts_info_for_toc = polish_progress.get("parts_polished", {})
+    
+    # Build subchapter locations mapping (which part contains which subchapter)
+    subchapter_locations = {}
+    for i, chapter in enumerate(structure["chapters"], 1):
+        if "subchapters" in chapter and chapter["subchapters"]:
+            chapter_key = str(i)
+            if parts_info_for_toc and chapter_key in parts_info_for_toc and parts_info_for_toc[chapter_key] > 1:
+                # Multi-part chapter - need to find which subchapters are in which parts
+                for j, subchapter in enumerate(chapter["subchapters"], 1):
+                    sub_title = subchapter["title"]
+                    # Search through all parts to find where this subchapter is
+                    for part_num in range(1, parts_info_for_toc[chapter_key] + 1):
+                        part_file = polished_dir / f"chapter_{i}.part{part_num}.md"
+                        if part_file.exists():
+                            with open(part_file, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                                # Check if this subchapter heading is in this part
+                                # Look for markdown headings with the subchapter title
+                                # First try exact match
+                                if re.search(f'^#+\\s*{re.escape(sub_title)}', content, re.MULTILINE | re.IGNORECASE):
+                                    subchapter_locations[(i, j)] = part_num
+                                    logger.debug(f"Found subchapter '{sub_title}' in part {part_num}")
+                                    break
+                                
+                                # If exact match fails, try fuzzy matching
+                                # Look for any heading that contains most of the important words
+                                import difflib
+                                lines = content.split('\n')
+                                for line in lines:
+                                    if line.strip().startswith('#'):
+                                        # Extract the heading text
+                                        heading = re.sub(r'^#+\s*', '', line).strip()
+                                        # Use sequence matcher for fuzzy comparison
+                                        similarity = difflib.SequenceMatcher(None, sub_title.lower(), heading.lower()).ratio()
+                                        if similarity > 0.8:  # 80% similarity threshold
+                                            subchapter_locations[(i, j)] = part_num
+                                            logger.debug(f"Found subchapter '{sub_title}' (fuzzy matched to '{heading}') in part {part_num}")
+                                            break
+                                else:
+                                    continue  # Continue to next part if not found
+                                break  # Break from part loop if found
+            else:
+                # Single part chapter - all subchapters are in the main file
+                for j, subchapter in enumerate(chapter["subchapters"], 1):
+                    subchapter_locations[(i, j)] = None  # None means main file
+    
+    # Create TOC files
+    create_toc_ncx(structure, book_title, book_uuid, epub_dir / "toc.ncx", parts_info_for_toc, subchapter_locations)
+    create_toc_html(structure, book_title, text_dir / "toc.html", parts_info_for_toc, subchapter_locations)
+    
+    # Convert front matter to HTML if it exists
+    front_matter_md = polished_dir / "front_matter.md"
+    if front_matter_md.exists():
+        logger.info("Converting front matter to HTML")
+        front_matter_html = text_dir / "front_matter.html"
+        if convert_markdown_to_chapter_html(front_matter_md, front_matter_html, "Front Matter"):
+            logger.success("Front matter converted to HTML")
+        else:
+            logger.warning("Failed to convert front matter")
+    
+    # Convert markdown chapters to HTML
+    # Use the same parts_info we loaded for TOC
+    parts_info = parts_info_for_toc
+    
+    # Track all HTML files created (for manifest and spine)
+    all_html_files = []  # List of (chapter_index, part_num, html_filename)
+    
+    # Build chapters_dict based on known parts
+    chapters_dict = {}
+    for chapter_idx_str, num_parts in parts_info.items():
+        chapter_index = int(chapter_idx_str)
+        chapters_dict[chapter_index] = []
         
-        # Update the chapter's generated status in the chapters array
-        for ch in progress["chapters"]:
-            if ch["index"] == i:
-                ch["generated"] = True
+        if num_parts == 1:
+            # Single file chapter
+            md_file = polished_dir / f"chapter_{chapter_index}.md"
+            if md_file.exists():
+                chapters_dict[chapter_index].append((None, md_file))
+        else:
+            # Multi-part chapter
+            for part_num in range(1, num_parts + 1):
+                md_file = polished_dir / f"chapter_{chapter_index}.part{part_num}.md"
+                if md_file.exists():
+                    chapters_dict[chapter_index].append((part_num, md_file))
+    
+    # Also check for any chapters not in parts_info (backward compatibility)
+    all_md_files = sorted(polished_dir.glob("chapter_*.md"))
+    for md_file in all_md_files:
+        match = re.search(r'chapter_(\d+)(\.part(\d+))?\.md', md_file.name)
+        if not match:
+            continue
+        
+        chapter_index = int(match.group(1))
+        part_num = int(match.group(3)) if match.group(3) else None
+        
+        # Only add if not already tracked
+        if chapter_index not in chapters_dict:
+            chapters_dict[chapter_index] = []
+            chapters_dict[chapter_index].append((part_num, md_file))
+    
+    # Process each chapter and its parts
+    for chapter_index in sorted(chapters_dict.keys()):
+        # Get chapter title and subchapters from structure
+        chapter_title = f"Chapter {chapter_index}"
+        subchapter_titles = []
+        if chapter_index <= len(structure["chapters"]):
+            chapter_data = structure["chapters"][chapter_index - 1]
+            chapter_title = chapter_data["title"]
+            # Get subchapter titles for anchor generation
+            if "subchapters" in chapter_data:
+                subchapter_titles = [sub["title"] for sub in chapter_data["subchapters"]]
+        
+        # Sort parts by part number (None sorts before numbers)
+        parts = sorted(chapters_dict[chapter_index], key=lambda x: x[0] if x[0] is not None else 0)
+        
+        all_parts_success = True
+        
+        for part_num, md_file in parts:
+            if part_num is None:
+                # Single file chapter or main file
+                html_filename = f"chapter_{chapter_index}.html"
+                html_path = text_dir / html_filename
+                logger.info(f"Converting chapter {chapter_index}: {md_file.name}")
+            else:
+                # Part file
+                html_filename = f"chapter_{chapter_index}.part{part_num}.html"
+                html_path = text_dir / html_filename
+                logger.info(f"Converting chapter {chapter_index} part {part_num}: {md_file.name}")
+            
+            # Convert markdown to HTML (use chapter title only for first part)
+            part_title = chapter_title if part_num is None or part_num == 1 else f"{chapter_title} (continued)"
+            
+            # Find which subchapters are in this part (with their original indices)
+            part_subchapters = []
+            if subchapter_titles:
+                for j, sub_title in enumerate(subchapter_titles, 1):
+                    # Check if this subchapter is in the current part
+                    if part_num is None:
+                        # Single file chapter - all subchapters are here
+                        part_subchapters.append((j, sub_title))
+                    else:
+                        # Multi-part chapter - check if subchapter is in this part
+                        with open(md_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            if re.search(f'^#+\\s*{re.escape(sub_title)}', content, re.MULTILINE | re.IGNORECASE):
+                                part_subchapters.append((j, sub_title))
+            
+            # Pass subchapter info for this specific part
+            if part_subchapters:
+                success = convert_markdown_to_chapter_html(md_file, html_path, part_title, chapter_index, part_subchapters)
+            else:
+                success = convert_markdown_to_chapter_html(md_file, html_path, part_title)
+            
+            if success:
+                all_html_files.append((chapter_index, part_num, html_filename))
+            else:
+                all_parts_success = False
+                logger.error(f"Failed to convert {md_file.name}")
                 break
         
-        save_generation_progress(progress_file, progress)
-
-        # Add processed chapter to context for next chapters
-        with open(chapter_html_path, "r", encoding="utf-8") as f:
-            chapter_content = f.read()
-            previous_chapters.append(chapter_content)
-            # Save money by only keeping the most recent chapter
-            # previous_chapters = [chapter_content]
-
-    # Create the content.opf file if not already done
-    if not progress["content_opf_created"]:
-        create_content_opf(
-            book_title,
-            book_uuid,
-            author,
-            chapter_titles,
-            cover_image_filename,
-            epub_dir / "content.opf",
-            epub_dir,
-        )
-        progress["content_opf_created"] = True
-        save_generation_progress(progress_file, progress)
-    else:
-        logger.info("Skipping content.opf creation (already done)")
+        if not all_parts_success:
+            logger.error(f"Failed to convert chapter {chapter_index}, stopping")
+            return
     
-    # Clean up unused images before finalizing the EPUB
-    clean_unused_images(epub_dir)
+    # Convert back matter to HTML if it exists
+    back_matter_md = polished_dir / "back_matter.md"
+    if back_matter_md.exists():
+        logger.info("Converting back matter to HTML")
+        back_matter_html = text_dir / "back_matter.html"
+        if convert_markdown_to_chapter_html(back_matter_md, back_matter_html, "Back Matter"):
+            logger.success("Back matter converted to HTML")
+        else:
+            logger.warning("Failed to convert back matter")
     
-    # Create the final EPUB file
+    # Create content.opf
+    create_content_opf(structure, book_title, author, book_uuid, epub_dir / "content.opf", has_cover, all_html_files, images_dir)
+    
+    # Create the EPUB file
     epub_path = create_epub(book_title, epub_dir)
-
-    logger.success(f"EPUB creation complete! File saved to: {epub_path}")
+    
+    logger.success(f"EPUB generation complete!")
+    logger.info(f"Output: {epub_path}")
 
 
 if __name__ == "__main__":

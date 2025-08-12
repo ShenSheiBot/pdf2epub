@@ -5,3 +5,25 @@
 *.epub
 *.env
 *__pycache__/
+
+# Security - API keys and credentials
+sa-keys.json
+service-account-*.json
+*-service-account.json
+credentials.json
+client_secrets.json
+
+# Logs that might contain sensitive data
+*.log
+logs/
+*.log.*
+
+# Additional config files that might contain secrets
+config.yaml
+settings.yaml
+secrets.yaml
+.env.*
+
+# Claude-related files
+*.claude
+.claude/

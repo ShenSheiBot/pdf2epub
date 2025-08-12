@@ -9,7 +9,7 @@
 ### Demo
 转换前：http://biopolitics.kom.uni.st/Michel%20Foucault/The%20Foucault%20Reader%20(149)/The%20Foucault%20Reader%20-%20Michel%20Foucault.pdf
 
-转换后：https://raw.githubusercontent.com/shensheibot/pdf2epub/main/example.epub
+转换后：https://raw.githubusercontent.com/ShenSheiBot/pdf2epub/refs/heads/main/example.epub
 
 ## 局限性
 因为其复杂性和对多模态LLM的依赖，转换速度较慢并有可能会因为LLM的审核原因失败。建议使用多家不同LLM提供商混合使用。

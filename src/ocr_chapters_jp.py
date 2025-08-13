@@ -1191,6 +1191,13 @@ def main():
     if len(progress["chapters_processed"]) < progress["total_chapters"]:
         missing = set(range(1, progress["total_chapters"] + 1)) - set(progress["chapters_processed"])
         logger.warning(f"Missing chapters: {sorted(missing)}")
+    
+    # Log safety block statistics
+    safety_stats = ocr_client.get_safety_stats()
+    if safety_stats:
+        logger.info("\n=== Safety Block Statistics ===")
+        for provider, blocked_count in safety_stats.items():
+            logger.info(f"{provider}: {blocked_count} pages blocked for safety")
 
 
 if __name__ == "__main__":

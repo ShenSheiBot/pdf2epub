@@ -63,7 +63,8 @@ Transcribe the entire page content accurately."""
         self.config = config
         self._gemini_client = None
         self._anthropic_client = None
-        self._blocked_providers = set()  # Track providers that hit safety blocks
+        # Track safety blocks per page to allow retrying on different pages
+        self._safety_blocked_pages = {}  # {provider: set(page_nums)}
         
         # Initialize clients based on available API keys
         if config.get("google_api_key"):
@@ -116,11 +117,16 @@ Transcribe the entire page content accurately."""
             model = model_config["model"]
             max_retries = model_config.get("max_retries", 1)
             
-            # Skip if provider is blocked due to safety
-            if provider in self._blocked_providers:
-                logger.info(f"Skipping {provider} for {operation_name} (previously blocked for safety)")
-                attempts_summary.append(f"{provider}: skipped (safety)")
-                continue
+            # Skip if provider was blocked for this specific page
+            if provider in self._safety_blocked_pages:
+                if page_num and page_num in self._safety_blocked_pages[provider]:
+                    logger.info(f"Skipping {provider} for {operation_name} (blocked on this page)")
+                    attempts_summary.append(f"{provider}: skipped (safety on this page)")
+                    continue
+                # Log if provider has had safety issues on other pages but trying anyway
+                elif self._safety_blocked_pages[provider]:
+                    blocked_count = len(self._safety_blocked_pages[provider])
+                    logger.debug(f"{provider} had safety blocks on {blocked_count} other page(s), trying anyway for {operation_name}")
             
             try:
                 logger.info(f"Trying {provider} model {model} for {operation_name}")
@@ -153,9 +159,14 @@ Transcribe the entire page content accurately."""
                     continue
                     
             except SafetyBlockError as e:
-                # Mark provider as blocked and don't retry with same provider
-                self._blocked_providers.add(provider)
-                logger.warning(f"{provider} blocked for safety for {operation_name}: {e}")
+                # Track which pages have safety blocks for this provider
+                if provider not in self._safety_blocked_pages:
+                    self._safety_blocked_pages[provider] = set()
+                if page_num:
+                    self._safety_blocked_pages[provider].add(page_num)
+                    logger.warning(f"{provider} blocked for safety on page {page_num}: {e}")
+                else:
+                    logger.warning(f"{provider} blocked for safety for {operation_name}: {e}")
                 attempts_summary.append(f"{provider}: safety blocked")
                 last_error = e
                 continue
@@ -288,6 +299,24 @@ Transcribe the entire page content accurately."""
             return False
         return is_transient_anthropic_error(exception)
     
-    def reset_safety_blocks(self):
-        """Reset safety block tracking (useful between different content)."""
-        self._blocked_providers.clear()
+    def get_safety_stats(self) -> Dict[str, int]:
+        """Get statistics about safety blocks per provider."""
+        stats = {}
+        for provider, blocked_pages in self._safety_blocked_pages.items():
+            stats[provider] = len(blocked_pages)
+        return stats
+    
+    def clear_safety_blocks(self, provider: Optional[str] = None):
+        """Clear safety block tracking for a provider or all providers.
+        
+        Args:
+            provider: Specific provider to clear, or None to clear all
+        """
+        if provider:
+            if provider in self._safety_blocked_pages:
+                self._safety_blocked_pages[provider].clear()
+                logger.info(f"Cleared safety blocks for {provider}")
+        else:
+            self._safety_blocked_pages.clear()
+            logger.info("Cleared all safety blocks")
+    

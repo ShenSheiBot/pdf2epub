@@ -367,9 +367,6 @@ def polish_markdown_part(
     Returns:
         Tuple of (part_idx, polished_content, success)
     """
-    # Reset safety blocks for each new content
-    llm_client.reset_safety_blocks()
-    
     # Create the comprehensive polish prompt
     book_info = f" from the book titled \"{book_title}\"" if book_title else ""
     
@@ -628,17 +625,35 @@ def process_markdown_file(
     max_tokens_per_part = 10000
     
     # Only increase limit if we can verify no limited-context models are being used
+    logger.debug(f"polish_models value: {polish_models}")
     if polish_models:
         # Check if any model contains indicators of smaller/faster models
-        limited_model_indicators = ["flash", "haiku", "mini"]
+        # Use more specific patterns to avoid false positives
+        limited_model_patterns = [
+            "flash",  # e.g., gemini-1.5-flash
+            "haiku",  # e.g., claude-3-haiku
+            "-mini",  # e.g., gpt-4-mini (but not gemini since it doesn't have -mini)
+        ]
+        
+        # Debug: log the models being checked
+        model_names = [model_config.get("model", "") for model_config in polish_models]
+        logger.debug(f"Checking models for limited context indicators: {model_names}")
+        
         has_limited_model = any(
-            any(indicator in model_config.get("model", "").lower() for indicator in limited_model_indicators)
+            any(pattern in model_config.get("model", "").lower() for pattern in limited_model_patterns)
             for model_config in polish_models
         )
+        
         if not has_limited_model:
             max_tokens_per_part = 30000
             logger.info(f"Using max_tokens_per_part=30000 (no limited-context models detected)")
         else:
+            # Log which model triggered the limited context
+            for model_config in polish_models:
+                model_name = model_config.get("model", "").lower()
+                for pattern in limited_model_patterns:
+                    if pattern in model_name:
+                        logger.debug(f"Limited context triggered by '{pattern}' in model '{model_config.get('model', '')}'")
             logger.info(f"Using max_tokens_per_part=10000 (limited-context model detected)")
     else:
         # Can't determine models, use conservative limit
@@ -815,6 +830,13 @@ def main():
         logger.warning(f"Failed files: {', '.join(failed)}")
     else:
         logger.success("All files polished successfully!")
+    
+    # Log safety block statistics
+    safety_stats = llm_client.get_safety_stats()
+    if safety_stats:
+        logger.info("\n=== Safety Block Statistics ===")
+        for provider, blocked_count in safety_stats.items():
+            logger.info(f"{provider}: {blocked_count} operations blocked for safety")
 
 
 if __name__ == "__main__":

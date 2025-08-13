@@ -293,8 +293,8 @@ def detect_truncation(
     
     # Decision logic based on n-gram analysis
     
-    # 1. If token ratio is very high (≥95%), definitely not truncated
-    if token_ratio >= 0.95:
+    # 1. If token ratio is very high (≥80%), definitely not truncated
+    if token_ratio >= 0.80:
         return False, f"High token retention ({token_ratio:.1%})", details
     
     # 2. If tail is incomplete (mid-sentence), likely truncated

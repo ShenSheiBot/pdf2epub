@@ -18,7 +18,7 @@ target_language: English  # Target language for translation
 source_language: Japanese  # Source language
 
 # General Settings
-num_retries: 3
+num_retries: 2
 max_backoff_seconds: 30
 max_concurrent_workers: 8  # Maximum number of concurrent API calls (adjust based on your API rate limits)
 

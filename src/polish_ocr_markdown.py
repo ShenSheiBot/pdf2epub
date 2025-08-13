@@ -2,7 +2,7 @@ import json
 import yaml
 import argparse
 import re
-import regex  # For fuzzy matching
+import regex  # For fuzzy matching in content splitting (not image restoration)
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -11,6 +11,7 @@ from loguru import logger
 from utils.logging_config import configure_logging
 from utils.llm_client import LLMClient
 from utils.network_utils import GeminiClient
+from fast_image_restore import restore_lost_images_fast as restore_lost_images
 from truncation_detector import (
     detect_truncation, 
     get_truncation_summary,
@@ -184,6 +185,7 @@ def split_content_simple(content: str, max_tokens: int) -> List[str]:
     return parts if parts else [content]
 
 
+
 def split_content_intelligently(content: str, max_tokens: int, gemini_client: GeminiClient) -> List[str]:
     """
     Use LLM to intelligently split content at natural boundaries.
@@ -347,7 +349,8 @@ def polish_markdown_part(
     llm_client: LLMClient,
     book_title: str,
     skip_truncation_check: bool = False,
-    polish_models: Optional[List[Dict]] = None
+    polish_models: Optional[List[Dict]] = None,
+    original_content: Optional[str] = None
 ) -> Tuple[int, str, bool]:
     """
     Polish a single part of markdown content using configured models.
@@ -517,6 +520,10 @@ Polish the following content:"""
                 end_idx = len(lines) - 1 if lines[-1] == '```' else len(lines)
                 polished_content = '\n'.join(lines[start_idx:end_idx])
             
+            # Restore any lost images if we have the original content
+            if original_content and total_parts == 1:  # Only for single parts to avoid duplicates
+                polished_content = restore_lost_images(original_content, polished_content)
+            
             # Save the part file
             if total_parts > 1:
                 part_output_path = output_path.with_suffix(f'.part{part_idx}.md')
@@ -685,7 +692,8 @@ def process_markdown_file(
             llm_client=llm_client,
             book_title=book_title,
             skip_truncation_check=False,  # Always check truncation
-            polish_models=polish_models
+            polish_models=polish_models,
+            original_content=content  # Pass original content for image restoration
         )
         
         if success:
@@ -697,8 +705,12 @@ def process_markdown_file(
     # If multiple parts, combine them
     if len(parts) > 1 and all_parts_success:
         combined_content = "\n\n".join(polished_parts)
+        
+        # Restore any lost images using fuzzy matching
+        final_content = restore_lost_images(content, combined_content)
+        
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(combined_content)
+            f.write(final_content)
         logger.success(f"Combined {len(parts)} parts into {output_path.name}")
         
         # Clean up part files

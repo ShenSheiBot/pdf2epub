@@ -41,7 +41,7 @@ ocr_settings:
   
   # Illustration detection settings
   illustration_padding: 25  # Pixels to pad around text regions when whiting out
-  trim_step_percent: 0.02  # Step size for border trimming (0.01-0.1)
+  trim_step_percent: 0.005  # Step size for border trimming (0.005-0.1)
   min_black_pixels: 200  # Minimum non-white pixels to consider as content
 
 # OCR model configuration

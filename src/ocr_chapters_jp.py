@@ -40,7 +40,7 @@ DEFAULT_OCR_SETTINGS = {
     'max_workers': 4,
     'page_retry_backoff': 2,
     'illustration_padding': 25,
-    'trim_step_percent': 0.02,
+    'trim_step_percent': 0.005,
     'min_black_pixels': 200
 }
 
@@ -260,7 +260,7 @@ def trim_white_borders(img: Image.Image, step_percent: float = None, min_black_p
     
     # Use parameters from config or defaults
     if step_percent is None:
-        step_percent = config.get('ocr_settings', {}).get('trim_step_percent', 0.02) if config else 0.02
+        step_percent = config.get('ocr_settings', {}).get('trim_step_percent', 0.005) if config else 0.005
     if min_black_pixels is None:
         min_black_pixels = config.get('ocr_settings', {}).get('min_black_pixels', 200) if config else 200
     

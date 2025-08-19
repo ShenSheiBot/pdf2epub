@@ -137,21 +137,26 @@ def preprocess_pdf(input_pdf, output_dir):
     if file_size_mb > 45:
         logger.warning(f"PDF file size ({file_size_mb:.2f}MB) exceeds 45MB. Compressing...")
 
-        # Create temporary file for compression output
-        temp_output = output_dir / "compressed_temp.pdf"
-
         # Start with moderate compression settings
         compression_settings = [
             # (dpi, quality, grayscale)
             (150, 60, False),  # Medium compression
             (120, 40, False),  # Higher compression
-            (100, 30, True)    # Aggressive compression with grayscale
+            (100, 30, True),   # Aggressive compression with grayscale
+            (80, 25, True),    # Very aggressive
+            (72, 20, True),    # Ultra aggressive (minimum readable)
+            (60, 15, True)     # Extreme compression (last resort)
         ]
 
         # Try compression with increasingly aggressive settings until size is under limit
+        current_size_mb = file_size_mb
         for dpi, quality, grayscale in compression_settings:
+            # Create a fresh temporary file for each compression attempt
+            temp_output = output_dir / f"compressed_temp_{dpi}_{quality}.pdf"
             try:
                 logger.info(f"Trying compression with DPI={dpi}, quality={quality}, grayscale={grayscale}...")
+                logger.info(f"Current file size before compression: {current_size_mb:.2f}MB")
+                
                 success, stats = compress_pdf(
                     str(processed_pdf), 
                     str(temp_output), 
@@ -167,23 +172,39 @@ def preprocess_pdf(input_pdf, output_dir):
                     )
 
                     # If compression was successful and reduced size, use the compressed file
-                    if compressed_size_mb < file_size_mb:
+                    if compressed_size_mb < current_size_mb:
                         # Replace the processed file with our compressed version
                         if temp_output.exists():
                             shutil.move(str(temp_output), str(processed_pdf))
+                            # Update current_size_mb for next iteration
+                            current_size_mb = compressed_size_mb
+                            logger.info(f"Replaced file with compressed version: {current_size_mb:.2f}MB")
+                        else:
+                            logger.error("Compressed temp file doesn't exist!")
                     else:
                         logger.warning("Compression did not reduce file size. Keeping original.")
+                        # Clean up unused temp file
+                        if temp_output.exists():
+                            temp_output.unlink()
 
                     # If we're under 45MB, we're done
-                    if compressed_size_mb <= 45:
+                    if current_size_mb <= 45:
+                        logger.info(f"File size {current_size_mb:.2f}MB is now under 45MB limit. Stopping compression.")
                         break
+                else:
+                    logger.warning(f"Compression failed with DPI={dpi}, quality={quality}, grayscale={grayscale}")
+                    # Clean up temp file if it exists
+                    if temp_output.exists():
+                        temp_output.unlink()
 
             except Exception as e:
                 logger.error(f"Compression attempt failed: {e}")
+                # Clean up temp file if it exists
+                if temp_output.exists():
+                    temp_output.unlink()
 
-            # Clean up temp file if it exists
-            if temp_output.exists():
-                temp_output.unlink()
+        # Update the original variable for final check
+        file_size_mb = current_size_mb
 
         # Check final file size
         final_size_mb = processed_pdf.stat().st_size / (1024 * 1024)

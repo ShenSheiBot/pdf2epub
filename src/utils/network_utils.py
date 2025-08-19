@@ -224,15 +224,22 @@ class AnthropicClient:
         
         # Aggregate streamed response
         response_text = ""
+        chunk_count = 0
         for event in stream:
             if event.type == "content_block_delta":
                 if hasattr(event.delta, 'text'):
                     response_text += event.delta.text
+                    chunk_count += 1
+                    
+                    # Log progress periodically (similar to Gemini)
+                    if len(response_text) % 2000 < 10:
+                        estimated_tokens = len(response_text) // 4
+                        logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
         
         if not response_text:
             raise ValueError(f"Empty response from Anthropic for {operation_name}")
         
-        logger.info(f"Received {len(response_text)} chars from Anthropic for {operation_name}")
+        logger.info(f"Streamed {len(response_text)} chars ({chunk_count} chunks) from Anthropic for {operation_name}")
         return response_text
     
     def _process_content(self, prompt: Union[str, List[Dict]]) -> Union[str, List[Dict]]:

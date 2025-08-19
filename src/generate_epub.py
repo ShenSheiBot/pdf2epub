@@ -19,6 +19,7 @@ from io import BytesIO
 from PIL import Image
 from loguru import logger
 from utils.logging_config import configure_logging
+from utils.zip_utils import create_password_protected_zip
 from markdown_to_html import convert_markdown_to_html
 
 # Configure logger
@@ -916,6 +917,8 @@ def create_epub(book_title, epub_dir):
     return epub_path
 
 
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate EPUB from polished markdown files")
     parser.add_argument("-c", "--config", default="config.yaml", help="Path to config file")
@@ -1201,6 +1204,16 @@ def main():
     
     logger.success(f"EPUB generation complete!")
     logger.info(f"Output: {epub_path}")
+    
+    # Create password-protected ZIP file
+    logger.info("Creating password-protected ZIP file...")
+    zip_path, password = create_password_protected_zip(epub_path)
+    
+    if zip_path:
+        logger.success(f"Password-protected ZIP created: {zip_path}")
+        logger.info(f"The password is embedded in the filename: 【密码：{password}】")
+    else:
+        logger.warning("Failed to create password-protected ZIP file")
 
 
 if __name__ == "__main__":

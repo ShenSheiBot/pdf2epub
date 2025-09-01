@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-OCR client for testing different vision models (Gemini and Anthropic).
+OCR client using vision language models (VLLMs) like Claude and Gemini.
+Interface compatible with ocr_chapters_jp.py for PDF processing.
 """
 
 import os
 import base64
-import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
-import fitz  # PyMuPDF
 import anthropic
 from google import genai
 from google.genai.types import Part
 from PIL import Image
 import io
 import yaml
+import numpy as np
+from loguru import logger
+
+try:
+    from .illustration_extractor import extract_illustrations
+except ImportError:
+    from illustration_extractor import extract_illustrations
 
 
 class OCRClient:
@@ -66,15 +72,6 @@ class OCRClient:
             self.anthropic_model = config.get('anthropic_model', 'claude-3-5-sonnet-20241022')
         else:
             raise ValueError(f"Unknown model type: {model_type}. Use 'gemini' or 'anthropic'")
-    
-    def pdf_page_to_image(self, pdf_path: str, page_num: int = 0) -> Image.Image:
-        """Convert a PDF page to PIL Image."""
-        doc = fitz.open(pdf_path)
-        page = doc.load_page(page_num)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale for better quality
-        img_data = pix.tobytes("png")
-        doc.close()
-        return Image.open(io.BytesIO(img_data))
     
     def image_to_base64(self, image: Image.Image) -> str:
         """Convert PIL Image to base64 string."""
@@ -150,122 +147,118 @@ Please extract the complete text maintaining the original structure."""
         else:
             return self.ocr_anthropic(image, prompt)
     
-    def ocr_pdf_page(self, pdf_path: str, page_num: int = 0, prompt: Optional[str] = None) -> str:
-        """
-        Perform OCR on a specific page of a PDF.
+
+
+# Interface functions for ocr_chapters_jp.py compatibility
+def init_client(config: Dict) -> OCRClient:
+    """
+    Initialize VLLM OCR client for use with ocr_chapters_jp.py.
+    
+    Args:
+        config: Configuration dictionary from config.yaml
         
-        Args:
-            pdf_path: Path to the PDF file
-            page_num: Page number (0-indexed)
-            prompt: Custom prompt for the model
-        """
-        image = self.pdf_page_to_image(pdf_path, page_num)
-        return self.ocr(image, prompt)
-
-
-# Test examples (same as in analyze_azure_reading_order.py)
-EXAMPLES = {
-    1: {
-        'pdf_path': '/Users/kevinzhou/Github/pdf2epub/output/今さらですが、幼なじみを好きになってしまいました1/input_original.pdf',
-        'page_num': 62,
-        'description': 'Page with furigana (幼なじみ page 62)'
-    },
-    2: {
-        'pdf_path': '/Users/kevinzhou/Github/pdf2epub/output/ゼルトリーク戦記_追放された皇子が美女たちを娶り帝国を統一するまで_ノベル/input_original.pdf',
-        'page_num': 5,
-        'description': 'Page without furigana (ゼルトリーク page 5)'
-    },
-    3: {
-        'pdf_path': '/Users/kevinzhou/Github/pdf2epub/output/今さらですが、幼なじみを好きになってしまいました1/input_original.pdf',
-        'page_num': 21,
-        'description': 'Page with furigana (幼なじみ page 21)'
-    },
-    4: {
-        'pdf_path': '/Users/kevinzhou/Github/pdf2epub/output/今さらですが、幼なじみを好きになってしまいました1/input_original.pdf',
-        'page_num': 186,
-        'description': 'Page with furigana (幼なじみ page 186)'
-    },
-    5: {
-        'pdf_path': '/Users/kevinzhou/Github/pdf2epub/output/今さらですが、幼なじみを好きになってしまいました1/input_original.pdf',
-        'page_num': 40,
-        'description': 'Page with illustration (幼なじみ page 40)'
-    },
-    6: {
-        'pdf_path': '/Users/kevinzhou/Github/pdf2epub/output/今さらですが、幼なじみを好きになってしまいました1/input_original.pdf',
-        'page_num': 11,
-        'description': 'Page with illustration (幼なじみ page 12)'
-    }
-}
-
-
-def main():
-    """Main function for testing OCR models."""
-    parser = argparse.ArgumentParser(description='Test OCR with different vision models')
-    parser.add_argument('--model', choices=['gemini', 'anthropic'], default='gemini',
-                        help='Model to use for OCR')
-    parser.add_argument('--example', type=int, choices=range(1, 7),
-                        help='Example number to test (1-6)')
-    parser.add_argument('--pdf', type=str,
-                        help='Path to custom PDF file')
-    parser.add_argument('--page', type=int, default=0,
-                        help='Page number (0-indexed)')
-    parser.add_argument('--prompt', type=str,
-                        help='Custom prompt for the model')
-    parser.add_argument('--api-key', type=str,
-                        help='API key for the model')
+    Returns:
+        OCRClient instance configured based on ocr_vllm_models in config
+    """
+    # Get VLLM model configuration
+    vllm_models = config.get('ocr_vllm_models', [])
+    if not vllm_models:
+        raise ValueError("No ocr_vllm_models configured in config.yaml")
     
-    args = parser.parse_args()
+    # Use the first configured model
+    model_config = vllm_models[0]
+    provider = model_config.get('provider', 'anthropic')
     
-    # Initialize OCR client
-    try:
-        client = OCRClient(model_type=args.model, api_key=args.api_key)
-    except ValueError as e:
-        print(f"Error: {e}")
-        return
-    
-    # Determine what to process
-    if args.example:
-        example = EXAMPLES[args.example]
-        pdf_path = example['pdf_path']
-        page_num = example['page_num']
-        print(f"\nUsing Example {args.example}: {example['description']}")
-        print(f"PDF: {pdf_path}, Page: {page_num}")
-    elif args.pdf:
-        pdf_path = args.pdf
-        page_num = args.page
-        print(f"\nProcessing custom PDF: {pdf_path}, Page: {page_num}")
+    # Map provider to model type for OCRClient
+    if provider == 'anthropic':
+        model_type = 'anthropic'
+        # Set the model name in config for OCRClient to use
+        config['anthropic_model'] = model_config.get('model', 'claude-3-5-sonnet-20241022')
+    elif provider == 'google' or provider == 'gemini':
+        model_type = 'gemini'
+        config['model'] = model_config.get('model', 'gemini-1.5-flash')
     else:
-        print("Error: Please specify either --example or --pdf")
-        return
+        raise ValueError(f"Unsupported VLLM provider: {provider}")
     
-    # Check if file exists
-    if not Path(pdf_path).exists():
-        print(f"Error: File not found: {pdf_path}")
-        return
+    return OCRClient(model_type=model_type, config_path='config.yaml')
+
+
+def process_page(
+    client: OCRClient,
+    img_bytes: bytes,
+    page_num: int,
+    config: Dict,
+    base_output_dir: Path = None,
+    verbose: bool = False,
+) -> Dict:
+    """
+    Process a single page using VLLM OCR.
+    Interface function for ocr_chapters_jp.py.
+    
+    Args:
+        client: OCRClient instance
+        img_bytes: Image data as bytes
+        page_num: Page number being processed
+        config: Configuration dictionary
+        base_output_dir: Base output directory (typically output/{book_title})
+        verbose: If True, enables detailed logging
+        
+    Returns:
+        Dictionary with:
+            - text: Extracted text from the page
+            - illustrations: List of detected illustrations
+            - columns: Column classification data (empty for VLLM)
+            - viz_data: Visualization data (empty for VLLM)
+    """
+    # Convert bytes to PIL Image
+    img = Image.open(io.BytesIO(img_bytes))
+    img_array = np.array(img)
+    
+    # Log if verbose
+    if verbose:
+        logger.info(f"Processing page {page_num} with VLLM OCR (provider: {client.model_type})")
+    
+    # Get custom prompt from config if available
+    prompt = config.get('ocr_vllm_prompt', None)
+    if prompt is None:
+        prompt = """Extract all Japanese text from this image, preserving the exact layout and reading order.
+For vertical Japanese text (read right-to-left), maintain the column structure.
+Include all furigana (ruby text) inline with parentheses after the kanji.
+Example format: 漢字(かんじ)
+
+If the page contains an illustration or image (not just text), include "[illustration]" in your output at the appropriate position.
+
+Please extract the complete text maintaining the original structure."""
     
     # Perform OCR
-    print(f"\nPerforming OCR with {args.model.upper()} model...")
-    print("=" * 80)
-    
     try:
-        result = client.ocr_pdf_page(pdf_path, page_num, args.prompt)
-        print("\nOCR Result:")
-        print("-" * 80)
-        print(result)
+        text = client.ocr(img, prompt)
     except Exception as e:
-        print(f"Error during OCR: {e}")
-        return
+        logger.error(f"VLLM OCR failed for page {page_num}: {e}")
+        text = ""
     
-    # Optionally save result
-    output_file = f"ocr_result_{args.model}_{Path(pdf_path).stem}_p{page_num}.txt"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(f"Model: {args.model.upper()}\n")
-        f.write(f"PDF: {pdf_path}\n")
-        f.write(f"Page: {page_num}\n")
-        f.write("=" * 80 + "\n")
-        f.write(result)
-    print(f"\nResult saved to: {output_file}")
+    # Extract illustrations using the illustration extractor
+    # For VLLM, we pass the OCR text as text_annotation so it can check for [illustration] markers
+    illustrations = []
+    if base_output_dir:
+        try:
+            illustrations = extract_illustrations(
+                img_array=img_array,
+                backend="vllm",
+                text_annotation=text,  # Pass the OCR text to check for [illustration] markers
+                config=config,
+                page_num=page_num,
+                output_dir=base_output_dir,
+            )
+        except Exception as e:
+            logger.warning(f"Illustration extraction failed for page {page_num}: {e}")
+            illustrations = []
+    
+    return {
+        "text": text,
+        "illustrations": illustrations,
+        "columns": {},  # VLLM doesn't provide column data
+        "viz_data": [],  # VLLM doesn't provide visualization data
+    }
 
 
-if __name__ == "__main__":
-    main()

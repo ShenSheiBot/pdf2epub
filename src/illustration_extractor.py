@@ -397,6 +397,39 @@ def extract_illustrations(
             whitened_img = white_out_text_regions_vision(
                 img_array, text_annotation, padding
             )
+    elif backend == "vllm":
+        # VLLM detects illustrations and marks them in the text output
+        # text_annotation here is actually the OCR text output string
+        logger.debug(
+            f"Page {page_num}: VLLM backend - checking for [illustration] markers in text"
+        )
+        
+        # Check if the text contains [illustration] marker
+        if text_annotation and "[illustration]" in text_annotation.lower():
+            # Save the entire page as an illustration
+            logger.info(f"Page {page_num}: VLLM detected illustration on page")
+            
+            # Save the full page image
+            img_pil = Image.fromarray(img_array)
+            images_dir = output_dir / "images"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            
+            if chapter_num is not None:
+                filename = f"ch{chapter_num:03d}_p{page_num:03d}_illustration.png"
+            else:
+                filename = f"p{page_num:03d}_illustration.png"
+            
+            img_path = images_dir / filename
+            img_pil.save(img_path, "PNG", optimize=True)
+            
+            return [{
+                "path": str(img_path.relative_to(output_dir)),
+                "page": page_num,
+                "placement": "full_page",
+                "bounds": [0, 0, img_array.shape[1], img_array.shape[0]]
+            }]
+        else:
+            return []
     else:
         raise ValueError(f"Unknown backend: {backend}")
 

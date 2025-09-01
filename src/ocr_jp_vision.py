@@ -481,15 +481,10 @@ def _match_furigana_to_main_text(
     # Step 1: For each furigana group, find its best parent WORD based on Y-overlap.
     for furi_group in grouped_furigana_words:
         best_match = {"max_overlap": 0, "line": None, "word_idx": -1}
-        
-        # Debug: Check what words are near this furigana
-        if verbose and "こんしん" in furi_group["text"]:
-            logger.info(f"  DEBUG: Looking for parent word for furigana 'こんしん' at x={furi_group['x_avg']:.1f}, y_range=[{furi_group['y_min']:.1f}, {furi_group['y_max']:.1f}]")
-        
         for line in main_text_lines:
             for word_idx, word in enumerate(line["words"]):
                 x_dist = furi_group["x_avg"] - word["x_center"]
-                
+
                 # Furigana should be to the right of the main text
                 if not (0 < x_dist < max_furigana_distance):
                     continue
@@ -500,11 +495,6 @@ def _match_furigana_to_main_text(
                     min(furi_group["y_max"], word["y_max"])
                     - max(furi_group["y_min"], word["y_min"]),
                 )
-                
-                # Debug: Show words with y-overlap
-                if verbose and "こんしん" in furi_group["text"] and y_overlap > 0:
-                    logger.info(f"    Word '{word['text']}' has y_overlap={y_overlap:.1f} (y_range=[{word['y_min']:.1f}, {word['y_max']:.1f}])")
-                
                 # Choose the word with maximum Y-overlap
                 if y_overlap > best_match["max_overlap"]:
                     best_match.update(
@@ -517,11 +507,6 @@ def _match_furigana_to_main_text(
             word_idx = best_match["word_idx"]
             word = line["words"][word_idx]
             
-            # Debug logging for specific cases
-            if verbose and "こんしん" in furi_group["text"]:
-                logger.info(f"  DEBUG: Furigana 'こんしん' matched to word '{word['text']}' "
-                          f"at word_idx={word_idx}, y_overlap={best_match['max_overlap']:.1f}")
-
             # --- KEY CHANGE: Fallback to ALL characters if no kanji are present ---
             has_kanji = any(_is_kanji(c["text"]) for c in word["chars"])
             target_chars = (
@@ -536,7 +521,7 @@ def _match_furigana_to_main_text(
             for i, c in enumerate(word["chars"]):
                 if c not in target_chars:
                     continue
-                    
+
                 # Check vertical overlap
                 y_overlap = max(
                     0,
@@ -545,18 +530,16 @@ def _match_furigana_to_main_text(
                 )
                 if y_overlap <= 0:
                     continue
-                    
+
                 # Check that furigana is to the right of this character
                 # (furigana x should be greater than character x)
-                char_x_center = (c.get("x_min", 0) + c.get("x_max", 0)) / 2 if "x_min" in c else c.get("x_center", 0)
+                char_x_center = (
+                    (c.get("x_min", 0) + c.get("x_max", 0)) / 2
+                    if "x_min" in c
+                    else c.get("x_center", 0)
+                )
                 x_dist_to_char = furi_group["x_avg"] - char_x_center
-                
-                # Debug logging for specific cases
-                if verbose and "渾" in word["text"] and "こんしん" in furi_group["text"]:
-                    logger.info(f"    DEBUG: Matching furigana 'こんしん' to char '{c['text']}': "
-                              f"x_dist={x_dist_to_char:.1f}, y_overlap={y_overlap:.1f}, "
-                              f"char_x={char_x_center:.1f}, furi_x={furi_group['x_avg']:.1f}")
-                
+
                 # Furigana should be to the right (positive x_dist) and within reasonable distance
                 if 0 < x_dist_to_char < max_furigana_distance:
                     overlapping_chars.append((i, c))
@@ -565,12 +548,6 @@ def _match_furigana_to_main_text(
                 # The span is the min and max index of the overlapping characters
                 start_char_idx = min(i for i, c in overlapping_chars)
                 end_char_idx = max(i for i, c in overlapping_chars)
-                
-                # Debug logging for specific cases
-                if verbose and "こんしん" in furi_group["text"]:
-                    char_text = "".join(c["text"] for i, c in overlapping_chars)
-                    logger.info(f"    DEBUG: Furigana 'こんしん' overlaps with chars '{char_text}' "
-                              f"at indices {start_char_idx}-{end_char_idx} in word '{word['text']}'")
 
                 # Store the furigana group to be processed later
                 span_furigana_map[line["idx"]][word_idx][
@@ -597,12 +574,6 @@ def _match_furigana_to_main_text(
                 final_span_map[span] = "".join(g["text"] for g in furi_groups)
 
             sorted_spans = sorted(final_span_map.keys())
-            
-            # Debug logging for specific cases
-            if verbose and "渾身" in word["text"]:
-                logger.info(f"    DEBUG: Reconstructing word '{word['text']}' with spans: {sorted_spans}")
-                for idx, c in enumerate(word["chars"]):
-                    logger.info(f"      char[{idx}]: '{c['text']}'")
 
             reconstructed_word = ""
             current_char_idx = 0
@@ -623,12 +594,6 @@ def _match_furigana_to_main_text(
             reconstructed_word += "".join(
                 c["text"] for c in word["chars"][current_char_idx:]
             )
-            
-            # Debug logging for specific cases
-            if verbose and "渾身" in word["text"]:
-                logger.info(f"    DEBUG: Reconstructed word with furigana: '{reconstructed_word}' "
-                          f"(original: '{word['text']}')")
-            
             reconstructed_words.append(reconstructed_word)
 
         line_reconstructions[line["idx"]] = "".join(reconstructed_words)

@@ -127,98 +127,35 @@ def breakdown_command(args):
 
 def ocr_command(args):
     """Handle the OCR subcommand."""
-    # Import based on whether Japanese OCR is requested
-    if args.japanese or args.backend:
-        from pdf2epub.ocr_chapters_jp import (
-            load_config,
-            load_book_structure,
-            get_backend_module,
-            process_chapters_parallel
-        )
-    else:
-        from pdf2epub.ocr_chapters import (
-            load_config,
-            load_book_structure,
-            process_chapter,
-            GeminiClient
-        )
+    import sys
+    original_argv = sys.argv
     
-    # Load configuration
-    config = load_config(args.config if hasattr(args, 'config') else 'config.yaml')
-    book_title = config.get("title", "book")
-    
-    logger.info(f"Starting OCR for: {book_title}")
-    
-    # For Japanese OCR
-    if args.japanese or args.backend:
-        # Determine backend
-        backend = args.backend or config.get('jp_ocr_backend', 'azure')
-        logger.info(f"Using Japanese OCR backend: {backend}")
+    try:
+        if args.japanese or args.backend:
+            # Use Japanese OCR
+            from pdf2epub.ocr_chapters_jp import main as ocr_main
+            
+            # Build argv for ocr_chapters_jp main
+            new_argv = ['ocr_chapters_jp.py']
+            if args.backend:
+                new_argv.extend(['--backend', args.backend])
+            if hasattr(args, 'resume') and args.resume:
+                new_argv.append('--resume')
+            if hasattr(args, 'max_workers'):
+                new_argv.extend(['--max-workers', str(args.max_workers)])
+        else:
+            # Use regular OCR
+            from pdf2epub.ocr_chapters import main as ocr_main
+            
+            # Build argv for regular ocr_chapters main
+            new_argv = ['ocr_chapters.py']
+            if hasattr(args, 'resume') and args.resume:
+                new_argv.append('--resume')
         
-        # Import backend functions
-        init_client, process_page_func = get_backend_module(backend)
-        
-        # Load book structure
-        structure = load_book_structure(book_title)
-        if not structure:
-            logger.error(f"Book structure not found. Run 'breakdown' first.")
-            return 1
-        
-        chapters = structure["chapters"]
-        
-        # Add chapter indices
-        for idx, chapter in enumerate(chapters):
-            chapter["index"] = idx + 1
-        
-        # Get PDF path
-        pdf_path = Path("output") / book_title / "input_original.pdf"
-        if not pdf_path.exists():
-            logger.error(f"PDF not found: {pdf_path}")
-            return 1
-        
-        # Initialize client
-        client = init_client(config)
-        
-        # Process chapters
-        process_chapters_parallel(
-            chapters=chapters,
-            pdf_path=pdf_path,
-            client=client,
-            process_page_func=process_page_func,
-            book_title=book_title,
-            max_workers=args.max_workers,
-            resume=args.resume
-        )
-    else:
-        # Regular OCR
-        api_key = config.get("google_api_key")
-        if not api_key:
-            logger.error("Google API key not found in config.yaml")
-            return 1
-        
-        # Load book structure
-        structure = load_book_structure(book_title)
-        if not structure:
-            logger.error(f"Book structure not found. Run 'breakdown' first.")
-            return 1
-        
-        # Initialize Gemini client
-        gemini_client = GeminiClient(api_key)
-        
-        # Get PDF path
-        pdf_path = Path("output") / book_title / "input.pdf"
-        if not pdf_path.exists():
-            logger.error(f"PDF not found: {pdf_path}")
-            return 1
-        
-        # Process each chapter
-        chapters = structure.get("chapters", [])
-        for chapter in chapters:
-            logger.info(f"Processing {chapter['title']}...")
-            process_chapter(chapter, pdf_path, gemini_client, book_title)
-    
-    logger.success("OCR processing completed")
-    return 0
+        sys.argv = new_argv
+        return ocr_main()
+    finally:
+        sys.argv = original_argv
 
 
 def extract_entities_command(args):

@@ -2,6 +2,7 @@
 
 from typing import Dict, Any, Callable, Tuple
 
+
 def get_backend(backend_name: str) -> Tuple[Callable, Callable]:
     """
     Get the init_client and process_page functions for a backend.
@@ -25,5 +26,6 @@ def get_backend(backend_name: str) -> Tuple[Callable, Callable]:
         raise ValueError(f"Unknown backend: {backend_name}")
     
     return init_client, process_page
+
 
 __all__ = ['get_backend']

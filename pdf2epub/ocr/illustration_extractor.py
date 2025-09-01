@@ -482,6 +482,7 @@ def extract_illustrations(
                     illust_path = images_dir / f"page_{page_num}_illustration.png"
 
                 Image.fromarray(illustration).save(illust_path)
+                illust_filename = illust_path.name  # Get the filename from the path
 
                 # Use standardized keys: 'path' and 'bbox'
                 illustrations.append(

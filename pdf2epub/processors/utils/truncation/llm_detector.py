@@ -50,10 +50,24 @@ class LLMTruncationDetector(BaseTruncationDetector):
             return True, "Translation is empty", {'last_lines_original': '', 'last_lines_translated': ''}
         
         # Extract last N lines from both texts
-        original_lines = [l for l in original.strip().split('\n') if l.strip()]
-        translated_lines = [l for l in processed.strip().split('\n') if l.strip()]
+        # Count all lines for statistics
+        all_original_lines = original.strip().split('\n')
+        all_translated_lines = processed.strip().split('\n')
         
-        # Get last N lines
+        # Get non-empty lines for content comparison
+        original_lines = [l for l in all_original_lines if l.strip()]
+        translated_lines = [l for l in all_translated_lines if l.strip()]
+        
+        # Quick check: if line counts match exactly, skip LLM check
+        if len(translated_lines) == len(original_lines):
+            return False, "Line counts match exactly", {
+                'original_line_count': len(original_lines),
+                'translated_line_count': len(translated_lines),
+                'line_ratio': 1.0,
+                'skipped_llm_check': True
+            }
+        
+        # Get last N non-empty lines for comparison
         last_original = '\n'.join(original_lines[-self.num_lines:]) if original_lines else ""
         last_translated = '\n'.join(translated_lines[-self.num_lines:]) if translated_lines else ""
         
@@ -66,16 +80,20 @@ class LLMTruncationDetector(BaseTruncationDetector):
 
 Compare these endings:
 
-ORIGINAL (last {self.num_lines} lines):
+ORIGINAL (last {self.num_lines} non-empty lines):
 {last_original}
 
-TRANSLATION (last {self.num_lines} lines):
+TRANSLATION (last {self.num_lines} non-empty lines):
 {last_translated}
 
 Answer with ONLY "complete" or "truncated" based on:
-1. Does the translation end at a natural stopping point like the original?
-2. Are there missing elements that appear in the original's ending?
-3. Does the translation stop mid-sentence or mid-paragraph?
+1. Does the translation include all the content from the original's ending?
+2. Are there significant content elements from the original's ending that are completely missing in the translation?
+
+Note: 
+- Minor formatting differences or slight variations in the final lines are acceptable
+- A translation can be truncated even if it ends at a complete sentence
+- Focus on whether ALL original content was translated, not how it ends
 
 Your answer (one word only):"""
         

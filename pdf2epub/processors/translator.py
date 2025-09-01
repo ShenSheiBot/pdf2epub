@@ -25,7 +25,8 @@ class TranslateProcessor(BaseMarkdownProcessor):
         max_workers: int = 4,
         resume: bool = False,
         translation_models: Optional[list] = None,
-        use_entities: Optional[bool] = None
+        use_entities: Optional[bool] = None,
+        use_longest_on_failure: bool = False
     ):
         """
         Initialize the translation processor.
@@ -40,6 +41,7 @@ class TranslateProcessor(BaseMarkdownProcessor):
             translation_models: Optional override for model configurations
             use_entities: Whether to use extracted entities for consistency
                         (None = auto-detect, True = force use, False = force disable)
+            use_longest_on_failure: If True, use longest response when all attempts fail validation
         """
         super().__init__(
             config=config,
@@ -47,7 +49,8 @@ class TranslateProcessor(BaseMarkdownProcessor):
             input_dir="polished_markdown",
             output_dir="translated",
             max_workers=max_workers,
-            resume=resume
+            resume=resume,
+            use_longest_on_failure=use_longest_on_failure
         )
         
         self.source_language = source_language

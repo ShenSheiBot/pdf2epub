@@ -47,7 +47,8 @@ def polish_command(args):
         resume=args.resume,
         skip_truncation_check=args.skip_truncation_check,
         polish_models=config.get("polish_models"),
-        content_type=args.content_type
+        content_type=args.content_type,
+        use_longest_on_failure=args.use_longest_on_failure
     )
     
     # Process all files
@@ -299,7 +300,8 @@ def translate_command(args):
         max_workers=args.max_workers,
         resume=args.resume,
         translation_models=config.get("translation_models"),
-        use_entities=use_entities
+        use_entities=use_entities,
+        use_longest_on_failure=args.use_longest_on_failure
     )
     
     # Process all files
@@ -438,6 +440,11 @@ Examples:
         default=4,
         help="Maximum number of concurrent workers"
     )
+    polish_parser.add_argument(
+        "--use-longest-on-failure",
+        action="store_true",
+        help="Use longest response when all validation attempts fail (default: skip file)"
+    )
     polish_parser.set_defaults(func=polish_command)
     
     # Translate subcommand
@@ -475,6 +482,11 @@ Examples:
         "--no-entities",
         action="store_true",
         help="Force disable entity usage even if file exists"
+    )
+    translate_parser.add_argument(
+        "--use-longest-on-failure",
+        action="store_true",
+        help="Use longest response when all validation attempts fail (default: skip file)"
     )
     translate_parser.set_defaults(func=translate_command)
     

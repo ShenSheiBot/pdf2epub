@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 from pdf2epub.utils.llm_client import LLMClient
+from .utils.content_splitter import split_content_simple
 
 
 class BaseMarkdownProcessor(ABC):
@@ -26,7 +27,8 @@ class BaseMarkdownProcessor(ABC):
         input_dir: str,
         output_dir: str,
         max_workers: int = 4,
-        resume: bool = False
+        resume: bool = False,
+        use_longest_on_failure: bool = False
     ):
         """
         Initialize the base processor.
@@ -38,11 +40,13 @@ class BaseMarkdownProcessor(ABC):
             output_dir: Output directory name (e.g., "translated")
             max_workers: Maximum number of concurrent workers
             resume: Whether to resume from previous progress
+            use_longest_on_failure: If True, use longest response when all attempts fail validation
         """
         self.config = config
         self.book_title = book_title
         self.max_workers = max_workers
         self.resume = resume
+        self.use_longest_on_failure = use_longest_on_failure
         
         # Setup directories
         self.input_dir = Path("output") / book_title / input_dir
@@ -143,6 +147,85 @@ class BaseMarkdownProcessor(ABC):
         with open(self.progress_file, "w") as f:
             json.dump(self.progress, f, indent=2, ensure_ascii=False)
     
+    def process_with_splitting(
+        self,
+        content: str,
+        file_name: str,
+        max_tokens: int = 30000,
+        **kwargs
+    ) -> Optional[str]:
+        """
+        Process content by splitting it into smaller parts if validation fails.
+        
+        Args:
+            content: The content to process
+            file_name: Name of the file being processed
+            max_tokens: Maximum tokens per split
+            **kwargs: Additional processor-specific arguments
+            
+        Returns:
+            Processed content or None if all attempts fail
+        """
+        logger.info(f"Attempting to process {file_name} by splitting into parts")
+        
+        # Estimate current content tokens (rough estimate: 1 token ≈ 4 chars)
+        estimated_tokens = len(content) // 4
+        
+        # Split content into parts
+        # Use a safe token limit that's 70% of the estimated current size to ensure actual splitting
+        safe_token_limit = int(estimated_tokens * 0.7)
+        parts = split_content_simple(content, min(safe_token_limit, max_tokens))
+        
+        # Force at least 2 parts if we still got only 1
+        if len(parts) == 1:
+            # Force split into 2 parts
+            logger.info(f"Content estimated at ~{estimated_tokens} tokens, forcing split into 2 parts")
+            parts = split_content_simple(content, estimated_tokens // 2)
+        
+        logger.info(f"Split {file_name} into {len(parts)} parts")
+        
+        processed_parts = []
+        for i, part in enumerate(parts, 1):
+            part_name = f"{file_name} (part {i}/{len(parts)})"
+            logger.info(f"Processing {part_name}")
+            
+            # Process each part (Tenacity handles retries)
+            try:
+                processed_part = self.process_content(
+                    content=part,
+                    file_name=part_name,
+                    **kwargs
+                )
+                
+                # Validate the part
+                is_valid, reason = self.validate_output(
+                    original=part,
+                    processed=processed_part,
+                    file_name=part_name
+                )
+                
+                if is_valid:
+                    processed_parts.append(processed_part)
+                    logger.success(f"Successfully processed {part_name}")
+                else:
+                    # For parts, use output even if validation fails
+                    logger.warning(f"Validation failed for {part_name}: {reason}, using output anyway")
+                    processed_parts.append(processed_part)
+                    
+            except Exception as e:
+                # Part processing failed after all Tenacity retries
+                logger.error(f"Failed to process {part_name} after all retries: {e}")
+                return None  # Abort the entire splitting strategy
+        
+        # Combine all processed parts
+        if len(processed_parts) == len(parts):
+            combined = "\n\n".join(processed_parts)
+            logger.success(f"Successfully processed all {len(parts)} parts of {file_name}")
+            return combined
+        else:
+            logger.error(f"Only processed {len(processed_parts)}/{len(parts)} parts of {file_name}")
+            return None
+    
     def process_file(
         self,
         input_path: Path,
@@ -171,13 +254,19 @@ class BaseMarkdownProcessor(ABC):
             logger.warning(f"File {file_name} is empty, skipping")
             return False
         
-        max_attempts = 3
-        last_error = None
-        attempts_data = []  # Store all attempts with their validation status
+        # Get max validation retries from config (default to 3)
+        max_validation_attempts = 3
+        if hasattr(self, 'translation_models') and self.translation_models:
+            # For translator, use max_retries from model config
+            max_validation_attempts = self.translation_models[0].get('max_retries', 3)
+        elif hasattr(self, 'polish_models') and self.polish_models:
+            # For polisher, use max_retries from model config
+            max_validation_attempts = self.polish_models[0].get('max_retries', 3)
         
-        for attempt in range(max_attempts):
+        last_error = None
+        for attempt in range(max_validation_attempts):
             try:
-                # Process the content
+                # Process the content (Tenacity handles API retries internally)
                 processed_content = self.process_content(
                     content=content,
                     file_name=file_name,
@@ -191,29 +280,16 @@ class BaseMarkdownProcessor(ABC):
                     file_name=file_name
                 )
                 
-                # Store this attempt's data
-                attempts_data.append({
-                    'content': processed_content,
-                    'is_valid': is_valid,
-                    'reason': reason,
-                    'length': len(processed_content)
-                })
-                
                 if not is_valid:
-                    logger.warning(f"Validation failed for {file_name}: {reason}")
-                    if attempt < max_attempts - 1:
-                        logger.info(f"Retrying {file_name} (attempt {attempt + 2}/{max_attempts})...")
-                        time.sleep(2 ** attempt)  # Exponential backoff
+                    # Validation failed - retry
+                    if attempt < max_validation_attempts - 1:
+                        logger.warning(f"Validation failed for {file_name}: {reason}")
+                        logger.info(f"Retrying {file_name} (attempt {attempt + 2}/{max_validation_attempts})...")
                         continue
                     else:
-                        # All attempts failed validation - use the longest response
-                        longest_attempt = max(attempts_data, key=lambda x: x['length'])
-                        processed_content = longest_attempt['content']
-                        logger.warning(
-                            f"All attempts failed validation for {file_name}. "
-                            f"Using longest response ({longest_attempt['length']} chars) "
-                            f"from attempt {attempts_data.index(longest_attempt) + 1}"
-                        )
+                        # All validation attempts failed
+                        last_error = ValueError(f"All {max_validation_attempts} validation attempts failed: {reason}")
+                        break
                 
                 # Save the processed file
                 with open(output_path, 'w', encoding='utf-8') as f:
@@ -223,28 +299,36 @@ class BaseMarkdownProcessor(ABC):
                 return True
                 
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1}/{max_attempts} failed for {file_name}: {e}")
+                # API or other error - also retry
                 last_error = e
-                if attempt < max_attempts - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                if attempt < max_validation_attempts - 1:
+                    logger.warning(f"Attempt {attempt + 1} failed for {file_name}: {e}")
+                    logger.info(f"Retrying {file_name} (attempt {attempt + 2}/{max_validation_attempts})...")
+                    continue
+                else:
+                    break
         
-        # All attempts failed - check if we have any successful content generation
-        if attempts_data:
-            longest_attempt = max(attempts_data, key=lambda x: x['length'])
-            logger.warning(
-                f"All attempts failed for {file_name}, but using longest response "
-                f"({longest_attempt['length']} chars) from attempt {attempts_data.index(longest_attempt) + 1}"
-            )
-            
-            # Save the longest response we got
+        # All attempts failed
+        logger.error(f"Failed to process {file_name} after {max_validation_attempts} attempts: {last_error}")
+        
+        # Try fallback strategy: split into smaller parts
+        logger.warning(f"Attempting to process {file_name} by splitting into smaller parts...")
+        
+        split_result = self.process_with_splitting(
+            content=content,
+            file_name=file_name,
+            **kwargs
+        )
+        
+        if split_result:
+            # Save the split result
             with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(longest_attempt['content'])
-            
+                f.write(split_result)
+            logger.success(f"Successfully processed {file_name} using splitting strategy")
             return True
-        
-        # No successful content generation at all
-        logger.error(f"Failed to process {file_name} after {max_attempts} attempts. Last error: {last_error}")
-        return False
+        else:
+            logger.error(f"Failed to process {file_name} with all strategies")
+            return False
     
     def process_all_files(self) -> Dict[str, Any]:
         """

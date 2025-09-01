@@ -28,7 +28,8 @@ class PolishProcessor(BaseMarkdownProcessor):
         resume: bool = False,
         skip_truncation_check: bool = False,
         polish_models: Optional[List[Dict]] = None,
-        content_type: str = "auto"
+        content_type: str = "auto",
+        use_longest_on_failure: bool = False
     ):
         """
         Initialize the polish processor.
@@ -41,6 +42,7 @@ class PolishProcessor(BaseMarkdownProcessor):
             skip_truncation_check: Whether to skip truncation detection
             polish_models: Optional override for model configurations
             content_type: Type of content ("academic", "japanese", "general", "auto")
+            use_longest_on_failure: If True, use longest response when all attempts fail validation
         """
         super().__init__(
             config=config,
@@ -48,7 +50,8 @@ class PolishProcessor(BaseMarkdownProcessor):
             input_dir="ocr_markdown",
             output_dir="polished_markdown",
             max_workers=max_workers,
-            resume=resume
+            resume=resume,
+            use_longest_on_failure=use_longest_on_failure
         )
         
         self.skip_truncation_check = skip_truncation_check

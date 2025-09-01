@@ -14,6 +14,39 @@ from google.genai.types import (
     SafetySetting
 )
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
+from tenacity.stop import stop_base
+from tenacity.wait import wait_base
+import random
+
+
+class stop_after_self_retries(stop_base):
+    """Stop after `self.num_retries` attempts (defaults to 3 if missing)."""
+    def __init__(self, attr: str = "num_retries", default: int = 3):
+        self.attr = attr
+        self.default = default
+
+    def __call__(self, retry_state):
+        # For bound instance methods, args[0] is `self`
+        obj = retry_state.args[0] if retry_state.args else None
+        num = getattr(obj, self.attr, self.default)
+        return retry_state.attempt_number >= int(num)
+
+
+class wait_exponential_with_self_max(wait_base):
+    """Use Tenacity's wait_random_exponential with self.max_backoff_seconds."""
+    def __init__(self, multiplier: float = 1, attr: str = "max_backoff_seconds", default: int = 30):
+        self.multiplier = multiplier
+        self.attr = attr
+        self.default = default
+
+    def __call__(self, retry_state):
+        # For bound instance methods, args[0] is `self`
+        obj = retry_state.args[0] if retry_state.args else None
+        max_seconds = getattr(obj, self.attr, self.default)
+        
+        # Create and use Tenacity's wait_random_exponential
+        wait_strategy = wait_random_exponential(multiplier=self.multiplier, max=max_seconds)
+        return wait_strategy(retry_state)
 
 
 # Define transient errors that should trigger retries
@@ -88,15 +121,17 @@ def is_transient_openai_error(exception: Exception) -> bool:
 class GeminiClient:
     """Wrapper for Gemini API with smart retry logic."""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, num_retries: int = 3, max_backoff_seconds: int = 30):
         """Initialize Gemini client."""
         from google import genai
         self.client = genai.Client(api_key=api_key)
+        self.num_retries = num_retries
+        self.max_backoff_seconds = max_backoff_seconds
     
     @retry(
         retry=retry_if_exception(is_transient_gemini_error),
-        wait=wait_random_exponential(multiplier=1, max=30),
-        stop=stop_after_attempt(5),
+        wait=wait_exponential_with_self_max(multiplier=1),
+        stop=stop_after_self_retries(),
         reraise=True
     )
     def generate_content(
@@ -125,8 +160,8 @@ class GeminiClient:
     
     @retry(
         retry=retry_if_exception(is_transient_gemini_error),
-        wait=wait_random_exponential(multiplier=1, max=30),
-        stop=stop_after_attempt(5),
+        wait=wait_exponential_with_self_max(multiplier=1),
+        stop=stop_after_self_retries(),
         reraise=True
     )
     def generate_content_stream(
@@ -212,18 +247,20 @@ class GeminiClient:
 class AnthropicClient:
     """Wrapper for Anthropic API with smart retry logic."""
     
-    def __init__(self, api_key: str, base_url: Optional[str] = None):
+    def __init__(self, api_key: str, base_url: Optional[str] = None, num_retries: int = 3, max_backoff_seconds: int = 30):
         """Initialize Anthropic client."""
         import anthropic
         if base_url:
             self.client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
         else:
             self.client = anthropic.Anthropic(api_key=api_key)
+        self.num_retries = num_retries
+        self.max_backoff_seconds = max_backoff_seconds
     
     @retry(
         retry=retry_if_exception(is_transient_anthropic_error),
-        wait=wait_random_exponential(multiplier=1, max=30),
-        stop=stop_after_attempt(5),
+        wait=wait_exponential_with_self_max(multiplier=1),
+        stop=stop_after_self_retries(),
         reraise=True
     )
     def generate_content(
@@ -317,7 +354,7 @@ class AnthropicClient:
 class OpenAIClient:
     """Wrapper for OpenAI API with smart retry logic."""
     
-    def __init__(self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None, num_retries: int = 3, max_backoff_seconds: int = 30):
         """Initialize OpenAI client."""
         from openai import OpenAI
         
@@ -329,12 +366,19 @@ class OpenAIClient:
         
         # Store default model
         self.default_model = model or "gpt-4o"
+        self.num_retries = num_retries
+        self.max_backoff_seconds = max_backoff_seconds
     
     @retry(
         retry=retry_if_exception(is_transient_openai_error),
-        wait=wait_random_exponential(multiplier=1, max=30),
-        stop=stop_after_attempt(5),
-        reraise=True
+        wait=wait_exponential_with_self_max(multiplier=1),
+        stop=stop_after_self_retries(),
+        reraise=True,
+        before_sleep=lambda retry_state: logger.warning(
+            f"OpenAI API retry {retry_state.attempt_number} for "
+            f"{retry_state.args[0] if retry_state.args else 'unknown operation'}: "
+            f"{retry_state.outcome.exception()}"
+        )
     )
     def generate_content(
         self,
@@ -354,13 +398,17 @@ class OpenAIClient:
         messages = self._format_messages(prompt)
         
         # Create chat completion with streaming
-        stream = self.client.chat.completions.create(
-            model=model_to_use,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True
-        )
+        try:
+            stream = self.client.chat.completions.create(
+                model=model_to_use,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to create OpenAI stream for {operation_name}: {e}")
+            raise
         
         # Aggregate streamed response
         response_text = ""

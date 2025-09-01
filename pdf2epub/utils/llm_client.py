@@ -43,20 +43,31 @@ class LLMClient:
         self._safety_blocked_operations = {}  # {provider: set(operation_names)}
         
         # Initialize clients based on available API keys
+        num_retries = config.get("num_retries", 3)
+        max_backoff_seconds = config.get("max_backoff_seconds", 30)
+        
         if config.get("google_api_key"):
-            self._gemini_client = GeminiClient(config["google_api_key"])
+            self._gemini_client = GeminiClient(
+                api_key=config["google_api_key"],
+                num_retries=num_retries,
+                max_backoff_seconds=max_backoff_seconds
+            )
             
         if config.get("anthropic_api_key"):
             self._anthropic_client = AnthropicClient(
                 api_key=config["anthropic_api_key"],
-                base_url=config.get("anthropic_base_url")
+                base_url=config.get("anthropic_base_url"),
+                num_retries=num_retries,
+                max_backoff_seconds=max_backoff_seconds
             )
         
         if config.get("openai_api_key"):
             self._openai_client = OpenAIClient(
                 api_key=config["openai_api_key"],
                 base_url=config.get("openai_base_url"),
-                model=config.get("openai_model")
+                model=config.get("openai_model"),
+                num_retries=num_retries,
+                max_backoff_seconds=max_backoff_seconds
             )
     
     def generate(

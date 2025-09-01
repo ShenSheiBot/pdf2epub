@@ -401,8 +401,10 @@ Your tasks for JAPANESE content:
    - DO NOT remove ルビ芸 like 妄想 in「何もないからこ(妄)ういう(想)話に逃(に)げてんじゃん!」
 
 3. **Images and illustrations**:
-   - Preserve all illustration references
-   - Maintain [illustration] markers
+   - PRESERVE ALL IMAGE LINKS EXACTLY AS THEY ARE
+   - Keep markdown image syntax: ![Image](../images/filename.png)
+   - DO NOT replace image links with [illustration] or any other placeholder
+   - DO NOT modify image paths or filenames
    - Verify furigana is attached to correct kanji
 """
         

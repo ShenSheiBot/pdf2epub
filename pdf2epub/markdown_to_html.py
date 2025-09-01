@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 import yaml
 from loguru import logger
-from utils.logging_config import configure_logging
+from .utils.logging_config import configure_logging
 
 # We'll use markdown library - need to add to pyproject.toml: 
 # poetry add markdown

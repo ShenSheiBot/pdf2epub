@@ -18,9 +18,9 @@ from pathlib import Path
 from io import BytesIO
 from PIL import Image
 from loguru import logger
-from utils.logging_config import configure_logging
-from utils.zip_utils import create_password_protected_zip
-from markdown_to_html import convert_markdown_to_html
+from .utils.logging_config import configure_logging
+from .utils.zip_utils import create_password_protected_zip
+from .markdown_to_html import convert_markdown_to_html
 
 # Configure logger
 logger = configure_logging()

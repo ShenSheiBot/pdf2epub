@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Analyze Azure AI Document Intelligence OCR with Japanese text and visualize bounding boxes."""
+"""Azure AI Document Intelligence OCR backend for Japanese text extraction."""
 
-import sys
 import os
 from pathlib import Path
 import yaml
@@ -12,23 +11,10 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 import base64
 from typing import Dict, Tuple, Any, List
-
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
 from loguru import logger
-try:
-    from .utils.logging_config import configure_logging
-    from .illustration_extractor import extract_illustrations
-except ImportError:
-    # When running as a script
-    from utils.logging_config import configure_logging
-    try:
-        from illustration_extractor import extract_illustrations
-    except ImportError:
-        # If running from src directory
-        sys.path.insert(0, str(Path(__file__).parent))
-        from illustration_extractor import extract_illustrations
+
+from pdf2epub.utils.logging_config import configure_logging
+from ..illustration_extractor import extract_illustrations
 
 # Configure logger
 logger = configure_logging()

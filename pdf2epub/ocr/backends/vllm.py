@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-OCR client using vision language models (VLLMs) like Claude and Gemini.
-Interface compatible with ocr_chapters_jp.py for PDF processing.
-"""
+"""Vision Language Model (VLLM) OCR backend using Claude and Gemini."""
 
 import os
 import base64
@@ -17,10 +14,11 @@ import yaml
 import numpy as np
 from loguru import logger
 
-try:
-    from .illustration_extractor import extract_illustrations
-except ImportError:
-    from illustration_extractor import extract_illustrations
+from pdf2epub.utils.logging_config import configure_logging
+from ..illustration_extractor import extract_illustrations
+
+# Configure logger
+logger = configure_logging()
 
 
 class OCRClient:

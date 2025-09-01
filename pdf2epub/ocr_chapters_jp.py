@@ -8,14 +8,11 @@ import time
 from pathlib import Path
 from typing import List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from illustration_extractor import inject_illustrations_into_text
 import fitz  # PyMuPDF
 from loguru import logger
-try:
-    from .utils.logging_config import configure_logging
-except ImportError:
-    # When running as a script
-    from utils.logging_config import configure_logging
+
+from pdf2epub.ocr import inject_illustrations_into_text
+from pdf2epub.utils.logging_config import configure_logging
 
 # Configure logger
 logger = configure_logging()
@@ -62,22 +59,8 @@ def save_progress(progress_file: Path, progress: Dict):
 
 def get_backend_module(backend: str):
     """Import the appropriate backend module based on configuration."""
-    if backend == 'azure':
-        try:
-            from .ocr_jp_azure import init_client, process_page
-        except ImportError:
-            # When running as a script
-            from ocr_jp_azure import init_client, process_page
-    elif backend == 'vision':
-        try:
-            from .ocr_jp_vision import init_client, process_page
-        except ImportError:
-            # When running as a script
-            from ocr_jp_vision import init_client, process_page
-    else:
-        raise ValueError(f"Unknown OCR backend: {backend}. Use 'azure' or 'vision'")
-    
-    return init_client, process_page
+    from pdf2epub.ocr.backends import get_backend
+    return get_backend(backend)
 
 
 def ocr_page(client, process_page_func, img_bytes: bytes, page_num: int, config: Dict, base_output_dir: Path) -> str:

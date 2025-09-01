@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Analyze Google Cloud Vision OCR with Japanese text and visualize bounding boxes."""
+"""Google Cloud Vision OCR backend for Japanese text extraction."""
 
-import sys
 import os
 from pathlib import Path
 import yaml
@@ -12,25 +11,10 @@ from google.cloud import vision_v1 as vision
 from google.oauth2 import service_account
 from typing import Dict, Tuple, Any, List
 from collections import defaultdict
-
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
 from loguru import logger
 
-try:
-    from .utils.logging_config import configure_logging
-    from .illustration_extractor import extract_illustrations
-except ImportError:
-    # When running as a script
-    from utils.logging_config import configure_logging
-
-    try:
-        from illustration_extractor import extract_illustrations
-    except ImportError:
-        # If running from src directory
-        sys.path.insert(0, str(Path(__file__).parent))
-        from illustration_extractor import extract_illustrations
+from pdf2epub.utils.logging_config import configure_logging
+from ..illustration_extractor import extract_illustrations
 
 # Configure logger
 logger = configure_logging()

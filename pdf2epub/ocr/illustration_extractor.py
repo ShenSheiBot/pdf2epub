@@ -423,7 +423,7 @@ def extract_illustrations(
             img_pil.save(img_path, "PNG", optimize=True)
             
             return [{
-                "path": str(img_path.relative_to(output_dir)),
+                "path": f"../images/{filename}",
                 "page": page_num,
                 "placement": "full_page",
                 "bounds": [0, 0, img_array.shape[1], img_array.shape[0]]
@@ -486,7 +486,7 @@ def extract_illustrations(
                 # Use standardized keys: 'path' and 'bbox'
                 illustrations.append(
                     {
-                        "path": str(illust_path.relative_to(output_dir)),
+                        "path": f"../images/{illust_filename}",
                         "bbox": (
                             left,
                             top,

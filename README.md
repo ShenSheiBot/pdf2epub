@@ -144,10 +144,10 @@ jp_ocr_backend: vision
 # OCR 模型配置（用于非日语书籍）
 ocr_models:
   - provider: gemini
-    model: gemini-2.0-flash-exp
+    model: gemini-2.5-pro
     max_retries: 1
   - provider: anthropic
-    model: claude-3-5-sonnet-20241022
+    model: claude-sonnet-4-20250514
     max_retries: 2
 ```
 

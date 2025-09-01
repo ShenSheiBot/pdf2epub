@@ -173,6 +173,7 @@ class BaseMarkdownProcessor(ABC):
         
         max_attempts = 3
         last_error = None
+        attempts_data = []  # Store all attempts with their validation status
         
         for attempt in range(max_attempts):
             try:
@@ -190,6 +191,14 @@ class BaseMarkdownProcessor(ABC):
                     file_name=file_name
                 )
                 
+                # Store this attempt's data
+                attempts_data.append({
+                    'content': processed_content,
+                    'is_valid': is_valid,
+                    'reason': reason,
+                    'length': len(processed_content)
+                })
+                
                 if not is_valid:
                     logger.warning(f"Validation failed for {file_name}: {reason}")
                     if attempt < max_attempts - 1:
@@ -197,8 +206,14 @@ class BaseMarkdownProcessor(ABC):
                         time.sleep(2 ** attempt)  # Exponential backoff
                         continue
                     else:
-                        # Use the output anyway on final attempt
-                        logger.warning(f"Using output despite validation failure for {file_name}")
+                        # All attempts failed validation - use the longest response
+                        longest_attempt = max(attempts_data, key=lambda x: x['length'])
+                        processed_content = longest_attempt['content']
+                        logger.warning(
+                            f"All attempts failed validation for {file_name}. "
+                            f"Using longest response ({longest_attempt['length']} chars) "
+                            f"from attempt {attempts_data.index(longest_attempt) + 1}"
+                        )
                 
                 # Save the processed file
                 with open(output_path, 'w', encoding='utf-8') as f:
@@ -213,7 +228,21 @@ class BaseMarkdownProcessor(ABC):
                 if attempt < max_attempts - 1:
                     time.sleep(2 ** attempt)  # Exponential backoff
         
-        # All attempts failed
+        # All attempts failed - check if we have any successful content generation
+        if attempts_data:
+            longest_attempt = max(attempts_data, key=lambda x: x['length'])
+            logger.warning(
+                f"All attempts failed for {file_name}, but using longest response "
+                f"({longest_attempt['length']} chars) from attempt {attempts_data.index(longest_attempt) + 1}"
+            )
+            
+            # Save the longest response we got
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(longest_attempt['content'])
+            
+            return True
+        
+        # No successful content generation at all
         logger.error(f"Failed to process {file_name} after {max_attempts} attempts. Last error: {last_error}")
         return False
     
@@ -260,8 +289,10 @@ class BaseMarkdownProcessor(ABC):
                 )
                 futures.append((future, file_key))
             
-            # Process completed tasks
-            for future, file_key in futures:
+            # Process completed tasks as they finish
+            future_to_key = {future: file_key for future, file_key in futures}
+            for future in as_completed(future_to_key):
+                file_key = future_to_key[future]
                 try:
                     success = future.result()
                     progress_key = self.get_progress_key()
@@ -271,6 +302,7 @@ class BaseMarkdownProcessor(ABC):
                             "completed": True,
                             "timestamp": time.time()
                         }
+                        logger.info(f"Progress saved for {file_key}")
                     else:
                         self.progress[progress_key][file_key] = {
                             "completed": False,

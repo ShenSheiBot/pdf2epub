@@ -8,6 +8,7 @@ and translated text.
 
 from typing import Tuple, Dict, Optional
 from .base import BaseTruncationDetector
+from ....utils.model_utils import get_cheapest_model_configs
 
 
 class LLMTruncationDetector(BaseTruncationDetector):
@@ -79,12 +80,21 @@ Answer with ONLY "complete" or "truncated" based on:
 Your answer (one word only):"""
         
         try:
-            # Use a simple, fast model for this check
+            # Use cheapest models for this check
+            cheapest_models = get_cheapest_model_configs(
+                self.llm_client.config,
+                max_models=3
+            )
+            
+            # If no cheap models configured, fall back to default
+            if not cheapest_models:
+                cheapest_models = [
+                    {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 1}
+                ]
+            
             response = self.llm_client.generate(
                 prompt=prompt,
-                model_configs=[
-                    {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 1}
-                ],
+                model_configs=cheapest_models,
                 operation_name="Translation truncation check"
             )
             

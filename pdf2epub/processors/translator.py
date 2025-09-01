@@ -243,6 +243,18 @@ IMPORTANT REQUIREMENTS:
 6. **For literary texts**: Preserve the style and tone of the original
 7. **Do NOT add explanations**: Return ONLY the translated markdown, no explanations or comments"""
         
+        # Add specific rules for Japanese to Chinese translation
+        if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            prompt += """
+
+SPECIFIC RULES FOR JAPANESE TO CHINESE:
+8. **Remove unnecessary ruby annotations**: Do NOT include pronunciation guides like 谦逊（けんそん）. Chinese readers don't need Japanese readings.
+9. **Handle Japanese particles properly**: 
+   - Remove or adapt っ at the end of sentences/exclamations
+   - 「っ，呜，呜嗯っ……呜，呜」 should become 「呜，呜嗯……呜，呜」
+   - Do not literally translate っ as a character
+10. **Natural Chinese expression**: Ensure the translation reads naturally in Chinese without Japanese linguistic artifacts"""
+        
         # Add entity reference if available
         if self.entities:
             prompt += self._create_entity_reference_section()
@@ -256,7 +268,8 @@ IMPORTANT REQUIREMENTS:
             return ""
         
         reference = "\n\n**TRANSLATION CONSISTENCY REFERENCE:**\n"
-        reference += "Use these established translations for consistency:\n\n"
+        reference += "Use these established translations for consistency:\n"
+        reference += "IMPORTANT: Always use the provided translations for character names AND their nicknames.\n\n"
         
         # Add characters
         if "characters" in self.entities and self.entities["characters"]:
@@ -269,6 +282,15 @@ IMPORTANT REQUIREMENTS:
                 if char.get('gender'):
                     reference += f" [{char['gender']}]"
                 reference += "\n"
+                
+                # Add nicknames if present
+                if char.get('nicknames'):
+                    for nickname in char['nicknames']:
+                        if isinstance(nickname, dict):
+                            reference += f"  • {nickname.get('japanese', '')} → {nickname.get('chinese', '')}\n"
+                        elif isinstance(nickname, str):
+                            # Old format compatibility - just the Japanese nickname
+                            reference += f"  • {nickname} (needs translation)\n"
             reference += "\n"
         
         # Add places

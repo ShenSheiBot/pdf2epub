@@ -6,8 +6,11 @@ authors = ["ShenSheiBot <shensheibot@protonmail.com>"]
 readme = "README.md"
 
 packages = [
-    {include = "src"}
+    {include = "pdf2epub"}
 ]
+
+[tool.poetry.scripts]
+pdf2epub = "pdf2epub.cli:main"
 
 [tool.poetry.dependencies]
 python = "^3.11"

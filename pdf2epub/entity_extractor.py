@@ -80,6 +80,7 @@ For each entity, provide:
 - Suggested Chinese translation
 - Brief description in Chinese
 - Category type
+- For characters: Include nicknames with their Chinese translations
 
 Return as JSON with this structure:
 {{
@@ -98,7 +99,10 @@ Return as JSON with this structure:
       "description": "主人公，精灵少女",
       "role": "protagonist",
       "relationships": ["妹妹: 露娜"],
-      "nicknames": []
+      "nicknames": [
+        {{"japanese": "ひなちゃん", "chinese": "小绯奈"}},
+        {{"japanese": "ヒナ様", "chinese": "绯奈大人"}}
+      ]
     }}
   ],
   "places": [

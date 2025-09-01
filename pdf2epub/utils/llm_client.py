@@ -9,8 +9,10 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_i
 from .network_utils import (
     GeminiClient, 
     AnthropicClient,
+    OpenAIClient,
     is_transient_gemini_error,
-    is_transient_anthropic_error
+    is_transient_anthropic_error,
+    is_transient_openai_error
 )
 
 
@@ -36,6 +38,7 @@ class LLMClient:
         self.config = config
         self._gemini_client = None
         self._anthropic_client = None
+        self._openai_client = None
         # Track safety blocks per operation to allow retrying on different content
         self._safety_blocked_operations = {}  # {provider: set(operation_names)}
         
@@ -47,6 +50,13 @@ class LLMClient:
             self._anthropic_client = AnthropicClient(
                 api_key=config["anthropic_api_key"],
                 base_url=config.get("anthropic_base_url")
+            )
+        
+        if config.get("openai_api_key"):
+            self._openai_client = OpenAIClient(
+                api_key=config["openai_api_key"],
+                base_url=config.get("openai_base_url"),
+                model=config.get("openai_model")
             )
     
     def generate(
@@ -111,6 +121,16 @@ class LLMClient:
                     
                 elif provider == "anthropic" and self._anthropic_client:
                     response = self._generate_with_anthropic(
+                        prompt=prompt,
+                        model=model,
+                        max_retries=max_retries,
+                        operation_name=operation_name
+                    )
+                    logger.success(f"Successfully generated with {provider} for {operation_name}")
+                    return response
+                    
+                elif provider == "openai" and self._openai_client:
+                    response = self._generate_with_openai(
                         prompt=prompt,
                         model=model,
                         max_retries=max_retries,
@@ -250,6 +270,55 @@ class LLMClient:
         if isinstance(exception, SafetyBlockError):
             return False
         return is_transient_anthropic_error(exception)
+    
+    def _generate_with_openai(
+        self,
+        prompt: Union[str, List[Dict]],
+        model: str,
+        max_retries: int,
+        operation_name: str
+    ) -> str:
+        """Generate content with OpenAI, handling retries internally."""
+        
+        # Use model-specific max tokens if available
+        max_tokens = 8192  # Default for most OpenAI models
+        if "gpt-4" in model.lower():
+            max_tokens = 8192
+        elif "gpt-3.5" in model.lower():
+            max_tokens = 4096
+        
+        temperature = 0.1  # Low temperature for consistent results
+        
+        # Create retry decorator with specified attempts
+        @retry(
+            retry=retry_if_exception(self._is_retryable_openai_error),
+            wait=wait_random_exponential(multiplier=1, max=30),
+            stop=stop_after_attempt(max_retries),
+            reraise=True
+        )
+        def generate_with_retry():
+            try:
+                return self._openai_client.generate_content(
+                    prompt=prompt,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    operation_name=operation_name
+                )
+            except Exception as e:
+                # Check for safety/content policy blocks
+                error_str = str(e).lower()
+                if any(term in error_str for term in ['content_policy', 'refused', 'violation']):
+                    raise SafetyBlockError(str(e), "openai")
+                raise
+        
+        return generate_with_retry()
+    
+    def _is_retryable_openai_error(self, exception: Exception) -> bool:
+        """Check if OpenAI error should be retried (not safety blocks)."""
+        if isinstance(exception, SafetyBlockError):
+            return False
+        return is_transient_openai_error(exception)
     
     def get_safety_stats(self) -> Dict[str, int]:
         """Get statistics about safety blocks per provider."""

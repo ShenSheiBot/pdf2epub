@@ -60,6 +60,31 @@ def is_transient_anthropic_error(exception: Exception) -> bool:
     return False
 
 
+def is_transient_openai_error(exception: Exception) -> bool:
+    """Check if an OpenAI API error is transient and should be retried."""
+    error_str = str(exception).lower()
+    
+    # Don't retry content policy violations
+    if any(term in error_str for term in ['content_policy', 'violation', 'refused']):
+        return False
+    
+    # Retry rate limits and server errors
+    if '429' in error_str or 'rate' in error_str:
+        return True
+    
+    if any(code in error_str for code in ['500', '502', '503', '504']):
+        return True
+    
+    if isinstance(exception, (TimeoutError, ConnectionError, httpx.TimeoutException)):
+        return True
+    
+    # OpenAI specific errors
+    if 'timeout' in error_str or 'connection' in error_str:
+        return True
+        
+    return False
+
+
 class GeminiClient:
     """Wrapper for Gemini API with smart retry logic."""
     
@@ -126,16 +151,18 @@ class GeminiClient:
         
         aggregated_text = ""
         chunk_count = 0
+        last_log_length = 0
         
         for chunk in stream_response:
             chunk_count += 1
             if hasattr(chunk, 'text') and chunk.text:
                 aggregated_text += chunk.text
                 
-                # Log progress periodically
-                if len(aggregated_text) % 2000 < 10:
+                # Log progress periodically - every 2000 characters
+                if len(aggregated_text) - last_log_length >= 2000:
                     estimated_tokens = len(aggregated_text) // 4
                     logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
+                    last_log_length = len(aggregated_text)
             
             # Check for early termination
             if hasattr(chunk, 'candidates') and chunk.candidates:
@@ -225,16 +252,18 @@ class AnthropicClient:
         # Aggregate streamed response
         response_text = ""
         chunk_count = 0
+        last_log_length = 0
         for event in stream:
             if event.type == "content_block_delta":
                 if hasattr(event.delta, 'text'):
                     response_text += event.delta.text
                     chunk_count += 1
                     
-                    # Log progress periodically (similar to Gemini)
-                    if len(response_text) % 2000 < 10:
+                    # Log progress periodically - every 2000 characters
+                    if len(response_text) - last_log_length >= 2000:
                         estimated_tokens = len(response_text) // 4
                         logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
+                        last_log_length = len(response_text)
         
         if not response_text:
             raise ValueError(f"Empty response from Anthropic for {operation_name}")
@@ -283,6 +312,128 @@ class AnthropicClient:
             return processed
         
         return prompt
+
+
+class OpenAIClient:
+    """Wrapper for OpenAI API with smart retry logic."""
+    
+    def __init__(self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None):
+        """Initialize OpenAI client."""
+        from openai import OpenAI
+        
+        # Set up client with optional base URL
+        if base_url:
+            self.client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            self.client = OpenAI(api_key=api_key)
+        
+        # Store default model
+        self.default_model = model or "gpt-4o"
+    
+    @retry(
+        retry=retry_if_exception(is_transient_openai_error),
+        wait=wait_random_exponential(multiplier=1, max=30),
+        stop=stop_after_attempt(5),
+        reraise=True
+    )
+    def generate_content(
+        self,
+        prompt: Union[str, List[Dict]],
+        model: Optional[str] = None,
+        max_tokens: int = 8192,
+        temperature: float = 0.1,
+        operation_name: str = "OpenAI API call"
+    ) -> str:
+        """Generate content with automatic retry for transient errors."""
+        logger.info(f"Calling OpenAI API for {operation_name}")
+        
+        # Use provided model or default
+        model_to_use = model or self.default_model
+        
+        # Process content for messages format
+        messages = self._format_messages(prompt)
+        
+        # Create chat completion with streaming
+        stream = self.client.chat.completions.create(
+            model=model_to_use,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True
+        )
+        
+        # Aggregate streamed response
+        response_text = ""
+        chunk_count = 0
+        last_log_length = 0
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                response_text += chunk.choices[0].delta.content
+                chunk_count += 1
+                
+                # Log progress periodically - every 2000 characters
+                if len(response_text) - last_log_length >= 2000:
+                    estimated_tokens = len(response_text) // 4
+                    logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
+                    last_log_length = len(response_text)
+        
+        if not response_text:
+            raise ValueError(f"Empty response from OpenAI for {operation_name}")
+        
+        logger.info(f"Streamed {len(response_text)} chars ({chunk_count} chunks) from OpenAI for {operation_name}")
+        return response_text
+    
+    def _format_messages(self, prompt: Union[str, List[Dict]]) -> List[Dict]:
+        """Format prompt into OpenAI messages format."""
+        if isinstance(prompt, str):
+            return [{"role": "user", "content": prompt}]
+        
+        if isinstance(prompt, list):
+            # Handle multi-part content
+            content_parts = []
+            for part in prompt:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        content_parts.append({
+                            "type": "text",
+                            "text": part["text"]
+                        })
+                    elif part.get("type") == "image":
+                        # Handle image data
+                        if "source" in part and isinstance(part["source"], dict):
+                            # Already in structured format
+                            base64_data = part["source"].get("data")
+                            mime_type = part["source"].get("media_type", "image/png")
+                        else:
+                            # Simple format
+                            image_data = part.get("data")
+                            mime_type = part.get("mime_type", "image/png")
+                            
+                            if isinstance(image_data, bytes):
+                                base64_data = base64.b64encode(image_data).decode('utf-8')
+                            else:
+                                base64_data = image_data
+                        
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_data}"
+                            }
+                        })
+                    else:
+                        # Pass through other types
+                        content_parts.append(part)
+                else:
+                    # String content
+                    content_parts.append({
+                        "type": "text",
+                        "text": str(part)
+                    })
+            
+            return [{"role": "user", "content": content_parts}]
+        
+        # Default case
+        return [{"role": "user", "content": str(prompt)}]
 
 
 def generate_with_fallback(

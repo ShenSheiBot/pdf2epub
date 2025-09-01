@@ -185,7 +185,6 @@ def split_content_simple(content: str, max_tokens: int) -> List[str]:
     return parts if parts else [content]
 
 
-
 def split_content_intelligently(content: str, max_tokens: int, gemini_client: GeminiClient) -> List[str]:
     """
     Use LLM to intelligently split content at natural boundaries.
@@ -392,6 +391,7 @@ Your tasks:
 
 4. **For Japanese text**:
    - Keep ruby text/furigana annotations like: 一人(ひとり), 今更(いまさら), 幼馴染(おさななじみ)
+   - However, DO NOT ADD new ruby that is not in OCR
    - Preserve the parentheses format for readings
 
 5. **Fix footnotes**:

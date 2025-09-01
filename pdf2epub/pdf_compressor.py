@@ -19,7 +19,7 @@ from pathlib import Path
 from PIL import Image
 import fitz  # PyMuPDF
 from loguru import logger
-from utils.logging_config import configure_logging
+from .utils.logging_config import configure_logging
 
 # Configure logger
 logger = configure_logging()

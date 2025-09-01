@@ -66,12 +66,12 @@ def breakdown_command(args):
     """Handle the breakdown subcommand."""
     from pdf2epub.breakdown import (
         load_config as load_breakdown_config,
-        add_page_number_patches,
-        GeminiClient,
-        compress_pdf,
-        analyze_book_structure,
-        save_book_structure
+        preprocess_pdf,
+        analyze_pdf_structure,
+        detect_front_and_back_matter
     )
+    from pdf2epub.utils.network_utils import GeminiClient
+    import json
     
     # Load configuration
     config = load_breakdown_config(args.config)
@@ -102,31 +102,25 @@ def breakdown_command(args):
     # Setup Gemini API
     gemini_client = GeminiClient(api_key)
     
-    # Copy input PDF to output directory
-    target_pdf = output_dir / "input_original.pdf"
-    if not target_pdf.exists() or args.force:
-        import shutil
-        shutil.copy2(input_pdf, target_pdf)
-        logger.info(f"Copied input PDF to {target_pdf}")
-    
-    # Add page number patches if requested
-    if args.add_page_numbers:
-        logger.info("Adding page number patches...")
-        add_page_number_patches(target_pdf, target_pdf)
-    
-    # Compress PDF
-    compressed_pdf = output_dir / "input.pdf"
-    if not compressed_pdf.exists() or args.force:
-        logger.info("Compressing PDF...")
-        compress_pdf(target_pdf, compressed_pdf, dpi=args.dpi)
+    # Use preprocess_pdf which handles page number patches and multi-round compression
+    processed_pdf = preprocess_pdf(input_pdf, output_dir)
     
     # Analyze book structure
     logger.info("Analyzing book structure...")
-    structure = analyze_book_structure(compressed_pdf, gemini_client)
+    structure = analyze_pdf_structure(gemini_client, processed_pdf, book_title, config)
     
-    # Save structure
-    save_book_structure(structure, book_title)
-    logger.success(f"Book structure saved for {book_title}")
+    # Add book title to the structure
+    structure['book_title'] = book_title
+    
+    # Detect front matter and back matter automatically
+    structure = detect_front_and_back_matter(structure, processed_pdf)
+    
+    # Save the structured output to the output directory
+    output_file = output_dir / "book_structure.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(structure, f, ensure_ascii=False, indent=2)
+    
+    logger.success(f"Book structure saved to {output_file}")
     
     return 0
 
@@ -264,11 +258,16 @@ def extract_entities_command(args):
     
     # Check if PDF exists
     if not pdf_path.exists():
-        # Try output directory
-        alt_path = output_dir / "input_original.pdf"
-        if alt_path.exists():
-            pdf_path = alt_path
-            logger.info(f"Using PDF from: {pdf_path}")
+        # Try output directory - prefer processed input.pdf over original
+        processed_path = output_dir / "input.pdf"
+        original_path = output_dir / "input_original.pdf"
+        
+        if processed_path.exists():
+            pdf_path = processed_path
+            logger.info(f"Using processed PDF from: {pdf_path}")
+        elif original_path.exists():
+            pdf_path = original_path
+            logger.info(f"Using original PDF from: {pdf_path}")
         else:
             logger.error(f"PDF not found: {args.input}")
             return 1
@@ -308,11 +307,16 @@ def epub_command(args):
         new_argv = ['generate_epub.py', '-c', args.config]
         if args.input:
             new_argv.extend(['-i', args.input])
+        if args.translated:
+            new_argv.append('--translated')
         
         sys.argv = new_argv
         
         # Call the main function
-        logger.info("Generating EPUB...")
+        if args.translated:
+            logger.info("Generating translated EPUB...")
+        else:
+            logger.info("Generating EPUB...")
         generate_epub_main()
         
         return 0
@@ -336,7 +340,7 @@ def translate_command(args):
     
     # Get language settings
     target_language = args.target_language or config.get("target_language", "Chinese")
-    source_language = args.source_language or config.get("source_language", "English")
+    source_language = args.source_language or config.get("source_language", "Japanese")
     
     logger.info(f"Starting translation for: {book_title}")
     logger.info(f"Translation: {source_language} → {target_language}")
@@ -391,7 +395,7 @@ Examples:
   python -m pdf2epub.cli extract-entities -i manga.pdf  # Extract for consistency
   python -m pdf2epub.cli ocr --japanese --backend vision
   python -m pdf2epub.cli polish --content-type japanese
-  python -m pdf2epub.cli translate --target-language Chinese --use-entities
+  python -m pdf2epub.cli translate --target-language Chinese  # Auto-uses entities
   python -m pdf2epub.cli epub
   
   # Academic book with translation:
@@ -569,6 +573,11 @@ Examples:
     epub_parser.add_argument(
         "-i", "--input",
         help="Path to PDF file for cover extraction (optional)"
+    )
+    epub_parser.add_argument(
+        "--translated",
+        action="store_true",
+        help="Generate EPUB from translated markdown instead of polished"
     )
     epub_parser.set_defaults(func=epub_command)
     

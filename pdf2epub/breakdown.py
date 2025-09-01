@@ -3,11 +3,11 @@ import yaml
 import shutil
 from pathlib import Path
 from google.genai.types import Part
-from utils.network_utils import GeminiClient
-from pdf_compressor import compress_pdf
+from .utils.network_utils import GeminiClient
+from .pdf_compressor import compress_pdf
 import argparse
 from loguru import logger
-from utils.logging_config import configure_logging
+from .utils.logging_config import configure_logging
 import fitz  # PyMuPDF for PDF manipulation
 
 # Configure logger
@@ -33,8 +33,14 @@ def add_page_number_patches(pdf_path, output_path=None):
     Returns:
         Path to the patched PDF
     """
+    import tempfile
+    import os
+    
     if output_path is None:
         output_path = pdf_path
+    
+    # Check if we're overwriting the same file
+    same_file = (Path(pdf_path).resolve() == Path(output_path).resolve())
     
     try:
         doc = fitz.open(pdf_path)
@@ -89,8 +95,20 @@ def add_page_number_patches(pdf_path, output_path=None):
         page_count = len(doc)
         
         # Save the modified PDF
-        doc.save(output_path)
-        doc.close()
+        if same_file:
+            # When overwriting the same file, we need to use a temp file
+            temp_fd, temp_path = tempfile.mkstemp(suffix=".pdf", dir=Path(output_path).parent)
+            os.close(temp_fd)  # Close the file descriptor
+            
+            doc.save(temp_path)
+            doc.close()
+            
+            # Replace the original with the temp file
+            os.replace(temp_path, output_path)
+        else:
+            # Different files, can save directly
+            doc.save(output_path)
+            doc.close()
         
         logger.info(f"Added page number patches to {page_count} pages")
         return Path(output_path)
@@ -126,7 +144,8 @@ def preprocess_pdf(input_pdf, output_dir):
 
     # Add page number patches to create input.pdf
     logger.info("Adding page number patches to PDF...")
-
+    add_page_number_patches(original_pdf, processed_pdf)
+    
     # Get file size in MB
     file_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
 
@@ -134,11 +153,12 @@ def preprocess_pdf(input_pdf, output_dir):
     if file_size_mb > 45:
         logger.warning(f"PDF file size ({file_size_mb:.2f}MB) exceeds 45MB. Compressing...")
 
+        # Create temporary file for compression output
+        temp_output = output_dir / "compressed_temp.pdf"
+
         # Start with moderate compression settings
         compression_settings = [
             # (dpi, quality, grayscale)
-            (150, 60, False),  # Medium compression
-            (120, 40, False),  # Higher compression
             (100, 30, True),   # Aggressive compression with grayscale
             (80, 25, True),    # Very aggressive
             (72, 20, True),    # Ultra aggressive (minimum readable)
@@ -146,14 +166,9 @@ def preprocess_pdf(input_pdf, output_dir):
         ]
 
         # Try compression with increasingly aggressive settings until size is under limit
-        current_size_mb = file_size_mb
         for dpi, quality, grayscale in compression_settings:
-            # Create a fresh temporary file for each compression attempt
-            temp_output = output_dir / f"compressed_temp_{dpi}_{quality}.pdf"
             try:
                 logger.info(f"Trying compression with DPI={dpi}, quality={quality}, grayscale={grayscale}...")
-                logger.info(f"Current file size before compression: {current_size_mb:.2f}MB")
-                
                 success, stats = compress_pdf(
                     str(processed_pdf), 
                     str(temp_output), 
@@ -169,39 +184,23 @@ def preprocess_pdf(input_pdf, output_dir):
                     )
 
                     # If compression was successful and reduced size, use the compressed file
-                    if compressed_size_mb < current_size_mb:
+                    if compressed_size_mb < file_size_mb:
                         # Replace the processed file with our compressed version
                         if temp_output.exists():
                             shutil.move(str(temp_output), str(processed_pdf))
-                            # Update current_size_mb for next iteration
-                            current_size_mb = compressed_size_mb
-                            logger.info(f"Replaced file with compressed version: {current_size_mb:.2f}MB")
-                        else:
-                            logger.error("Compressed temp file doesn't exist!")
                     else:
                         logger.warning("Compression did not reduce file size. Keeping original.")
-                        # Clean up unused temp file
-                        if temp_output.exists():
-                            temp_output.unlink()
 
                     # If we're under 45MB, we're done
-                    if current_size_mb <= 45:
-                        logger.info(f"File size {current_size_mb:.2f}MB is now under 45MB limit. Stopping compression.")
+                    if compressed_size_mb <= 45:
                         break
-                else:
-                    logger.warning(f"Compression failed with DPI={dpi}, quality={quality}, grayscale={grayscale}")
-                    # Clean up temp file if it exists
-                    if temp_output.exists():
-                        temp_output.unlink()
 
             except Exception as e:
                 logger.error(f"Compression attempt failed: {e}")
-                # Clean up temp file if it exists
-                if temp_output.exists():
-                    temp_output.unlink()
 
-        # Update the original variable for final check
-        file_size_mb = current_size_mb
+            # Clean up temp file if it exists
+            if temp_output.exists():
+                temp_output.unlink()
 
         # Check final file size
         final_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
@@ -405,6 +404,9 @@ def main():
     logger.info(f"Analyzing PDF structure for '{book_title}'...")
     try:
         structure = analyze_pdf_structure(client, processed_pdf, book_title, config)
+        
+        # Add book title to the structure
+        structure['book_title'] = book_title
         
         # Detect front matter and back matter automatically
         structure = detect_front_and_back_matter(structure, processed_pdf)

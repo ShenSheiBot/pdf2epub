@@ -258,7 +258,7 @@ IMPORTANT REQUIREMENTS:
         # Add characters
         if "characters" in self.entities and self.entities["characters"]:
             reference += "**Characters:**\n"
-            for char in self.entities["characters"][:20]:  # Limit to avoid token overflow
+            for char in self.entities["characters"]:
                 reference += f"- {char['japanese']}"
                 if char.get('reading'):
                     reference += f" ({char['reading']})"
@@ -271,28 +271,28 @@ IMPORTANT REQUIREMENTS:
         # Add places
         if "places" in self.entities and self.entities["places"]:
             reference += "**Places:**\n"
-            for place in self.entities["places"][:15]:
+            for place in self.entities["places"]:
                 reference += f"- {place['japanese']} → {place['chinese']}\n"
             reference += "\n"
         
         # Add important terms
         if "terms" in self.entities and self.entities["terms"]:
             reference += "**Special Terms:**\n"
-            for term in self.entities["terms"][:20]:
+            for term in self.entities["terms"]:
                 reference += f"- {term['japanese']} → {term['chinese']}\n"
             reference += "\n"
         
         # Add organizations
         if "organizations" in self.entities and self.entities["organizations"]:
             reference += "**Organizations:**\n"
-            for org in self.entities["organizations"][:10]:
+            for org in self.entities["organizations"]:
                 reference += f"- {org['japanese']} → {org['chinese']}\n"
             reference += "\n"
         
         # Add races if present
         if "races" in self.entities and self.entities["races"]:
             reference += "**Races/Species:**\n"
-            for race in self.entities["races"][:10]:
+            for race in self.entities["races"]:
                 reference += f"- {race['japanese']} → {race['chinese']}"
                 if race.get('chinese_plural'):
                     reference += f" (plural: {race['chinese_plural']})"
@@ -302,7 +302,7 @@ IMPORTANT REQUIREMENTS:
         # Add items if present  
         if "items" in self.entities and self.entities["items"]:
             reference += "**Items:**\n"
-            for item in self.entities["items"][:10]:
+            for item in self.entities["items"]:
                 reference += f"- {item['japanese']} → {item['chinese']}\n"
             reference += "\n"
         

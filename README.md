@@ -222,15 +222,20 @@ python -m pdf2epub.cli extract-entities -i input.pdf --source-lang Japanese --ta
 #### 翻译处理
 
 ```bash
-# 基本翻译
+# 基本翻译（自动检测并使用实体文件，如果存在）
 python -m pdf2epub.cli translate --target-language Chinese
 
-# 使用实体参考确保一致性
+# 强制使用实体参考（即使文件不存在也会报错）
 python -m pdf2epub.cli translate --target-language Chinese --use-entities
+
+# 强制不使用实体（即使文件存在）
+python -m pdf2epub.cli translate --target-language Chinese --no-entities
 
 # 指定源语言和目标语言
 python -m pdf2epub.cli translate --source-language Japanese --target-language Chinese
 ```
+
+**注意**：如果 `translation_entities.json` 文件存在，翻译器会自动使用它以保持一致性。
 
 ### 4. 完整工作流程示例
 
@@ -248,8 +253,8 @@ python -m pdf2epub.cli ocr --japanese --backend vision
 # 4. 日语内容润色
 python -m pdf2epub.cli polish --content-type japanese
 
-# 5. 翻译成中文（使用实体）
-python -m pdf2epub.cli translate --use-entities
+# 5. 翻译成中文（自动使用已提取的实体）
+python -m pdf2epub.cli translate
 
 # 6. 生成EPUB
 python -m pdf2epub.cli epub

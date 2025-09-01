@@ -51,7 +51,7 @@ class OCRClient:
             self.client = genai.Client(api_key=key)
             
             # Use model from config if available
-            self.model_name = config.get('model', 'gemini-1.5-flash')
+            self.model_name = config.get('model', 'gemini-2.5-pro')
             
         elif self.model_type == "anthropic":
             # Try: provided key -> config.yaml -> env var
@@ -171,10 +171,10 @@ def init_client(config: Dict) -> OCRClient:
     if provider == 'anthropic':
         model_type = 'anthropic'
         # Set the model name in config for OCRClient to use
-        config['anthropic_model'] = model_config.get('model', 'claude-3-5-sonnet-20241022')
+        config['anthropic_model'] = model_config.get('model', 'claude-sonnet-4-20250514')
     elif provider == 'google' or provider == 'gemini':
         model_type = 'gemini'
-        config['model'] = model_config.get('model', 'gemini-1.5-flash')
+        config['model'] = model_config.get('model', 'gemini-2.5-pro')
     else:
         raise ValueError(f"Unsupported VLLM provider: {provider}")
     

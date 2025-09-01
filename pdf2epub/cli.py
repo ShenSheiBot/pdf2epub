@@ -227,6 +227,73 @@ def ocr_command(args):
     return 0
 
 
+def extract_entities_command(args):
+    """Handle the extract-entities subcommand."""
+    from pdf2epub.entity_extractor import (
+        load_config as load_entity_config,
+        extract_entities_from_pdf,
+        save_entities,
+        GeminiClient
+    )
+    
+    # Load configuration
+    config = load_entity_config(args.config)
+    book_title = config.get("title")
+    
+    if not book_title:
+        # Use PDF filename as fallback
+        book_title = Path(args.input).stem
+        logger.warning(f"No title in config, using: {book_title}")
+    
+    # Get API key
+    api_key = config.get("google_api_key")
+    if not api_key:
+        logger.error("Google API key not found in config.yaml")
+        return 1
+    
+    logger.info(f"Extracting entities from: {book_title}")
+    logger.info(f"Language pair: {args.source_lang} → {args.target_lang}")
+    
+    # Initialize Gemini client
+    gemini_client = GeminiClient(api_key)
+    
+    # Setup paths
+    pdf_path = Path(args.input)
+    output_dir = Path("output") / book_title
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if PDF exists
+    if not pdf_path.exists():
+        # Try output directory
+        alt_path = output_dir / "input_original.pdf"
+        if alt_path.exists():
+            pdf_path = alt_path
+            logger.info(f"Using PDF from: {pdf_path}")
+        else:
+            logger.error(f"PDF not found: {args.input}")
+            return 1
+    
+    try:
+        # Extract entities
+        entities = extract_entities_from_pdf(
+            pdf_path=pdf_path,
+            book_title=book_title,
+            gemini_client=gemini_client,
+            config=config,
+            language_pair=(args.source_lang, args.target_lang)
+        )
+        
+        # Save results
+        save_entities(entities, output_dir)
+        
+        logger.success("Entity extraction completed!")
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Entity extraction failed: {e}")
+        return 1
+
+
 def epub_command(args):
     """Handle the epub generation subcommand."""
     # Import the main function from generate_epub
@@ -274,6 +341,14 @@ def translate_command(args):
     logger.info(f"Starting translation for: {book_title}")
     logger.info(f"Translation: {source_language} → {target_language}")
     
+    # Determine use_entities value based on flags
+    if args.no_entities:
+        use_entities = False
+    elif args.use_entities:
+        use_entities = True
+    else:
+        use_entities = None  # Auto-detect
+    
     # Initialize the translation processor
     processor = TranslateProcessor(
         config=config,
@@ -282,7 +357,8 @@ def translate_command(args):
         target_language=target_language,
         max_workers=args.max_workers,
         resume=args.resume,
-        translation_models=config.get("translation_models")
+        translation_models=config.get("translation_models"),
+        use_entities=use_entities
     )
     
     # Process all files
@@ -310,10 +386,12 @@ Examples:
   python -m pdf2epub.cli polish
   python -m pdf2epub.cli epub
   
-  # Japanese book pipeline:
+  # Japanese book with translation:
   python -m pdf2epub.cli breakdown -i manga.pdf
+  python -m pdf2epub.cli extract-entities -i manga.pdf  # Extract for consistency
   python -m pdf2epub.cli ocr --japanese --backend vision
   python -m pdf2epub.cli polish --content-type japanese
+  python -m pdf2epub.cli translate --target-language Chinese --use-entities
   python -m pdf2epub.cli epub
   
   # Academic book with translation:
@@ -446,7 +524,41 @@ Examples:
         default=4,
         help="Maximum number of concurrent workers"
     )
+    translate_parser.add_argument(
+        "--use-entities",
+        action="store_true",
+        default=None,
+        help="Force use of extracted entities (auto-detects by default)"
+    )
+    translate_parser.add_argument(
+        "--no-entities",
+        action="store_true",
+        help="Force disable entity usage even if file exists"
+    )
     translate_parser.set_defaults(func=translate_command)
+    
+    # Entity extraction subcommand
+    entity_parser = subparsers.add_parser(
+        "extract-entities",
+        help="Extract characters, places, and terms for translation consistency",
+        description="Analyze PDF to extract entities that need consistent translation"
+    )
+    entity_parser.add_argument(
+        "-i", "--input",
+        required=True,
+        help="Path to input PDF file"
+    )
+    entity_parser.add_argument(
+        "--source-lang",
+        default="Japanese",
+        help="Source language (default: Japanese)"
+    )
+    entity_parser.add_argument(
+        "--target-lang",
+        default="Chinese",
+        help="Target language for translation (default: Chinese)"
+    )
+    entity_parser.set_defaults(func=extract_entities_command)
     
     # EPUB generation subcommand
     epub_parser = subparsers.add_parser(

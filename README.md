@@ -27,9 +27,9 @@
 
 ## 推荐LLM：
 
-无审核压力：gemini-2.0-flash-exp
+无审核压力：gemini-2.5-pro
 
-有审核压力：claude-3-5-sonnet-20241022，或者从gemini回落到claude
+有审核压力：claude-sonnet-4-20250514，或者从gemini回落到claude
 
 ## 日语OCR架构
 
@@ -111,11 +111,11 @@ jp_ocr_backend: vllm  # 使用VLLM后端
 # VLLM模型配置
 ocr_vllm_models:
   - provider: anthropic
-    model: claude-3-5-sonnet-20241022
+    model: claude-sonnet-4-20250514
     max_retries: 2
   # 或使用Gemini
   - provider: gemini
-    model: gemini-2.0-flash-exp
+    model: gemini-2.5-pro
     max_retries: 1
 
 # API密钥
@@ -147,15 +147,17 @@ ocr_models:
     model: gemini-2.5-pro
     max_retries: 1
   - provider: anthropic
-    model: claude-sonnet-4-20250514
+    model: claude-3-5-haiku-20241022
     max_retries: 2
 ```
 
-### 2. 基本工作流程
+### 2. 基本工作流程（统一CLI）
+
+所有功能通过统一的CLI入口访问：
 
 #### 步骤 1: 分析 PDF 结构
 ```bash
-poetry run python pdf2epub/breakdown.py -i input.pdf
+python -m pdf2epub.cli breakdown -i input.pdf
 ```
 生成 `output/{book_title}/book_structure.json`
 
@@ -163,12 +165,12 @@ poetry run python pdf2epub/breakdown.py -i input.pdf
 
 **对于普通书籍：**
 ```bash
-poetry run python pdf2epub/ocr_chapters.py
+python -m pdf2epub.cli ocr
 ```
 
 **对于日语纵排书籍：**
 ```bash
-poetry run python pdf2epub/ocr_chapters_jp.py
+python -m pdf2epub.cli ocr --japanese --backend vision
 ```
 
 参数说明：
@@ -178,20 +180,100 @@ poetry run python pdf2epub/ocr_chapters_jp.py
 
 #### 步骤 3: 内容润色
 ```bash
-poetry run python pdf2epub/polish_ocr_markdown.py
+python -m pdf2epub.cli polish
 ```
-- 自动建立链接跳转
-- 修正 OCR 错误
-- 去除页眉页脚
-- 整理章节标题
+
+针对不同内容类型：
+```bash
+# 学术书籍（带脚注和引用）
+python -m pdf2epub.cli polish --content-type academic
+
+# 日语书籍（保留振假名）
+python -m pdf2epub.cli polish --content-type japanese
+
+# 自动检测内容类型
+python -m pdf2epub.cli polish --content-type auto
+```
 
 #### 步骤 4: 生成 EPUB
 ```bash
-poetry run python pdf2epub/generate_epub.py
+python -m pdf2epub.cli epub
 ```
 最终 EPUB 文件保存在 `output/{book_title}/output.epub`
 
-### 3. 高级配置
+### 3. 翻译功能
+
+#### 实体提取（可选，用于保持翻译一致性）
+
+对于包含大量专有名词的书籍（如日语轻小说），可以先提取实体：
+
+```bash
+# 提取人物、地点、术语等实体
+python -m pdf2epub.cli extract-entities -i input.pdf --source-lang Japanese --target-lang Chinese
+```
+
+生成 `output/{book_title}/translation_entities.json`，包含：
+- **人物名称**：包含性别、描述、关系
+- **地点名称**：城市、建筑、幻想世界
+- **组织机构**：公会、学校、公司
+- **专有术语**：魔法、技能、道具
+- **种族物种**：包含单复数形式
+
+#### 翻译处理
+
+```bash
+# 基本翻译
+python -m pdf2epub.cli translate --target-language Chinese
+
+# 使用实体参考确保一致性
+python -m pdf2epub.cli translate --target-language Chinese --use-entities
+
+# 指定源语言和目标语言
+python -m pdf2epub.cli translate --source-language Japanese --target-language Chinese
+```
+
+### 4. 完整工作流程示例
+
+#### 日语轻小说翻译流程
+```bash
+# 1. 分析结构
+python -m pdf2epub.cli breakdown -i manga.pdf
+
+# 2. 提取翻译实体
+python -m pdf2epub.cli extract-entities -i manga.pdf
+
+# 3. 日语OCR
+python -m pdf2epub.cli ocr --japanese --backend vision
+
+# 4. 日语内容润色
+python -m pdf2epub.cli polish --content-type japanese
+
+# 5. 翻译成中文（使用实体）
+python -m pdf2epub.cli translate --use-entities
+
+# 6. 生成EPUB
+python -m pdf2epub.cli epub
+```
+
+#### 学术书籍翻译流程
+```bash
+# 1. 分析结构（添加页码标记）
+python -m pdf2epub.cli breakdown -i thesis.pdf --add-page-numbers
+
+# 2. OCR提取
+python -m pdf2epub.cli ocr
+
+# 3. 学术内容润色（保留脚注）
+python -m pdf2epub.cli polish --content-type academic
+
+# 4. 翻译
+python -m pdf2epub.cli translate --target-language Chinese
+
+# 5. 生成EPUB
+python -m pdf2epub.cli epub
+```
+
+### 5. 高级配置
 
 #### 多模型自动切换
 系统支持在模型失败或触发安全审核时自动切换：
@@ -215,7 +297,7 @@ ocr_settings:
   illustration_min_black_pixels: 200  # 插图最小像素数
 ```
 
-### 4. 故障排除
+### 6. 故障排除
 
 #### OCR 失败
 - 检查 API 配额和密钥配置
@@ -231,7 +313,7 @@ ocr_settings:
 - 降低 `zoom_factor`
 - 分批处理章节
 
-### 5. 输出结构
+### 7. 输出结构
 ```
 output/
 └── {book_title}/
@@ -246,7 +328,14 @@ output/
     ├── images/                # 提取的插图
     │   ├── ch001_p010_illustration.png
     │   └── ...
+    ├── translated/            # 翻译后内容（如果执行了翻译）
+    │   ├── chapter_1.md
+    │   └── ...
+    ├── translation_entities.json  # 翻译实体参考（如果提取了）
+    ├── translation_reference.txt  # 人类可读的翻译参考
     ├── progress.json          # OCR进度跟踪
+    ├── polish_progress.json  # 润色进度跟踪
+    ├── translation_progress.json  # 翻译进度跟踪
     └── output.epub           # 最终 EPUB
 ```
 

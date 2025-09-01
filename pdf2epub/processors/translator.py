@@ -6,6 +6,7 @@ while preserving formatting and structure.
 """
 
 from typing import Dict, Optional, Tuple
+from pathlib import Path
 from loguru import logger
 
 from .base import BaseMarkdownProcessor
@@ -19,11 +20,12 @@ class TranslateProcessor(BaseMarkdownProcessor):
         self,
         config: Dict,
         book_title: str,
-        source_language: str = "English",
+        source_language: str = "Japanese",
         target_language: str = "Chinese",
         max_workers: int = 4,
         resume: bool = False,
-        translation_models: Optional[list] = None
+        translation_models: Optional[list] = None,
+        use_entities: Optional[bool] = None
     ):
         """
         Initialize the translation processor.
@@ -36,6 +38,8 @@ class TranslateProcessor(BaseMarkdownProcessor):
             max_workers: Maximum number of concurrent workers
             resume: Whether to resume from previous progress
             translation_models: Optional override for model configurations
+            use_entities: Whether to use extracted entities for consistency
+                        (None = auto-detect, True = force use, False = force disable)
         """
         super().__init__(
             config=config,
@@ -60,6 +64,22 @@ class TranslateProcessor(BaseMarkdownProcessor):
             llm_client=self.llm_client,
             num_lines=3
         )
+        
+        # Auto-detect entities if use_entities is None, otherwise use explicit value
+        if use_entities is None:
+            # Auto-detect: use entities if the file exists
+            entities_file = Path("output") / self.book_title / "translation_entities.json"
+            if entities_file.exists():
+                logger.info("Auto-detected translation entities file, will use for consistency")
+                self.entities = self._load_entities()
+            else:
+                self.entities = None
+        elif use_entities:
+            # Explicitly requested to use entities
+            self.entities = self._load_entities()
+        else:
+            # Explicitly requested NOT to use entities
+            self.entities = None
         
         # Store language info in progress
         if self.progress.get("target_language") != target_language:
@@ -183,9 +203,29 @@ class TranslateProcessor(BaseMarkdownProcessor):
         
         return success
     
+    def _load_entities(self) -> Optional[Dict]:
+        """Load translation entities from JSON file."""
+        import json
+        from pathlib import Path
+        
+        entities_file = Path("output") / self.book_title / "translation_entities.json"
+        if entities_file.exists():
+            try:
+                with open(entities_file, "r", encoding="utf-8") as f:
+                    entities = json.load(f)
+                logger.info(f"Loaded translation entities from {entities_file}")
+                return entities
+            except Exception as e:
+                logger.warning(f"Failed to load entities: {e}")
+                return None
+        else:
+            logger.warning(f"Entity file not found: {entities_file}")
+            logger.info("Run 'extract-entities' command first to generate entity reference")
+            return None
+    
     def _create_translation_prompt(self) -> str:
         """Create the prompt for translation."""
-        return f"""You are a professional translator specializing in academic and literary texts.
+        prompt = f"""You are a professional translator specializing in academic and literary texts.
 
 Translate the following markdown content from {self.source_language} to {self.target_language}.
 
@@ -198,6 +238,74 @@ IMPORTANT REQUIREMENTS:
 4. **Maintain document structure**: Keep the same paragraph breaks, section divisions, and overall layout
 5. **For academic texts**: Use appropriate academic terminology in the target language
 6. **For literary texts**: Preserve the style and tone of the original
-7. **Do NOT add explanations**: Return ONLY the translated markdown, no explanations or comments
-
-Translate the following content:"""
+7. **Do NOT add explanations**: Return ONLY the translated markdown, no explanations or comments"""
+        
+        # Add entity reference if available
+        if self.entities:
+            prompt += self._create_entity_reference_section()
+        
+        prompt += "\n\nTranslate the following content:"
+        return prompt
+    
+    def _create_entity_reference_section(self) -> str:
+        """Create the entity reference section for the prompt."""
+        if not self.entities:
+            return ""
+        
+        reference = "\n\n**TRANSLATION CONSISTENCY REFERENCE:**\n"
+        reference += "Use these established translations for consistency:\n\n"
+        
+        # Add characters
+        if "characters" in self.entities and self.entities["characters"]:
+            reference += "**Characters:**\n"
+            for char in self.entities["characters"][:20]:  # Limit to avoid token overflow
+                reference += f"- {char['japanese']}"
+                if char.get('reading'):
+                    reference += f" ({char['reading']})"
+                reference += f" → {char['chinese']}"
+                if char.get('gender'):
+                    reference += f" [{char['gender']}]"
+                reference += "\n"
+            reference += "\n"
+        
+        # Add places
+        if "places" in self.entities and self.entities["places"]:
+            reference += "**Places:**\n"
+            for place in self.entities["places"][:15]:
+                reference += f"- {place['japanese']} → {place['chinese']}\n"
+            reference += "\n"
+        
+        # Add important terms
+        if "terms" in self.entities and self.entities["terms"]:
+            reference += "**Special Terms:**\n"
+            for term in self.entities["terms"][:20]:
+                reference += f"- {term['japanese']} → {term['chinese']}\n"
+            reference += "\n"
+        
+        # Add organizations
+        if "organizations" in self.entities and self.entities["organizations"]:
+            reference += "**Organizations:**\n"
+            for org in self.entities["organizations"][:10]:
+                reference += f"- {org['japanese']} → {org['chinese']}\n"
+            reference += "\n"
+        
+        # Add races if present
+        if "races" in self.entities and self.entities["races"]:
+            reference += "**Races/Species:**\n"
+            for race in self.entities["races"][:10]:
+                reference += f"- {race['japanese']} → {race['chinese']}"
+                if race.get('chinese_plural'):
+                    reference += f" (plural: {race['chinese_plural']})"
+                reference += "\n"
+            reference += "\n"
+        
+        # Add items if present  
+        if "items" in self.entities and self.entities["items"]:
+            reference += "**Items:**\n"
+            for item in self.entities["items"][:10]:
+                reference += f"- {item['japanese']} → {item['chinese']}\n"
+            reference += "\n"
+        
+        reference += "**IMPORTANT:** Maintain these translations consistently throughout the text.\n"
+        
+        return reference

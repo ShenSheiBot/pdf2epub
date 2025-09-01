@@ -389,8 +389,8 @@ Your tasks for JAPANESE content:
 
 1. **Remove page artifacts**:
    - Delete page numbers and headers/footers
-   - Remove separators (---, ***, ___) between pages
-   - Join sentences broken by page boundaries
+   - Remove separators (---) between pages and join sentences
+   - Join continuous sentences broken by OCR
    - Handle vertical text OCR artifacts
 
 2. **Preserve Japanese text features**:
@@ -399,8 +399,6 @@ Your tasks for JAPANESE content:
    - DO NOT change () of furigana to （）
    - DO NOT remove furigana from the original text
    - DO NOT remove ルビ芸 like 妄想 in「何もないからこ(妄)ういう(想)話に逃(に)げてんじゃん!」
-   - Preserve the parentheses format for readings
-   - Keep Japanese punctuation: 。、「」『』（）
 
 3. **Images and illustrations**:
    - Preserve all illustration references
@@ -443,7 +441,7 @@ Your tasks:
 
 1. **Remove page artifacts**:
    - Delete page numbers, headers, and footers
-   - Remove page separators (---, ***, ___)
+   - Remove page separators (---)
    - Join sentences broken across pages
 
 2. **Fix structure**:

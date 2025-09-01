@@ -21,8 +21,6 @@ def load_config(config_path="config.yaml"):
     return config
 
 
-
-
 def add_page_number_patches(pdf_path, output_path=None):
     """
     Add white patches with actual PDF page numbers in the corners of each page.
@@ -78,7 +76,7 @@ def add_page_number_patches(pdf_path, output_path=None):
                 page.draw_rect(white_rect, color=(0, 0, 0), width=1, fill=None)
                 
                 # Add the text on top
-                text_point = fitz.Point(x + 15, y + patch_height/2 + 6)
+                text_point = fitz.Point(x + 15, y + patch_height / 2 + 6)
                 page.insert_text(
                     text_point,
                     f"PDF Page: {page_num}",  # More descriptive label
@@ -128,8 +126,7 @@ def preprocess_pdf(input_pdf, output_dir):
 
     # Add page number patches to create input.pdf
     logger.info("Adding page number patches to PDF...")
-    patched_pdf = add_page_number_patches(original_pdf, processed_pdf)
-    
+
     # Get file size in MB
     file_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
 

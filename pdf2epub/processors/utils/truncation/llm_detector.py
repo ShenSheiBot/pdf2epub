@@ -83,7 +83,7 @@ Your answer (one word only):"""
             response = self.llm_client.generate(
                 prompt=prompt,
                 model_configs=[
-                    {"provider": "gemini", "model": "gemini-1.5-flash", "max_retries": 1}
+                    {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 1}
                 ],
                 operation_name="Translation truncation check"
             )

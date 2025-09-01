@@ -440,14 +440,14 @@ def convert_markdown_to_html(
     # Configure markdown extensions
     extensions = [
         # Remove footnotes extension - we'll handle them manually
-        'markdown.extensions.tables',     # For table support
-        'markdown.extensions.fenced_code', # For code blocks
-        'markdown.extensions.codehilite',  # For code syntax highlighting
-        'markdown.extensions.nl2br',       # Convert newlines to <br>
-        'markdown.extensions.sane_lists',  # Better list handling
-        'markdown.extensions.smarty',      # Smart quotes and dashes
-        'markdown.extensions.toc',         # Table of contents
-        'markdown.extensions.meta',        # Metadata support
+        'markdown.extensions.tables',       # For table support
+        'markdown.extensions.fenced_code',  # For code blocks
+        'markdown.extensions.codehilite',   # For code syntax highlighting
+        'markdown.extensions.nl2br',        # Convert newlines to <br>
+        'markdown.extensions.sane_lists',   # Better list handling
+        'markdown.extensions.smarty',       # Smart quotes and dashes
+        'markdown.extensions.toc',          # Table of contents
+        'markdown.extensions.meta',         # Metadata support
     ]
     
     # Configure extension settings

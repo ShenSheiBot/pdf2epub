@@ -11,9 +11,9 @@
 转换后：https://raw.githubusercontent.com/ShenSheiBot/pdf2epub/refs/heads/main/example.epub
 
 ## 局限性
-因为其复杂性和对多模态LLM的依赖，转换速度较慢并有可能会因为LLM的审核原因失败。建议使用多家不同LLM提供商混合使用。
+因为其复杂性和对多模态LLM的依赖，转换速度较慢并有小概率可能会因为LLM的审核原因失败。第一步的目录分解和术语表提取强制需求 gemini 的大 context。剩余步骤建议尽量避免 gemini（审核最严格）。
 
-对于纵排日语，需要扫描文件的质量较高且为*白底*。
+对于纵排日语，需要扫描文件的质量较高且为*白底*。（并非白底会导致插图识别错误）
 
 因为逐页进行转换，要求书的新章节*新起一页*，否则章节的最后部分可能会被顺延到下一章节。如果扫描件是每两页一扫描的pdf，建议拆分成单页pdf再操作。
 
@@ -134,20 +134,38 @@ google_api_key: your-google-key
 title: 书名
 author: 作者名
 
-# API 密钥
+# LLM API 密钥
 google_api_key: your-google-api-key
-anthropic_api_key: your-anthropic-api-key  # 可选，作为备选
+anthropic_api_key: your-anthropic-api-key  # 可选
+anthropic_base_url: https://api.anthropic.com  # 可选，自定义端点
+openai_api_key: your-openai-api-key  # 可选，支持兼容API如DeepSeek
+openai_base_url: https://api.deepseek.com/v1  # 可选，自定义端点
+openai_model: deepseek-chat  # 可选，模型名称
 
 # 选择日语OCR后端 (azure/vision/vllm)
 jp_ocr_backend: vision
 
-# OCR 模型配置（用于非日语书籍）
-ocr_models:
-  - provider: gemini
-    model: gemini-2.5-pro
-    max_retries: 1
+# 高级配置
+num_retries: 1  # API重试次数
+max_backoff_seconds: 30  # 最大退避时间
+max_concurrent_workers: 8  # 最大并发API调用数
+
+# 实体提取模型（可选）
+entity_extraction_model: gemini-2.5-pro
+
+# 翻译配置
+source_language: Japanese
+target_language: Chinese
+
+# 处理模型配置
+polish_models:
   - provider: anthropic
-    model: claude-3-5-haiku-20241022
+    model: claude-sonnet-4-20250514
+    max_retries: 2
+
+translation_models:
+  - provider: openai
+    model: deepseek-chat
     max_retries: 2
 ```
 
@@ -157,7 +175,7 @@ ocr_models:
 
 #### 步骤 1: 分析 PDF 结构
 ```bash
-python -m pdf2epub.cli breakdown -i input.pdf
+pdf2epub breakdown -i input.pdf
 ```
 生成 `output/{book_title}/book_structure.json`
 
@@ -165,12 +183,12 @@ python -m pdf2epub.cli breakdown -i input.pdf
 
 **对于普通书籍：**
 ```bash
-python -m pdf2epub.cli ocr
+pdf2epub ocr
 ```
 
 **对于日语纵排书籍：**
 ```bash
-python -m pdf2epub.cli ocr --japanese --backend vision
+pdf2epub ocr --japanese --backend vision
 ```
 
 参数说明：
@@ -180,24 +198,24 @@ python -m pdf2epub.cli ocr --japanese --backend vision
 
 #### 步骤 3: 内容润色
 ```bash
-python -m pdf2epub.cli polish
+pdf2epub polish
 ```
 
 针对不同内容类型：
 ```bash
 # 学术书籍（带脚注和引用）
-python -m pdf2epub.cli polish --content-type academic
+pdf2epub polish --content-type academic
 
 # 日语书籍（保留振假名）
-python -m pdf2epub.cli polish --content-type japanese
+pdf2epub polish --content-type japanese
 
 # 自动检测内容类型
-python -m pdf2epub.cli polish --content-type auto
+pdf2epub polish --content-type auto
 ```
 
 #### 步骤 4: 生成 EPUB
 ```bash
-python -m pdf2epub.cli epub
+pdf2epub epub
 ```
 最终 EPUB 文件保存在 `output/{book_title}/output.epub`
 
@@ -209,7 +227,7 @@ python -m pdf2epub.cli epub
 
 ```bash
 # 提取人物、地点、术语等实体
-python -m pdf2epub.cli extract-entities -i input.pdf --source-lang Japanese --target-lang Chinese
+pdf2epub extract-entities -i input.pdf --source-lang Japanese --target-lang Chinese
 ```
 
 生成 `output/{book_title}/translation_entities.json`，包含：
@@ -223,16 +241,16 @@ python -m pdf2epub.cli extract-entities -i input.pdf --source-lang Japanese --ta
 
 ```bash
 # 基本翻译（自动检测并使用实体文件，如果存在）
-python -m pdf2epub.cli translate --target-language Chinese
+pdf2epub translate --target-language Chinese
 
 # 强制使用实体参考（即使文件不存在也会报错）
-python -m pdf2epub.cli translate --target-language Chinese --use-entities
+pdf2epub translate --target-language Chinese --use-entities
 
 # 强制不使用实体（即使文件存在）
-python -m pdf2epub.cli translate --target-language Chinese --no-entities
+pdf2epub translate --target-language Chinese --no-entities
 
 # 指定源语言和目标语言
-python -m pdf2epub.cli translate --source-language Japanese --target-language Chinese
+pdf2epub translate --source-language Japanese --target-language Chinese
 ```
 
 **注意**：如果 `translation_entities.json` 文件存在，翻译器会自动使用它以保持一致性。
@@ -242,40 +260,40 @@ python -m pdf2epub.cli translate --source-language Japanese --target-language Ch
 #### 日语轻小说翻译流程
 ```bash
 # 1. 分析结构
-python -m pdf2epub.cli breakdown -i manga.pdf
+pdf2epub breakdown -i manga.pdf
 
 # 2. 提取翻译实体
-python -m pdf2epub.cli extract-entities -i manga.pdf
+pdf2epub extract-entities -i manga.pdf
 
 # 3. 日语OCR
-python -m pdf2epub.cli ocr --japanese --backend vision
+pdf2epub ocr --japanese --backend vision
 
 # 4. 日语内容润色
-python -m pdf2epub.cli polish --content-type japanese
+pdf2epub polish --content-type japanese
 
 # 5. 翻译成中文（自动使用已提取的实体）
-python -m pdf2epub.cli translate
+pdf2epub translate
 
 # 6. 生成EPUB
-python -m pdf2epub.cli epub
+pdf2epub epub
 ```
 
 #### 学术书籍翻译流程
 ```bash
 # 1. 分析结构（添加页码标记）
-python -m pdf2epub.cli breakdown -i thesis.pdf --add-page-numbers
+pdf2epub breakdown -i thesis.pdf
 
 # 2. OCR提取
-python -m pdf2epub.cli ocr
+pdf2epub ocr
 
 # 3. 学术内容润色（保留脚注）
-python -m pdf2epub.cli polish --content-type academic
+pdf2epub polish --content-type academic
 
 # 4. 翻译
-python -m pdf2epub.cli translate --target-language Chinese
+pdf2epub translate --target-language Chinese
 
 # 5. 生成EPUB
-python -m pdf2epub.cli epub
+pdf2epub epub
 ```
 
 ### 5. 高级配置

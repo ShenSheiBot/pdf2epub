@@ -1139,8 +1139,11 @@ def main():
     # Load book structure
     structure = load_book_structure(book_title)
     if not structure:
-        logger.error(f"Book structure not found for {book_title}")
-        return
+        logger.warning(f"Book structure not found for {book_title}, creating minimal structure")
+        # Create minimal structure with just the book title
+        structure = {
+            "book_title": book_title
+        }
 
     # Determine which markdown directory to use and get display title
     display_title = book_title  # Default to original title
@@ -1166,7 +1169,10 @@ def main():
             safe_title = "".join(c for c in display_title if c not in '<>:"/\\|?*')
             output_filename = f"{safe_title}.epub"
         else:
-            output_filename = "output_translated.epub"
+            # Fallback to original title with _translated suffix
+            logger.warning(f"No translated title found, using original title with suffix")
+            safe_title = "".join(c for c in book_title if c not in '<>:"/\\|?*')
+            output_filename = f"{safe_title}_translated.epub"
 
         # Setup paths for translated EPUB
         epub_dir = Path("output") / book_title / "epub_translated"
@@ -1185,7 +1191,10 @@ def main():
             safe_title = "".join(c for c in display_title if c not in '<>:"/\\|?*')
             output_filename = f"{safe_title}.epub"
         else:
-            output_filename = "output.epub"
+            # This shouldn't happen since we ensure structure always has book_title
+            logger.warning(f"No book_title in structure, using config title")
+            safe_title = "".join(c for c in book_title if c not in '<>:"/\\|?*')
+            output_filename = f"{safe_title}.epub"
 
         # Setup paths for original EPUB
         epub_dir = Path("output") / book_title / "epub"

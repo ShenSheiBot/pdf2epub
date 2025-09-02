@@ -324,25 +324,25 @@ def main():
         epilog="""
 Examples:
   # Complete pipeline for a book:
-  python -m pdf2epub.cli breakdown -i mybook.pdf
-  python -m pdf2epub.cli ocr
-  python -m pdf2epub.cli polish
-  python -m pdf2epub.cli epub
+  pdf2epub breakdown -i mybook.pdf
+  pdf2epub ocr
+  pdf2epub polish
+  pdf2epub epub
   
   # Japanese book with translation:
-  python -m pdf2epub.cli breakdown -i manga.pdf
-  python -m pdf2epub.cli extract-entities -i manga.pdf  # Extract for consistency
-  python -m pdf2epub.cli ocr --japanese --backend vision
-  python -m pdf2epub.cli polish --content-type japanese
-  python -m pdf2epub.cli translate --target-language Chinese  # Auto-uses entities
-  python -m pdf2epub.cli epub
+  pdf2epub breakdown -i manga.pdf
+  pdf2epub extract-entities -i manga.pdf  # Extract for consistency
+  pdf2epub ocr --japanese --backend vision
+  pdf2epub polish --content-type japanese
+  pdf2epub translate --target-language Chinese  # Auto-uses entities
+  pdf2epub epub
   
   # Academic book with translation:
-  python -m pdf2epub.cli breakdown -i thesis.pdf --add-page-numbers
-  python -m pdf2epub.cli ocr
-  python -m pdf2epub.cli polish --content-type academic
-  python -m pdf2epub.cli translate --target-language Chinese
-  python -m pdf2epub.cli epub
+  pdf2epub breakdown -i thesis.pdf
+  pdf2epub ocr
+  pdf2epub polish --content-type academic
+  pdf2epub translate --target-language Chinese
+  pdf2epub epub
         """
     )
     
@@ -364,11 +364,6 @@ Examples:
         "-i", "--input",
         required=True,
         help="Path to input PDF file"
-    )
-    breakdown_parser.add_argument(
-        "--add-page-numbers",
-        action="store_true",
-        help="Add page number patches to PDF"
     )
     breakdown_parser.add_argument(
         "--dpi",

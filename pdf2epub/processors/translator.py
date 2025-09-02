@@ -145,6 +145,10 @@ class TranslateProcessor(BaseMarkdownProcessor):
         # Clean the response
         translated_content = self.clean_markdown_response(translated_content)
         
+        # Apply Japanese to Chinese specific post-processing
+        if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            translated_content = self._clean_japanese_artifacts(translated_content)
+        
         return translated_content
     
     def validate_output(
@@ -225,6 +229,37 @@ class TranslateProcessor(BaseMarkdownProcessor):
             logger.warning(f"Entity file not found: {entities_file}")
             logger.info("Run 'extract-entities' command first to generate entity reference")
             return None
+    
+    def _clean_japanese_artifacts(self, text: str) -> str:
+        """
+        Clean up Japanese artifacts in Chinese translation.
+        Specifically removes っ when it appears around punctuation.
+        """
+        import re
+        
+        # Define Japanese and Chinese punctuation marks
+        punctuation = [
+            '。', '、', '，', '！', '？', '…', '～', '—', '「', '」', '『', '』',
+            '（', '）', '【', '】', '・', '：', '；', '"', '"', ''', '''
+        ]
+        
+        # Remove っ before punctuation
+        for p in punctuation:
+            text = text.replace(f'っ{p}', p)
+        
+        # Remove っ after punctuation
+        for p in punctuation:
+            text = text.replace(f'{p}っ', p)
+        
+        # Remove standalone っ surrounded by spaces or punctuation
+        # Pattern: punctuation/space + っ + punctuation/space
+        pattern = r'([。、，！？…～—「」『』（）【】・：；\s])っ([。、，！？…～—「」『』（）【】・：；\s])'
+        text = re.sub(pattern, r'\1\2', text)
+        
+        # Remove っ at the end of quoted speech before closing quotes
+        text = re.sub(r'っ([」』])', r'\1', text)
+        
+        return text
     
     def _create_translation_prompt(self) -> str:
         """Create the prompt for translation."""

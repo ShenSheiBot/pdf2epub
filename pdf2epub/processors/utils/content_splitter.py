@@ -7,8 +7,12 @@ particularly useful for processing large chapters that exceed model token limits
 
 import json
 import regex
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from loguru import logger
+import tiktoken
+
+# Initialize tokenizer for accurate token counting
+tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
 def fuzzy_find_sentence(
@@ -18,12 +22,12 @@ def fuzzy_find_sentence(
 ) -> Optional[Tuple[int, int, str]]:
     """
     Find a sentence in text with fuzzy matching, allowing for small differences.
-    
+
     Args:
         haystack: The text to search in
         needle: The sentence to find
         max_edits: Maximum number of character edits allowed
-    
+
     Returns:
         Tuple of (start_pos, end_pos, matched_text) or None if not found
     """
@@ -35,103 +39,165 @@ def fuzzy_find_sentence(
     # Try fuzzy match with regex library
     try:
         # Allow up to max_edits character differences
-        pattern = f'(?b)({regex.escape(needle)}){{e<={max_edits}}}'
+        pattern = f"(?b)({regex.escape(needle)}){{e<={max_edits}}}"
         match = regex.search(pattern, haystack)
         if match:
             return (match.start(), match.end(), match.group(0))
     except Exception as e:
         logger.debug(f"Fuzzy matching failed: {e}")
-    
+
     # Try to find with common escape variations
     variations = [
-        needle.replace('&', r'\&'),  # Escaped ampersand
-        needle.replace(r'\&', '&'),  # Unescaped ampersand
-        needle.replace('"', r'\"'),  # Escaped quotes
-        needle.replace(r'\"', '"'),  # Unescaped quotes
+        needle.replace("&", r"\&"),  # Escaped ampersand
+        needle.replace(r"\&", "&"),  # Unescaped ampersand
+        needle.replace('"', r"\""),  # Escaped quotes
+        needle.replace(r"\"", '"'),  # Unescaped quotes
         needle.replace("'", r"\'"),  # Escaped single quotes
         needle.replace(r"\'", "'"),  # Unescaped single quotes
     ]
-    
+
     for variant in variations:
         pos = haystack.find(variant)
         if pos != -1:
             return (pos, pos + len(variant), variant)
-    
+
     return None
 
 
 def split_content_simple(content: str, max_tokens: int) -> List[str]:
     """
     Simple content splitter that divides content into roughly equal parts.
-    
+
     Args:
         content: The content to split
         max_tokens: Maximum tokens per part
-    
+
     Returns:
         List of content parts
     """
-    # Estimate total tokens (rough approximation: 1 token ≈ 4 chars)
-    estimated_tokens = len(content) // 4
-    
-    if estimated_tokens <= max_tokens:
+    # Use proper token counting with tiktoken
+    actual_tokens = len(tokenizer.encode(content))
+
+    if actual_tokens <= max_tokens:
         return [content]
-    
+
     # Calculate number of parts needed
-    num_parts = (estimated_tokens // max_tokens) + 1
-    
+    num_parts = (actual_tokens // max_tokens) + 1
+
     # Split by paragraphs
-    paragraphs = content.split('\n\n')
-    
-    # Distribute paragraphs evenly
+    paragraphs = content.split("\n\n")
+
+    # If we don't have enough paragraphs, split by lines
+    if len(paragraphs) < num_parts * 2:
+        paragraphs = content.split("\n")
+
+    # Distribute paragraphs to achieve roughly equal token counts per part
     parts = []
-    paras_per_part = len(paragraphs) // num_parts
-    
-    for i in range(num_parts):
-        start_idx = i * paras_per_part
-        if i == num_parts - 1:
-            # Last part gets all remaining paragraphs
-            part = '\n\n'.join(paragraphs[start_idx:])
+    target_tokens_per_part = actual_tokens // num_parts
+
+    current_part = []
+    current_tokens = 0
+
+    for para in paragraphs:
+        para_tokens = len(tokenizer.encode(para))
+
+        # If adding this paragraph would exceed target and we have content, start new part
+        if current_tokens + para_tokens > target_tokens_per_part * 1.2 and current_part:
+            parts.append(
+                "\n\n".join(current_part)
+                if "\n\n" in content
+                else "\n".join(current_part)
+            )
+            current_part = [para]
+            current_tokens = para_tokens
         else:
-            end_idx = start_idx + paras_per_part
-            part = '\n\n'.join(paragraphs[start_idx:end_idx])
-        
-        if part:
-            parts.append(part)
-    
+            current_part.append(para)
+            current_tokens += para_tokens
+
+    # Add the last part
+    if current_part:
+        parts.append(
+            "\n\n".join(current_part) if "\n\n" in content else "\n".join(current_part)
+        )
+
+    # Log the actual token counts for each part
+    for i, part in enumerate(parts):
+        part_tokens = len(tokenizer.encode(part))
+        logger.debug(f"Part {i + 1}/{len(parts)}: {part_tokens:,} tokens")
+
     return parts if parts else [content]
 
 
 def split_content_intelligently(
     content: str,
     max_tokens: int,
-    llm_client
+    llm_client,
+    model_configs: Optional[List[Dict]] = None,
+    content_type: str = "auto",
 ) -> List[str]:
     """
     Use LLM to intelligently split content at natural boundaries.
-    
+
     Args:
         content: The content to split
         max_tokens: Maximum tokens per part (used as guideline)
         llm_client: LLM client for split detection (should support generate method)
-    
+        model_configs: Optional model configurations to use for splitting
+        content_type: Type of content ("academic", "japanese", "general", "auto")
+
     Returns:
         List of content parts
     """
-    # Estimate total tokens
-    estimated_tokens = len(content) // 4
-    
-    if estimated_tokens <= max_tokens:
+    # Use proper token counting with tiktoken
+    actual_tokens = len(tokenizer.encode(content))
+
+    if actual_tokens <= max_tokens:
         return [content]
-    
+
     # Calculate number of parts needed
-    num_parts = max(2, (estimated_tokens // max_tokens) + 1)
-    
-    logger.info(f"Content has ~{estimated_tokens:,} tokens, splitting into {num_parts} parts")
-    
-    # Ask LLM to identify good split points
-    total_tokens = estimated_tokens
-    split_prompt = f"""You are helping split a long academic chapter into smaller parts for processing.
+    num_parts = max(2, (actual_tokens // max_tokens) + 1)
+
+    logger.info(
+        f"Content has {actual_tokens:,} tokens, splitting into {num_parts} parts"
+    )
+
+    # Auto-detect content type if needed
+    if content_type == "auto":
+        import re
+
+        # Check for Japanese characters
+        japanese_chars = re.findall(
+            r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]", content[:5000]
+        )
+        if len(japanese_chars) > 500:  # Significant Japanese content
+            content_type = "japanese"
+            logger.info("Auto-detected content type: Japanese")
+        else:
+            # Check for academic indicators
+            academic_indicators = [
+                r"\[\^\d+\]",  # Markdown footnotes
+                r"References\s*\n",
+                r"Bibliography\s*\n",
+            ]
+            if any(
+                re.search(pattern, content[:5000]) for pattern in academic_indicators
+            ):
+                content_type = "academic"
+                logger.info("Auto-detected content type: Academic")
+            else:
+                content_type = "general"
+                logger.info("Auto-detected content type: General")
+
+    # Create appropriate split prompt based on content type
+    total_tokens = actual_tokens
+
+    if content_type == "japanese":
+        split_prompt = f"""You are helping split a long Japanese novel/light novel chapter into smaller parts for processing.
+
+The chapter has approximately {total_tokens:,} tokens. We'd prefer parts under {max_tokens:,} tokens. Return a JSON array of the EXACT final sentences that mark the end of each part (except the last one). Part ideally start with a subsection and does not contain any incomplete sentences or break a important scene."""
+
+    elif content_type == "academic":
+        split_prompt = f"""You are helping split a long academic chapter into smaller parts for processing.
 
 The chapter has approximately {total_tokens:,} tokens. While we'd prefer parts under {max_tokens:,} tokens, 
 the MOST IMPORTANT criteria are semantic completeness and avoiding citation conflicts.
@@ -186,7 +252,38 @@ Choose split points that respect the above priorities. For inline footnotes, spl
 For end-of-section footnotes, split AFTER the Notes/References section ends.
 
 Example response:
-["[^5]: Johnson, 2019, p. 45.", "This concludes the historical overview."]
+["[^5]: Johnson, 2019, p. 45.", "This concludes the historical overview."]"""
+
+    else:  # general content
+        split_prompt = f"""You are helping split a long document into smaller parts for processing.
+
+The document has approximately {total_tokens:,} tokens. We need to split it into roughly {num_parts} parts.
+Each part should ideally be under {max_tokens:,} tokens.
+
+SPLITTING RULES:
+
+1. **Maintain Semantic Coherence**:
+   - Split at natural boundaries (section breaks, topic changes)
+   - Keep related paragraphs together
+   - Preserve the logical flow of ideas
+
+2. **Respect Document Structure**:
+   - Split at heading boundaries when possible (##, ###)
+   - Keep lists and enumerations intact
+   - Don't split in the middle of examples or code blocks
+
+3. **Balance Part Sizes**:
+   - Aim for roughly equal-sized parts
+   - It's OK if some parts are larger to maintain coherence
+
+Return a JSON array of the EXACT final sentences that mark the end of each part (except the last one).
+Choose split points at natural breaks like section endings, topic transitions, or clear paragraph boundaries.
+
+Example response:
+["This concludes our discussion of the basic concepts.", "The next section explores advanced techniques."]"""
+
+    # Add the content to analyze
+    split_prompt += f"""
 
 Here is the content to analyze:
 
@@ -197,44 +294,77 @@ Here is the content to analyze:
         response = llm_client.generate(
             prompt=split_prompt,
             model_configs=[
-                {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 2}
+                {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 2}
             ],
             operation_name="Split chapter"
         )
-        
         if not response or not response.strip():
-            logger.warning("Failed to get LLM split suggestions, falling back to simple split")
+            logger.warning(
+                "Failed to get LLM split suggestions, falling back to simple split"
+            )
             return split_content_simple(content, max_tokens)
-        
-        # Clean response if wrapped in code blocks
-        if response.startswith('```'):
-            lines = response.split('\n')
-            # Find the actual JSON content
-            json_start = 1 if lines[0].startswith('```') else 0
-            json_end = len(lines)
-            for i in range(len(lines) - 1, -1, -1):
-                if lines[i].strip() == '```':
-                    json_end = i
-                    break
-            response = '\n'.join(lines[json_start:json_end])
-        
+
+        # Extract JSON from the response, handling various formats
+        response = response.strip()
+
+        # Try to find JSON array in the response
+        json_str = None
+
+        # Method 1: Look for ```json code block
+        if "```json" in response:
+            start = response.find("```json") + 7
+            end = response.find("```", start)
+            if end != -1:
+                json_str = response[start:end].strip()
+        # Method 2: Look for ``` code block
+        elif "```" in response:
+            start = response.find("```") + 3
+            # Skip to next line if ``` is on its own line
+            if response[start : start + 1] == "\n":
+                start += 1
+            end = response.find("```", start)
+            if end != -1:
+                json_str = response[start:end].strip()
+        # Method 3: Look for JSON array directly (starts with [)
+        elif "[" in response:
+            # Find the first [ and last ]
+            start = response.find("[")
+            end = response.rfind("]")
+            if start != -1 and end != -1 and end > start:
+                json_str = response[start : end + 1]
+
+        if not json_str:
+            # Fallback: try the whole response
+            json_str = response
+
         # Parse the JSON response
+        logger.debug(f"Parsing split response: {json_str[:200]}...")
         try:
-            split_sentences = json.loads(response)
+            split_sentences = json.loads(json_str.strip())
             if not isinstance(split_sentences, list):
                 raise ValueError("Response is not a list")
         except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"Failed to parse LLM split response: {e}, falling back to simple split")
+            logger.warning(
+                f"Failed to parse LLM split response: {e}, falling back to simple split"
+            )
             return split_content_simple(content, max_tokens)
-        
+
         # Find the split points in the content
         parts = []
         start_pos = 0
-        
+
         for split_sentence in split_sentences:
-            # Use fuzzy matching to find the sentence
-            match_result = fuzzy_find_sentence(content, split_sentence)
+            # Clean up the split sentence
+            # Remove ellipsis that LLMs often add to indicate continuation
+            cleaned_sentence = split_sentence
+            if cleaned_sentence.endswith('...'):
+                cleaned_sentence = cleaned_sentence[:-3].rstrip()
+            if cleaned_sentence.endswith('…'):  # Unicode ellipsis
+                cleaned_sentence = cleaned_sentence[:-1].rstrip()
             
+            # Use fuzzy matching to find the sentence
+            match_result = fuzzy_find_sentence(content, cleaned_sentence)
+
             if match_result:
                 end_pos = match_result[1]
                 # Include the sentence in the current part
@@ -244,26 +374,30 @@ Here is the content to analyze:
                 start_pos = end_pos
                 logger.debug(f"Found split point: '{match_result[2][:50]}...'")
             else:
-                logger.warning(f"Could not find split sentence: '{split_sentence[:50]}...'")
-        
+                logger.warning(
+                    f"Could not find split sentence: '{split_sentence[:50]}...'"
+                )
+
         # Add the remaining content as the last part
         if start_pos < len(content):
             last_part = content[start_pos:].strip()
             if last_part:
                 parts.append(last_part)
-        
+
         # Validate the split
         if len(parts) < 2:
-            logger.warning("LLM split resulted in too few parts, falling back to simple split")
+            logger.warning(
+                "LLM split resulted in too few parts, falling back to simple split"
+            )
             return split_content_simple(content, max_tokens)
-        
+
         # Log part sizes
         for i, part in enumerate(parts, 1):
-            part_tokens = len(part) // 4
-            logger.info(f"Part {i}/{len(parts)}: ~{part_tokens:,} tokens")
-        
+            part_tokens = len(tokenizer.encode(part))
+            logger.info(f"Part {i}/{len(parts)}: {part_tokens:,} tokens")
+
         return parts
-        
+
     except Exception as e:
         logger.warning(f"Intelligent split failed: {e}, falling back to simple split")
         return split_content_simple(content, max_tokens)

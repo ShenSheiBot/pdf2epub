@@ -16,7 +16,7 @@ from google.genai.types import (
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
 from tenacity.stop import stop_base
 from tenacity.wait import wait_base
-import random
+import tiktoken
 
 
 class stop_after_self_retries(stop_base):
@@ -127,6 +127,8 @@ class GeminiClient:
         self.client = genai.Client(api_key=api_key)
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
+        # Initialize tokenizer for accurate token counting
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
     
     @retry(
         retry=retry_if_exception(is_transient_gemini_error),
@@ -193,11 +195,11 @@ class GeminiClient:
             if hasattr(chunk, 'text') and chunk.text:
                 aggregated_text += chunk.text
                 
-                # Log progress periodically - every 2000 characters
-                if len(aggregated_text) - last_log_length >= 2000:
-                    estimated_tokens = len(aggregated_text) // 4
-                    logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
-                    last_log_length = len(aggregated_text)
+                # Log progress periodically - every 500 tokens
+                current_tokens = len(self.tokenizer.encode(aggregated_text))
+                if current_tokens - last_log_length >= 500:
+                    logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                    last_log_length = current_tokens
             
             # Check for early termination
             if hasattr(chunk, 'candidates') and chunk.candidates:
@@ -210,7 +212,9 @@ class GeminiClient:
         if not aggregated_text:
             raise ValueError(f"Empty stream response for {operation_name}")
         
-        logger.info(f"Streamed {len(aggregated_text)} chars ({chunk_count} chunks) for {operation_name}")
+        # Get final token count
+        final_tokens = len(self.tokenizer.encode(aggregated_text))
+        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) for {operation_name}")
         return aggregated_text
     
     @staticmethod
@@ -256,6 +260,8 @@ class AnthropicClient:
             self.client = anthropic.Anthropic(api_key=api_key)
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
+        # Initialize tokenizer for accurate token counting
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
     
     @retry(
         retry=retry_if_exception(is_transient_anthropic_error),
@@ -296,16 +302,18 @@ class AnthropicClient:
                     response_text += event.delta.text
                     chunk_count += 1
                     
-                    # Log progress periodically - every 2000 characters
-                    if len(response_text) - last_log_length >= 2000:
-                        estimated_tokens = len(response_text) // 4
-                        logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
-                        last_log_length = len(response_text)
+                    # Log progress periodically - every 500 tokens
+                    current_tokens = len(self.tokenizer.encode(response_text))
+                    if current_tokens - last_log_length >= 500:
+                        logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                        last_log_length = current_tokens
         
         if not response_text:
             raise ValueError(f"Empty response from Anthropic for {operation_name}")
         
-        logger.info(f"Streamed {len(response_text)} chars ({chunk_count} chunks) from Anthropic for {operation_name}")
+        # Get final token count
+        final_tokens = len(self.tokenizer.encode(response_text))
+        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from Anthropic for {operation_name}")
         return response_text
     
     def _process_content(self, prompt: Union[str, List[Dict]]) -> Union[str, List[Dict]]:
@@ -368,6 +376,9 @@ class OpenAIClient:
         self.default_model = model or "gpt-4o"
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
+        
+        # Initialize tokenizer for accurate token counting
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
     
     @retry(
         retry=retry_if_exception(is_transient_openai_error),
@@ -413,22 +424,24 @@ class OpenAIClient:
         # Aggregate streamed response
         response_text = ""
         chunk_count = 0
-        last_log_length = 0
+        last_log_tokens = 0
         for chunk in stream:
             if chunk.choices[0].delta.content:
                 response_text += chunk.choices[0].delta.content
                 chunk_count += 1
                 
-                # Log progress periodically - every 2000 characters
-                if len(response_text) - last_log_length >= 2000:
-                    estimated_tokens = len(response_text) // 4
-                    logger.debug(f"Streaming {operation_name}: ~{estimated_tokens} tokens")
-                    last_log_length = len(response_text)
+                # Log progress periodically - every 500 tokens
+                current_tokens = len(self.tokenizer.encode(response_text))
+                if current_tokens - last_log_tokens >= 500:
+                    logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                    last_log_tokens = current_tokens
         
         if not response_text:
             raise ValueError(f"Empty response from OpenAI for {operation_name}")
         
-        logger.info(f"Streamed {len(response_text)} chars ({chunk_count} chunks) from OpenAI for {operation_name}")
+        # Get final token count
+        final_tokens = len(self.tokenizer.encode(response_text))
+        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from OpenAI for {operation_name}")
         return response_text
     
     def _format_messages(self, prompt: Union[str, List[Dict]]) -> List[Dict]:

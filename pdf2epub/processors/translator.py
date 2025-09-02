@@ -109,6 +109,45 @@ class TranslateProcessor(BaseMarkdownProcessor):
         """Get the operation name for logging."""
         return f"Translate {file_name}"
     
+    def _detect_part_files(self, file_name: str) -> list:
+        """Detect if there are part files for this file."""
+        base_name = Path(file_name).stem
+        part_files = sorted(self.input_dir.glob(f"{base_name}.part*.md"))
+        return part_files
+    
+    def _translate_part(self, content: str, file_name: str, part_idx: int = None, total_parts: int = None) -> str:
+        """Translate a single part of content."""
+        # Create the translation prompt
+        prompt = self._create_translation_prompt()
+        
+        # Create multi-part content for the LLM
+        multi_part_content = [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": content}
+        ]
+        
+        # Generate operation name
+        if part_idx and total_parts:
+            operation_name = f"{self.get_operation_name(file_name)} part {part_idx}/{total_parts}"
+        else:
+            operation_name = self.get_operation_name(file_name)
+        
+        # Generate translation
+        translated_content = self.llm_client.generate(
+            prompt=multi_part_content,
+            model_configs=self.translation_models,
+            operation_name=operation_name
+        )
+        
+        # Clean the response
+        translated_content = self.clean_markdown_response(translated_content)
+        
+        # Apply Japanese to Chinese specific post-processing
+        if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            translated_content = self._clean_japanese_artifacts(translated_content)
+        
+        return translated_content
+    
     def process_content(
         self,
         content: str,
@@ -126,30 +165,57 @@ class TranslateProcessor(BaseMarkdownProcessor):
         Returns:
             Translated markdown content
         """
-        # Create the translation prompt
-        prompt = self._create_translation_prompt()
+        # If this is already a part file, don't look for more parts
+        if '.part' in Path(file_name).stem:
+            # This is already a part file, translate it directly
+            return self._translate_part(content, file_name)
         
-        # Create multi-part content for the LLM
-        multi_part_content = [
-            {"type": "text", "text": prompt},
-            {"type": "text", "text": content}
-        ]
+        # Check if there are part files (from polisher)
+        part_files = self._detect_part_files(file_name)
         
-        # Generate translation
-        translated_content = self.llm_client.generate(
-            prompt=multi_part_content,
-            model_configs=self.translation_models,
-            operation_name=self.get_operation_name(file_name)
-        )
-        
-        # Clean the response
-        translated_content = self.clean_markdown_response(translated_content)
-        
-        # Apply Japanese to Chinese specific post-processing
-        if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
-            translated_content = self._clean_japanese_artifacts(translated_content)
-        
-        return translated_content
+        if part_files:
+            logger.info(f"Found {len(part_files)} part files for {file_name}, translating separately")
+            translated_parts = []
+            
+            for part_idx, part_file in enumerate(part_files, 1):
+                # Read part content
+                with open(part_file, 'r', encoding='utf-8') as f:
+                    part_content = f.read()
+                
+                # Translate the part
+                translated_part = self._translate_part(
+                    content=part_content,
+                    file_name=file_name,
+                    part_idx=part_idx,
+                    total_parts=len(part_files)
+                )
+                
+                # Validate this part
+                is_valid, reason = self.validate_output(
+                    original=part_content,
+                    processed=translated_part,
+                    file_name=f"{file_name} part {part_idx}/{len(part_files)}"
+                )
+                
+                if not is_valid:
+                    logger.warning(f"Part {part_idx}/{len(part_files)} validation failed: {reason}")
+                
+                translated_parts.append(translated_part)
+                
+                # Save translated part file
+                output_dir = Path(self.output_dir)
+                base_name = Path(file_name).stem
+                translated_part_file = output_dir / f"{base_name}.part{part_idx}.md"
+                with open(translated_part_file, 'w', encoding='utf-8') as f:
+                    f.write(translated_part)
+                logger.debug(f"Saved translated part: {translated_part_file.name}")
+            
+            # Combine all parts
+            combined = "\n\n".join(translated_parts)
+            return combined
+        else:
+            # No parts, translate as single file
+            return self._translate_part(content, file_name)
     
     def validate_output(
         self,

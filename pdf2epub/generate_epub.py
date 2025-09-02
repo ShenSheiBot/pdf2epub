@@ -694,11 +694,13 @@ def create_toc_ncx(
     output_path,
     parts_info=None,
     subchapter_locations=None,
+    chapters_with_parts=None,
 ):
     """Create the NCX table of contents file.
 
     Args:
         subchapter_locations: Dict mapping (chapter_idx, subchapter_idx) to part number
+        chapters_with_parts: Set of chapter indices that have part files
     """
     ncx_content = f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
@@ -725,8 +727,11 @@ def create_toc_ncx(
         chapter_title = chapter["title"]
         # Check if this chapter has parts
         chapter_key = str(i)
-        if parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
-            # Multi-part chapter - link to first part
+        if chapters_with_parts and i in chapters_with_parts:
+            # This chapter has part files - link to first part
+            chapter_file = f"chapter_{i}.part1.html"
+        elif parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
+            # Multi-part chapter according to progress info - link to first part
             chapter_file = f"chapter_{i}.part1.html"
         else:
             # Single file chapter
@@ -748,12 +753,14 @@ def create_toc_ncx(
                 # Determine which part contains this subchapter
                 if subchapter_locations and (i, j) in subchapter_locations:
                     part_num = subchapter_locations[(i, j)]
-                    if part_num and part_num > 1:
-                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
+                    if part_num is None:
+                        # In main file (single file chapter)
+                        sub_chapter_file = f"chapter_{i}.html"
                     else:
-                        sub_chapter_file = chapter_file
+                        # In a specific part
+                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
                 else:
-                    # Default to main chapter file (or part1 for multi-part)
+                    # Default to chapter file (which is already set correctly above)
                     sub_chapter_file = chapter_file
 
                 ncx_content += f"""
@@ -779,7 +786,7 @@ def create_toc_ncx(
 
 
 def create_toc_html(
-    structure, book_title, output_path, parts_info=None, subchapter_locations=None
+    structure, book_title, output_path, parts_info=None, subchapter_locations=None, chapters_with_parts=None
 ):
     """Create the HTML table of contents.
 
@@ -890,8 +897,11 @@ def create_toc_html(
         chapter_title = chapter["title"]
         # Check if this chapter has parts
         chapter_key = str(i)
-        if parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
-            # Multi-part chapter - link to first part
+        if chapters_with_parts and i in chapters_with_parts:
+            # This chapter has part files - link to first part
+            chapter_file = f"chapter_{i}.part1.html"
+        elif parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
+            # Multi-part chapter according to progress info - link to first part
             chapter_file = f"chapter_{i}.part1.html"
         else:
             # Single file chapter
@@ -910,12 +920,14 @@ def create_toc_html(
                 # Determine which part contains this subchapter
                 if subchapter_locations and (i, j) in subchapter_locations:
                     part_num = subchapter_locations[(i, j)]
-                    if part_num and part_num > 1:
-                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
+                    if part_num is None:
+                        # In main file (single file chapter)
+                        sub_chapter_file = f"chapter_{i}.html"
                     else:
-                        sub_chapter_file = chapter_file
+                        # In a specific part
+                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
                 else:
-                    # Default to main chapter file (or part1 for multi-part)
+                    # Default to chapter file (which is already set correctly above)
                     sub_chapter_file = chapter_file
 
                 toc_html += f"""
@@ -1262,6 +1274,13 @@ def main():
     # Copy all chapter images to EPUB images directory
     copy_chapter_images(markdown_dir, images_dir)
 
+    # First, check which chapters actually have part files
+    chapters_with_parts = set()
+    for md_file in markdown_dir.glob("chapter_*.part*.md"):
+        match = re.search(r"chapter_(\d+)\.part\d+\.md", md_file.name)
+        if match:
+            chapters_with_parts.add(int(match.group(1)))
+
     # Load polish progress to get parts info for TOC generation
     # Load progress file based on mode
     if args.translated:
@@ -1274,30 +1293,52 @@ def main():
             progress_data = json.load(f)
             # Support both old and new format
             # Handle both polish and translation progress formats
-            if "parts_info" in progress_data:
-                parts_info_for_toc = {
-                    k: v["total_parts"]
-                    for k, v in progress_data["parts_info"].items()
-                    if v.get("is_complete", False)
-                }
-            else:
-                parts_info_for_toc = progress_data.get("parts_polished", {})
+            
+            # First check the appropriate progress key based on the file type
+            progress_key = None
+            if args.translated and "translations" in progress_data:
+                progress_key = "translations"
+            elif not args.translated and "parts_info" in progress_data:
+                progress_key = "parts_info"
+            elif "parts_polished" in progress_data:
+                progress_key = "parts_polished"
+            elif "polished" in progress_data:
+                progress_key = "polished"
+            
+            if progress_key:
+                if progress_key == "parts_polished":
+                    # Old format - direct mapping
+                    parts_info_for_toc = progress_data[progress_key]
+                else:
+                    # New format - extract total_parts from each chapter
+                    for chapter_key, chapter_data in progress_data[progress_key].items():
+                        if isinstance(chapter_data, dict) and "total_parts" in chapter_data:
+                            # Extract chapter number from key like "chapter_11" -> "11"
+                            if chapter_key.startswith("chapter_"):
+                                chapter_num = chapter_key.replace("chapter_", "")
+                                parts_info_for_toc[chapter_num] = chapter_data["total_parts"]
 
+    # Pass chapters_with_parts info to TOC generation
     # Build subchapter locations mapping (which part contains which subchapter)
     subchapter_locations = {}
     for i, chapter in enumerate(structure["chapters"], 1):
         if "subchapters" in chapter and chapter["subchapters"]:
             chapter_key = str(i)
-            if (
+            # Check if this chapter has parts (either from parts_info or actual part files)
+            has_parts = (i in chapters_with_parts) or (
                 parts_info_for_toc
                 and chapter_key in parts_info_for_toc
                 and parts_info_for_toc[chapter_key] > 1
-            ):
+            )
+            
+            if has_parts:
                 # Multi-part chapter - need to find which subchapters are in which parts
+                # Determine how many parts to check
+                num_parts = parts_info_for_toc.get(chapter_key, 10)  # Default to checking up to 10 parts
                 for j, subchapter in enumerate(chapter["subchapters"], 1):
                     sub_title = subchapter["title"]
                     # Search through all parts to find where this subchapter is
-                    for part_num in range(1, parts_info_for_toc[chapter_key] + 1):
+                    for part_num in range(1, num_parts + 1):
                         part_file = markdown_dir / f"chapter_{i}.part{part_num}.md"
                         if part_file.exists():
                             with open(part_file, "r", encoding="utf-8") as f:
@@ -1351,6 +1392,7 @@ def main():
         epub_dir / "toc.ncx",
         parts_info_for_toc,
         subchapter_locations,
+        chapters_with_parts,
     )
     create_toc_html(
         structure,
@@ -1358,6 +1400,7 @@ def main():
         text_dir / "toc.html",
         parts_info_for_toc,
         subchapter_locations,
+        chapters_with_parts,
     )
 
     # Convert front matter to HTML if it exists
@@ -1381,21 +1424,24 @@ def main():
 
     # Build chapters_dict based on known parts
     chapters_dict = {}
+    
     for chapter_idx_str, num_parts in parts_info.items():
         chapter_index = int(chapter_idx_str)
         chapters_dict[chapter_index] = []
 
-        if num_parts == 1:
-            # Single file chapter
-            md_file = markdown_dir / f"chapter_{chapter_index}.md"
-            if md_file.exists():
-                chapters_dict[chapter_index].append((None, md_file))
-        else:
-            # Multi-part chapter
-            for part_num in range(1, num_parts + 1):
+        # Check if this chapter has part files
+        if chapter_index in chapters_with_parts:
+            # Use part files regardless of what parts_info says
+            for part_num in range(1, max(num_parts, 10) + 1):  # Check up to 10 parts
                 md_file = markdown_dir / f"chapter_{chapter_index}.part{part_num}.md"
                 if md_file.exists():
                     chapters_dict[chapter_index].append((part_num, md_file))
+                    logger.debug(f"Added part file: {md_file.name}")
+        else:
+            # No part files, use the combined file
+            md_file = markdown_dir / f"chapter_{chapter_index}.md"
+            if md_file.exists():
+                chapters_dict[chapter_index].append((None, md_file))
 
     # Also check for any chapters not in parts_info (backward compatibility)
     all_md_files = sorted(markdown_dir.glob("chapter_*.md"))
@@ -1407,10 +1453,21 @@ def main():
         chapter_index = int(match.group(1))
         part_num = int(match.group(3)) if match.group(3) else None
 
+        # Skip combined files if this chapter has part files
+        if part_num is None and chapter_index in chapters_with_parts:
+            logger.debug(f"Skipping combined file {md_file.name} (using part files instead)")
+            continue
+
         # Only add if not already tracked
         if chapter_index not in chapters_dict:
             chapters_dict[chapter_index] = []
-            chapters_dict[chapter_index].append((part_num, md_file))
+        
+        # For chapters not in chapters_dict or to add missing parts
+        if part_num is not None or chapter_index not in chapters_with_parts:
+            # Only add if this specific file isn't already tracked
+            existing_parts = [p for p, _ in chapters_dict[chapter_index]]
+            if part_num not in existing_parts:
+                chapters_dict[chapter_index].append((part_num, md_file))
 
     # Process each chapter and its parts
     for chapter_index in sorted(chapters_dict.keys()):

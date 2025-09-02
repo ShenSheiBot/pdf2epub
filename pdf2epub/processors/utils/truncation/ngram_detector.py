@@ -102,8 +102,8 @@ class NGramTruncationDetector(BaseTruncationDetector):
 
         # Decision logic based on n-gram analysis
 
-        # 1. If token ratio is very high (≥90%), definitely not truncated
-        if token_ratio >= 0.9 and token_ratio <= 1.05:
+        # 1. If token ratio is very high (≥85%), definitely not truncated
+        if token_ratio >= 0.85 and token_ratio <= 1.05:
             return False, f"High token retention ({token_ratio:.1%})", details
 
         # 2. If tail is incomplete (mid-sentence), likely truncated

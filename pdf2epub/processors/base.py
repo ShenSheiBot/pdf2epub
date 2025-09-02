@@ -8,13 +8,17 @@ concurrent processing.
 
 import json
 import time
+import tiktoken
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 from pdf2epub.utils.llm_client import LLMClient
-from .utils.content_splitter import split_content_simple
+from .utils.content_splitter import split_content_intelligently
+
+# Initialize tokenizer for accurate token counting
+tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
 class BaseMarkdownProcessor(ABC):
@@ -168,19 +172,30 @@ class BaseMarkdownProcessor(ABC):
         """
         logger.info(f"Attempting to process {file_name} by splitting into parts")
         
-        # Estimate current content tokens (rough estimate: 1 token ≈ 4 chars)
-        estimated_tokens = len(content) // 4
+        # Count actual tokens using tiktoken
+        estimated_tokens = len(tokenizer.encode(content))
         
         # Split content into parts
         # Use a safe token limit that's 70% of the estimated current size to ensure actual splitting
         safe_token_limit = int(estimated_tokens * 0.7)
-        parts = split_content_simple(content, min(safe_token_limit, max_tokens))
+        
+        # Get model configs for splitting (if available)
+        model_configs = None
+        if hasattr(self, 'polish_models'):
+            model_configs = self.polish_models
+        elif hasattr(self, 'translation_models'):
+            model_configs = self.translation_models
+        
+        # Get content type if available
+        content_type = getattr(self, 'content_type', 'auto')
+        
+        parts = split_content_intelligently(content, min(safe_token_limit, max_tokens), self.llm_client, model_configs, content_type)
         
         # Force at least 2 parts if we still got only 1
         if len(parts) == 1:
             # Force split into 2 parts
             logger.info(f"Content estimated at ~{estimated_tokens} tokens, forcing split into 2 parts")
-            parts = split_content_simple(content, estimated_tokens // 2)
+            parts = split_content_intelligently(content, estimated_tokens // 2, self.llm_client, model_configs, content_type)
         
         logger.info(f"Split {file_name} into {len(parts)} parts")
         
@@ -338,13 +353,36 @@ class BaseMarkdownProcessor(ABC):
             Summary statistics
         """
         # Find all markdown files
-        markdown_files = sorted(self.input_dir.glob("*.md"))
+        all_markdown_files = sorted(self.input_dir.glob("*.md"))
+        
+        # Filter out combined files that have part files
+        markdown_files = []
+        combined_files_with_parts = set()
+        
+        # First pass: identify which files have parts
+        for file_path in all_markdown_files:
+            if '.part' in file_path.stem:
+                # This is a part file, extract the base name
+                base_name = file_path.stem.split('.part')[0]
+                combined_files_with_parts.add(base_name)
+        
+        # Second pass: only include files that aren't combined files with parts
+        for file_path in all_markdown_files:
+            if '.part' in file_path.stem:
+                # Include all part files
+                markdown_files.append(file_path)
+            elif file_path.stem not in combined_files_with_parts:
+                # Include files that don't have parts
+                markdown_files.append(file_path)
+            else:
+                # Skip combined files that have parts
+                logger.debug(f"Skipping {file_path.name} (using part files instead)")
         
         if not markdown_files:
             logger.error(f"No markdown files found in {self.input_dir}")
             return {"error": "No files found"}
         
-        logger.info(f"Found {len(markdown_files)} markdown files to process")
+        logger.info(f"Found {len(markdown_files)} markdown files to process ({len(combined_files_with_parts)} combined files skipped)")
         
         # Update total files in progress
         self.progress["total_files"] = len(markdown_files)
@@ -453,45 +491,23 @@ class BaseMarkdownProcessor(ABC):
         """
         lines = content.strip().split('\n')
         
-        # Check first two lines for common prefixes/patterns to remove
-        lines_removed = 0
-        max_lines_to_check = min(2, len(lines))
+        # Look for code block markers in first 3 non-empty lines
+        non_empty_count = 0
+        code_block_start = -1
         
-        for i in range(max_lines_to_check):
-            if i >= len(lines):
-                break
-                
-            line = lines[i].strip().lower()
-            
-            # Remove common LLM preambles (case-insensitive)
-            preamble_patterns = [
-                "here's the polished markdown",
-                "here is the polished markdown",
-                "here's the cleaned markdown",
-                "here is the cleaned markdown",
-            ]
-            
-            should_remove = False
-            
-            # Check for preamble patterns
-            for pattern in preamble_patterns:
-                if pattern in line:
-                    should_remove = True
+        for i, line in enumerate(lines):
+            if line.strip():  # Non-empty line
+                non_empty_count += 1
+                # Check if this line is a code block marker
+                if line.strip() in ['```markdown', '```'] or line.strip().startswith('```'):
+                    code_block_start = i + 1  # Start from the line after the marker
                     break
-            
-            # Check for code fence markers
-            if line in ['```markdown', '```'] or line.startswith('```'):
-                should_remove = True
-            
-            if should_remove:
-                lines_removed += 1
-            else:
-                # Stop checking once we hit actual content
-                break
+                if non_empty_count >= 3:
+                    break
         
-        # Remove the identified lines
-        if lines_removed > 0:
-            lines = lines[lines_removed:]
+        # If we found a code block marker, remove everything before and including it
+        if code_block_start > 0:
+            lines = lines[code_block_start:]
         
         # Rejoin the content
         content = '\n'.join(lines)

@@ -243,14 +243,8 @@ pdf2epub extract-entities -i input.pdf --source-lang Japanese --target-lang Chin
 # 基本翻译（自动检测并使用实体文件，如果存在）
 pdf2epub translate --target-language Chinese
 
-# 强制使用实体参考（即使文件不存在也会报错）
-pdf2epub translate --target-language Chinese --use-entities
-
 # 强制不使用实体（即使文件存在）
 pdf2epub translate --target-language Chinese --no-entities
-
-# 指定源语言和目标语言
-pdf2epub translate --source-language Japanese --target-language Chinese
 ```
 
 **注意**：如果 `translation_entities.json` 文件存在，翻译器会自动使用它以保持一致性。
@@ -365,6 +359,7 @@ output/
 ## 贡献
 
 欢迎提交Issue和Pull Request！
+关注[甚谁](https://www.zhihu.com/people/sakuraayane_justice)谢谢喵！
 
 ## 许可
 

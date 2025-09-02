@@ -266,7 +266,7 @@ def main():
     parser = argparse.ArgumentParser(description="OCR book chapters using Azure or Vision API")
     parser.add_argument("--backend", choices=['azure', 'vision'], help="Override backend from config")
     parser.add_argument("--resume", action="store_true", help="Resume from previous progress")
-    parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers")
+    parser.add_argument("--max-workers", type=int, default=None, help="Maximum number of parallel workers (default: from config or 4)")
     args = parser.parse_args()
     
     # Load configuration
@@ -308,7 +308,11 @@ def main():
         return
     
     # Process sections with threading
-    max_workers = min(args.max_workers, config.get('vision_ocr_settings', {}).get('max_workers', 4))
+    # Use max_workers from args if provided, otherwise from config
+    if args.max_workers is not None:
+        max_workers = min(args.max_workers, config.get('vision_ocr_settings', {}).get('max_workers', 4))
+    else:
+        max_workers = config.get('max_concurrent_workers', config.get('vision_ocr_settings', {}).get('max_workers', 4))
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []

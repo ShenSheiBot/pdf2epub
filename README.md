@@ -22,14 +22,15 @@
 2. **markdown ocr**：对于非纵排日语，使用多模态LLM将每页转换成带有插图的markdown。
 3. **markdown ocr (jp)**: 对于纵排日语，使用专门的OCR后端处理，支持振假名(furigana)识别和插图提取。
 4. **polish**: 使用LLM建立正确的链接跳转，消除OCR错误、多余的页眉页脚、页间分隔符、空白页，整理跨页的标题等级等。
-5. **epub**: 将markdown和图片打包为epub格式。
+5. **translate**: （可选）使用LLM将markdown内容翻译成目标语言，保持原有格式和结构。
+6. **epub**: 将markdown和图片打包为epub格式。
 
 
 ## 推荐LLM：
 
-无审核压力：gemini-2.5-pro
-
-有审核压力：claude-sonnet-4-20250514，或者从gemini回落到claude
+- breakdown / entity extraction：仅支持 gemini-2.5-pro，一般不会有审核问题
+- polish：deepseek-chat 或 claude-sonnet-4，仅当无审核压力时推荐gemini-2.5-pro
+- translate：deepseek-chat，claude-sonnet-4 翻译流畅度较差，仅当无审核压力时推荐gemini-2.5-pro
 
 ## 日语OCR架构
 

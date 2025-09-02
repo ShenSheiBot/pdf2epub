@@ -451,11 +451,56 @@ class BaseMarkdownProcessor(ABC):
         Returns:
             Cleaned markdown content
         """
-        # Remove code block wrappers if present
-        if content.startswith('```'):
-            lines = content.split('\n')
-            start_idx = 1 if lines[0].startswith('```') else 0
-            end_idx = len(lines) - 1 if lines[-1] == '```' else len(lines)
-            content = '\n'.join(lines[start_idx:end_idx])
+        lines = content.strip().split('\n')
+        
+        # Check first two lines for common prefixes/patterns to remove
+        lines_removed = 0
+        max_lines_to_check = min(2, len(lines))
+        
+        for i in range(max_lines_to_check):
+            if i >= len(lines):
+                break
+                
+            line = lines[i].strip().lower()
+            
+            # Remove common LLM preambles (case-insensitive)
+            preamble_patterns = [
+                "here's the polished markdown",
+                "here is the polished markdown",
+                "here's the cleaned markdown",
+                "here is the cleaned markdown",
+            ]
+            
+            should_remove = False
+            
+            # Check for preamble patterns
+            for pattern in preamble_patterns:
+                if pattern in line:
+                    should_remove = True
+                    break
+            
+            # Check for code fence markers
+            if line in ['```markdown', '```'] or line.startswith('```'):
+                should_remove = True
+            
+            if should_remove:
+                lines_removed += 1
+            else:
+                # Stop checking once we hit actual content
+                break
+        
+        # Remove the identified lines
+        if lines_removed > 0:
+            lines = lines[lines_removed:]
+        
+        # Rejoin the content
+        content = '\n'.join(lines)
+        
+        # Also handle case where ``` appears at the end
+        if content.strip().endswith('```'):
+            lines = content.strip().split('\n')
+            if lines[-1].strip() == '```':
+                lines = lines[:-1]
+                content = '\n'.join(lines)
         
         return content.strip()

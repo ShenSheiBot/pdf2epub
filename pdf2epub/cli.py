@@ -43,7 +43,7 @@ def polish_command(args):
     processor = PolishProcessor(
         config=config,
         book_title=book_title,
-        max_workers=args.max_workers,
+        max_workers=args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4),
         resume=args.resume,
         skip_truncation_check=args.skip_truncation_check,
         polish_models=config.get("polish_models"),
@@ -129,7 +129,12 @@ def breakdown_command(args):
 def ocr_command(args):
     """Handle the OCR subcommand."""
     import sys
+    from pdf2epub.utils import load_config
     original_argv = sys.argv
+    
+    # Load config to get max_concurrent_workers default
+    config = load_config(args.config)
+    max_workers = args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4)
     
     try:
         if args.japanese or args.backend:
@@ -142,8 +147,7 @@ def ocr_command(args):
                 new_argv.extend(['--backend', args.backend])
             if hasattr(args, 'resume') and args.resume:
                 new_argv.append('--resume')
-            if hasattr(args, 'max_workers'):
-                new_argv.extend(['--max-workers', str(args.max_workers)])
+            new_argv.extend(['--max-workers', str(max_workers)])
         else:
             # Use regular OCR
             from pdf2epub.ocr_chapters import main as ocr_main
@@ -297,7 +301,7 @@ def translate_command(args):
         book_title=book_title,
         source_language=source_language,
         target_language=target_language,
-        max_workers=args.max_workers,
+        max_workers=args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4),
         resume=args.resume,
         translation_models=config.get("translation_models"),
         use_entities=use_entities,
@@ -402,8 +406,8 @@ Examples:
     ocr_parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
-        help="Maximum number of concurrent workers"
+        default=None,
+        help="Maximum number of concurrent workers (default: from config or 4)"
     )
     ocr_parser.set_defaults(func=ocr_command)
     
@@ -432,8 +436,8 @@ Examples:
     polish_parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
-        help="Maximum number of concurrent workers"
+        default=None,
+        help="Maximum number of concurrent workers (default: from config or 4)"
     )
     polish_parser.add_argument(
         "--use-longest-on-failure",
@@ -464,8 +468,8 @@ Examples:
     translate_parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
-        help="Maximum number of concurrent workers"
+        default=None,
+        help="Maximum number of concurrent workers (default: from config or 4)"
     )
     translate_parser.add_argument(
         "--use-entities",

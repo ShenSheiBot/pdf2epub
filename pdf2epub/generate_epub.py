@@ -8,7 +8,6 @@ import json
 import os
 import uuid
 import shutil
-import yaml
 import zipfile
 import re
 import argparse
@@ -235,9 +234,6 @@ def update_markdown_heading_levels(markdown_dir, changes):
                     # Create the old and new heading markers
                     old_marker = "#" * old_level
                     new_marker = "#" * new_level
-                    
-                    # Find and replace the heading
-                    import re
                     
                     # Escape special regex characters in old title
                     escaped_old_title = re.escape(old_title)
@@ -629,7 +625,7 @@ Book structure to translate:"""
             for i in range(min(3, len(original_structure["chapters"]))):
                 orig = original_structure["chapters"][i]["title"]
                 trans = translated_structure["chapters"][i]["title"]
-                logger.info(f"Chapter {i+1}: '{orig}' → '{trans}'")
+                logger.info(f"Chapter {i + 1}: '{orig}' → '{trans}'")
 
         return translated_structure
 
@@ -637,8 +633,6 @@ Book structure to translate:"""
         logger.error(f"Failed to translate book structure: {e}")
         logger.warning("Falling back to original structure")
         return original_structure
-
-
 
 
 def cleanup_old_files(epub_dir):
@@ -649,33 +643,104 @@ def cleanup_old_files(epub_dir):
         logger.info("Old files cleaned up")
 
 
-def copy_chapter_images(source_dir, dest_dir):
-    """Copy all chapter images from source to destination directory."""
+def compress_and_copy_image(src_path, dest_path, max_width=1600, jpeg_quality=85):
+    """Compress and convert image to JPEG for smaller EPUB size."""
+    try:
+        # Open the image
+        img = Image.open(src_path)
+        
+        # Convert RGBA to RGB if necessary (for JPEG compatibility)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create a white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            if 'A' in img.mode:
+                background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
+                img = background
+            else:
+                img = img.convert('RGB')
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize if too wide (preserve aspect ratio)
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Save as JPEG with compression
+        # Change extension to .jpg
+        if dest_path.suffix.lower() not in ['.jpg', '.jpeg']:
+            dest_path = dest_path.with_suffix('.jpg')
+        
+        img.save(dest_path, 'JPEG', quality=jpeg_quality, optimize=True)
+        return dest_path
+    except Exception as e:
+        logger.warning(f"Failed to compress {src_path}: {e}. Copying as-is.")
+        # Fall back to simple copy
+        shutil.copy2(src_path, dest_path)
+        return dest_path
+
+
+def copy_chapter_images(source_dir, dest_dir, compress=True, max_width=1600, jpeg_quality=85):
+    """Copy all chapter images from source to destination directory with optional compression."""
     image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp"}
-    images_copied = 0
+    images_processed = 0
+    total_size_before = 0
+    total_size_after = 0
+    image_mapping = {}  # Maps original filename to new filename
 
     # Look for images in the parent directory of polished_markdown (usually 'images' folder)
     images_source = source_dir.parent / "images"
     if images_source.exists():
         for img_file in images_source.iterdir():
             if img_file.suffix.lower() in image_extensions:
-                dest_path = dest_dir / img_file.name
-                shutil.copy2(img_file, dest_path)
-                images_copied += 1
-                logger.debug(f"Copied image: {img_file.name}")
+                total_size_before += img_file.stat().st_size
+                
+                if compress and img_file.suffix.lower() not in ['.svg', '.gif']:
+                    # Compress and convert to JPEG (except SVG and GIF)
+                    dest_path = dest_dir / img_file.stem
+                    final_path = compress_and_copy_image(img_file, dest_path, max_width, jpeg_quality)
+                else:
+                    # Copy as-is for SVG, GIF, or if compression disabled
+                    dest_path = dest_dir / img_file.name
+                    shutil.copy2(img_file, dest_path)
+                    final_path = dest_path
+                
+                total_size_after += final_path.stat().st_size
+                images_processed += 1
+                image_mapping[img_file.name] = final_path.name
+                logger.debug(f"Processed image: {img_file.name} -> {final_path.name}")
 
     # Also look for images in the polished_markdown directory itself
     for img_file in source_dir.iterdir():
         if img_file.suffix.lower() in image_extensions:
-            dest_path = dest_dir / img_file.name
-            shutil.copy2(img_file, dest_path)
-            images_copied += 1
-            logger.debug(f"Copied image: {img_file.name}")
+            total_size_before += img_file.stat().st_size
+            
+            if compress and img_file.suffix.lower() not in ['.svg', '.gif']:
+                # Compress and convert to JPEG
+                dest_path = dest_dir / img_file.stem
+                final_path = compress_and_copy_image(img_file, dest_path, max_width, jpeg_quality)
+            else:
+                # Copy as-is
+                dest_path = dest_dir / img_file.name
+                shutil.copy2(img_file, dest_path)
+                final_path = dest_path
+            
+            total_size_after += final_path.stat().st_size
+            images_processed += 1
+            image_mapping[img_file.name] = final_path.name
+            logger.debug(f"Processed image: {img_file.name} -> {final_path.name}")
 
-    if images_copied > 0:
-        logger.success(f"Copied {images_copied} images to EPUB")
+    if images_processed > 0:
+        if compress and total_size_before > 0:
+            reduction = (1 - total_size_after / total_size_before) * 100
+            logger.success(f"Processed {images_processed} images (size reduced by {reduction:.1f}%)")
+        else:
+            logger.success(f"Copied {images_processed} images to EPUB")
 
-    return images_copied
+    return images_processed, image_mapping
 
 
 def extract_cover_image(pdf_path, output_dir):
@@ -707,7 +772,7 @@ def extract_cover_image(pdf_path, output_dir):
 
 
 def convert_markdown_to_chapter_html(
-    markdown_path, output_path, chapter_title, chapter_index=None, subchapter_info=None
+    markdown_path, output_path, chapter_title, chapter_index=None, subchapter_info=None, image_mapping=None
 ):
     """Convert a markdown file to HTML chapter format with proper anchors for subchapters.
 
@@ -719,7 +784,7 @@ def convert_markdown_to_chapter_html(
             markdown_content = f.read()
 
         # Convert markdown to HTML (just the body content, not a full document)
-        html_content = convert_markdown_to_html(markdown_content, standalone=False)
+        html_content = convert_markdown_to_html(markdown_content, standalone=False, image_mapping=image_mapping)
 
         # Add/update anchors to subchapter headings if we have the info
         if chapter_index and subchapter_info:
@@ -767,7 +832,7 @@ def convert_markdown_to_chapter_html(
                         f'<{h_level}[^>]*id="([^"]*)"[^>]*>([^<]+)</{h_level}>'
                     )
                     for match in re.finditer(heading_pattern, html_content):
-                        heading_id = match.group(1)
+                        # heading_id = match.group(1)
                         heading_text = match.group(2)
                         similarity = difflib.SequenceMatcher(
                             None, sub_title.lower(), heading_text.lower()
@@ -884,7 +949,6 @@ body {
     margin: 2em auto;
     padding: 0 1em;
     background-color: #fdfdfd;
-    color: #333;
     text-align: justify;
 }
 
@@ -945,7 +1009,6 @@ blockquote {
     padding-left: 1em;
     border-left: 3px solid #ddd;
     font-style: italic;
-    color: #555;
 }
 
 code {
@@ -983,7 +1046,6 @@ li {
 
 /* Links */
 a {
-    color: #0066cc;
     text-decoration: none;
 }
 
@@ -1063,7 +1125,6 @@ hr {
 
 .toc a {
     text-decoration: none;
-    color: #000;
 }
 
 /* Footnote references in text */
@@ -1074,7 +1135,6 @@ sup {
 
 sup a, .footnote-ref {
     text-decoration: none;
-    color: #0066cc;
 }
 
 sup a:hover, .footnote-ref:hover {
@@ -1121,7 +1181,6 @@ sup a:hover, .footnote-ref:hover {
 
 .footnote-backref, .footnote-item a[href^="#fnref"] {
     text-decoration: none;
-    color: #0066cc;
     margin-left: 0.3em;
 }
 
@@ -1235,14 +1294,11 @@ def create_toc_html(
             margin: 2em auto;
             max-width: 800px;
             padding: 0 1em;
-            background-color: #fdfdfd;
-            color: #333;
         }}
         h1 {{
             text-align: center;
             margin-bottom: 1.5em;
-            color: #222;
-            border-bottom: 3px solid #4a5568;
+            border-bottom: 3px solid;
             padding-bottom: 0.5em;
             font-weight: bold;
             font-size: 2em;
@@ -1259,22 +1315,15 @@ def create_toc_html(
         .toc > ul > li {{
             margin-bottom: 1.5em;
             padding-left: 1.5em;
-            border-left: 4px solid #e2e8f0;
-            transition: border-color 0.3s ease;
-        }}
-        .toc > ul > li:hover {{
-            border-left-color: #4a5568;
+            border-left: 4px solid;
         }}
         .toc a {{
             text-decoration: none;
-            color: #2563eb;
             font-weight: 600;
             font-size: 1.1em;
             display: block;
-            transition: color 0.2s ease;
         }}
         .toc a:hover {{
-            color: #1d4ed8;
             text-decoration: underline;
         }}
         .chapter-number {{
@@ -1282,7 +1331,6 @@ def create_toc_html(
             min-width: 2em;
             margin-right: 0.5em;
             font-weight: bold;
-            color: #555;
         }}
         /* Nested subchapters */
         .toc ul ul {{
@@ -1294,24 +1342,15 @@ def create_toc_html(
         .toc ul ul li {{
             margin-bottom: 0.4em;
             padding-left: 1em;
-            border-left: 2px solid #cbd5e1;
-            transition: border-color 0.3s ease;
-        }}
-        .toc ul ul li:hover {{
-            border-left-color: #64748b;
+            border-left: 2px solid;
         }}
         .toc ul ul a {{
             font-size: 0.95em;
             font-weight: normal;
-            color: #475569;
-        }}
-        .toc ul ul a:hover {{
-            color: #1e293b;
         }}
         /* Part labels */
         .part-label {{
             font-size: 0.85em;
-            color: #64748b;
             font-style: italic;
             margin-left: 0.5em;
         }}
@@ -1740,8 +1779,18 @@ def main():
     # Create container.xml
     create_container_xml(meta_inf_dir / "container.xml")
 
-    # Copy all chapter images to EPUB images directory
-    copy_chapter_images(markdown_dir, images_dir)
+    # Copy all chapter images to EPUB images directory with compression
+    # Get config for compression settings
+    compress_images = config.get('epub_compress_images', True)
+    max_image_width = config.get('epub_max_image_width', 1600)
+    jpeg_quality = config.get('epub_jpeg_quality', 85)
+    
+    _, image_mapping = copy_chapter_images(
+        markdown_dir, images_dir, 
+        compress=compress_images,
+        max_width=max_image_width,
+        jpeg_quality=jpeg_quality
+    )
 
     # First, check which chapters actually have part files
     chapters_with_parts = set()
@@ -1878,7 +1927,7 @@ def main():
         logger.info("Converting front matter to HTML")
         front_matter_html = text_dir / "front_matter.html"
         if convert_markdown_to_chapter_html(
-            front_matter_md, front_matter_html, "Front Matter"
+            front_matter_md, front_matter_html, "Front Matter", image_mapping=image_mapping
         ):
             logger.success("Front matter converted to HTML")
         else:
@@ -2002,11 +2051,11 @@ def main():
             # Pass subchapter info for this specific part
             if part_subchapters:
                 success = convert_markdown_to_chapter_html(
-                    md_file, html_path, part_title, chapter_index, part_subchapters
+                    md_file, html_path, part_title, chapter_index, part_subchapters, image_mapping
                 )
             else:
                 success = convert_markdown_to_chapter_html(
-                    md_file, html_path, part_title
+                    md_file, html_path, part_title, image_mapping=image_mapping
                 )
 
             if success:
@@ -2026,7 +2075,7 @@ def main():
         logger.info("Converting back matter to HTML")
         back_matter_html = text_dir / "back_matter.html"
         if convert_markdown_to_chapter_html(
-            back_matter_md, back_matter_html, "Back Matter"
+            back_matter_md, back_matter_html, "Back Matter", image_mapping=image_mapping
         ):
             logger.success("Back matter converted to HTML")
         else:

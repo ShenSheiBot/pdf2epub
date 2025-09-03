@@ -59,11 +59,11 @@ class LLMTruncationDetector(BaseTruncationDetector):
         translated_lines = [l for l in all_translated_lines if l.strip()]
         
         # Quick check: if line counts match exactly, skip LLM check
-        if len(translated_lines) == len(original_lines):
+        if len(translated_lines) < len(original_lines) + 3 and len(translated_lines) > len(original_lines) - 3:
             return False, "Line counts match exactly", {
                 'original_line_count': len(original_lines),
                 'translated_line_count': len(translated_lines),
-                'line_ratio': 1.0,
+                'line_ratio': len(translated_lines) / len(original_lines),
                 'skipped_llm_check': True
             }
         

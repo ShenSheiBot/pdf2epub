@@ -123,7 +123,7 @@ def breakdown_command(args):
 def ocr_command(args):
     """Handle the OCR subcommand."""
     import sys
-    from pdf2epub.utils import load_config
+    from pdf2epub.utils.common import load_config
     original_argv = sys.argv
     
     # Load config to get max_concurrent_workers default
@@ -142,6 +142,9 @@ def ocr_command(args):
             if hasattr(args, 'resume') and args.resume:
                 new_argv.append('--resume')
             new_argv.extend(['--max-workers', str(max_workers)])
+            if hasattr(args, 'azure_illustrations') and args.azure_illustrations:
+                new_argv.append('--azure-illustrations')
+                logger.info("Adding --azure-illustrations flag to Japanese OCR")
         else:
             # Use regular OCR
             from pdf2epub.ocr_chapters import main as ocr_main
@@ -406,6 +409,11 @@ Examples:
         type=int,
         default=None,
         help="Maximum number of concurrent workers (default: from config or 4)"
+    )
+    ocr_parser.add_argument(
+        "--azure-illustrations",
+        action="store_true",
+        help="Use Azure's native figure detection to extract illustrations (Azure backend only)"
     )
     ocr_parser.set_defaults(func=ocr_command)
     

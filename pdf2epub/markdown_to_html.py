@@ -35,8 +35,6 @@ body {
     max-width: 800px;
     margin: 2em auto;
     padding: 0 1em;
-    background-color: #fdfdfd;
-    color: #333;
 }
 ruby {
     ruby-align: center;
@@ -51,7 +49,7 @@ h1 {
     margin-bottom: 2em;
     font-weight: bold;
     font-size: 2em;
-    border-bottom: 2px solid #ccc;
+    border-bottom: 2px solid;
     padding-bottom: 0.5em;
 }
 h2 {
@@ -59,7 +57,7 @@ h2 {
     font-weight: bold;
     margin-top: 2.5em;
     margin-bottom: 1em;
-    border-bottom: 1px solid #ddd;
+    border-bottom: 1px solid;
     padding-bottom: 0.3em;
 }
 h3 {
@@ -76,7 +74,7 @@ p {
 blockquote {
     margin: 1.5em 2em;
     padding-left: 1em;
-    border-left: 3px solid #ddd;
+    border-left: 3px solid;
     font-style: italic;
 }
 ul, ol {
@@ -87,19 +85,16 @@ li {
     margin-bottom: 0.5em;
 }
 code {
-    background-color: #f4f4f4;
     padding: 0.2em 0.4em;
     border-radius: 3px;
     font-family: monospace;
 }
 pre {
-    background-color: #f4f4f4;
     padding: 1em;
     border-radius: 5px;
     overflow-x: auto;
 }
 pre code {
-    background-color: transparent;
     padding: 0;
 }
 img {
@@ -114,12 +109,11 @@ table {
     margin: 1.5em 0;
 }
 th, td {
-    border: 1px solid #ddd;
+    border: 1px solid;
     padding: 0.5em;
     text-align: left;
 }
 th {
-    background-color: #f4f4f4;
     font-weight: bold;
 }
 .footnote {
@@ -151,7 +145,6 @@ sup {
 }
 sup a {
     text-decoration: none;
-    color: #0066cc;
 }
 sup a:hover {
     text-decoration: underline;
@@ -414,13 +407,18 @@ def convert_markdown_to_html(
     markdown_content: str,
     title: Optional[str] = None,
     include_css: bool = True,
-    standalone: bool = True
+    standalone: bool = True,
+    image_mapping: Optional[dict] = None
 ) -> str:
     """
     Convert markdown content to HTML.
     
     Args:
         markdown_content: The markdown text to convert
+        title: Optional title for the HTML document
+        include_css: Whether to include CSS styles
+        standalone: Whether to create a complete HTML document
+        image_mapping: Optional dict mapping original image names to new names
         title: Optional title for the HTML document
         include_css: Whether to include CSS in the HTML head
         standalone: Whether to create a complete HTML document or just the body content
@@ -436,6 +434,16 @@ def convert_markdown_to_html(
     
     # Pre-process markdown to fix various issues
     markdown_content = preprocess_markdown(markdown_content)
+    
+    # Update image references if mapping provided
+    if image_mapping:
+        for original_name, new_name in image_mapping.items():
+            # Handle various image reference patterns
+            # Standard markdown: ![alt](path/image.png)
+            markdown_content = markdown_content.replace(f']({original_name})', f']({new_name})')
+            markdown_content = markdown_content.replace(f'](../{original_name})', f'](../{new_name})')
+            markdown_content = markdown_content.replace(f'](../images/{original_name})', f'](../images/{new_name})')
+            markdown_content = markdown_content.replace(f'](images/{original_name})', f'](images/{new_name})')
     
     # Configure markdown extensions
     extensions = [

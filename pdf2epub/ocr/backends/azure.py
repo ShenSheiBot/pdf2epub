@@ -20,6 +20,160 @@ from ..illustration_extractor import extract_illustrations
 logger = configure_logging()
 
 
+def _extract_azure_figures(client: DocumentIntelligenceClient, azure_result, page_num: int, base_output_dir: Path = None, config: Dict = None) -> List[Dict]:
+    """Extract figures using Azure's native figure detection."""
+    illustrations = []
+    
+    if not hasattr(azure_result, 'figures') or not azure_result.figures:
+        return illustrations
+    
+    # Set up output directory for images
+    if base_output_dir:
+        images_dir = base_output_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        images_dir = None
+    
+    # Get operation ID for downloading figure images
+    operation_id = getattr(azure_result, '_operation_id', None)
+    model_id = getattr(azure_result, 'model_id', 'prebuilt-layout')
+    
+    if not operation_id:
+        logger.warning("No operation ID found for downloading figure images")
+        # Even without operation ID, we can still report figure locations
+        for idx, figure in enumerate(azure_result.figures):
+            for region in (figure.bounding_regions or []):
+                # Azure returns page 1 for single-page analysis, so we don't need to check
+                illustrations.append({
+                    'path': None,  # No image file available
+                    'caption': figure.caption.content if hasattr(figure, 'caption') and figure.caption else None,
+                    'page': page_num,
+                    'figure_id': figure.id,
+                    'polygon': region.polygon,  # Store bounding region
+                    'placement': 'end'  # Default placement for Azure figures
+                })
+        return illustrations
+    
+    # Get page dimensions 
+    page_width = None
+    page_height = None
+    
+    # Try to get from Azure pages info first
+    if hasattr(azure_result, 'pages') and azure_result.pages:
+        page = azure_result.pages[0]  # Single page analysis
+        if hasattr(page, 'width'):
+            page_width = page.width
+        if hasattr(page, 'height'):
+            page_height = page.height
+            
+    # Fallback: estimate from all content bounding boxes
+    if not page_width or not page_height:
+        max_x = 0
+        max_y = 0
+        
+        # Check all figures
+        for fig in (azure_result.figures or []):
+            for region in (fig.bounding_regions or []):
+                if region.polygon:
+                    # Flat list [x1, y1, x2, y2, ...]
+                    for i in range(0, len(region.polygon), 2):
+                        max_x = max(max_x, region.polygon[i])
+                        if i + 1 < len(region.polygon):
+                            max_y = max(max_y, region.polygon[i + 1])
+
+        # Check all lines if available
+        if hasattr(azure_result, 'pages') and azure_result.pages:
+            for page in azure_result.pages:
+                if hasattr(page, 'lines'):
+                    for line in (page.lines or []):
+                        if hasattr(line, 'polygon') and line.polygon:
+                            # Flat list [x1, y1, x2, y2, ...]
+                            for i in range(0, len(line.polygon), 2):
+                                max_x = max(max_x, line.polygon[i])
+                                if i + 1 < len(line.polygon):
+                                    max_y = max(max_y, line.polygon[i + 1])
+
+        # Use max coordinates as page size estimate (with small margin)
+        if max_x > 0 and max_y > 0:
+            page_width = max_x * 1.05
+            page_height = max_y * 1.05
+    
+    for idx, figure in enumerate(azure_result.figures):
+        try:
+            # Extract bounding region for this page
+            # Azure returns page_number as 1 for single-page analysis
+            for region in (figure.bounding_regions or []):
+                
+                # Calculate figure dimensions from bounding polygon
+                if region.polygon:
+                    # Azure returns polygon as flat list of coordinates [x1, y1, x2, y2, ...]
+                    xs = [region.polygon[i] for i in range(0, len(region.polygon), 2)]
+                    ys = [region.polygon[i] for i in range(1, len(region.polygon), 2)]
+                    
+                    fig_width = max(xs) - min(xs)
+                    fig_height = max(ys) - min(ys)
+                    
+                    # Check if figure is too small (less than 3% of page area)
+                    if page_width and page_height:
+                        fig_area = fig_width * fig_height
+                        page_area = page_width * page_height
+                        area_ratio = fig_area / page_area
+                        
+                        # Skip if too small (likely page number or decoration)
+                        min_area_ratio = config.get('azure_min_figure_area_ratio', 0.03) if config else 0.03  # Default 3%
+                        if area_ratio < min_area_ratio:
+                            logger.info(f"Skipping small figure {idx} on page {page_num}: {fig_width:.0f}x{fig_height:.0f} ({area_ratio:.1%} of page)")
+                            continue
+                
+                # Since we're analyzing one page at a time, region.page_number is always 1
+                # So we should process all figures found on this single-page analysis
+                
+                # Download the cropped figure image
+                if figure.id and images_dir:
+                    figure_filename = f"page_{page_num}_figure_{idx + 1}.png"
+                    figure_path = images_dir / figure_filename
+                    
+                    try:
+                        # Download the figure using the SDK method
+                        stream = client.get_analyze_result_figure(
+                            model_id=model_id,
+                            result_id=operation_id,
+                            figure_id=figure.id
+                        )
+                        
+                        with open(figure_path, "wb") as f:
+                            for chunk in stream:
+                                f.write(chunk)
+                        
+                        logger.success(f"Saved Azure figure to {figure_path}")
+                        
+                        # Add to illustrations list
+                        # Use relative path for markdown (../images/ from ocr_markdown folder)
+                        relative_path = f"../images/{figure_filename}"
+                        illustrations.append({
+                            'path': relative_path,
+                            'caption': figure.caption.content if hasattr(figure, 'caption') and figure.caption else None,
+                            'page': page_num,
+                            'figure_id': figure.id,
+                            'placement': 'end'  # Default placement for Azure figures
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to download figure {figure.id}: {e}")
+                        # Add without path for tracking
+                        illustrations.append({
+                            'path': None,
+                            'caption': figure.caption.content if hasattr(figure, 'caption') and figure.caption else None,
+                            'page': page_num,
+                            'figure_id': figure.id,
+                            'placement': 'end',  # Default placement for Azure figures
+                            'error': str(e)
+                        })
+        except Exception as e:
+            logger.error(f"Error processing figure {idx}: {e}")
+    
+    return illustrations
+
+
 # Interface functions for ocr_chapters_jp.py
 def init_client(config: Dict) -> DocumentIntelligenceClient:
     """Initialize Azure Document Intelligence client for use with ocr_chapters_jp.py."""
@@ -62,7 +216,10 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     else:
         images_dir = None
     
-    # Call analyze_azure_ocr directly
+    # Check if we should use Azure's native figure extraction
+    use_azure_illustrations = config.get('use_azure_illustrations', False)
+    
+    # Call analyze_azure_ocr directly with figure extraction if enabled
     clean_text, azure_result, all_lines_data = analyze_azure_ocr(
         img_bytes=img_bytes,
         page_num=page_num,
@@ -70,21 +227,30 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
         config=config,
         client=client,
         use_layout=True,
-        verbose=verbose
+        verbose=verbose,
+        extract_figures=use_azure_illustrations
     )
     
-    # Use custom illustration extraction
-    img = Image.open(io.BytesIO(img_bytes))
-    img_array = np.array(img)
-    
-    illustrations = extract_illustrations(
-        img_array=img_array,
-        backend="azure",
-        text_annotation=azure_result,  # Pass the Azure result for text region detection
-        config=config,
-        page_num=page_num,
-        output_dir=base_output_dir if base_output_dir else None
-    )
+    # Check if Azure returned figures
+    if use_azure_illustrations:
+        if hasattr(azure_result, 'figures') and azure_result.figures:
+            # Use Azure's native figure detection
+            illustrations = _extract_azure_figures(client, azure_result, page_num, base_output_dir, config)
+        else:
+            illustrations = []
+    else:
+        # Use custom illustration extraction as fallback
+        img = Image.open(io.BytesIO(img_bytes))
+        img_array = np.array(img)
+        
+        illustrations = extract_illustrations(
+            img_array=img_array,
+            backend="azure",
+            text_annotation=azure_result,  # Pass the Azure result for text region detection
+            config=config,
+            page_num=page_num,
+            output_dir=base_output_dir if base_output_dir else None
+        )
     
     return {
         'text': clean_text if clean_text is not None else "",
@@ -94,7 +260,7 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     }
 
 
-def _call_azure_api(client, img_bytes, use_layout=True):
+def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False):
     """Calls the Azure Document Intelligence API and returns the result."""
     from azure.core.exceptions import AzureError
     
@@ -103,13 +269,43 @@ def _call_azure_api(client, img_bytes, use_layout=True):
         model_id = "prebuilt-layout" if use_layout else "prebuilt-read"
         img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
-        poller = client.begin_analyze_document(
-            model_id=model_id,
-            body={"base64Source": img_base64},
-            locale="ja-JP",
-            features=["languages"] if use_layout else None
-        )
+        # Prepare kwargs for the API call
+        api_kwargs = {
+            "model_id": model_id,
+            "body": {"base64Source": img_base64},
+            "locale": "ja-JP"
+        }
+        
+        # Add features if using layout
+        if use_layout:
+            api_kwargs["features"] = ["languages"]
+        
+        # Add figure extraction output if requested
+        if extract_figures and use_layout:
+            api_kwargs["output"] = ["figures"]
+        
+        poller = client.begin_analyze_document(**api_kwargs)
+        
+        # Store the operation ID before getting result for figure extraction
+        if extract_figures:
+            try:
+                # According to Azure SDK docs, operation_id should be in details
+                operation_id = poller.details.get("operation_id") if hasattr(poller, 'details') else None
+            except Exception as e:
+                logger.warning(f"Error accessing poller details: {e}")
+                operation_id = None
+        
         result = poller.result()
+        
+        # Store the operation ID and model ID for figure extraction
+        if extract_figures:
+            result.model_id = model_id
+            result._operation_id = operation_id
+            if operation_id:
+                logger.info(f"Operation ID for figures: {operation_id}")
+            else:
+                logger.warning("No operation ID found - figure images cannot be downloaded")
+        
         logger.success("Azure Document Intelligence analysis completed.")
         return result
     except AzureError as e:
@@ -576,7 +772,7 @@ def _format_clean_output(reconstructed_lines, verbose=False):
     return '\n'.join(output_lines)
 
 
-def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, client=None, use_layout=True, verbose=False) -> Tuple[str, Any, List[Dict]]:
+def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, client=None, use_layout=True, verbose=False, extract_figures=False) -> Tuple[str, Any, List[Dict]]:
     """
     Analyzes Azure Document Intelligence OCR with Japanese text from image bytes.
     This function orchestrates the process: API call -> Data Extraction -> Analysis -> Reconstruction.
@@ -606,7 +802,7 @@ def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, clien
     
     # 2. API Call
     try:
-        result = _call_azure_api(client, img_bytes, use_layout)
+        result = _call_azure_api(client, img_bytes, use_layout, extract_figures)
     except Exception:
         return None, None, []
         

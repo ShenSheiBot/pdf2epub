@@ -253,6 +253,7 @@ def main():
     parser.add_argument("--backend", choices=['azure', 'vision'], help="Override backend from config")
     parser.add_argument("--resume", action="store_true", help="Resume from previous progress")
     parser.add_argument("--max-workers", type=int, default=None, help="Maximum number of parallel workers (default: from config or 4)")
+    parser.add_argument("--azure-illustrations", action="store_true", help="Use Azure's native figure detection to extract illustrations (Azure backend only)")
     args = parser.parse_args()
     
     # Load configuration
@@ -262,6 +263,13 @@ def main():
     # Determine backend
     backend = args.backend or config.get('jp_ocr_backend', 'azure')
     logger.info(f"Using OCR backend: {backend}")
+    
+    # Store azure-illustrations flag in config for backend to use
+    if args.azure_illustrations:
+        config['use_azure_illustrations'] = True
+        logger.info("Azure native illustrations enabled")
+    else:
+        logger.debug(f"Azure illustrations not enabled: {args.azure_illustrations}")
     
     # Import backend functions
     init_client, process_page_func = get_backend_module(backend)

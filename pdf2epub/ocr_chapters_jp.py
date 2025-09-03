@@ -13,24 +13,10 @@ from loguru import logger
 
 from pdf2epub.ocr import inject_illustrations_into_text
 from pdf2epub.utils.logging_config import configure_logging
+from pdf2epub.utils.common import load_config, load_book_structure
 
 # Configure logger
 logger = configure_logging()
-
-
-def load_config(config_path="config.yaml"):
-    """Load configuration from config file."""
-    with open(config_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    return config
-
-
-def load_book_structure(book_title):
-    """Load the book structure JSON file."""
-    structure_path = Path("output") / Path(book_title) / "book_structure.json"
-    with open(structure_path, "r", encoding="utf-8") as file:
-        structure = json.load(file)
-    return structure
 
 
 def load_or_create_progress(progress_file: Path, structure: Dict) -> Dict:

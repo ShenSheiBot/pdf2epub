@@ -12,6 +12,7 @@ import yaml
 import zipfile
 import re
 import argparse
+import html
 import fitz  # PyMuPDF for cover extraction
 from datetime import datetime
 from pathlib import Path
@@ -20,27 +21,497 @@ from PIL import Image
 from loguru import logger
 from .utils.logging_config import configure_logging
 from .utils.zip_utils import create_password_protected_zip
+from .utils.common import load_config, load_book_structure, ensure_directory, sanitize_filename as sanitize_filename_util
 from .markdown_to_html import convert_markdown_to_html
 
 # Configure logger
 logger = configure_logging()
 
-
-def load_config(config_path="config.yaml"):
-    """Load configuration from config file."""
-    with open(config_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    return config
+# Keep sanitize_filename for backward compatibility but use the common one
+sanitize_filename = sanitize_filename_util
 
 
-def load_book_structure(book_title):
-    """Load the book structure JSON file."""
-    structure_path = Path("output") / Path(book_title) / "book_structure.json"
-    if structure_path.exists():
-        with open(structure_path, "r", encoding="utf-8") as file:
-            structure = json.load(file)
-        return structure
-    return None
+def relevel_book_structure(markdown_structure, original_structure, config):
+    """
+    Use LLM to analyze and re-level the markdown book structure using original OCR structure as reference.
+    
+    Args:
+        markdown_structure: Book structure generated from markdown headings
+        original_structure: Original book structure from OCR (reference)
+        config: Configuration with API keys
+        
+    Returns:
+        Dict with level and text changes for markdown headings
+    """
+    from pdf2epub.utils.llm_client import LLMClient
+    
+    logger.info("Analyzing book structure for re-leveling using original OCR structure as reference...")
+    
+    # Initialize LLM client
+    llm_client = LLMClient(config)
+    
+    # Create simplified structures for both
+    markdown_headings = []
+    for chapter in markdown_structure.get("chapters", []):
+        markdown_headings.append({
+            "title": chapter["title"],
+            "level": 1,
+            "index": chapter.get("index", 0),
+            "type": "chapter"
+        })
+        
+        for j, subchapter in enumerate(chapter.get("subchapters", []), 1):
+            markdown_headings.append({
+                "title": subchapter["title"],
+                "level": 2,
+                "chapter_index": chapter.get("index", 0),
+                "subchapter_index": j,
+                "type": "subchapter"
+            })
+    
+    # Create simplified original structure for reference
+    original_headings = []
+    if original_structure:
+        for chapter in original_structure.get("chapters", []):
+            original_headings.append({
+                "title": chapter.get("title", ""),
+                "level": 1
+            })
+            
+            if "subchapters" in chapter:
+                for subchapter in chapter["subchapters"]:
+                    original_headings.append({
+                        "title": subchapter.get("title", ""),
+                        "level": 2
+                    })
+    
+    # Create prompt for LLM
+    prompt = """You are a book structure expert. Your task is to improve the markdown-generated book structure using the original OCR structure as a reference.
+
+You have TWO structures:
+1. ORIGINAL OCR STRUCTURE (reference) - This shows the intended hierarchy from the original book
+2. MARKDOWN STRUCTURE (to be modified) - This is what was extracted from markdown files
+
+YOUR TASK:
+1. Analyze both structures to understand the intended hierarchy
+2. For each heading in the MARKDOWN structure, determine:
+   - The appropriate level (1=chapter, 2=section, 3=subsection)
+   - Whether the title text should be updated (e.g., if OCR had better formatting or complete text)
+3. The NUMBER of headings must remain EXACTLY the same as in the markdown structure
+4. You can change both "level" and "title" fields in the markdown structure
+5. Use the original OCR structure as guidance for hierarchy and proper titles
+
+IMPORTANT:
+- Return the modified markdown structure with the SAME number of entries
+- Each entry should have: title (possibly updated), level (possibly updated), and all original fields
+- Maintain logical hierarchy - level 3 cannot appear without a parent level 2
+
+ORIGINAL OCR STRUCTURE (reference):
+"""
+    
+    original_json = json.dumps(original_headings, ensure_ascii=False, indent=2)
+    markdown_json = json.dumps(markdown_headings, ensure_ascii=False, indent=2)
+    
+    multi_part_content = [
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": original_json},
+        {"type": "text", "text": "\n\nMARKDOWN STRUCTURE (to modify):\n"},
+        {"type": "text", "text": markdown_json},
+        {"type": "text", "text": "\n\nReturn the modified markdown structure with updated levels and titles:"}
+    ]
+    
+    # Use the same models as translation
+    releveling_models = [
+        {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 2},
+        {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+    ]
+    
+    try:
+        response = llm_client.generate(
+            prompt=multi_part_content,
+            model_configs=releveling_models,
+            operation_name="Re-level book structure with OCR reference"
+        )
+        
+        # Clean response
+        if "```json" in response:
+            response = response.split("```json")[1].split("```")[0]
+        elif "```" in response:
+            response = response.split("```")[1].split("```")[0]
+        
+        releveled_structure = json.loads(response)
+        
+        # Build changes mapping
+        changes = {}
+        for i, new_item in enumerate(releveled_structure):
+            if i >= len(markdown_headings):
+                logger.warning(f"Response has more items than original markdown structure")
+                break
+                
+            original_item = markdown_headings[i]
+            
+            # Check for changes
+            level_changed = original_item["level"] != new_item.get("level", original_item["level"])
+            title_changed = original_item["title"] != new_item.get("title", original_item["title"])
+            
+            if level_changed or title_changed:
+                if original_item.get("type") == "subchapter":
+                    # It's a subchapter
+                    key = (original_item["chapter_index"], original_item["subchapter_index"])
+                else:
+                    # It's a chapter
+                    key = (original_item["index"], 0)
+                
+                changes[key] = {
+                    "old_title": original_item["title"],
+                    "new_title": new_item.get("title", original_item["title"]),
+                    "old_level": original_item["level"],
+                    "new_level": new_item.get("level", original_item["level"])
+                }
+                
+                if title_changed:
+                    logger.info(f"Updating title: '{original_item['title']}' → '{new_item['title']}'")
+                if level_changed:
+                    logger.info(f"Re-leveling: '{new_item.get('title', original_item['title'])}' from level {original_item['level']} to level {new_item['level']}")
+        
+        return changes
+        
+    except Exception as e:
+        logger.error(f"Failed to re-level structure: {e}")
+        return {}
+
+
+def update_markdown_heading_levels(markdown_dir, changes):
+    """
+    Update heading levels and titles in markdown files based on changes.
+    
+    Args:
+        markdown_dir: Directory containing markdown files  
+        changes: Dict mapping (chapter_idx, subchapter_idx) to change info with old/new title and level
+    """
+    if not changes:
+        logger.info("No heading changes needed")
+        return
+    
+    logger.info(f"Updating {len(changes)} headings in markdown files...")
+    
+    # Group changes by chapter
+    changes_by_chapter = {}
+    for (chapter_idx, subchapter_idx), change_info in changes.items():
+        if chapter_idx not in changes_by_chapter:
+            changes_by_chapter[chapter_idx] = []
+        changes_by_chapter[chapter_idx].append((subchapter_idx, change_info))
+    
+    # Process each chapter
+    for chapter_idx, chapter_changes in changes_by_chapter.items():
+        # Find all relevant files (main and parts)
+        files_to_update = []
+        
+        # Check for part files
+        part_files = sorted(markdown_dir.glob(f"chapter_{chapter_idx}.part*.md"))
+        if part_files:
+            files_to_update.extend(part_files)
+        else:
+            # Single file
+            main_file = markdown_dir / f"chapter_{chapter_idx}.md"
+            if main_file.exists():
+                files_to_update.append(main_file)
+        
+        # Update each file
+        for file_path in files_to_update:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                original_content = content
+                
+                # Apply each change
+                for subchapter_idx, change_info in chapter_changes:
+                    old_title = change_info["old_title"]
+                    new_title = change_info["new_title"]
+                    old_level = change_info["old_level"]
+                    new_level = change_info["new_level"]
+                    
+                    # Create the old and new heading markers
+                    old_marker = "#" * old_level
+                    new_marker = "#" * new_level
+                    
+                    # Find and replace the heading
+                    import re
+                    
+                    # Escape special regex characters in old title
+                    escaped_old_title = re.escape(old_title)
+                    
+                    # Pattern to match the heading line
+                    pattern = f"^{re.escape(old_marker)}\\s+{escaped_old_title}\\s*$"
+                    replacement = f"{new_marker} {new_title}"
+                    
+                    # Perform replacement
+                    new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+                    
+                    if new_content != content:
+                        if old_title != new_title:
+                            logger.debug(f"Updated title: '{old_title}' → '{new_title}' in {file_path.name}")
+                        if old_level != new_level:
+                            logger.debug(f"Updated level: {old_level} → {new_level} for '{new_title}' in {file_path.name}")
+                        content = new_content
+                
+                # Write back if changed
+                if content != original_content:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    logger.success(f"Updated headings in {file_path.name}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to update {file_path}: {e}")
+    
+    logger.success("Heading updates complete")
+
+
+def clean_invalid_headings_in_markdown(markdown_dir):
+    """
+    Remove empty or too-long (>50 chars) heading lines from markdown files.
+    
+    Args:
+        markdown_dir: Directory containing markdown files
+        
+    Returns:
+        Number of headings removed
+    """
+    total_removed = 0
+    
+    # Process all markdown files
+    for md_file in markdown_dir.glob("*.md"):
+        if not md_file.name.startswith(("chapter_", "front_matter", "back_matter")):
+            continue
+            
+        try:
+            with open(md_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            new_lines = []
+            removed_count = 0
+            
+            for line in lines:
+                should_keep = True
+                stripped = line.strip()
+                
+                # Check if it's a heading line
+                if stripped.startswith('#'):
+                    # Extract the heading level and text
+                    import re
+                    heading_match = re.match(r'^(#+)\s*(.*)', stripped)
+                    if heading_match:
+                        markers = heading_match.group(1)
+                        title = heading_match.group(2).strip()
+                        
+                        # Remove if empty or too long (for level 2+ headings)
+                        if len(markers) >= 2:  # ## or more
+                            if not title:
+                                logger.debug(f"Removing empty heading in {md_file.name}: {stripped}")
+                                should_keep = False
+                                removed_count += 1
+                            elif len(title) > 50:
+                                logger.debug(f"Removing too-long heading ({len(title)} chars) in {md_file.name}: {title[:50]}...")
+                                should_keep = False
+                                removed_count += 1
+                
+                if should_keep:
+                    new_lines.append(line)
+            
+            # Write back if any changes were made
+            if removed_count > 0:
+                with open(md_file, 'w', encoding='utf-8') as f:
+                    f.writelines(new_lines)
+                logger.info(f"Removed {removed_count} invalid headings from {md_file.name}")
+                total_removed += removed_count
+                
+        except Exception as e:
+            logger.error(f"Failed to clean headings in {md_file}: {e}")
+    
+    if total_removed > 0:
+        logger.success(f"Total invalid headings removed: {total_removed}")
+    
+    return total_removed
+
+
+def build_structure_from_markdown(markdown_dir, book_title):
+    """
+    Build book structure by extracting headings from markdown files.
+    
+    Args:
+        markdown_dir: Directory containing markdown files
+        book_title: Title of the book
+        
+    Returns:
+        Dictionary with book structure based on markdown headings
+    """
+    structure = {
+        "book_title": book_title,
+        "chapters": []
+    }
+    
+    # Find all chapter files (including part files)
+    chapter_files = {}
+    
+    # First collect all files by chapter number
+    for md_file in sorted(markdown_dir.glob("*.md")):
+        if md_file.name.startswith("chapter_"):
+            # Extract chapter number
+            match = re.match(r"chapter_(\d+)(?:\.part(\d+))?\.md", md_file.name)
+            if match:
+                chapter_num = int(match.group(1))
+                part_num = int(match.group(2)) if match.group(2) else None
+                
+                if chapter_num not in chapter_files:
+                    chapter_files[chapter_num] = {}
+                
+                if part_num is not None:
+                    chapter_files[chapter_num][part_num] = md_file
+                else:
+                    chapter_files[chapter_num]['main'] = md_file
+    
+    # Now process each chapter
+    for chapter_num in sorted(chapter_files.keys()):
+        files = chapter_files[chapter_num]
+        
+        # Determine which files to read
+        files_to_read = []
+        if 'main' in files and len(files) == 1:
+            # Single file chapter
+            files_to_read = [files['main']]
+        else:
+            # Multi-part chapter - read parts in order
+            for part_num in sorted([k for k in files.keys() if isinstance(k, int)]):
+                files_to_read.append(files[part_num])
+        
+        # Extract headings from files
+        chapter_title = f"Chapter {chapter_num}"
+        subchapters = []
+        
+        for file_path in files_to_read:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    
+                    # Extract headings using regex
+                    lines = content.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        
+                        # Check for level 1 heading
+                        if line.startswith('# ') and not line.startswith('## '):
+                            # Extract title without the # marker
+                            title = line[2:].strip()
+                            if title:  # Only update if not empty
+                                chapter_title = title
+                        
+                        # Check for level 2 heading
+                        elif line.startswith('## ') and not line.startswith('### '):
+                            # Extract subtitle without the ## marker
+                            subtitle = line[3:].strip()
+                            if subtitle and len(subtitle) <= 50:  # Ignore empty or too long
+                                subchapters.append({"title": subtitle})
+                                
+            except Exception as e:
+                logger.warning(f"Failed to read {file_path}: {e}")
+        
+        # Add chapter to structure
+        chapter_info = {
+            "title": chapter_title,
+            "index": chapter_num
+        }
+        
+        if subchapters:
+            chapter_info["subchapters"] = subchapters
+        
+        structure["chapters"].append(chapter_info)
+    
+    # Also check for front_matter and back_matter
+    if (markdown_dir / "front_matter.md").exists():
+        structure["front_matter"] = {"title": "Front Matter"}
+    
+    if (markdown_dir / "back_matter.md").exists():
+        structure["back_matter"] = {"title": "Back Matter"}
+    
+    logger.info(f"Built structure from markdown: {len(structure['chapters'])} chapters found")
+    return structure
+
+
+def get_chapter_html_filename(chapter_index, parts_info=None, chapters_with_parts=None):
+    """
+    Determine the HTML filename for a chapter based on whether it has parts.
+    
+    Args:
+        chapter_index: The chapter number (1-based)
+        parts_info: Dict with chapter keys and number of parts
+        chapters_with_parts: Set of chapter indices that have part files
+    
+    Returns:
+        The HTML filename for the chapter (links to part1 if multi-part)
+    """
+    chapter_key = str(chapter_index)
+    if chapters_with_parts and chapter_index in chapters_with_parts:
+        # This chapter has part files - link to first part
+        return f"chapter_{chapter_index}.part1.html"
+    elif parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
+        # Multi-part chapter according to progress info - link to first part
+        return f"chapter_{chapter_index}.part1.html"
+    else:
+        # Single file chapter
+        return f"chapter_{chapter_index}.html"
+
+
+def get_subchapter_html_file(chapter_index, subchapter_index, subchapter_locations, chapter_file):
+    """
+    Determine which HTML file contains a specific subchapter.
+    
+    Args:
+        chapter_index: The chapter number (1-based)
+        subchapter_index: The subchapter number (1-based)
+        subchapter_locations: Dict mapping (chapter_idx, subchapter_idx) to part number
+        chapter_file: Default chapter file if location not found
+    
+    Returns:
+        The HTML filename containing the subchapter
+    """
+    if subchapter_locations and (chapter_index, subchapter_index) in subchapter_locations:
+        part_num = subchapter_locations[(chapter_index, subchapter_index)]
+        if part_num is None:
+            # In main file (single file chapter)
+            return f"chapter_{chapter_index}.html"
+        else:
+            # In a specific part
+            return f"chapter_{chapter_index}.part{part_num}.html"
+    else:
+        # Default to chapter file
+        return chapter_file
+
+
+def create_xhtml_document(title, body_content, css_path="../stylesheet.css"):
+    """
+    Create a standard XHTML document wrapper.
+    
+    Args:
+        title: The document title
+        body_content: The HTML content for the body
+        css_path: Path to the CSS file (relative to the HTML file)
+    
+    Returns:
+        Complete XHTML document as string
+    """
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+    <title>{title}</title>
+    <link rel="stylesheet" type="text/css" href="{css_path}"/>
+</head>
+<body>
+    {body_content}
+</body>
+</html>"""
 
 
 def load_or_create_translated_book_structure(book_title, original_structure, config):
@@ -168,9 +639,6 @@ Book structure to translate:"""
         return original_structure
 
 
-def ensure_directory(directory_path):
-    """Ensure a directory exists, create it if it doesn't."""
-    Path(directory_path).mkdir(parents=True, exist_ok=True)
 
 
 def cleanup_old_files(epub_dir):
@@ -377,19 +845,8 @@ def convert_markdown_to_chapter_html(
                             break
 
         # Create full HTML document
-        html_doc = f"""<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
-<head>
-    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
-    <title>{chapter_title}</title>
-    <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
-</head>
-<body>
-    {html_content}
-</body>
-</html>"""
-
+        html_doc = create_xhtml_document(chapter_title, html_content)
+        
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(html_doc)
 
@@ -403,21 +860,12 @@ def convert_markdown_to_chapter_html(
 
 def create_cover_html(cover_image_filename, book_title, output_path):
     """Create the cover HTML page."""
-    cover_html = f"""<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
-<head>
-    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
-    <title>Cover</title>
-    <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
-</head>
-<body>
-    <div class="cover">
+    body_content = f"""<div class="cover">
         <img src="../images/{cover_image_filename}" alt="{book_title} Cover" />
-    </div>
-</body>
-</html>"""
-
+    </div>"""
+    
+    cover_html = create_xhtml_document("Cover", body_content)
+    
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(cover_html)
 
@@ -712,7 +1160,7 @@ def create_toc_ncx(
     <meta name="dtb:maxPageNumber" content="0"/>
   </head>
   <docTitle>
-    <text>{book_title}</text>
+    <text>{html.escape(book_title)}</text>
   </docTitle>
   <navMap>
     <navPoint id="navpoint-toc" playOrder="1">
@@ -725,22 +1173,13 @@ def create_toc_ncx(
     play_order = 2
     for i, chapter in enumerate(structure["chapters"], 1):
         chapter_title = chapter["title"]
-        # Check if this chapter has parts
-        chapter_key = str(i)
-        if chapters_with_parts and i in chapters_with_parts:
-            # This chapter has part files - link to first part
-            chapter_file = f"chapter_{i}.part1.html"
-        elif parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
-            # Multi-part chapter according to progress info - link to first part
-            chapter_file = f"chapter_{i}.part1.html"
-        else:
-            # Single file chapter
-            chapter_file = f"chapter_{i}.html"
+        # Get the appropriate chapter file
+        chapter_file = get_chapter_html_filename(i, parts_info, chapters_with_parts)
 
         ncx_content += f"""
     <navPoint id="navpoint-{i}" playOrder="{play_order}">
       <navLabel>
-        <text>{chapter_title}</text>
+        <text>{html.escape(chapter_title)}</text>
       </navLabel>
       <content src="text/{chapter_file}"/>"""
 
@@ -751,22 +1190,12 @@ def create_toc_ncx(
                 sub_title = subchapter["title"]
 
                 # Determine which part contains this subchapter
-                if subchapter_locations and (i, j) in subchapter_locations:
-                    part_num = subchapter_locations[(i, j)]
-                    if part_num is None:
-                        # In main file (single file chapter)
-                        sub_chapter_file = f"chapter_{i}.html"
-                    else:
-                        # In a specific part
-                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
-                else:
-                    # Default to chapter file (which is already set correctly above)
-                    sub_chapter_file = chapter_file
+                sub_chapter_file = get_subchapter_html_file(i, j, subchapter_locations, chapter_file)
 
                 ncx_content += f"""
       <navPoint id="navpoint-{i}-{j}" playOrder="{play_order}">
         <navLabel>
-          <text>{sub_title}</text>
+          <text>{html.escape(sub_title)}</text>
         </navLabel>
         <content src="text/{sub_chapter_file}#{i}-{j}"/>
       </navPoint>"""
@@ -895,21 +1324,12 @@ def create_toc_html(
 
     for i, chapter in enumerate(structure["chapters"], 1):
         chapter_title = chapter["title"]
-        # Check if this chapter has parts
-        chapter_key = str(i)
-        if chapters_with_parts and i in chapters_with_parts:
-            # This chapter has part files - link to first part
-            chapter_file = f"chapter_{i}.part1.html"
-        elif parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
-            # Multi-part chapter according to progress info - link to first part
-            chapter_file = f"chapter_{i}.part1.html"
-        else:
-            # Single file chapter
-            chapter_file = f"chapter_{i}.html"
+        # Get the appropriate chapter file
+        chapter_file = get_chapter_html_filename(i, parts_info, chapters_with_parts)
 
         toc_html += f"""
             <li>
-                <a href="{chapter_file}">{chapter_title}</a>"""
+                <a href="{chapter_file}">{html.escape(chapter_title)}</a>"""
 
         # Add subchapters if they exist
         if "subchapters" in chapter and chapter["subchapters"]:
@@ -918,20 +1338,10 @@ def create_toc_html(
             for j, subchapter in enumerate(chapter["subchapters"], 1):
                 sub_title = subchapter["title"]
                 # Determine which part contains this subchapter
-                if subchapter_locations and (i, j) in subchapter_locations:
-                    part_num = subchapter_locations[(i, j)]
-                    if part_num is None:
-                        # In main file (single file chapter)
-                        sub_chapter_file = f"chapter_{i}.html"
-                    else:
-                        # In a specific part
-                        sub_chapter_file = f"chapter_{i}.part{part_num}.html"
-                else:
-                    # Default to chapter file (which is already set correctly above)
-                    sub_chapter_file = chapter_file
+                sub_chapter_file = get_subchapter_html_file(i, j, subchapter_locations, chapter_file)
 
                 toc_html += f"""
-                    <li><a href="{sub_chapter_file}#{i}-{j}">{sub_title}</a></li>"""
+                    <li><a href="{sub_chapter_file}#{i}-{j}">{html.escape(sub_title)}</a></li>"""
             toc_html += """
                 </ul>"""
 
@@ -1000,8 +1410,8 @@ def create_content_opf(
     opf_content = f"""<?xml version="1.0" encoding="utf-8"?>
 <package version="2.0" unique-identifier="BookId" xmlns="http://www.idpf.org/2007/opf">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
-    <dc:title>{book_title}</dc:title>
-    <dc:creator opf:role="aut">{author}</dc:creator>
+    <dc:title>{html.escape(book_title)}</dc:title>
+    <dc:creator opf:role="aut">{html.escape(author)}</dc:creator>
     <dc:language>en</dc:language>
     <dc:identifier id="BookId" opf:scheme="UUID">{book_uuid}</dc:identifier>
     <dc:date>{current_date}</dc:date>
@@ -1136,6 +1546,16 @@ def main():
         action="store_true",
         help="Use translated markdown instead of polished",
     )
+    parser.add_argument(
+        "--zip",
+        action="store_true",
+        help="Create password-protected ZIP file after EPUB generation",
+    )
+    parser.add_argument(
+        "--relevel",
+        action="store_true",
+        help="Use LLM to analyze and re-level the book structure (adjust heading hierarchy)",
+    )
 
     args = parser.parse_args()
 
@@ -1148,18 +1568,7 @@ def main():
         logger.error("Book title not found in config.yaml")
         return
 
-    # Load book structure
-    structure = load_book_structure(book_title)
-    if not structure:
-        logger.warning(f"Book structure not found for {book_title}, creating minimal structure")
-        # Create minimal structure with just the book title
-        structure = {
-            "book_title": book_title
-        }
-
-    # Determine which markdown directory to use and get display title
-    display_title = book_title  # Default to original title
-
+    # Determine which markdown directory to use first
     if args.translated:
         markdown_dir = Path("output") / book_title / "translated"
         if not markdown_dir.exists():
@@ -1167,27 +1576,6 @@ def main():
             logger.info("Please run translate command first")
             return
         logger.info(f"Using translated markdown from: {markdown_dir}")
-
-        # Load or create translated book structure
-        structure = load_or_create_translated_book_structure(
-            book_title, structure, config
-        )
-
-        # Use translated title if available
-        if "book_title" in structure:
-            display_title = structure["book_title"]
-            logger.info(f"Using translated title: {display_title}")
-            # Use translated title for output filename (sanitize for filesystem)
-            safe_title = "".join(c for c in display_title if c not in '<>:"/\\|?*')
-            output_filename = f"{safe_title}.epub"
-        else:
-            # Fallback to original title with _translated suffix
-            logger.warning(f"No translated title found, using original title with suffix")
-            safe_title = "".join(c for c in book_title if c not in '<>:"/\\|?*')
-            output_filename = f"{safe_title}_translated.epub"
-
-        # Setup paths for translated EPUB
-        epub_dir = Path("output") / book_title / "epub_translated"
     else:
         markdown_dir = Path("output") / book_title / "polished_markdown"
         if not markdown_dir.exists():
@@ -1196,17 +1584,98 @@ def main():
             return
         logger.info(f"Using polished markdown from: {markdown_dir}")
 
-        # Use original title from structure if available
-        if "book_title" in structure:
-            display_title = structure["book_title"]
-            # Use book title for output filename (sanitize for filesystem)
-            safe_title = "".join(c for c in display_title if c not in '<>:"/\\|?*')
-            output_filename = f"{safe_title}.epub"
+    # Clean invalid headings from markdown files first
+    logger.info("Cleaning invalid headings from markdown files...")
+    removed_count = clean_invalid_headings_in_markdown(markdown_dir)
+    if removed_count > 0:
+        logger.info(f"Cleaned {removed_count} invalid headings from markdown files")
+    
+    # Always build book structure from markdown headings to ensure links match content
+    logger.info("Building TOC from markdown headings...")
+    structure = build_structure_from_markdown(markdown_dir, book_title)
+
+    # Re-level the structure if requested
+    if args.relevel:
+        # Load appropriate reference structure based on whether we're working with translated content
+        if args.translated:
+            # For translated content, try to load translated structure first
+            logger.info("Loading translated book structure for reference...")
+            translated_structure_path = Path("output") / book_title / "book_structure_translated.json"
+            
+            if translated_structure_path.exists():
+                with open(translated_structure_path, "r", encoding="utf-8") as f:
+                    reference_structure = json.load(f)
+                logger.info("Using translated book structure as reference")
+            else:
+                # Fall back to original structure
+                logger.info("Translated structure not found, loading original OCR book structure...")
+                reference_structure = load_book_structure(book_title)
+                if reference_structure:
+                    logger.warning("Using original (untranslated) structure as reference for translated content")
         else:
-            # This shouldn't happen since we ensure structure always has book_title
-            logger.warning(f"No book_title in structure, using config title")
-            safe_title = "".join(c for c in book_title if c not in '<>:"/\\|?*')
-            output_filename = f"{safe_title}.epub"
+            # For original content, use original structure
+            logger.info("Loading original OCR book structure for reference...")
+            reference_structure = load_book_structure(book_title)
+        
+        if not reference_structure:
+            logger.warning("Reference book structure not found. Re-leveling will proceed without reference.")
+            logger.info("Consider running 'pdf2epub breakdown' first to generate the original structure.")
+        
+        logger.info("Re-leveling book structure using LLM...")
+        changes = relevel_book_structure(structure, reference_structure, config)
+        
+        if changes:
+            # Update the markdown files with new heading levels and titles
+            update_markdown_heading_levels(markdown_dir, changes)
+            
+            # Rebuild the structure after updating markdown
+            logger.info("Rebuilding TOC after re-leveling...")
+            structure = build_structure_from_markdown(markdown_dir, book_title)
+            logger.success("Book structure re-leveling complete")
+        else:
+            logger.info("No heading changes needed")
+
+    # For translated version, determine the display title
+    if args.translated:
+        # For translated content, we have two scenarios:
+        # 1. No relevel: translate the OCR structure for book title only
+        # 2. With relevel: use the markdown structure directly (already releveled)
+        
+        if not args.relevel:
+            # Only load translated structure for the book title when not releveling
+            # The chapter structure comes from markdown, but we want translated book title
+            translated_structure_path = Path("output") / book_title / "book_structure_translated.json"
+            
+            if translated_structure_path.exists():
+                logger.info("Loading translated book title from translated structure...")
+                with open(translated_structure_path, "r", encoding="utf-8") as f:
+                    translated_structure = json.load(f)
+                    display_title = translated_structure.get("book_title", book_title)
+            else:
+                # Create translated structure just for the book title
+                logger.info("Creating translated book structure for title...")
+                translated_structure = load_or_create_translated_book_structure(
+                    book_title, {"book_title": book_title}, config
+                )
+                display_title = translated_structure.get("book_title", book_title)
+        else:
+            # When releveling, we're using the markdown structure which should already have proper titles
+            # Just use the book title from config or structure
+            display_title = structure.get("book_title", book_title)
+        
+        logger.info(f"Using translated title: {display_title}")
+        # Use translated title for output filename (sanitize for filesystem)
+        safe_title = sanitize_filename(display_title)
+        output_filename = f"{safe_title}.epub"
+
+        # Setup paths for translated EPUB
+        epub_dir = Path("output") / book_title / "epub_translated"
+    else:
+        # Use original title from structure if available
+        display_title = structure.get("book_title", book_title)
+        # Use book title for output filename (sanitize for filesystem)
+        safe_title = sanitize_filename(display_title)
+        output_filename = f"{safe_title}.epub"
 
         # Setup paths for original EPUB
         epub_dir = Path("output") / book_title / "epub"
@@ -1581,15 +2050,16 @@ def main():
     logger.success(f"EPUB generation complete!")
     logger.info(f"Output: {epub_path}")
 
-    # Create password-protected ZIP file
-    logger.info("Creating password-protected ZIP file...")
-    zip_path, password = create_password_protected_zip(epub_path)
+    # Create password-protected ZIP file if requested
+    if args.zip:
+        logger.info("Creating password-protected ZIP file...")
+        zip_path, password = create_password_protected_zip(epub_path)
 
-    if zip_path:
-        logger.success(f"Password-protected ZIP created: {zip_path}")
-        logger.info(f"The password is embedded in the filename: 【密码：{password}】")
-    else:
-        logger.warning("Failed to create password-protected ZIP file")
+        if zip_path:
+            logger.success(f"Password-protected ZIP created: {zip_path}")
+            logger.info(f"The password is embedded in the filename: 【密码：{password}】")
+        else:
+            logger.warning("Failed to create password-protected ZIP file")
 
 
 if __name__ == "__main__":

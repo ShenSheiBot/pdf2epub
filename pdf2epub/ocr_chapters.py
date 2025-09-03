@@ -12,25 +12,11 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 from loguru import logger
 from utils.logging_config import configure_logging
+from utils.common import load_config, load_book_structure
 from pdf_compressor import compress_pdf
 
 # Configure logger
 logger = configure_logging()
-
-
-def load_config(config_path="config.yaml"):
-    """Load configuration from config file."""
-    with open(config_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    return config
-
-
-def load_book_structure(book_title):
-    """Load the book structure JSON file."""
-    structure_path = Path("output") / Path(book_title) / "book_structure.json"
-    with open(structure_path, "r", encoding="utf-8") as file:
-        structure = json.load(file)
-    return structure
 
 
 def extract_pdf_pages(pdf_path: Path, start_page: int, end_page: int) -> bytes:

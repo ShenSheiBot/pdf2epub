@@ -12,17 +12,11 @@ import sys
 from pathlib import Path
 from loguru import logger
 from pdf2epub.utils.logging_config import configure_logging
+from pdf2epub.utils.common import load_config
 from pdf2epub.processors import PolishProcessor, TranslateProcessor
 
 # Configure logger
 logger = configure_logging()
-
-
-def load_config(config_path="config.yaml"):
-    """Load configuration from config file."""
-    with open(config_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    return config
 
 
 def polish_command(args):
@@ -251,6 +245,10 @@ def epub_command(args):
             new_argv.extend(['-i', args.input])
         if args.translated:
             new_argv.append('--translated')
+        if args.zip:
+            new_argv.append('--zip')
+        if args.relevel:
+            new_argv.append('--relevel')
         
         sys.argv = new_argv
         
@@ -526,6 +524,16 @@ Examples:
         "--translated",
         action="store_true",
         help="Generate EPUB from translated markdown instead of polished"
+    )
+    epub_parser.add_argument(
+        "--zip",
+        action="store_true",
+        help="Create password-protected ZIP file after EPUB generation"
+    )
+    epub_parser.add_argument(
+        "--relevel",
+        action="store_true",
+        help="Use LLM to analyze and re-level the book structure (adjust heading hierarchy)"
     )
     epub_parser.set_defaults(func=epub_command)
     

@@ -77,254 +77,35 @@ class EpubBuilder:
             True if successful
         """
         try:
-            stylesheet = """/* Enhanced EPUB Stylesheet */
+            # Load stylesheet from resources directory
+            resources_dir = Path(__file__).parent / "resources"
+            stylesheet_path = resources_dir / "stylesheet.css"
+            
+            if stylesheet_path.exists():
+                # Use the elegant stylesheet from resources
+                with open(stylesheet_path, "r", encoding="utf-8") as f:
+                    stylesheet = f.read()
+                logger.info(f"Loaded stylesheet from {stylesheet_path}")
+            else:
+                # Fallback to a minimal default stylesheet if file not found
+                logger.warning(f"Stylesheet not found at {stylesheet_path}, using default")
+                stylesheet = """/* Default EPUB Stylesheet */
 @namespace h "http://www.w3.org/1999/xhtml";
 
 body {
-    font-family: "Hiragino Mincho ProN", "MS Mincho", serif;
-    line-height: 1.8;
-    max-width: 800px;
-    margin: 2em auto;
-    padding: 0 1em;
-    background-color: #fdfdfd;
-    text-align: justify;
-}
-
-h1 {
-    text-align: center;
-    margin-top: 1em;
-    margin-bottom: 2em;
-    font-weight: bold;
-    font-size: 2em;
-    border-bottom: 2px solid #ccc;
-    padding-bottom: 0.5em;
-    page-break-before: always;
-}
-
-h2 {
-    font-size: 1.5em;
-    font-weight: bold;
-    margin-top: 2.5em;
-    margin-bottom: 1em;
-    border-bottom: 1px solid #ddd;
-    padding-bottom: 0.3em;
-}
-
-h3 {
-    font-size: 1.2em;
-    font-weight: bold;
-    margin-top: 2em;
-    margin-bottom: 0.8em;
-}
-
-h4 {
-    font-size: 1.1em;
-    font-weight: bold;
-    margin-top: 1.5em;
-    margin-bottom: 0.6em;
-}
-
-p {
-    margin-bottom: 1.2em;
-    text-indent: 1em;
-    text-align: justify;
-}
-
-/* No indent after headings or block elements */
-h1 + p,
-h2 + p,
-h3 + p,
-h4 + p,
-blockquote + p,
-ul + p,
-ol + p,
-pre + p {
-    text-indent: 0;
-}
-
-blockquote {
-    margin: 1.5em 2em;
-    padding-left: 1em;
-    border-left: 3px solid #ddd;
-    font-style: italic;
-}
-
-code {
-    font-family: "Courier New", monospace;
-    font-size: 0.9em;
-    background-color: #f4f4f4;
-    padding: 0.2em 0.4em;
-    border-radius: 3px;
-}
-
-pre {
-    font-family: "Courier New", monospace;
-    font-size: 0.9em;
-    background-color: #f4f4f4;
-    padding: 1em;
-    border-radius: 5px;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    margin: 1em 0;
-}
-
-pre code {
-    background-color: transparent;
-    padding: 0;
-}
-
-ul, ol {
-    margin: 1em 0;
-    padding-left: 2em;
-}
-
-li {
-    margin: 0.5em 0;
-}
-
-/* Links */
-a {
-    text-decoration: none;
-}
-
-a:hover {
-    text-decoration: underline;
-}
-
-/* Tables */
-table {
-    border-collapse: collapse;
-    width: 100%;
-    margin: 1.5em 0;
-}
-
-th, td {
-    border: 1px solid #ddd;
-    padding: 0.5em;
-    text-align: left;
-}
-
-th {
-    background-color: #f4f4f4;
-    font-weight: bold;
-}
-
-/* Images */
-img {
-    max-width: 100%;
-    height: auto;
-    display: block;
-    margin: 1.5em auto;
-}
-
-/* Superscript and subscript */
-sup, sub {
-    font-size: 0.8em;
-    line-height: 0;
-}
-
-sup {
-    vertical-align: super;
-}
-
-sub {
-    vertical-align: sub;
-}
-
-/* Horizontal rules */
-hr {
-    border: none;
-    border-top: 1px solid #ccc;
-    margin: 2em 0;
-}
-
-.cover {
-    text-align: center;
-    page-break-after: always;
-}
-
-.cover img {
-    max-width: 100%;
-    height: auto;
-}
-
-.toc {
-    page-break-after: always;
-}
-
-.toc ul {
-    list-style-type: none;
-    padding-left: 0;
-}
-
-.toc li {
-    margin: 0.5em 0;
-}
-
-.toc a {
-    text-decoration: none;
-}
-
-/* Footnote references in text */
-sup {
-    font-size: 0.8em;
-    vertical-align: super;
-}
-
-sup a, .footnote-ref {
-    text-decoration: none;
-}
-
-sup a:hover, .footnote-ref:hover {
-    text-decoration: underline;
-}
-
-/* Footnote section at end of chapter */
-.footnote, .footnotes {
-    margin-top: 2em;
-    padding-top: 0.5em;
-    border-top: none;  /* Remove top border since Notes h2 already has bottom border */
-    font-size: 0.9em;
-}
-
-/* Keep the Notes h2 border for visual separation */
-.footnote h2, .footnotes h2 {
-    font-size: 1.2em;
-    border-bottom: 1px solid #ddd;  /* Use same style as regular h2 */
-    padding-bottom: 0.3em;
-    margin-top: 0;
-    margin-bottom: 0.8em;
-}
-
-/* Hide the hr element in footnote sections */
-.footnote hr, .footnotes hr {
-    display: none;
-}
-
-.footnote ol, .footnotes ol {
-    padding-left: 1.5em;
-    list-style-type: decimal;
-    margin-top: 0;
-}
-
-.footnote li, .footnotes li, .footnote-item {
-    margin-bottom: 0.8em;
+    font-family: Georgia, serif;
     line-height: 1.6;
+    margin: 1em;
 }
 
-.footnote-item p {
-    text-indent: 0;
-    margin-bottom: 0.5em;
-}
-
-.footnote-backref, .footnote-item a[href^="#fnref"] {
-    text-decoration: none;
-    margin-left: 0.3em;
-}
-
-.footnote-backref:hover, .footnote-item a[href^="#fnref"]:hover {
-    text-decoration: underline;
-}"""
+h1 { font-size: 2em; margin: 1em 0; page-break-before: always; }
+h2 { font-size: 1.5em; margin: 0.8em 0; }
+h3 { font-size: 1.2em; margin: 0.6em 0; }
+p { margin: 0.8em 0; }
+a { text-decoration: none; }
+.toc { page-break-after: always; }
+.cover { text-align: center; page-break-after: always; }
+"""
             
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(stylesheet)
@@ -472,13 +253,14 @@ sup a:hover, .footnote-ref:hover {
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
 </head>
 <body>
-    <h1>Table of Contents</h1>
-    <ul class="toc">
+    <div class="toc">
+        <h1>Table of Contents</h1>
+        <ul>
 """
             
             # Add front matter if exists
             if structure.get("front_matter"):
-                toc_html += """        <li><a href="front_matter.html">Front Matter</a></li>
+                toc_html += """            <li><a href="front_matter.html">Front Matter</a></li>
 """
             
             # Add chapters
@@ -495,13 +277,13 @@ sup a:hover, .footnote-ref:hover {
                 
                 chapter_title = chapter.get("title", f"Chapter {i}")
                 
-                toc_html += f"""        <li>
-            <a href="{chapter_file}">{html.escape(chapter_title)}</a>
+                toc_html += f"""            <li>
+                <a href="{chapter_file}">{html.escape(chapter_title)}</a>
 """
                 
                 # Add subchapters if they exist
                 if "subchapters" in chapter and chapter["subchapters"]:
-                    toc_html += """            <ul>
+                    toc_html += """                <ul>
 """
                     for j, subchapter in enumerate(chapter["subchapters"], 1):
                         sub_title = subchapter.get("title", f"Section {j}")
@@ -515,20 +297,21 @@ sup a:hover, .footnote-ref:hover {
                         else:
                             subchapter_file = chapter_file
                         
-                        toc_html += f"""                <li><a href="{subchapter_file}#{anchor}">{html.escape(sub_title)}</a></li>
+                        toc_html += f"""                    <li><a href="{subchapter_file}#{anchor}">{html.escape(sub_title)}</a></li>
 """
-                    toc_html += """            </ul>
+                    toc_html += """                </ul>
 """
                 
-                toc_html += """        </li>
+                toc_html += """            </li>
 """
             
             # Add back matter if exists
             if structure.get("back_matter"):
-                toc_html += """        <li><a href="back_matter.html">Back Matter</a></li>
+                toc_html += """            <li><a href="back_matter.html">Back Matter</a></li>
 """
             
-            toc_html += """    </ul>
+            toc_html += """        </ul>
+    </div>
 </body>
 </html>"""
             

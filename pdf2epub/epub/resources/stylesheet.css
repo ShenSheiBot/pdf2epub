@@ -1,0 +1,617 @@
+/* Elegant EPUB Stylesheet - Theme Adaptive */
+@namespace h "http://www.w3.org/1999/xhtml";
+
+/* =================================
+   Base Typography 
+   ================================= */
+body {
+    font-family: "Hiragino Mincho ProN", "Noto Serif", "Crimson Text", "Georgia", serif;
+    font-size: 1em;
+    line-height: 1.75;
+    max-width: 42em;
+    margin: 0 auto;
+    padding: 2em 1.5em;
+    text-align: justify;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    hyphens: auto;
+}
+
+/* =================================
+   Elegant Headings with Decorative Elements
+   ================================= */
+h1 {
+    font-size: 2.5em;
+    font-weight: 300;
+    letter-spacing: -0.02em;
+    text-align: center;
+    margin: 2em 0 1.5em 0;
+    padding: 0.5em 0;
+    page-break-before: always;
+    page-break-after: avoid;
+    position: relative;
+}
+
+
+h2 {
+    font-size: 1.75em;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    margin: 3em 0 1.2em 0;
+    padding-bottom: 0.2em;
+    position: relative;
+    page-break-after: avoid;
+}
+
+/* Subtle decorative line under h2 */
+h2::after {
+    content: "";
+    display: block;
+    width: 3em;
+    height: 2px;
+    background: currentColor;
+    margin-top: 0.5em;
+}
+
+h3 {
+    font-size: 1.3em;
+    font-weight: 500;
+    font-style: italic;
+    margin: 2.5em 0 1em 0;
+    letter-spacing: 0.02em;
+    page-break-after: avoid;
+}
+
+h4 {
+    font-size: 1.1em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 2em 0 0.8em 0;
+    page-break-after: avoid;
+}
+
+h5 {
+    font-size: 1.05em;
+    font-weight: 600;
+    margin: 1.8em 0 0.7em 0;
+    page-break-after: avoid;
+}
+
+h6 {
+    font-size: 1em;
+    font-weight: 600;
+    font-style: italic;
+    margin: 1.5em 0 0.6em 0;
+    page-break-after: avoid;
+}
+
+/* Special styling for nested subsection levels */
+.subsection-level-1 {
+    font-size: 1.4em;
+    font-weight: 500;
+    margin: 2.5em 0 1em 0;
+}
+
+.subsection-level-2 {
+    font-size: 1.25em;
+    font-weight: 500;
+    margin: 2em 0 0.8em 0;
+    padding-left: 1.5em;
+}
+
+.subsection-level-3 {
+    font-size: 1.15em;
+    font-weight: 500;
+    margin: 1.8em 0 0.7em 0;
+    padding-left: 3em;
+}
+
+.subsection-level-4 {
+    font-size: 1.05em;
+    font-weight: 400;
+    margin: 1.5em 0 0.6em 0;
+    padding-left: 4.5em;
+    font-style: italic;
+}
+
+.subsection-level-5 {
+    font-size: 1em;
+    font-weight: 400;
+    margin: 1.2em 0 0.5em 0;
+    padding-left: 6em;
+    font-style: italic;
+}
+
+/* =================================
+   Sophisticated Paragraphs
+   ================================= */
+p {
+    margin: 0 0 1.3em 0;
+    text-indent: 1.5em;
+    orphans: 2;
+    widows: 2;
+}
+
+/* No indent for first paragraphs */
+h1 + p,
+h2 + p,
+h3 + p,
+h4 + p,
+blockquote + p,
+ul + p,
+ol + p,
+pre + p,
+hr + p {
+    text-indent: 0;
+}
+
+/* =================================
+   Elegant Links
+   ================================= */
+a {
+    color: inherit;  /* Inherit color from reader theme */
+    text-decoration: none;
+    position: relative;
+    transition: all 0.3s ease;
+}
+
+a:link, a:visited {
+    color: inherit;  /* Override browser defaults */
+}
+
+/* Subtle underline animation on hover */
+a::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: currentColor;
+    transform: scaleX(0);
+    transition: transform 0.3s ease;
+}
+
+a:hover {
+    opacity: 0.8;  /* Subtle hover effect */
+}
+
+a:hover::after {
+    transform: scaleX(1);
+}
+
+/* =================================
+   Beautiful Blockquotes
+   ================================= */
+blockquote {
+    position: relative;
+    margin: 2em 1em 2em 3em;
+    padding: 0;
+    font-style: italic;
+    font-size: 1.05em;
+    line-height: 1.8;
+}
+
+/* Large decorative quote mark */
+blockquote::before {
+    content: """;
+    position: absolute;
+    left: -0.6em;
+    top: -0.2em;
+    font-size: 4em;
+    font-family: "Georgia", serif;
+    line-height: 1;
+}
+
+/* Attribution styling */
+blockquote footer,
+blockquote cite {
+    display: block;
+    text-align: right;
+    font-style: normal;
+    font-size: 0.9em;
+    margin-top: 1em;
+}
+
+blockquote footer::before,
+blockquote cite::before {
+    content: "— ";
+}
+
+/* =================================
+   Refined Lists
+   ================================= */
+ul, ol {
+    margin: 1.5em 0;
+    padding-left: 2.5em;
+}
+
+ul {
+    list-style-type: none;
+    position: relative;
+}
+
+/* Custom bullet points */
+ul li::before {
+    content: "▸";
+    position: absolute;
+    left: -1.5em;
+    font-weight: bold;
+}
+
+ol {
+    counter-reset: item;
+    list-style: none;
+}
+
+ol li {
+    counter-increment: item;
+    position: relative;
+}
+
+ol li::before {
+    content: counter(item, decimal-leading-zero) ".";
+    position: absolute;
+    left: -2em;
+    font-weight: 600;
+    font-size: 0.9em;
+}
+
+li {
+    margin: 0.5em 0;
+    line-height: 1.7;
+}
+
+/* =================================
+   Artistic Horizontal Rules
+   ================================= */
+hr {
+    border: none;
+    text-align: center;
+    margin: 3em 0;
+    page-break-after: avoid;
+}
+
+hr::before {
+    content: "⁂";
+    font-size: 1.5em;
+    letter-spacing: 0.5em;
+}
+
+/* Alternative ornaments - you can use these classes */
+hr.asterism::before { content: "⁂"; }
+hr.fleuron::before { content: "❦"; }
+hr.dots::before { content: "• • •"; }
+
+/* =================================
+   Elegant Table of Contents
+   ================================= */
+.toc {
+    page-break-after: always;
+    margin: 0;
+    padding: 2em 0;
+}
+
+.toc h1 {
+    font-size: 2em;
+    font-weight: 300;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 3em;
+}
+
+.toc h1::after {
+    content: none; /* Remove ornament from TOC title */
+}
+
+.toc ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.toc > ul > li {
+    margin: 2em 0;
+    font-size: 1.15em;
+    position: relative;
+}
+
+/* Chapter numbers as decorative elements */
+.toc .chapter-number {
+    display: inline-block;
+    width: 3em;
+    font-weight: 300;
+    font-size: 0.9em;
+}
+
+/* Dotted leader lines for main chapters */
+.toc > ul > li > a {
+    display: flex;
+    text-decoration: none;
+    align-items: baseline;
+}
+
+.toc > ul > li > a::after {
+    content: "";
+    flex: 1;
+    border-bottom: 1px dotted;
+    margin: 0 0.5em;
+    min-width: 2em;
+}
+
+/* Page numbers (if you add them later) */
+.toc .page-num {
+    font-weight: 300;
+    font-size: 0.9em;
+}
+
+/* Subchapter styling - Level 1 */
+.toc ul ul {
+    margin: 0.5em 0 0 2.5em;
+    font-size: 0.95em;
+}
+
+.toc ul ul li {
+    margin: 0.7em 0;
+    font-weight: 400;
+}
+
+.toc ul ul a {
+    text-decoration: none;
+    display: block;
+    padding-left: 0;
+    transition: padding-left 0.2s ease;
+}
+
+.toc ul ul a:hover {
+    padding-left: 0.5em;
+}
+
+/* Subchapter styling - Level 2 */
+.toc ul ul ul {
+    margin: 0.3em 0 0 2em;
+    font-size: 0.92em;
+}
+
+.toc ul ul ul li {
+    margin: 0.5em 0;
+    font-weight: 300;
+}
+
+/* Subchapter styling - Level 3 */
+.toc ul ul ul ul {
+    margin: 0.3em 0 0 1.8em;
+    font-size: 0.88em;
+    font-style: italic;
+}
+
+.toc ul ul ul ul li {
+    margin: 0.4em 0;
+}
+
+/* Subchapter styling - Level 4 and beyond */
+.toc ul ul ul ul ul {
+    margin: 0.2em 0 0 1.5em;
+    font-size: 0.85em;
+}
+
+.toc ul ul ul ul ul li {
+    margin: 0.3em 0;
+}
+
+/* Visual indicators for nested levels */
+.toc ul ul > li::before {
+    content: "▸ ";
+    font-weight: bold;
+}
+
+.toc ul ul ul > li::before {
+    content: "▹ ";
+    font-weight: normal;
+}
+
+.toc ul ul ul ul > li::before {
+    content: "• ";
+    font-size: 0.8em;
+}
+
+.toc ul ul ul ul ul > li::before {
+    content: "◦ ";
+    font-size: 0.7em;
+}
+
+/* =================================
+   Beautiful Code Blocks
+   ================================= */
+code {
+    font-family: "Fira Code", "Consolas", "Monaco", monospace;
+    font-size: 0.85em;
+    padding: 0.15em 0.3em;
+    border-radius: 0.2em;
+}
+
+pre {
+    font-family: "Fira Code", "Consolas", "Monaco", monospace;
+    font-size: 0.85em;
+    line-height: 1.45;
+    padding: 1.5em;
+    margin: 2em -1em;
+    overflow-x: auto;
+    white-space: pre;
+    position: relative;
+}
+
+/* Code block decoration */
+pre::before {
+    content: "< / >";
+    position: absolute;
+    top: 0.5em;
+    right: 1em;
+    font-size: 0.7em;
+    font-weight: bold;
+}
+
+pre code {
+    padding: 0;
+    border-radius: 0;
+}
+
+/* =================================
+   Refined Tables
+   ================================= */
+table {
+    width: 100%;
+    margin: 2em 0;
+    border-spacing: 0;
+    border-collapse: separate;
+}
+
+thead {
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 0.9em;
+    letter-spacing: 0.05em;
+}
+
+th {
+    padding: 1em;
+    text-align: left;
+    border-bottom: 2px solid;
+}
+
+td {
+    padding: 0.8em 1em;
+    border-bottom: 1px solid;
+}
+
+tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* =================================
+   Elegant Images
+   ================================= */
+img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 2em auto;
+}
+
+/* Image captions */
+figure {
+    margin: 2em 0;
+    text-align: center;
+}
+
+figcaption {
+    font-size: 0.9em;
+    font-style: italic;
+    margin-top: 0.5em;
+    line-height: 1.5;
+}
+
+/* =================================
+   Cover Page
+   ================================= */
+.cover {
+    text-align: center;
+    page-break-after: always;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+}
+
+/* =================================
+   Refined Footnotes
+   ================================= */
+sup {
+    font-size: 0.75em;
+    vertical-align: super;
+    line-height: 0;
+    font-weight: 600;
+}
+
+sup a {
+    text-decoration: none;
+}
+
+.footnote, .footnotes {
+    margin-top: 4em;
+    padding-top: 2em;
+    font-size: 0.9em;
+    line-height: 1.6;
+    position: relative;
+}
+
+/* Decorative separator before footnotes */
+.footnote::before, 
+.footnotes::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 25%;
+    height: 1px;
+    background: currentColor;
+}
+
+.footnote h2, 
+.footnotes h2 {
+    font-size: 1em;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 600;
+    margin-bottom: 1.5em;
+}
+
+.footnote ol, 
+.footnotes ol {
+    padding-left: 2em;
+    counter-reset: footnote;
+    list-style: none;
+}
+
+.footnote li, 
+.footnotes li {
+    counter-increment: footnote;
+    margin-bottom: 1em;
+    position: relative;
+}
+
+.footnote li::before,
+.footnotes li::before {
+    content: counter(footnote) ".";
+    position: absolute;
+    left: -1.5em;
+    font-weight: 600;
+    font-size: 0.9em;
+}
+
+/* =================================
+   Special Typography Classes
+   ================================= */
+.small-caps {
+    font-variant: small-caps;
+    letter-spacing: 0.05em;
+}
+
+.lead {
+    font-size: 1.2em;
+    line-height: 1.6;
+    font-weight: 300;
+}
+
+.verse {
+    font-style: italic;
+    text-align: left;
+    margin: 2em 3em;
+    line-height: 1.8;
+}
+
+.centered {
+    text-align: center;
+    text-indent: 0;
+}

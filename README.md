@@ -55,7 +55,7 @@
 
 ### 依赖要求
 - Python 3.11+
-- Poetry (包管理器)
+- UV (包管理器)
 - 至少一个OCR后端的API账户
 
 ### 安装步骤
@@ -66,14 +66,14 @@ git clone https://github.com/yourusername/pdf2epub.git
 cd pdf2epub
 ```
 
-2. 安装 Poetry（如果未安装）
+2. 安装 UV（如果未安装）
 ```bash
-curl -sSL https://install.python-poetry.org | python3 -
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 3. 安装项目依赖
 ```bash
-poetry install
+uv sync
 ```
 
 4. 配置 API 密钥
@@ -176,7 +176,7 @@ translation_models:
 
 #### 步骤 1: 分析 PDF 结构
 ```bash
-pdf2epub breakdown -i input.pdf
+uv run pdf2epub breakdown -i input.pdf
 ```
 生成 `output/{book_title}/book_structure.json`
 
@@ -184,12 +184,12 @@ pdf2epub breakdown -i input.pdf
 
 **对于普通书籍：**
 ```bash
-pdf2epub ocr
+uv run pdf2epub ocr
 ```
 
 **对于日语纵排书籍：**
 ```bash
-pdf2epub ocr --japanese --backend vision
+uv run pdf2epub ocr --japanese --backend vision
 ```
 
 参数说明：
@@ -199,24 +199,24 @@ pdf2epub ocr --japanese --backend vision
 
 #### 步骤 3: 内容润色
 ```bash
-pdf2epub polish
+uv run pdf2epub polish
 ```
 
 针对不同内容类型：
 ```bash
 # 学术书籍（带脚注和引用）
-pdf2epub polish --content-type academic
+uv run pdf2epub polish --content-type academic
 
 # 日语书籍（保留振假名）
-pdf2epub polish --content-type japanese
+uv run pdf2epub polish --content-type japanese
 
 # 自动检测内容类型
-pdf2epub polish --content-type auto
+uv run pdf2epub polish --content-type auto
 ```
 
 #### 步骤 4: 生成 EPUB
 ```bash
-pdf2epub epub
+uv run pdf2epub epub
 ```
 最终 EPUB 文件保存在 `output/{book_title}/output.epub`
 
@@ -228,7 +228,7 @@ pdf2epub epub
 
 ```bash
 # 提取人物、地点、术语等实体
-pdf2epub extract-entities -i input.pdf --source-lang Japanese --target-lang Chinese
+uv run pdf2epub extract-entities -i input.pdf --source-lang Japanese --target-lang Chinese
 ```
 
 生成 `output/{book_title}/translation_entities.json`，包含：
@@ -242,10 +242,10 @@ pdf2epub extract-entities -i input.pdf --source-lang Japanese --target-lang Chin
 
 ```bash
 # 基本翻译（自动检测并使用实体文件，如果存在）
-pdf2epub translate --target-language Chinese
+uv run pdf2epub translate --target-language Chinese
 
 # 强制不使用实体（即使文件存在）
-pdf2epub translate --target-language Chinese --no-entities
+uv run pdf2epub translate --target-language Chinese --no-entities
 ```
 
 **注意**：如果 `translation_entities.json` 文件存在，翻译器会自动使用它以保持一致性。
@@ -255,40 +255,40 @@ pdf2epub translate --target-language Chinese --no-entities
 #### 日语轻小说翻译流程
 ```bash
 # 1. 分析结构
-pdf2epub breakdown -i manga.pdf
+uv run pdf2epub breakdown -i manga.pdf
 
 # 2. 提取翻译实体
-pdf2epub extract-entities -i manga.pdf
+uv run pdf2epub extract-entities -i manga.pdf
 
 # 3. 日语OCR
-pdf2epub ocr --japanese --backend vision
+uv run pdf2epub ocr --japanese --backend vision
 
 # 4. 日语内容润色
-pdf2epub polish --content-type japanese
+uv run pdf2epub polish --content-type japanese
 
 # 5. 翻译成中文（自动使用已提取的实体）
-pdf2epub translate
+uv run pdf2epub translate
 
 # 6. 生成EPUB
-pdf2epub epub
+uv run pdf2epub epub
 ```
 
 #### 学术书籍翻译流程
 ```bash
 # 1. 分析结构（添加页码标记）
-pdf2epub breakdown -i thesis.pdf
+uv run pdf2epub breakdown -i thesis.pdf
 
 # 2. OCR提取
-pdf2epub ocr
+uv run pdf2epub ocr
 
 # 3. 学术内容润色（保留脚注）
-pdf2epub polish --content-type academic
+uv run pdf2epub polish --content-type academic
 
 # 4. 翻译
-pdf2epub translate --target-language Chinese
+uv run pdf2epub translate --target-language Chinese
 
 # 5. 生成EPUB
-pdf2epub epub
+uv run pdf2epub epub
 ```
 
 ### 5. 高级配置

@@ -11,9 +11,9 @@ import requests
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 from loguru import logger
-from utils.logging_config import configure_logging
-from utils.common import load_config, load_book_structure
-from pdf_compressor import compress_pdf
+from .utils.logging_config import configure_logging
+from .utils.common import load_config, load_book_structure
+from .pdf_compressor import compress_pdf
 
 # Configure logger
 logger = configure_logging()

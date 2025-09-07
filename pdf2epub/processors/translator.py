@@ -8,6 +8,7 @@ while preserving formatting and structure.
 from typing import Dict, Optional, Tuple
 from pathlib import Path
 from loguru import logger
+import re
 
 from .base import BaseMarkdownProcessor
 from .utils.truncation import LLMTruncationDetector
@@ -145,6 +146,9 @@ class TranslateProcessor(BaseMarkdownProcessor):
         # Apply Japanese to Chinese specific post-processing
         if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
             translated_content = self._clean_japanese_artifacts(translated_content)
+        
+        # Correct footnote colon syntax for all translations
+        translated_content = self._correct_footnote_colons(translated_content)
         
         return translated_content
     
@@ -296,12 +300,34 @@ class TranslateProcessor(BaseMarkdownProcessor):
             logger.info("Run 'extract-entities' command first to generate entity reference")
             return None
     
+    def _correct_footnote_colons(self, text: str) -> str:
+        """
+        Correct full-width colons in footnote definitions to standard ASCII colons.
+        
+        Targets patterns like [^1]： and replaces the full-width colon with a standard colon.
+        This is a common issue when LLMs translate footnotes, especially to languages
+        that use full-width punctuation.
+        
+        Args:
+            text: The translated text to correct
+        
+        Returns:
+            Text with corrected footnote colons
+        """
+        # Pattern to find footnote references followed by full-width colon
+        # (\[\^.+?\]) captures the footnote reference (e.g., [^1], [^note])
+        # ： matches the full-width colon that needs to be replaced
+        pattern = r'(\[\^.+?\])：'
+        replacement = r'\1: '
+        
+        corrected_text = re.sub(pattern, replacement, text)
+        return corrected_text
+    
     def _clean_japanese_artifacts(self, text: str) -> str:
         """
         Clean up Japanese artifacts in Chinese translation.
         Specifically removes っ when it appears around punctuation.
         """
-        import re
         
         # Define Japanese and Chinese punctuation marks
         punctuation = [

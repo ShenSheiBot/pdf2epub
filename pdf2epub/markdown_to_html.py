@@ -317,7 +317,9 @@ def preprocess_footnotes(markdown_content: str) -> str:
                 current_footnote = None
             
             # Check if we're entering a Notes section
-            if 'Notes' in line or 'Footnotes' in line:
+            # Support multiple languages: English, Chinese, Japanese, etc.
+            notes_keywords = ['Notes', 'Footnotes', '注释', '注解', '脚注', '註釋', '註解', '脚註']
+            if any(keyword in line for keyword in notes_keywords):
                 in_notes_section = True
             else:
                 in_notes_section = False

@@ -26,69 +26,66 @@ def build_subchapter_locations(markdown_dir, parts_info):
     """Build mapping of which subchapters are in which parts with fuzzy matching."""
     import difflib
     import re
-    
+
     subchapter_locations = {}
-    
+
     for chapter_index, parts in parts_info.items():
         if parts > 1:
             # This chapter has multiple parts
             for part_num in range(1, parts + 1):
                 part_file = markdown_dir / f"chapter_{chapter_index}.part{part_num}.md"
                 if part_file.exists():
-                    with open(part_file, 'r', encoding='utf-8') as f:
+                    with open(part_file, "r", encoding="utf-8") as f:
                         lines = f.readlines()
-                        
+
                     # Find all subchapter headings in this part
                     for line in lines:
-                        if line.strip().startswith("##") and not line.strip().startswith("###"):
+                        if line.strip().startswith(
+                            "##"
+                        ) and not line.strip().startswith("###"):
                             # Extract the heading text
                             heading = re.sub(r"^##\s*", "", line).strip()
-                            
+
                             # Store which part this subchapter is in
                             # We'll store multiple keys for fuzzy matching later
                             location_key = f"{chapter_index}:{heading}"
                             subchapter_locations[location_key] = {
-                                'chapter': chapter_index,
-                                'part': part_num,
-                                'title': heading,
-                                'exact_title': heading  # Store the exact title from markdown
+                                "chapter": chapter_index,
+                                "part": part_num,
+                                "title": heading,
+                                "exact_title": heading,  # Store the exact title from markdown
                             }
-    
+
     # Add fuzzy matching capability by storing all titles for lookup
-    subchapter_locations['_all_titles'] = {}
+    subchapter_locations["_all_titles"] = {}
     for key, info in subchapter_locations.items():
-        if key != '_all_titles' and isinstance(info, dict):
-            chapter = info.get('chapter')
-            if chapter not in subchapter_locations['_all_titles']:
-                subchapter_locations['_all_titles'][chapter] = []
-            subchapter_locations['_all_titles'][chapter].append({
-                'title': info['title'],
-                'part': info['part'],
-                'key': key
-            })
-    
+        if key != "_all_titles" and isinstance(info, dict):
+            chapter = info.get("chapter")
+            if chapter not in subchapter_locations["_all_titles"]:
+                subchapter_locations["_all_titles"][chapter] = []
+            subchapter_locations["_all_titles"][chapter].append(
+                {"title": info["title"], "part": info["part"], "key": key}
+            )
+
     return subchapter_locations
 
 
 def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
     """
     Build book structure by extracting headings from markdown files.
-    
+
     Args:
         markdown_dir: Directory containing markdown files
         book_title: Title of the book
-        
+
     Returns:
         Dictionary with book structure based on markdown headings
     """
-    structure = {
-        "book_title": book_title,
-        "chapters": []
-    }
-    
+    structure = {"book_title": book_title, "chapters": []}
+
     # Find all chapter files (including part files)
     chapter_files = {}
-    
+
     # First collect all files by chapter number
     for md_file in sorted(markdown_dir.glob("*.md")):
         if md_file.name.startswith("chapter_"):
@@ -97,83 +94,86 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
             if match:
                 chapter_num = int(match.group(1))
                 part_num = int(match.group(2)) if match.group(2) else None
-                
+
                 if chapter_num not in chapter_files:
                     chapter_files[chapter_num] = {}
-                
+
                 if part_num is not None:
                     chapter_files[chapter_num][part_num] = md_file
                 else:
-                    chapter_files[chapter_num]['main'] = md_file
-    
+                    chapter_files[chapter_num]["main"] = md_file
+
     # Now process each chapter
     for chapter_num in sorted(chapter_files.keys()):
         files = chapter_files[chapter_num]
-        
+
         # Determine which files to read
         files_to_read = []
-        if 'main' in files and len(files) == 1:
+        if "main" in files and len(files) == 1:
             # Single file chapter
-            files_to_read = [files['main']]
+            files_to_read = [files["main"]]
         else:
             # Multi-part chapter - read parts in order
             for part_num in sorted([k for k in files.keys() if isinstance(k, int)]):
                 files_to_read.append(files[part_num])
-        
+
         # Extract headings from files
         chapter_title = f"Chapter {chapter_num}"
         subchapters = []
-        
+
         for file_path in files_to_read:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    
+
                     # Extract headings using regex
-                    lines = content.split('\n')
+                    lines = content.split("\n")
                     for line in lines:
                         line = line.strip()
-                        
+
                         # Check for level 1 heading
-                        if line.startswith('# ') and not line.startswith('## '):
+                        if line.startswith("# ") and not line.startswith("## "):
                             # Extract title without the # marker
                             title = line[2:].strip()
                             if title:  # Only update if not empty
                                 chapter_title = title
-                        
+
                         # Check for level 2 heading
-                        elif line.startswith('## ') and not line.startswith('### '):
+                        elif line.startswith("## ") and not line.startswith("### "):
                             # Extract subtitle without the ## marker
                             subtitle = line[3:].strip()
-                            if subtitle and len(subtitle) <= 50:  # Ignore empty or too long
+                            if (
+                                subtitle and len(subtitle) <= 50
+                            ):  # Ignore empty or too long
                                 subchapters.append({"title": subtitle})
-                                
+
             except Exception as e:
                 logger.warning(f"Failed to read {file_path}: {e}")
-        
+
         # Add chapter to structure
-        chapter_info = {
-            "title": chapter_title,
-            "index": chapter_num
-        }
-        
+        chapter_info = {"title": chapter_title, "index": chapter_num}
+
         if subchapters:
             chapter_info["subchapters"] = subchapters
-        
+
         structure["chapters"].append(chapter_info)
-    
+
     # Also check for front_matter and back_matter
     if (markdown_dir / "front_matter.md").exists():
         structure["front_matter"] = {"title": "Front Matter"}
-    
+
     if (markdown_dir / "back_matter.md").exists():
         structure["back_matter"] = {"title": "Back Matter"}
-    
-    logger.info(f"Built structure from markdown: {len(structure['chapters'])} chapters found")
+
+    logger.info(
+        f"Built structure from markdown: {len(structure['chapters'])} chapters found"
+    )
     return structure
 
 
-def load_or_create_translated_book_structure(book_title: str, original_structure: dict, config: dict) -> dict:
+def load_or_create_translated_book_structure(
+    book_title: str, original_structure: dict, config: dict
+) -> dict:
     """
     Load or create a translated version of the book structure.
 
@@ -288,58 +288,62 @@ Book structure to translate:"""
         return original_structure
 
 
-def relevel_book_structure(structure: dict, reference_structure: dict, config: dict) -> dict:
+def relevel_book_structure(
+    structure: dict, reference_structure: dict, config: dict
+) -> dict:
     """
     Use LLM to analyze and re-level the markdown book structure using original OCR structure as reference.
-    
+
     Args:
         structure: Book structure from markdown
         reference_structure: Original OCR structure (optional)
         config: Configuration with API keys
-        
+
     Returns:
         Dict with level and text changes for markdown headings
     """
-    logger.info("Analyzing book structure for re-leveling using original OCR structure as reference...")
-    
+    logger.info(
+        "Analyzing book structure for re-leveling using original OCR structure as reference..."
+    )
+
     # Initialize LLM client
     llm_client = LLMClient(config)
-    
+
     # Create simplified structures for both
     markdown_headings = []
     for chapter in structure.get("chapters", []):
-        markdown_headings.append({
-            "title": chapter["title"],
-            "level": 1,
-            "index": chapter.get("index", 0),
-            "type": "chapter"
-        })
-        
+        markdown_headings.append(
+            {
+                "title": chapter["title"],
+                "level": 1,
+                "index": chapter.get("index", 0),
+                "type": "chapter",
+            }
+        )
+
         for j, subchapter in enumerate(chapter.get("subchapters", []), 1):
-            markdown_headings.append({
-                "title": subchapter["title"],
-                "level": 2,
-                "chapter_index": chapter.get("index", 0),
-                "subchapter_index": j,
-                "type": "subchapter"
-            })
-    
+            markdown_headings.append(
+                {
+                    "title": subchapter["title"],
+                    "level": 2,
+                    "chapter_index": chapter.get("index", 0),
+                    "subchapter_index": j,
+                    "type": "subchapter",
+                }
+            )
+
     # Create simplified original structure for reference
     original_headings = []
     if reference_structure:
         for chapter in reference_structure.get("chapters", []):
-            original_headings.append({
-                "title": chapter.get("title", ""),
-                "level": 1
-            })
-            
+            original_headings.append({"title": chapter.get("title", ""), "level": 1})
+
             if "subchapters" in chapter:
                 for subchapter in chapter["subchapters"]:
-                    original_headings.append({
-                        "title": subchapter.get("title", ""),
-                        "level": 2
-                    })
-    
+                    original_headings.append(
+                        {"title": subchapter.get("title", ""), "level": 2}
+                    )
+
     # Create prompt for LLM
     prompt = """You are a book structure expert. Your task is to improve the markdown-generated book structure using the original OCR structure as a reference.
 
@@ -363,74 +367,94 @@ IMPORTANT:
 
 ORIGINAL OCR STRUCTURE (reference):
 """
-    
+
     original_json = json.dumps(original_headings, ensure_ascii=False, indent=2)
     markdown_json = json.dumps(markdown_headings, ensure_ascii=False, indent=2)
-    
+
     multi_part_content = [
         {"type": "text", "text": prompt},
         {"type": "text", "text": original_json},
         {"type": "text", "text": "\n\nMARKDOWN STRUCTURE (to modify):\n"},
         {"type": "text", "text": markdown_json},
-        {"type": "text", "text": "\n\nReturn the modified markdown structure with updated levels and titles:"}
+        {
+            "type": "text",
+            "text": "\n\nReturn the modified markdown structure with updated levels and titles:",
+        },
     ]
-    
+
     # Use the same models as translation
     releveling_models = [
         {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 2},
-        {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-20250514",
+            "max_retries": 2,
+        },
     ]
-    
+
     try:
         response = llm_client.generate(
             prompt=multi_part_content,
             model_configs=releveling_models,
-            operation_name="Re-level book structure with OCR reference"
+            operation_name="Re-level book structure with OCR reference",
         )
-        
+
         # Clean response
         if "```json" in response:
             response = response.split("```json")[1].split("```")[0]
         elif "```" in response:
             response = response.split("```")[1].split("```")[0]
-        
+
         releveled_structure = json.loads(response)
-        
+
         # Build changes mapping
         changes = {}
         for i, new_item in enumerate(releveled_structure):
             if i >= len(markdown_headings):
-                logger.warning(f"Response has more items than original markdown structure")
+                logger.warning(
+                    f"Response has more items than original markdown structure"
+                )
                 break
-                
+
             original_item = markdown_headings[i]
-            
+
             # Check for changes
-            level_changed = original_item["level"] != new_item.get("level", original_item["level"])
-            title_changed = original_item["title"] != new_item.get("title", original_item["title"])
-            
+            level_changed = original_item["level"] != new_item.get(
+                "level", original_item["level"]
+            )
+            title_changed = original_item["title"] != new_item.get(
+                "title", original_item["title"]
+            )
+
             if level_changed or title_changed:
                 if original_item.get("type") == "subchapter":
                     # It's a subchapter
-                    key = (original_item["chapter_index"], original_item["subchapter_index"])
+                    key = (
+                        original_item["chapter_index"],
+                        original_item["subchapter_index"],
+                    )
                 else:
                     # It's a chapter
                     key = (original_item["index"], 0)
-                
+
                 changes[key] = {
                     "old_title": original_item["title"],
                     "new_title": new_item.get("title", original_item["title"]),
                     "old_level": original_item["level"],
-                    "new_level": new_item.get("level", original_item["level"])
+                    "new_level": new_item.get("level", original_item["level"]),
                 }
-                
+
                 if title_changed:
-                    logger.info(f"Updating title: '{original_item['title']}' → '{new_item['title']}'")
+                    logger.info(
+                        f"Updating title: '{original_item['title']}' → '{new_item['title']}'"
+                    )
                 if level_changed:
-                    logger.info(f"Re-leveling: '{new_item.get('title', original_item['title'])}' from level {original_item['level']} to level {new_item['level']}")
-        
+                    logger.info(
+                        f"Re-leveling: '{new_item.get('title', original_item['title'])}' from level {original_item['level']} to level {new_item['level']}"
+                    )
+
         return changes
-        
+
     except Exception as e:
         logger.error(f"Failed to re-level structure: {e}")
         return {}
@@ -439,29 +463,29 @@ ORIGINAL OCR STRUCTURE (reference):
 def update_markdown_heading_levels(markdown_dir: Path, changes: dict):
     """
     Update heading levels and titles in markdown files based on changes.
-    
+
     Args:
-        markdown_dir: Directory containing markdown files  
+        markdown_dir: Directory containing markdown files
         changes: Dict mapping (chapter_idx, subchapter_idx) to change info with old/new title and level
     """
     if not changes:
         logger.info("No heading changes needed")
         return
-    
+
     logger.info(f"Updating {len(changes)} headings in markdown files...")
-    
+
     # Group changes by chapter
     changes_by_chapter = {}
     for (chapter_idx, subchapter_idx), change_info in changes.items():
         if chapter_idx not in changes_by_chapter:
             changes_by_chapter[chapter_idx] = []
         changes_by_chapter[chapter_idx].append((subchapter_idx, change_info))
-    
+
     # Process each chapter
     for chapter_idx, chapter_changes in changes_by_chapter.items():
         # Find all relevant files (main and parts)
         files_to_update = []
-        
+
         # Check for part files
         part_files = sorted(markdown_dir.glob(f"chapter_{chapter_idx}.part*.md"))
         if part_files:
@@ -471,59 +495,65 @@ def update_markdown_heading_levels(markdown_dir: Path, changes: dict):
             main_file = markdown_dir / f"chapter_{chapter_idx}.md"
             if main_file.exists():
                 files_to_update.append(main_file)
-        
+
         # Update each file
         for file_path in files_to_update:
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                
+
                 original_content = content
-                
+
                 # Apply each change
                 for subchapter_idx, change_info in chapter_changes:
                     old_title = change_info["old_title"]
                     new_title = change_info["new_title"]
                     old_level = change_info["old_level"]
                     new_level = change_info["new_level"]
-                    
+
                     # Create the old and new heading markers
                     old_marker = "#" * old_level
                     new_marker = "#" * new_level
-                    
+
                     # Escape special regex characters in old title
                     escaped_old_title = re.escape(old_title)
-                    
+
                     # Pattern to match the heading line
                     pattern = f"^{re.escape(old_marker)}\\s+{escaped_old_title}\\s*$"
                     replacement = f"{new_marker} {new_title}"
-                    
+
                     # Perform replacement
-                    new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
-                    
+                    new_content = re.sub(
+                        pattern, replacement, content, flags=re.MULTILINE
+                    )
+
                     if new_content != content:
                         if old_title != new_title:
-                            logger.debug(f"Updated title: '{old_title}' → '{new_title}' in {file_path.name}")
+                            logger.debug(
+                                f"Updated title: '{old_title}' → '{new_title}' in {file_path.name}"
+                            )
                         if old_level != new_level:
-                            logger.debug(f"Updated level: {old_level} → {new_level} for '{new_title}' in {file_path.name}")
+                            logger.debug(
+                                f"Updated level: {old_level} → {new_level} for '{new_title}' in {file_path.name}"
+                            )
                         content = new_content
-                
+
                 # Write back if changed
                 if content != original_content:
-                    with open(file_path, 'w', encoding='utf-8') as f:
+                    with open(file_path, "w", encoding="utf-8") as f:
                         f.write(content)
                     logger.success(f"Updated headings in {file_path.name}")
-                    
+
             except Exception as e:
                 logger.error(f"Failed to update {file_path}: {e}")
-    
+
     logger.success("Heading updates complete")
 
 
 def cleanup_old_files(epub_dir: Path):
     """Remove old EPUB files before generating new ones."""
     import shutil
-    
+
     logger.info(f"Cleaning up old files in {epub_dir}")
     if epub_dir.exists():
         shutil.rmtree(epub_dir)
@@ -559,19 +589,19 @@ def main():
 
     # Load configuration and create EpubConfig
     config_dict = load_config(args.config)
-    
+
     if not config_dict.get("title"):
         logger.error("Book title not found in config.yaml")
         return
-    
+
     # Create EpubConfig instance
     epub_config = EpubConfig.from_dict(
         config_dict,
         use_translated=args.translated,
         use_relevel=args.relevel,
-        create_zip=args.zip
+        create_zip=args.zip,
     )
-    
+
     # Set input PDF path if provided
     if args.input:
         epub_config.input_pdf_path = Path(args.input)
@@ -580,7 +610,7 @@ def main():
         original_pdf = epub_config.input_dir / "input_original.pdf"
         if original_pdf.exists():
             epub_config.input_pdf_path = original_pdf
-    
+
     # Check if markdown directory exists
     if not epub_config.markdown_dir.exists():
         logger.error(f"Markdown directory not found: {epub_config.markdown_dir}")
@@ -589,45 +619,71 @@ def main():
         else:
             logger.info("Please run polish command first")
         return
-    
+
     logger.info(f"Using markdown from: {epub_config.markdown_dir}")
-    
+
     # Initialize components
     converter = ContentConverter(epub_config)
-    builder = EpubBuilder(epub_config, converter)  # Pass converter for file naming helpers
-    
+    builder = EpubBuilder(
+        epub_config, converter
+    )  # Pass converter for file naming helpers
+
     # Clean and prepare markdown content
     logger.info("Cleaning invalid headings from markdown files...")
     converter.clean_invalid_headings()
-    
+
     logger.info("Removing duplicate titles from markdown files...")
     converter.remove_duplicate_titles()
-    
+
     # Build book structure from markdown
     logger.info("Building TOC from markdown headings...")
-    structure = build_structure_from_markdown(epub_config.markdown_dir, epub_config.book_title)
+    structure = build_structure_from_markdown(
+        epub_config.markdown_dir, epub_config.book_title
+    )
     epub_config.book_structure = structure
-    
+
     # For translated version, determine the display title
     display_title = epub_config.book_title  # Default to original title
     if args.translated:
-        # Load or create translated structure for book title
-        translated_structure_path = epub_config.input_dir / "book_structure_translated.json"
-        
-        if translated_structure_path.exists():
-            logger.info("Loading translated book title from translated structure...")
-            with open(translated_structure_path, "r", encoding="utf-8") as f:
-                translated_structure = json.load(f)
-                display_title = translated_structure.get("book_title", epub_config.book_title)
+        # Load or create full translated structure
+        original_structure = load_book_structure(epub_config.book_title)
+        if original_structure:
+            # Use the existing function to load or create translated structure
+            translated_structure = load_or_create_translated_book_structure(
+                epub_config.book_title, 
+                original_structure, 
+                config_dict
+            )
+            display_title = translated_structure.get("book_title", epub_config.book_title)
+            logger.info(f"Translated structure loaded with title: {display_title}")
         else:
-            # Create translated structure just for the book title
-            logger.info("Creating translated book structure for title...")
-            from .utils.llm_client import LLMClient
-            original_structure = load_book_structure(epub_config.book_title)
-            if original_structure:
-                # Use LLM to translate the structure
+            # Fallback: Check for existing translated structure or translation progress
+            translated_structure_path = (
+                epub_config.input_dir / "book_structure_translated.json"
+            )
+            if translated_structure_path.exists():
+                logger.info("Loading translated title from existing structure...")
+                with open(translated_structure_path, "r", encoding="utf-8") as f:
+                    translated_structure = json.load(f)
+                    display_title = translated_structure.get("book_title", epub_config.book_title)
+            else:
+                # Try to get language settings from translation_progress.json
+                translation_progress_path = epub_config.input_dir / "translated" / "translation_progress.json"
+                source_language = "English"  # Default for non-Japanese books
+                target_language = "Chinese"  # Default target
+                
+                if translation_progress_path.exists():
+                    with open(translation_progress_path, "r", encoding="utf-8") as f:
+                        progress = json.load(f)
+                        source_language = progress.get("source_language", source_language)
+                        target_language = progress.get("target_language", target_language)
+                
+                # Create minimal translated structure with just the title
+                logger.info(f"Translating book title from {source_language} to {target_language}...")
+                from .utils.llm_client import LLMClient
                 llm_client = LLMClient(config_dict)
-                prompt = f"""Translate the book title from Japanese to Chinese.
+                
+                prompt = f"""Translate the book title from {source_language} to {target_language}.
 Return ONLY the translated title, no explanations.
 
 Original title: {epub_config.book_title}"""
@@ -638,120 +694,138 @@ Original title: {epub_config.book_title}"""
                     translated_structure = {"book_title": display_title}
                     with open(translated_structure_path, "w", encoding="utf-8") as f:
                         json.dump(translated_structure, f, ensure_ascii=False, indent=2)
+                    logger.info(f"Created translated structure with title: {display_title}")
                 except Exception as e:
                     logger.warning(f"Failed to translate title: {e}")
-        
+
         logger.info(f"Using translated title: {display_title}")
         # Update config with translated title
         epub_config.book_title = display_title
-        
+
         # Update output path with translated title
         from .utils.common import sanitize_filename
+
         safe_title = sanitize_filename(display_title)
         epub_config.output_epub_path = epub_config.output_dir / f"{safe_title}.epub"
-    
+
     # Re-level structure if requested
     if args.relevel:
         # Load reference structure
         if args.translated:
             # For translated content, try translated structure first
-            translated_structure_path = epub_config.input_dir / "book_structure_translated.json"
+            translated_structure_path = (
+                epub_config.input_dir / "book_structure_translated.json"
+            )
             if translated_structure_path.exists():
                 with open(translated_structure_path, "r", encoding="utf-8") as f:
                     epub_config.reference_structure = json.load(f)
                 logger.info("Using translated book structure as reference")
             else:
-                epub_config.reference_structure = load_book_structure(epub_config.book_title)
+                epub_config.reference_structure = load_book_structure(
+                    epub_config.book_title
+                )
         else:
-            epub_config.reference_structure = load_book_structure(epub_config.book_title)
-        
+            epub_config.reference_structure = load_book_structure(
+                epub_config.book_title
+            )
+
         if epub_config.reference_structure:
             logger.info("Re-leveling book structure using LLM...")
             changes = relevel_book_structure(
-                structure, 
-                epub_config.reference_structure, 
-                config_dict
+                structure, epub_config.reference_structure, config_dict
             )
             if changes:
                 update_markdown_heading_levels(epub_config.markdown_dir, changes)
                 # Rebuild structure after changes
-                structure = build_structure_from_markdown(epub_config.markdown_dir, epub_config.book_title)
+                structure = build_structure_from_markdown(
+                    epub_config.markdown_dir, epub_config.book_title
+                )
                 epub_config.book_structure = structure
-    
+
     # Clean up old EPUB files
     cleanup_old_files(epub_config.epub_dir)
     ensure_directory(epub_config.epub_dir)
-    
+
     # Create EPUB directories
     text_dir = epub_config.epub_dir / "text"
     images_dir = epub_config.epub_dir / "images"
     meta_inf_dir = epub_config.epub_dir / "META-INF"
-    
+
     ensure_directory(text_dir)
     ensure_directory(images_dir)
     ensure_directory(meta_inf_dir)
-    
+
     # Extract cover if PDF is available
     cover_image = None
     if epub_config.input_pdf_path and epub_config.input_pdf_path.exists():
         logger.info(f"Extracting cover from {epub_config.input_pdf_path}")
-        cover_image = converter.extract_cover_image(epub_config.input_pdf_path, images_dir)
+        cover_image = converter.extract_cover_image(
+            epub_config.input_pdf_path, images_dir
+        )
         if cover_image:
             logger.info(f"Cover extracted: {cover_image}")
-    
+
     # Create cover HTML
     if cover_image:
         builder.create_cover_html(cover_image, text_dir / "cover.html")
-    
+
     # Create stylesheet
     builder.create_stylesheet(epub_config.epub_dir / "stylesheet.css")
-    
+
     # Create mimetype
     builder.create_mimetype(epub_config.epub_dir / "mimetype")
-    
+
     # Create container.xml
     builder.create_container_xml(meta_inf_dir / "container.xml")
-    
+
     # Copy chapter images
     logger.info("Copying chapter images...")
     _, image_mapping = converter.copy_chapter_images(images_dir)
-    
+
     # Detect multi-part chapters for proper TOC generation
     chapters_with_parts = set()
     parts_info = {}
     subchapter_locations = {}
-    
+
     for chapter in structure.get("chapters", []):
         chapter_index = chapter.get("index")
         # Check for multi-part files
-        part_files = sorted(epub_config.markdown_dir.glob(f"chapter_{chapter_index}.part*.md"))
+        part_files = sorted(
+            epub_config.markdown_dir.glob(f"chapter_{chapter_index}.part*.md")
+        )
         if part_files:
             chapters_with_parts.add(chapter_index)
             parts_info[str(chapter_index)] = len(part_files)
-            
+
             # Track where each subchapter is located (in which part)
             # This would need more detailed analysis of the markdown files
             # For now, we'll assume they're evenly distributed
-    
+
     # Create NCX TOC with multi-part info
-    builder.create_toc_ncx(structure, epub_config.epub_dir / "toc.ncx",
-                          parts_info=parts_info, 
-                          chapters_with_parts=chapters_with_parts,
-                          subchapter_locations=subchapter_locations)
-    
+    builder.create_toc_ncx(
+        structure,
+        epub_config.epub_dir / "toc.ncx",
+        parts_info=parts_info,
+        chapters_with_parts=chapters_with_parts,
+        subchapter_locations=subchapter_locations,
+    )
+
     # Create HTML TOC with multi-part info
-    builder.create_toc_html(structure, text_dir / "toc.html",
-                           parts_info=parts_info,
-                           chapters_with_parts=chapters_with_parts,
-                           subchapter_locations=subchapter_locations)
-    
+    builder.create_toc_html(
+        structure,
+        text_dir / "toc.html",
+        parts_info=parts_info,
+        chapters_with_parts=chapters_with_parts,
+        subchapter_locations=subchapter_locations,
+    )
+
     # Load parts info from progress files for better multi-part handling
     progress_file = None
     if args.translated:
         progress_file = epub_config.markdown_dir / "translation_progress.json"
     else:
         progress_file = epub_config.markdown_dir / "polish_progress.json"
-    
+
     parts_info_for_toc = {}
     if progress_file and progress_file.exists():
         with open(progress_file, "r") as f:
@@ -766,41 +840,58 @@ Original title: {epub_config.book_title}"""
                 progress_key = "parts_polished"
             elif "polished" in progress_data:
                 progress_key = "polished"
-            
+
             if progress_key:
                 if progress_key == "parts_polished":
                     # Old format - direct mapping
                     parts_info_for_toc = progress_data[progress_key]
                 else:
                     # New format - extract total_parts from each chapter
-                    for chapter_key, chapter_data in progress_data[progress_key].items():
-                        if isinstance(chapter_data, dict) and "total_parts" in chapter_data:
+                    for chapter_key, chapter_data in progress_data[
+                        progress_key
+                    ].items():
+                        if (
+                            isinstance(chapter_data, dict)
+                            and "total_parts" in chapter_data
+                        ):
                             if chapter_key.startswith("chapter_"):
                                 chapter_num = chapter_key.replace("chapter_", "")
-                                parts_info_for_toc[chapter_num] = chapter_data["total_parts"]
-    
+                                parts_info_for_toc[chapter_num] = chapter_data[
+                                    "total_parts"
+                                ]
+
     # Update parts_info with detected parts
     for chapter_num in parts_info:
-        parts_info[chapter_num] = parts_info_for_toc.get(chapter_num, parts_info[chapter_num])
-    
+        parts_info[chapter_num] = parts_info_for_toc.get(
+            chapter_num, parts_info[chapter_num]
+        )
+
     # Build detailed subchapter location mapping (which part contains which subchapter)
-    subchapter_locations = build_subchapter_locations(epub_config.markdown_dir, parts_info)
-    
+    subchapter_locations = build_subchapter_locations(
+        epub_config.markdown_dir, parts_info
+    )
+
     # Update TOC generation with complete info
-    builder.create_toc_ncx(structure, epub_config.epub_dir / "toc.ncx",
-                          parts_info=parts_info, 
-                          chapters_with_parts=chapters_with_parts,
-                          subchapter_locations=subchapter_locations)
-    
-    builder.create_toc_html(structure, text_dir / "toc.html",
-                           parts_info=parts_info,
-                           chapters_with_parts=chapters_with_parts,
-                           subchapter_locations=subchapter_locations)
-    
+    builder.create_toc_ncx(
+        structure,
+        epub_config.epub_dir / "toc.ncx",
+        parts_info=parts_info,
+        chapters_with_parts=chapters_with_parts,
+        subchapter_locations=subchapter_locations,
+    )
+
+    builder.create_toc_html(
+        structure,
+        text_dir / "toc.html",
+        parts_info=parts_info,
+        chapters_with_parts=chapters_with_parts,
+        subchapter_locations=subchapter_locations,
+    )
+
     # Convert markdown files to HTML with proper multi-part handling
     # Track all HTML files created for manifest and spine
     all_html_files = []
-    
+
     # Front matter
     if structure.get("front_matter"):
         logger.info("Converting front matter to HTML")
@@ -808,29 +899,31 @@ Original title: {epub_config.book_title}"""
             epub_config.markdown_dir / "front_matter.md",
             text_dir / "front_matter.html",
             "Front Matter",
-            image_mapping=image_mapping
+            image_mapping=image_mapping,
         )
         all_html_files.append("front_matter.html")
-    
+
     # Chapters with sophisticated multi-part handling
     for chapter in structure.get("chapters", []):
         chapter_index = chapter.get("index")
         chapter_file = f"chapter_{chapter_index}.md"
-        
+
         logger.info(f"Processing chapter {chapter_index}")
-        
+
         # Check for multi-part chapters
-        part_files = sorted(epub_config.markdown_dir.glob(f"chapter_{chapter_index}.part*.md"))
-        
+        part_files = sorted(
+            epub_config.markdown_dir.glob(f"chapter_{chapter_index}.part*.md")
+        )
+
         if part_files:
             # Multi-part chapter: create separate HTML for each part
             logger.info(f"Chapter {chapter_index} has {len(part_files)} parts")
-            
+
             for i, part_file in enumerate(part_files, 1):
                 part_output_file = f"chapter_{chapter_index}_part{i}.html"
-                
+
                 logger.info(f"Converting part {i} of chapter {chapter_index}")
-                
+
                 # Get subchapters for this specific part
                 part_subchapters = []
                 if chapter.get("subchapters"):
@@ -838,9 +931,9 @@ Original title: {epub_config.book_title}"""
                     for subchapter in chapter.get("subchapters", []):
                         location_key = f"{chapter_index}:{subchapter.get('title', '')}"
                         if location_key in subchapter_locations:
-                            if subchapter_locations[location_key]['part'] == i:
+                            if subchapter_locations[location_key]["part"] == i:
                                 part_subchapters.append(subchapter)
-                
+
                 # Convert this part to HTML
                 converter.convert_markdown_to_chapter_html(
                     part_file,
@@ -848,30 +941,30 @@ Original title: {epub_config.book_title}"""
                     f"{chapter.get('title', f'Chapter {chapter_index}')} (Part {i})",
                     chapter_index=chapter_index,
                     subchapter_info=part_subchapters,
-                    image_mapping=image_mapping
+                    image_mapping=image_mapping,
                 )
                 all_html_files.append(part_output_file)
         else:
             # Single file chapter
             output_file = f"chapter_{chapter_index}.html"
-            
+
             # Check if the single file exists
             single_file = epub_config.markdown_dir / chapter_file
             if single_file.exists():
                 logger.info(f"Converting single-file chapter {chapter_index}")
-                
+
                 converter.convert_markdown_to_chapter_html(
                     single_file,
                     text_dir / output_file,
                     chapter.get("title", f"Chapter {chapter_index}"),
                     chapter_index=chapter_index,
                     subchapter_info=chapter.get("subchapters", []),
-                    image_mapping=image_mapping
+                    image_mapping=image_mapping,
                 )
                 all_html_files.append(output_file)
             else:
                 logger.warning(f"Chapter file not found: {single_file}")
-    
+
     # Back matter
     if structure.get("back_matter"):
         logger.info("Converting back matter to HTML")
@@ -879,31 +972,30 @@ Original title: {epub_config.book_title}"""
             epub_config.markdown_dir / "back_matter.md",
             text_dir / "back_matter.html",
             "Back Matter",
-            image_mapping=image_mapping
+            image_mapping=image_mapping,
         )
         all_html_files.append("back_matter.html")
-    
+
     # Create content.opf with all HTML files for proper manifest/spine
     builder.create_content_opf(
         structure,
         epub_config.epub_dir,
         epub_config.epub_dir / "content.opf",
         cover_image=cover_image,
-        all_html_files=all_html_files
+        all_html_files=all_html_files,
     )
-    
+
     # Create the EPUB file
     builder.create_epub(epub_config.epub_dir, epub_config.output_epub_path)
-    
+
     logger.success("EPUB generation complete!")
     logger.info(f"Output: {epub_config.output_epub_path}")
-    
+
     # Create ZIP if requested
     if args.zip:
         logger.info("Creating password-protected ZIP file...")
         zip_path = create_password_protected_zip(
-            epub_config.output_epub_path,
-            epub_config.book_title
+            epub_config.output_epub_path, epub_config.book_title
         )
         logger.success(f"Created ZIP: {zip_path}")
 

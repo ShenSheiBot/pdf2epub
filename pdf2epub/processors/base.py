@@ -194,7 +194,7 @@ class BaseMarkdownProcessor(ABC):
             min(safe_token_limit, max_tokens),
             self.llm_client,
             model_configs,
-            content_type,
+            'simple',
         )
         
         # Force at least 2 parts if we still got only 1
@@ -206,7 +206,7 @@ class BaseMarkdownProcessor(ABC):
                 estimated_tokens // 2,
                 self.llm_client,
                 model_configs,
-                content_type,
+                'simple',
             )
         
         logger.info(f"Split {file_name} into {len(parts)} parts")

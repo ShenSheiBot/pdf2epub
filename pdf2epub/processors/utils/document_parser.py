@@ -295,7 +295,7 @@ def find_split_positions(
 ) -> List[int]:
     """
     Find the positions in content where splits should occur based on markers.
-    This version finds the position of the HEADING before the marker.
+    This version finds the position of the HEADING before the marker, with fuzzy matching.
 
     Args:
         content: The original content
@@ -322,19 +322,32 @@ def find_split_positions(
                 split_positions.append(pos)
             continue
 
-        # Find the position of the heading in the content
-        # We need to be careful with headings that might appear multiple times.
-        # Let's search from the last found position to be safer.
+        # --- FUZZY MATCHING LOGIC ---
+        # Extract the text part of the heading, stripping # and whitespace
+        heading_text_match = re.match(r'^(?:#{1,6}\s*)?(.+?)\s*', heading)
+        if not heading_text_match:
+            logger.warning(f"Could not extract text from heading: '{heading}'")
+            continue
+        
+        heading_text = heading_text_match.group(1)
+        
+        # Create a regex pattern to find this heading text with any # level
+        # Escape special regex characters in the heading text
+        escaped_heading_text = re.escape(heading_text)
+        pattern = re.compile(f"^(?:#{{1,6}}\s*)?{escaped_heading_text}\s*$", re.MULTILINE)
+        
+        # Search for the pattern from the last found position
         last_pos = split_positions[-1] if len(split_positions) > 1 else 0
-        pos = content.find(heading, last_pos)
+        match = pattern.search(content, last_pos)
 
-        if pos != -1:
+        if match:
             # The position should be the start of the heading line
+            pos = match.start()
             split_positions.append(pos)
-            logger.debug(f"Found split point at heading position {pos}: '{heading}'")
+            logger.debug(f"Found split point at fuzzy heading position {pos}: '{match.group(0)}'")
         else:
-            logger.warning(f"Could not find heading for split marker: '{heading}'")
-            # Fallback to marker search
+            logger.warning(f"Could not find heading via fuzzy match for: '{heading}'")
+            # Fallback to simple marker search
             pos = content.find(marker, last_pos)
             if pos != -1:
                 split_positions.append(pos)

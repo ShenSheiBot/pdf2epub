@@ -35,7 +35,8 @@ class PolishProcessor(BaseMarkdownProcessor):
         skip_truncation_check: bool = False,
         polish_models: Optional[List[Dict]] = None,
         content_type: str = "auto",
-        use_longest_on_failure: bool = False
+        use_longest_on_failure: bool = False,
+        book_structure: Optional[Dict] = None
     ):
         """
         Initialize the polish processor.
@@ -49,6 +50,7 @@ class PolishProcessor(BaseMarkdownProcessor):
             polish_models: Optional override for model configurations
             content_type: Type of content ("academic", "japanese", "general", "auto")
             use_longest_on_failure: If True, use longest response when all attempts fail validation
+            book_structure: Optional book structure from breakdown phase
         """
         super().__init__(
             config=config,
@@ -63,6 +65,10 @@ class PolishProcessor(BaseMarkdownProcessor):
         self.skip_truncation_check = skip_truncation_check
         self.polish_models = polish_models or config.get("polish_models")
         self.content_type = content_type
+        self.book_structure = book_structure or {}
+        
+        # Check if book has global notes chapter
+        self.use_global_footnotes = self._has_notes_chapter()
         
         # Initialize truncation detector
         self.truncation_detector = NGramTruncationDetector(
@@ -72,6 +78,44 @@ class PolishProcessor(BaseMarkdownProcessor):
         
         # Thread lock for progress updates
         self.progress_lock = threading.Lock()
+        
+        # Log global footnote detection
+        if self.use_global_footnotes:
+            logger.info("Detected Notes chapter - using global footnote mode for academic content")
+    
+    def _has_notes_chapter(self) -> bool:
+        """Check if book structure contains a notes chapter."""
+        for chapter in self.book_structure.get('chapters', []):
+            if chapter.get('type') == 'notes':
+                return True
+        return False
+    
+    def _get_chapter_info(self, file_name: str) -> Dict:
+        """
+        Get chapter information from book structure.
+        
+        Args:
+            file_name: The markdown file name (e.g., "chapter_12.md")
+        
+        Returns:
+            Chapter info dict with 'type', 'title', etc., or empty dict if not found
+        """
+        # Extract chapter number from file name
+        import re
+        
+        # Handle various formats: chapter_N.md, chapter_N.partM.md, chapter_N_partM.md
+        match = re.match(r'chapter_(\d+)', file_name)
+        if not match:
+            return {}
+        
+        chapter_num = int(match.group(1))
+        
+        # Find corresponding chapter in structure
+        chapters = self.book_structure.get('chapters', [])
+        if 0 <= chapter_num - 1 < len(chapters):
+            return chapters[chapter_num - 1]
+        
+        return {}
     
     def get_progress_filename(self) -> str:
         """Get the name for the progress file."""
@@ -550,6 +594,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         )
         
         if academic_score >= 2:
+            # Just return "academic" - the routing logic will handle global vs local
             logger.info("Auto-detected content type: Academic")
             return "academic"
         
@@ -564,6 +609,14 @@ class PolishProcessor(BaseMarkdownProcessor):
         part_content: str = None
     ) -> str:
         """Create the prompt for polishing content based on content type."""
+        # Get chapter information
+        chapter_info = self._get_chapter_info(chapter_name)
+        is_notes_chapter = chapter_info.get('type') == 'notes'
+        
+        # Special handling for notes chapters
+        if is_notes_chapter:
+            return self._create_notes_chapter_prompt(chapter_name, part_idx, total_parts)
+        
         # Determine content type
         content_type = self.content_type
         if content_type == "auto" and part_content:
@@ -573,7 +626,11 @@ class PolishProcessor(BaseMarkdownProcessor):
         
         # Route to appropriate prompt creator
         if content_type == "academic":
-            return self._create_academic_polish_prompt(chapter_name, part_idx, total_parts)
+            # Choose between global and local academic prompts
+            if self.use_global_footnotes:
+                return self._create_academic_global_prompt(chapter_name, part_idx, total_parts)
+            else:
+                return self._create_academic_polish_prompt(chapter_name, part_idx, total_parts)
         elif content_type == "japanese":
             return self._create_japanese_polish_prompt(chapter_name, part_idx, total_parts)
         else:
@@ -655,6 +712,110 @@ IMPORTANT: Return ONLY the polished markdown. Do not add explanations.
 Preserve all tables, figures, and images unless duplicated.
 
 Polish the following academic content:"""
+        
+        return prompt
+    
+    def _create_academic_global_prompt(
+        self,
+        chapter_name: str,
+        part_idx: int,
+        total_parts: int
+    ) -> str:
+        """Create prompt for academic content when footnotes are in separate Notes chapter."""
+        book_info = f' from the book titled "{self.book_title}"' if self.book_title else ""
+        
+        prompt = f"""You are an expert academic document editor specializing in scholarly texts. Polish this OCR-extracted academic content from "{chapter_name}"{book_info}.
+
+Your tasks for ACADEMIC content with centralized footnotes:
+
+1. **Remove page artifacts**:
+   - Delete page numbers, headers, and footers
+   - Remove horizontal separators between pages
+   - Join sentences broken by page boundaries
+
+2. **Preserve academic structure**:
+   - Main chapter title: # (H1)
+   - Sections: ## (H2), subsections: ### (H3)
+   - Keep abstract, introduction, conclusion sections intact
+   - Preserve figure/table captions and numbering
+
+3. **Handle citations ONLY**:
+   - Convert inline citation markers ($^1$, ¹, {{ }}^{{1}}, etc.) to [^1] format
+   - IMPORTANT: Just convert the markers - footnotes are managed in a separate Notes chapter
+   - Do NOT look for or create footnote definitions ([^1]: text)
+   - Text immediately after a citation is part of the main content, not a footnote
+
+4. **Preserve academic elements**:
+   - Keep equations, formulas, and mathematical notation
+   - Preserve code blocks and technical examples
+   - Maintain definition lists and theorems
+   - Keep cross-references ("see Section 2.3")
+
+5. **Quality checks**:
+   - Ensure academic terminology is preserved
+   - Verify proper markdown formatting"""
+        
+        # Add context for multi-part chapters
+        if total_parts > 1:
+            prompt += f"""
+
+CONTEXT: This is part {part_idx} of {total_parts} of a multi-part chapter."""
+            
+            if part_idx > 1:
+                prompt += """
+IMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2).
+Convert any # (H1) headings to ## (H2)."""
+        
+        prompt += """
+
+IMPORTANT: Return ONLY the polished markdown. Do not add explanations.
+Preserve all tables, figures, and images unless duplicated.
+
+Polish the following academic content:"""
+        
+        return prompt
+    
+    def _create_notes_chapter_prompt(
+        self,
+        chapter_name: str,
+        part_idx: int,
+        total_parts: int
+    ) -> str:
+        """Create prompt specifically for Notes/References chapters."""
+        book_info = f' from "{self.book_title}"' if self.book_title else ""
+        
+        prompt = f"""You are an expert editor processing a Notes/References section{book_info}. Format this chapter that contains footnotes and references for the entire book.
+
+Your task is to standardize all footnote definitions:
+
+1. **Convert footnote entries**:
+   - Transform any numbered notes (1., [1], (1), etc.) to markdown format: [^1]: content
+   - Preserve the EXACT numbering as it appears
+   - Each definition should start on a new line
+   - Keep the original content intact
+
+2. **Preserve structure**:
+   - Keep any section headings (Chapter notes, References, etc.)
+   - Maintain groupings if notes are organized by chapter
+   - Preserve any bibliography entries as-is
+
+3. **DO NOT**:
+   - Renumber or reorganize footnotes
+   - Add new footnotes
+   - Remove any content
+   - Change the footnote keys"""
+        
+        # Add context for multi-part chapters
+        if total_parts > 1:
+            prompt += f"""
+
+CONTEXT: This is part {part_idx} of {total_parts} of the Notes section."""
+        
+        prompt += """
+
+IMPORTANT: Return ONLY the formatted markdown.
+
+Format the following Notes/References content:"""
         
         return prompt
     

@@ -759,9 +759,26 @@ def main():
     else:
         logger.info(f"Using configured language: {epub_config.language}")
 
+    # Load book structure to check for notes chapters
+    book_structure = load_book_structure(epub_config.book_title)
+    has_notes_chapter = False
+    
+    if book_structure:
+        # Check if any chapter is marked as a notes chapter
+        has_notes_chapter = any(
+            chapter.get('type') == 'notes' 
+            for chapter in book_structure.get('chapters', [])
+        )
+    
+    # Auto-enable global footnotes if notes chapter detected
+    force_global_mode = args.global_footnotes or has_notes_chapter
+    
+    if has_notes_chapter and not args.global_footnotes:
+        logger.info("Detected 'Notes' chapter in book structure - auto-enabling global footnote mode")
+    
     # Initialize FootnoteManager to analyze footnote structure
     logger.info("Analyzing footnote structure...")
-    footnote_manager = FootnoteManager(epub_config.markdown_dir, force_global=args.global_footnotes)
+    footnote_manager = FootnoteManager(epub_config.markdown_dir, force_global=force_global_mode)
     
     # Initialize components
     converter = ContentConverter(epub_config, footnote_manager)

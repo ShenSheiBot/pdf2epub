@@ -224,6 +224,11 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     Note that nearby chapters may overlap if there are no page breaks.
     Keep the original language for all titles.
     
+    Additionally, identify special chapter types:
+    - If a chapter consists primarily of footnotes, endnotes, or references for citations in other chapters (e.g., "Notes", "Endnotes", "References", "Bibliography"), add a "type": "notes" field
+    - Abbreviations, index, or summary table are not considered as notes as they are not cited
+    - Regular content chapters should not have a "type" field
+    
     Return the result in the following JSON structure:
     {{
         "cover_page": {{
@@ -246,6 +251,7 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
                 "start_page": int,
                 "end_page": int,
                 "level": int,
+                "type": string,  # Optional: "notes" for footnote/reference chapters
                 "subchapters": [
                     {{
                         "title": string,
@@ -259,6 +265,15 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
         "back_cover": {{
             "page_number": int
         }}
+    }}
+    
+    Example of a notes chapter:
+    {{
+        "title": "Notes",
+        "start_page": 250,
+        "end_page": 275,
+        "level": 1,
+        "type": "notes"
     }}
     """
 

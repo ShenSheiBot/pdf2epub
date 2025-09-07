@@ -111,7 +111,7 @@ class NGramTruncationDetector(BaseTruncationDetector):
             return True, f"Text ends mid-sentence: {tail_reason}", details
 
         # 3. Excellent unique recall - definitely not truncated
-        if avg_unique_recall >= 0.9:
+        if avg_unique_recall >= 0.8:
             return (
                 False,
                 f"Excellent unique content preservation ({avg_unique_recall:.1%})",
@@ -120,7 +120,7 @@ class NGramTruncationDetector(BaseTruncationDetector):
 
         # 4. Good unique recall with high deduplication - acceptable
         if (
-            avg_unique_recall >= 0.8
+            avg_unique_recall >= 0.7
             and avg_dup_ratio >= 0.7
             and self.allow_deduplication
         ):

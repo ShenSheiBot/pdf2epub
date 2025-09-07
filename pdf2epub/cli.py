@@ -33,6 +33,17 @@ def polish_command(args):
     if args.content_type != "auto":
         logger.info(f"Content type: {args.content_type}")
     
+    # Load book structure if available
+    output_dir = Path("output") / book_title
+    structure_file = output_dir / "book_structure.json"
+    book_structure = None
+    
+    if structure_file.exists():
+        import json
+        with open(structure_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure for context-aware polishing")
+    
     # Initialize the polish processor
     processor = PolishProcessor(
         config=config,
@@ -42,7 +53,8 @@ def polish_command(args):
         skip_truncation_check=args.skip_truncation_check,
         polish_models=config.get("polish_models"),
         content_type=args.content_type,
-        use_longest_on_failure=args.use_longest_on_failure
+        use_longest_on_failure=args.use_longest_on_failure,
+        book_structure=book_structure
     )
     
     # Process all files

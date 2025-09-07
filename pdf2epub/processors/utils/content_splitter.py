@@ -190,6 +190,9 @@ class BaseLLMSplitter(ContentSplitter):
                 )
                 return SimpleSplitter().split(content, max_tokens)
 
+            # Filter out any empty markers from the LLM response
+            split_markers = [marker for marker in split_markers if marker and marker.strip()]
+
             # Find split positions using the markers and the structural map
             split_positions = find_split_positions(
                 content, split_markers, structural_map
@@ -209,9 +212,16 @@ class BaseLLMSplitter(ContentSplitter):
                 )
                 return SimpleSplitter().split(content, max_tokens)
 
+            # Validate that no part exceeds the max_tokens limit
             for i, part in enumerate(parts, 1):
                 part_tokens = len(tokenizer.encode(part))
                 logger.info(f"Part {i}/{len(parts)}: {part_tokens:,} tokens")
+                if part_tokens > max_tokens:
+                    logger.warning(
+                        f"Part {i} has {part_tokens:,} tokens, which exceeds the limit of {max_tokens:,}. "
+                        "Falling back to simple split."
+                    )
+                    return SimpleSplitter().split(content, max_tokens)
 
             return parts
 
@@ -367,9 +377,9 @@ def split_content(
             logger.info("Auto-detected content type: Japanese")
         else:
             academic_indicators = [
-                r"[\^\d+]",
-                r"References\s*\n",
-                r"Bibliography\s*\n",
+                r"[\\^\\d+",
+                r"References\\s*\n",
+                r"Bibliography\\s*\n",
             ]
             if any(
                 re.search(pattern, content[:5000]) for pattern in academic_indicators

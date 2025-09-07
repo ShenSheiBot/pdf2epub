@@ -307,20 +307,18 @@ class PolishProcessor(BaseMarkdownProcessor):
         if not all_parts_valid and not self.skip_truncation_check:
             logger.warning(f"Some parts of {file_name} failed validation")
         
-        # Combine parts if multiple
-        if len(parts) > 1:
-            # Filter out None or empty parts
-            valid_parts = [p for p in polished_parts if p]
-            if not valid_parts:
-                raise ValueError("All parts failed to process")
-            combined = "\n\n".join(valid_parts)
-            # Restore any lost images
-            combined = restore_lost_images(content, combined)
-            return combined
+        # Combine all parts and return the full content
+        # Part files have already been saved separately by _save_part_file
+        valid_parts = [p for p in polished_parts if p]
+        if not valid_parts:
+            raise ValueError("All parts failed to process")
+        
+        # Return combined content
+        if len(valid_parts) == 1:
+            return valid_parts[0]
         else:
-            if not polished_parts or not polished_parts[0]:
-                raise ValueError("Failed to process content")
-            return polished_parts[0]
+            # Join parts with double newlines
+            return "\n\n".join(valid_parts)
     
     def validate_output(
         self,
@@ -538,7 +536,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         """Polish a single part of content."""
         # Create the polish prompt with content for auto-detection
         prompt = self._create_polish_prompt(
-            chapter_name, part_idx, total_parts, part_content
+            chapter_name, part_idx, total_parts, part_content, file_name
         )
         
         # Create multi-part content for the LLM
@@ -606,12 +604,24 @@ class PolishProcessor(BaseMarkdownProcessor):
         chapter_name: str,
         part_idx: int,
         total_parts: int,
-        part_content: str = None
+        part_content: str = None,
+        file_name: str = None
     ) -> str:
         """Create the prompt for polishing content based on content type."""
-        # Get chapter information
-        chapter_info = self._get_chapter_info(chapter_name)
+        # Get chapter information using file_name if provided, otherwise fall back to chapter_name
+        lookup_name = file_name if file_name else chapter_name
+        chapter_info = self._get_chapter_info(lookup_name)
         is_notes_chapter = chapter_info.get('type') == 'notes'
+        
+        # Also detect Notes chapter by content (fallback for mapping issues)
+        if not is_notes_chapter and part_content:
+            # Check if this looks like a Notes/References chapter
+            content_start = part_content[:500].lower()
+            if any(marker in content_start for marker in ['# notes\n', '# notes \n', '## notes\n', '# references\n', '# bibliography\n']):
+                # Also check if it has typical footnote patterns
+                if '[^' not in part_content and re.search(r'^\d+\.\s+\w', part_content, re.MULTILINE):
+                    is_notes_chapter = True
+                    logger.info(f"Detected {chapter_name} as Notes chapter based on content")
         
         # Special handling for notes chapters
         if is_notes_chapter:
@@ -784,26 +794,38 @@ Polish the following academic content:"""
         """Create prompt specifically for Notes/References chapters."""
         book_info = f' from "{self.book_title}"' if self.book_title else ""
         
-        prompt = f"""You are an expert editor processing a Notes/References section{book_info}. Format this chapter that contains footnotes and references for the entire book.
+        prompt = f"""You are an expert editor processing a Notes/References section{book_info}. This chapter contains all footnotes and references for the entire book.
 
-Your task is to standardize all footnote definitions:
+Your tasks:
 
-1. **Convert footnote entries**:
-   - Transform any numbered notes (1., [1], (1), etc.) to markdown format: [^1]: content
-   - Preserve the EXACT numbering as it appears
-   - Each definition should start on a new line
-   - Keep the original content intact
+1. **Clean up OCR artifacts**:
+   - Remove page numbers, headers, and footers
+   - Join sentences broken across pages
+   - Fix line breaks within footnote entries
 
-2. **Preserve structure**:
-   - Keep any section headings (Chapter notes, References, etc.)
-   - Maintain groupings if notes are organized by chapter
-   - Preserve any bibliography entries as-is
+2. **Format footnote entries properly**:
+   - Convert numbered notes to markdown format:
+     * Input: "1. Author, Title..." → Output: "[^1]: Author, Title..."
+     * Input: "[1] Author, Title..." → Output: "[^1]: Author, Title..."
+     * Input: "1 Author, Title..." → Output: "[^1]: Author, Title..."
+   - Each [^n]: definition should start on its own line
+   - Keep multi-line footnotes properly indented
 
-3. **DO NOT**:
-   - Renumber or reorganize footnotes
-   - Add new footnotes
-   - Remove any content
-   - Change the footnote keys"""
+3. **Preserve structure**:
+   - Keep section headings like "## Introduction", "## Chapter 1", etc.
+   - Maintain the organization by chapter/section
+   - Keep the original footnote numbering exactly as it appears
+
+4. **Handle citations properly**:
+   - Format book citations: Author. *Title*. Publisher, Year.
+   - Format article citations: Author. "Article Title." *Journal*, vol(issue), Year, pages.
+   - Preserve all bibliographic details
+
+5. **DO NOT**:
+   - Change footnote numbers
+   - Reorder or reorganize content
+   - Add or remove footnotes
+   - Convert section headings to footnote format"""
         
         # Add context for multi-part chapters
         if total_parts > 1:

@@ -151,108 +151,6 @@ class BaseMarkdownProcessor(ABC):
         with open(self.progress_file, "w") as f:
             json.dump(self.progress, f, indent=2, ensure_ascii=False)
     
-    def process_with_splitting(
-        self,
-        content: str,
-        file_name: str,
-        max_tokens: int = 30000,
-        **kwargs
-    ) -> Optional[str]:
-        """
-        Process content by splitting it into smaller parts if validation fails.
-        
-        Args:
-            content: The content to process
-            file_name: Name of the file being processed
-            max_tokens: Maximum tokens per split
-            **kwargs: Additional processor-specific arguments
-            
-        Returns:
-            Processed content or None if all attempts fail
-        """
-        logger.info(f"Attempting to process {file_name} by splitting into parts")
-        
-        # Count actual tokens using tiktoken
-        estimated_tokens = len(tokenizer.encode(content))
-        
-        # Split content into parts
-        # Use a safe token limit that's 70% of the estimated current size to ensure actual splitting
-        safe_token_limit = int(estimated_tokens * 0.7)
-        
-        # Get model configs for splitting (if available)
-        model_configs = None
-        if hasattr(self, 'polish_models'):
-            model_configs = self.polish_models
-        elif hasattr(self, 'translation_models'):
-            model_configs = self.translation_models
-        
-        # Get content type if available
-        content_type = getattr(self, 'content_type', 'auto')
-        
-        parts = split_content(
-            content,
-            min(safe_token_limit, max_tokens),
-            self.llm_client,
-            model_configs,
-            'simple',
-        )
-        
-        # Force at least 2 parts if we still got only 1
-        if len(parts) == 1:
-            # Force split into 2 parts
-            logger.info(f"Content estimated at ~{estimated_tokens} tokens, forcing split into 2 parts")
-            parts = split_content(
-                content,
-                estimated_tokens // 2,
-                self.llm_client,
-                model_configs,
-                'simple',
-            )
-        
-        logger.info(f"Split {file_name} into {len(parts)} parts")
-        
-        processed_parts = []
-        for i, part in enumerate(parts, 1):
-            part_name = f"{file_name} (part {i}/{len(parts)})"
-            logger.info(f"Processing {part_name}")
-            
-            # Process each part (Tenacity handles retries)
-            try:
-                processed_part = self.process_content(
-                    content=part,
-                    file_name=part_name,
-                    **kwargs
-                )
-                
-                # Validate the part
-                is_valid, reason = self.validate_output(
-                    original=part,
-                    processed=processed_part,
-                    file_name=part_name
-                )
-                
-                if is_valid:
-                    processed_parts.append(processed_part)
-                    logger.success(f"Successfully processed {part_name}")
-                else:
-                    # For parts, use output even if validation fails
-                    logger.warning(f"Validation failed for {part_name}: {reason}, using output anyway")
-                    processed_parts.append(processed_part)
-                    
-            except Exception as e:
-                # Part processing failed after all Tenacity retries
-                logger.error(f"Failed to process {part_name} after all retries: {e}")
-                return None  # Abort the entire splitting strategy
-        
-        # Combine all processed parts
-        if len(processed_parts) == len(parts):
-            combined = "\n\n".join(processed_parts)
-            logger.success(f"Successfully processed all {len(parts)} parts of {file_name}")
-            return combined
-        else:
-            logger.error(f"Only processed {len(processed_parts)}/{len(parts)} parts of {file_name}")
-            return None
-    
     def process_file(
         self,
         input_path: Path,
@@ -337,25 +235,7 @@ class BaseMarkdownProcessor(ABC):
         
         # All attempts failed
         logger.error(f"Failed to process {file_name} after {max_validation_attempts} attempts: {last_error}")
-        
-        # Try fallback strategy: split into smaller parts
-        logger.warning(f"Attempting to process {file_name} by splitting into smaller parts...")
-        
-        split_result = self.process_with_splitting(
-            content=content,
-            file_name=file_name,
-            **kwargs
-        )
-        
-        if split_result:
-            # Save the split result
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(split_result)
-            logger.success(f"Successfully processed {file_name} using splitting strategy")
-            return True
-        else:
-            logger.error(f"Failed to process {file_name} with all strategies")
-            return False
+        return False
     
     def process_all_files(self) -> Dict[str, Any]:
         """

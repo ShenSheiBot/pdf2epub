@@ -20,6 +20,7 @@ from pdf2epub.processors.utils.splitter_strategies import (
 from pdf2epub.processors.utils.document_parser import (
     analyze_document_structure,
     find_split_positions,
+    find_split_positions_by_indices,
 )
 
 # Initialize tokenizer for accurate token counting
@@ -180,23 +181,40 @@ class BaseLLMSplitter(ContentSplitter):
                 json_str = response
 
             logger.debug(f"Parsing split response: {json_str[:200]}...")
+            
+            # Try to parse as indices first (new format)
+            split_indices = None
             try:
-                split_markers = json.loads(json_str.strip())
-                if not isinstance(split_markers, list):
+                parsed_response = json.loads(json_str.strip())
+                if not isinstance(parsed_response, list):
                     raise ValueError("Response is not a list")
+                
+                # Check if response contains integers (indices) or strings (old format)
+                if parsed_response and all(isinstance(x, int) for x in parsed_response):
+                    # New format: section indices
+                    split_indices = parsed_response
+                    logger.debug(f"Using section indices: {split_indices}")
+                else:
+                    # Old format: string markers (for backward compatibility)
+                    split_markers = [str(marker) for marker in parsed_response if marker]
+                    logger.debug(f"Using string markers (legacy): {len(split_markers)} markers")
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(
                     f"Failed to parse LLM split response: {e}, falling back to simple split"
                 )
                 return SimpleSplitter().split(content, max_tokens)
 
-            # Filter out any empty markers from the LLM response
-            split_markers = [marker for marker in split_markers if marker and marker.strip()]
-
-            # Find split positions using the markers and the structural map
-            split_positions = find_split_positions(
-                content, split_markers, structural_map
-            )
+            # Find split positions using either indices or markers
+            if split_indices is not None:
+                # Use the new index-based approach
+                split_positions = find_split_positions_by_indices(
+                    content, split_indices, structural_map
+                )
+            else:
+                # Use the old marker-based approach (backward compatibility)
+                split_positions = find_split_positions(
+                    content, split_markers, structural_map
+                )
 
             parts = []
             for i in range(len(split_positions) - 1):
@@ -212,13 +230,13 @@ class BaseLLMSplitter(ContentSplitter):
                 )
                 return SimpleSplitter().split(content, max_tokens)
 
-            # Validate that no part exceeds the max_tokens limit
+            # Validate that no part exceeds the max_tokens limit (with 25% tolerance)
             for i, part in enumerate(parts, 1):
                 part_tokens = len(tokenizer.encode(part))
                 logger.info(f"Part {i}/{len(parts)}: {part_tokens:,} tokens")
-                if part_tokens > max_tokens:
+                if part_tokens > max_tokens * 1.25:  # Allow 25% tolerance
                     logger.warning(
-                        f"Part {i} has {part_tokens:,} tokens, which exceeds the limit of {max_tokens:,}. "
+                        f"Part {i} has {part_tokens:,} tokens, which exceeds the limit of {max_tokens:,} by more than 25%. "
                         "Falling back to simple split."
                     )
                     return SimpleSplitter().split(content, max_tokens)
@@ -239,23 +257,27 @@ class GeneralLLMSplitter(BaseLLMSplitter):
         return "general"
 
     def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
-        total_tokens = sum(section["tokens"] for section in structural_map)
+        total_tokens = structural_map[-1]["cumulative_tokens"] if structural_map else 0
         return f"""You are a document planner. Based on the following structural analysis of a document, 
 group the sections into parts that are under {max_tokens:,} tokens each.
 
 The document has {total_tokens:,} tokens total. Aim for approximately {num_parts} parts.
 
 RULES:
-1. Group sections to stay under {max_tokens:,} tokens per part
+1. Target size: Each part should be under {max_tokens:,} tokens
+   - Strongly prefer staying under {max_tokens:,} tokens
+   - Acceptable if slightly over (up to {int(max_tokens * 1.25):,} tokens) when necessary
+   - Use cumulative_tokens field to calculate part sizes
 2. Keep related sections together when possible
 3. Split at natural boundaries (section headings)
 4. Create the fewest parts necessary
 
-Return a JSON array of the exact "starts_with" strings for sections that should begin each new part 
-(starting from the SECOND part). The first part always starts at the beginning.
+Return a JSON array of section indices where each new part should begin (starting from the SECOND part).
+The first part always starts at section 0.
 
-Example: If sections 1-3 should be Part 1, and section 4 should start Part 2, return the "starts_with" 
-value from section 4."""
+Example: [5, 12, 18] means part 2 starts at section index 5, part 3 at section 12, part 4 at section 18.
+
+IMPORTANT: Use the cumulative_tokens field. Aim for {max_tokens:,} tokens per part."""
 
 
 class JapaneseLLMSplitter(BaseLLMSplitter):
@@ -265,20 +287,26 @@ class JapaneseLLMSplitter(BaseLLMSplitter):
         return "japanese"
 
     def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
-        total_tokens = sum(section["tokens"] for section in structural_map)
+        total_tokens = structural_map[-1]["cumulative_tokens"] if structural_map else 0
         return f"""You are a document planner for Japanese content. Based on the following structural analysis, 
 group the sections into parts that are under {max_tokens:,} tokens each.
 
 The document has {total_tokens:,} tokens total.
 
 RULES:
-1. Group sections to stay under {max_tokens:,} tokens per part
+1. Target size: Each part should be under {max_tokens:,} tokens
+   - Strongly prefer staying under {max_tokens:,} tokens
+   - Acceptable if slightly over (up to {int(max_tokens * 1.25):,} tokens) when necessary
+   - Use cumulative_tokens field to calculate part sizes
 2. Keep scene breaks and natural story flow intact
 3. Split at section boundaries when possible
 4. Create the fewest parts necessary
 
-Return a JSON array of the exact "starts_with" strings for sections that should begin each new part 
-(starting from the SECOND part)."""
+Return a JSON array of section indices where each new part should begin (starting from the SECOND part).
+
+Example: [5, 12] means part 2 starts at section 5, part 3 at section 12.
+
+IMPORTANT: Use the cumulative_tokens field. Aim for {max_tokens:,} tokens per part."""
 
 
 class AcademicLLMSplitter(BaseLLMSplitter):
@@ -288,7 +316,7 @@ class AcademicLLMSplitter(BaseLLMSplitter):
         return "academic"
 
     def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
-        total_tokens = sum(section["tokens"] for section in structural_map)
+        total_tokens = structural_map[-1]["cumulative_tokens"] if structural_map else 0
         ideal_part_size = total_tokens // num_parts
         return f"""You are a document planner for academic texts. Below is a structural analysis of a chapter.
 
@@ -297,25 +325,35 @@ The ideal size for each part is approximately {ideal_part_size:,} tokens.
 
 CRITICAL RULES:
 
-1. **Balanced Parts** (HIGHEST PRIORITY):
-   - Create parts that are as close to the ideal size ({ideal_part_size:,} tokens) as possible.
-   - Avoid creating one very large part and one very small part. Aim for reasonably equal sizes.
+1. **Token Limit** (HIGHEST PRIORITY):
+   - Target: Keep each part under {max_tokens:,} tokens
+   - Hard limit: Never exceed {int(max_tokens * 1.25):,} tokens (25% tolerance)
+   - Use cumulative_tokens to calculate part sizes
+   - Example: If you split at section 10 (cumulative: 25,000) and section 15 (cumulative: 45,000), 
+     the part contains 45,000 - 25,000 = 20,000 tokens
 
-2. **Citation Integrity**:
-   - A section with `citations_made` MUST be in the same part as the section with the corresponding `footnotes_defined`.
-   - NEVER split citations from their definitions.
+2. **Balanced Parts**:
+   - Create parts close to the ideal size ({ideal_part_size:,} tokens)
+   - It's better to have slightly larger parts than very unbalanced ones
+   - Avoid creating tiny parts (< {int(ideal_part_size * 0.5):,} tokens) unless necessary
 
-3. **Token Limit**:
-   - No single part should exceed {max_tokens:,} tokens.
+3. **Citation Integrity**:
+   - Check citations_formatted field for citation ranges (e.g., "1-10, 15, 20-25")
+   - Try to keep sections with many citations together when possible
+   - Footnote definitions are less common in this document
 
 4. **Section Order**:
-   - Sections must remain in their original order.
+   - Sections must remain in order
 
-Analyze the document structure and token counts to find the best split points that create balanced parts while respecting all rules.
+Return a JSON array of section indices where new parts begin (starting from the SECOND part).
 
-Return a JSON array of the exact "starts_with" strings for sections that should begin each new part 
-(starting from the SECOND part).
-"""
+Example: [7, 14, 21] means:
+- Part 1: sections 0-6
+- Part 2: sections 7-13  
+- Part 3: sections 14-20
+- Part 4: sections 21-end
+
+Use the cumulative_tokens field to ensure parts don't exceed {max_tokens:,} tokens."""
 
 
 def get_splitter(

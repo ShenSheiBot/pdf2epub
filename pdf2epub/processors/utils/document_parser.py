@@ -15,6 +15,60 @@ import tiktoken
 # Initialize tokenizer for accurate token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
+
+def format_citation_ranges(citations: List[str]) -> str:
+    """
+    Format a list of citations into compact ranges.
+    
+    Args:
+        citations: List of citation numbers as strings
+    
+    Returns:
+        Formatted string with ranges, e.g., "1-5, 7, 10-15"
+    """
+    if not citations:
+        return ""
+    
+    # Try to convert to integers, keeping non-numeric ones separate
+    numeric_citations = []
+    non_numeric = []
+    
+    for c in citations:
+        try:
+            numeric_citations.append(int(c))
+        except ValueError:
+            non_numeric.append(c)
+    
+    # Sort numeric citations
+    numeric_citations.sort()
+    
+    # Build ranges for numeric citations
+    ranges = []
+    if numeric_citations:
+        start = numeric_citations[0]
+        end = numeric_citations[0]
+        
+        for num in numeric_citations[1:]:
+            if num == end + 1:
+                end = num
+            else:
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                start = num
+                end = num
+        
+        # Add the last range
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}-{end}")
+    
+    # Combine numeric ranges and non-numeric citations
+    all_formatted = ranges + non_numeric
+    return ", ".join(all_formatted)
+
 # Regex patterns for citations and footnotes
 # Citation patterns (found inline in text)
 CITATION_PATTERNS = [
@@ -69,6 +123,43 @@ def extract_first_sentence(text: str, max_length: int = 100) -> str:
         return text[:max_length].strip() + "..."
     
     return text
+
+
+def create_content_preview(text: str, preview_length: int = 200) -> str:
+    """
+    Create a preview of content showing beginning and end.
+    
+    Args:
+        text: The full text content
+        preview_length: Length of text to show from start and end
+        
+    Returns:
+        Preview string in format "first 200 chars...last 200 chars" or full text if short
+    """
+    text = text.strip()
+    if not text:
+        return ""
+    
+    # If text is short enough, return it all
+    if len(text) <= preview_length * 2:
+        return text
+    
+    # Get first and last parts
+    first_part = text[:preview_length].strip()
+    last_part = text[-preview_length:].strip()
+    
+    # Make sure we don't cut in the middle of a word
+    # Find last space in first part
+    last_space = first_part.rfind(' ')
+    if last_space > preview_length * 0.8:  # Only trim if we're not losing too much
+        first_part = first_part[:last_space]
+    
+    # Find first space in last part
+    first_space = last_part.find(' ')
+    if first_space > 0 and first_space < preview_length * 0.2:
+        last_part = last_part[first_space + 1:]
+    
+    return f"{first_part}...{last_part}"
 
 
 def find_citations_in_text(text: str) -> Set[str]:
@@ -216,9 +307,12 @@ def analyze_document_structure(content: str, content_type: str = "general") -> L
         
     Returns:
         List of dictionaries, each representing a section with metadata:
+        - section_index: Sequential index starting from 0
         - section: The section heading (e.g., "## Introduction")
         - tokens: Token count of the section
-        - starts_with: First sentence/words of the section
+        - cumulative_tokens: Running total of tokens up to and including this section
+        - content_preview: Preview showing beginning and end of section content
+        - position: Dict with 'start' and 'end' character positions
         - citations_made: (academic only) Citations found in the section
         - footnotes_defined: (academic only) Footnotes defined in the section
     """
@@ -226,6 +320,7 @@ def analyze_document_structure(content: str, content_type: str = "general") -> L
     
     sections = identify_sections(content)
     structural_map = []
+    cumulative_tokens = 0
     
     for i, (start_pos, end_pos, heading_level, heading_text) in enumerate(sections):
         # Extract section content
@@ -237,9 +332,9 @@ def analyze_document_structure(content: str, content_type: str = "general") -> L
         
         # Calculate token count
         token_count = len(tokenizer.encode(section_content))
+        cumulative_tokens += token_count
         
-        # Extract the first sentence/words for identification
-        # Skip the heading line itself if present
+        # Extract the actual content (skipping heading)
         lines = section_content.split('\n')
         content_start_idx = 0
         
@@ -248,13 +343,21 @@ def analyze_document_structure(content: str, content_type: str = "general") -> L
         
         # Get actual content (skipping heading)
         actual_content = '\n'.join(lines[content_start_idx:]).strip()
-        first_sentence = extract_first_sentence(actual_content) if actual_content else ""
+        
+        # Create content preview showing beginning and end
+        content_preview = create_content_preview(actual_content) if actual_content else ""
         
         # Build section info
         section_info = {
+            "section_index": len(structural_map),  # Sequential index
             "section": f"{heading_level} {heading_text}" if heading_level else "(No heading)",
             "tokens": token_count,
-            "starts_with": first_sentence
+            "cumulative_tokens": cumulative_tokens,
+            "content_preview": content_preview,
+            "position": {
+                "start": start_pos,
+                "end": end_pos
+            }
         }
         
         # For academic content, analyze citations and footnotes
@@ -263,12 +366,22 @@ def analyze_document_structure(content: str, content_type: str = "general") -> L
             definitions = find_footnote_definitions(section_content)
             
             # Convert sets to sorted lists for consistency
-            section_info["citations_made"] = sorted(list(citations))
-            section_info["footnotes_defined"] = sorted(list(definitions))
+            citations_list = sorted(list(citations))
+            definitions_list = sorted(list(definitions))
+            
+            # Store both raw and formatted versions
+            section_info["citations_made"] = citations_list
+            section_info["footnotes_defined"] = definitions_list
+            
+            # Add formatted versions for display
+            section_info["citations_formatted"] = format_citation_ranges(citations_list)
+            section_info["footnotes_formatted"] = format_citation_ranges(definitions_list)
             
             logger.debug(
-                f"Section '{section_info['section']}': "
-                f"{len(citations)} citations, {len(definitions)} definitions"
+                f"Section {section_info['section_index']}: '{section_info['section']}': "
+                f"citations: {section_info['citations_formatted'] or 'none'}, "
+                f"footnotes: {section_info['footnotes_formatted'] or 'none'}, "
+                f"cumulative tokens: {cumulative_tokens:,}"
             )
         
         structural_map.append(section_info)
@@ -276,7 +389,7 @@ def analyze_document_structure(content: str, content_type: str = "general") -> L
     logger.info(f"Document analysis complete: {len(structural_map)} sections identified")
     
     # Log summary statistics
-    total_tokens = sum(s["tokens"] for s in structural_map)
+    total_tokens = cumulative_tokens
     logger.info(f"Total document tokens: {total_tokens:,}")
     
     if content_type == "academic":
@@ -309,7 +422,7 @@ def find_split_positions(
 
     # Create a lookup table from starts_with to the full section heading
     marker_to_heading = {
-        section["starts_with"]: section["section"] for section in structural_map
+        section.get("starts_with", ""): section["section"] for section in structural_map
     }
 
     for marker in split_markers:
@@ -322,32 +435,19 @@ def find_split_positions(
                 split_positions.append(pos)
             continue
 
-        # --- FUZZY MATCHING LOGIC ---
-        # Extract the text part of the heading, stripping # and whitespace
-        heading_text_match = re.match(r'^(?:#{1,6}\s*)?(.+?)\s*', heading)
-        if not heading_text_match:
-            logger.warning(f"Could not extract text from heading: '{heading}'")
-            continue
-        
-        heading_text = heading_text_match.group(1)
-        
-        # Create a regex pattern to find this heading text with any # level
-        # Escape special regex characters in the heading text
-        escaped_heading_text = re.escape(heading_text)
-        pattern = re.compile(f"^(?:#{{1,6}}\s*)?{escaped_heading_text}\s*$", re.MULTILINE)
-        
-        # Search for the pattern from the last found position
+        # Find the position of the heading in the content
+        # We need to be careful with headings that might appear multiple times.
+        # Let's search from the last found position to be safer.
         last_pos = split_positions[-1] if len(split_positions) > 1 else 0
-        match = pattern.search(content, last_pos)
+        pos = content.find(heading, last_pos)
 
-        if match:
+        if pos != -1:
             # The position should be the start of the heading line
-            pos = match.start()
             split_positions.append(pos)
-            logger.debug(f"Found split point at fuzzy heading position {pos}: '{match.group(0)}'")
+            logger.debug(f"Found split point at heading position {pos}: '{heading}'")
         else:
-            logger.warning(f"Could not find heading via fuzzy match for: '{heading}'")
-            # Fallback to simple marker search
+            logger.warning(f"Could not find heading for split marker: '{heading}'")
+            # Fallback to marker search
             pos = content.find(marker, last_pos)
             if pos != -1:
                 split_positions.append(pos)
@@ -358,4 +458,42 @@ def find_split_positions(
     # Sort and remove duplicates
     split_positions = sorted(set(split_positions))
 
+    return split_positions
+
+
+def find_split_positions_by_indices(
+    content: str, split_indices: List[int], structural_map: List[Dict]
+) -> List[int]:
+    """
+    Find the positions in content where splits should occur based on section indices.
+    
+    Args:
+        content: The original content
+        split_indices: List of section indices where new parts should begin
+        structural_map: The structural map of the document
+    
+    Returns:
+        List of character positions where splits should occur
+    """
+    split_positions = [0]  # First part always starts at beginning
+    
+    for index in split_indices:
+        if index < 0 or index >= len(structural_map):
+            logger.warning(f"Invalid section index: {index} (map has {len(structural_map)} sections)")
+            continue
+        
+        # Get the character position from the structural map
+        position = structural_map[index]["position"]["start"]
+        split_positions.append(position)
+        logger.debug(
+            f"Split at section {index} ('{structural_map[index]['section']}'): "
+            f"position {position}"
+        )
+    
+    # Add end position
+    split_positions.append(len(content))
+    
+    # Sort and remove duplicates
+    split_positions = sorted(set(split_positions))
+    
     return split_positions

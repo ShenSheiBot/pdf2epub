@@ -314,11 +314,11 @@ class PolishProcessor(BaseMarkdownProcessor):
     
     def _determine_max_tokens(self) -> int:
         """Determine maximum tokens per part based on model configuration."""
-        max_tokens_per_part = 10000  # Conservative default
+        max_tokens_per_part = 8000  # Conservative default
         
         if self.polish_models:
             # Check if any model has limited context
-            limited_model_patterns = ["flash", "haiku", "-mini"]
+            limited_model_patterns = ["flash", "haiku", "-mini", "seek"]
             
             has_limited_model = any(
                 any(pattern in model_config.get("model", "").lower() 
@@ -326,19 +326,11 @@ class PolishProcessor(BaseMarkdownProcessor):
                 for model_config in self.polish_models
             )
 
-            is_deepseek = any(
-                "seek" in model_config.get("model", "").lower()
-                for model_config in self.polish_models
-            )
-
-            if is_deepseek:
-                max_tokens_per_part = 15000
-                logger.info("Using max_tokens_per_part=15000 (Deepseek detected)")
-            elif not has_limited_model:
+            if not has_limited_model:
                 max_tokens_per_part = 20000
                 logger.info("Using max_tokens_per_part=20000 (no limited-context models detected)")
             else:
-                logger.info("Using max_tokens_per_part=10000 (limited-context model detected)")
+                logger.info("Using max_tokens_per_part=8000 (limited-context model detected)")
         
         return max_tokens_per_part
     
@@ -622,9 +614,10 @@ Your tasks for ACADEMIC content:
      * Bottom of pages (separated from main text)
      * End of chapters in dedicated Notes/References sections
      * Clearly marked footnote sections
-   - DO NOT convert regular paragraph text after citations into footnote definitions
    - Preserve exact footnote numbering from the source
+   - If footnote is at the bottom of page, group and move them to the end of section
    - Never invent or add missing footnotes
+   - Keep footnote index as-is, do not try to mitigate duplicate [1] in the same section
 
 4. **Preserve academic elements**:
    - Keep equations, formulas, and mathematical notation

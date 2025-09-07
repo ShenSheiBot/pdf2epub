@@ -252,6 +252,8 @@ def epub_command(args):
             new_argv.append('--zip')
         if args.relevel:
             new_argv.append('--relevel')
+        if args.global_footnotes:
+            new_argv.append('--global-footnotes')
         
         sys.argv = new_argv
         
@@ -542,6 +544,11 @@ Examples:
         "--relevel",
         action="store_true",
         help="Use LLM to analyze and re-level the book structure (adjust heading hierarchy)"
+    )
+    epub_parser.add_argument(
+        "--global-footnotes",
+        action="store_true",
+        help="Force global footnotes (use last definition, ignore previous definitions)"
     )
     epub_parser.set_defaults(func=epub_command)
     

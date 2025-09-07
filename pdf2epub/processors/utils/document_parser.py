@@ -121,6 +121,14 @@ def find_footnote_definitions(text: str) -> Set[str]:
     definitions = set()
     lines = text.split('\n')
     
+    # Check if this section looks like a footnotes/notes/references section
+    text_lower = text.lower()
+    is_footnote_section = any(marker in text_lower[:500] for marker in [
+        '## notes', '## footnotes', '## references', '## endnotes',
+        '# notes', '# footnotes', '# references', '# endnotes',
+        'notes:', 'footnotes:', 'references:', 'endnotes:'
+    ])
+    
     for line in lines:
         line = line.strip()
         
@@ -130,22 +138,26 @@ def find_footnote_definitions(text: str) -> Set[str]:
             definitions.add(match.group(1))
             continue
         
-        # Academic style [1] at line start (followed by space/tab)
-        match = re.match(r'^\[(\d+)\]\s', line)
-        if match:
+        # Academic style [1] at line start (must be followed by actual content)
+        # More strict: require colon or substantial text after
+        match = re.match(r'^\[(\d+)\][\s:]\s*(.+)', line)
+        if match and len(match.group(2)) > 10:  # Require some actual content
             definitions.add(match.group(1))
             continue
         
-        # Numbered list style 1. (be more careful with this)
-        # Only treat as footnote if it's in a Notes/References section or follows a pattern
-        match = re.match(r'^(\d+)\.\s', line)
-        if match:
-            # Check if we're likely in a footnotes section
-            # This is a heuristic - we can refine it based on context
-            number = match.group(1)
-            # Only consider single or double digit numbers as likely footnotes
-            if len(number) <= 2:
-                definitions.add(number)
+        # Numbered list style 1. - ONLY in footnote sections
+        # This avoids false positives from regular numbered lists
+        if is_footnote_section:
+            match = re.match(r'^(\d+)\.\s+(.+)', line)
+            if match:
+                number = match.group(1)
+                content = match.group(2)
+                # Only consider as footnote if:
+                # 1. It's a reasonable footnote number (1-999)
+                # 2. Has substantial content (not just a few words)
+                # 3. Is in a footnote section
+                if len(number) <= 3 and len(content) > 20:
+                    definitions.add(number)
     
     return definitions
 

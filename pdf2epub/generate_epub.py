@@ -703,6 +703,11 @@ def main():
         action="store_true",
         help="Use LLM to analyze and re-level the book structure",
     )
+    parser.add_argument(
+        "--global-footnotes",
+        action="store_true",
+        help="Force global footnotes (use last definition, ignore previous definitions)",
+    )
 
     args = parser.parse_args()
 
@@ -756,7 +761,7 @@ def main():
 
     # Initialize FootnoteManager to analyze footnote structure
     logger.info("Analyzing footnote structure...")
-    footnote_manager = FootnoteManager(epub_config.markdown_dir)
+    footnote_manager = FootnoteManager(epub_config.markdown_dir, force_global=args.global_footnotes)
     
     # Initialize components
     converter = ContentConverter(epub_config, footnote_manager)

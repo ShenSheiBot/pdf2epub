@@ -270,6 +270,9 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
     """
     Process footnotes in GLOBAL mode - handles cross-chapter footnote references.
     
+    For definition chapters: Keep footnote definitions as-is in markdown format
+    For reference chapters: Convert footnote references to cross-chapter links
+    
     Args:
         markdown_content: The markdown text to process
         footnote_manager: FootnoteManager instance in GLOBAL mode
@@ -280,56 +283,65 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
     """
     lines = markdown_content.split('\n')
     processed_lines = []
-    in_notes_section = False
-    footnote_list = []
     
-    for line in lines:
-        # Check if this is a heading
-        if line.strip().startswith('#'):
-            # Check if we're entering a Notes section
-            notes_keywords = ['Notes', 'Footnotes', '注释', '注解', '脚注', '註釋', '註解', '脚註']
-            if any(keyword in line for keyword in notes_keywords):
-                in_notes_section = True
-            else:
-                in_notes_section = False
-            processed_lines.append(line)
-            continue
+    # Check if this chapter is a definition chapter
+    is_definition_chapter = False
+    if hasattr(footnote_manager, 'definition_chapters'):
+        is_definition_chapter = source_chapter in footnote_manager.definition_chapters
+    if hasattr(footnote_manager, 'primary_definition_chapters') and footnote_manager.primary_definition_chapters:
+        # If primary definition chapters are set (force_global mode), use those instead
+        is_definition_chapter = source_chapter in footnote_manager.primary_definition_chapters
+    
+    # Debug logging
+    from loguru import logger
+    logger.debug(f"Processing {source_chapter}: is_definition_chapter={is_definition_chapter}")
+    
+    # For definition chapters, convert footnote definitions to HTML without renumbering
+    if is_definition_chapter:
+        logger.debug(f"Definition chapter {source_chapter}: converting footnotes without renumbering")
+        def_occurrence = {}  # Track occurrence numbers for definitions
         
-        # Process footnote definitions [^1]:
-        if in_notes_section:
-            match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
-            if match:
-                fn_key = match.group(1)
-                fn_text = match.group(2)
+        for line in lines:
+            # Check for footnote definition [^1]:
+            def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+            if def_match:
+                fn_key = def_match.group(1)
+                fn_text = def_match.group(2)
                 
-                # Only include this definition if it belongs to this chapter
-                if footnote_manager.should_include_definition(fn_key, source_chapter):
-                    # Create the footnote HTML
-                    footnote_list.append((fn_key, fn_text))
-                # Skip the line either way - we'll output formatted footnotes later
-                continue
-        
-        # Process footnote references [^1]
-        def replace_ref(match):
-            fn_key = match.group(1)
-            # Get the HTML from FootnoteManager which handles cross-chapter links
-            return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
-        
-        line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
-        processed_lines.append(line)
-    
-    # Add footnote definitions at the end if any belong to this chapter
-    if footnote_list:
-        processed_lines.append('')
-        processed_lines.append('<div class="footnotes">')
-        processed_lines.append('<h2>Notes</h2>')
-        processed_lines.append('<ol>')
-        for fn_key, fn_text in footnote_list:
-            processed_lines.append(f'<li id="fn:{fn_key}">')
-            processed_lines.append(f'<p>{fn_text} <a class="footnote-backref" href="#fnref{fn_key}" title="Jump back to footnote {fn_key} in the text">↩</a></p>')
-            processed_lines.append('</li>')
-        processed_lines.append('</ol>')
-        processed_lines.append('</div>')
+                # Track occurrence number for this definition
+                if fn_key not in def_occurrence:
+                    def_occurrence[fn_key] = 0
+                def_occurrence[fn_key] += 1
+                occurrence_num = def_occurrence[fn_key]
+                
+                # In global mode with occurrence mapping, keep the original numbering
+                # Add ID based on occurrence number for cross-chapter linking
+                fn_id = f"fn:{fn_key}:{occurrence_num}"
+                
+                # Output as HTML with occurrence-based ID
+                processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
+                processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}</p>')
+                processed_lines.append('</div>')
+            else:
+                # Process footnote references [^1] but NOT definitions
+                def replace_ref(match):
+                    fn_key = match.group(1)
+                    # Get the HTML from FootnoteManager which handles cross-chapter links
+                    return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
+                
+                line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+                processed_lines.append(line)
+    else:
+        # For reference chapters, only process references (no definitions to handle)
+        for line in lines:
+            # Process footnote references [^1]
+            def replace_ref(match):
+                fn_key = match.group(1)
+                # Get the HTML from FootnoteManager which handles cross-chapter links
+                return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
+            
+            line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+            processed_lines.append(line)
     
     return '\n'.join(processed_lines)
 

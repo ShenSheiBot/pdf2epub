@@ -178,7 +178,7 @@ a { text-decoration: none; }
                 
                 chapter_title = chapter.get("title", f"Chapter {i}")
                 
-                ncx += f"""        <navPoint id="navpoint-{i}" playOrder="{play_order}">
+                ncx += f"""        <navPoint id="navpoint-chapter-{i}" playOrder="{play_order}">
             <navLabel>
                 <text>{html.escape(chapter_title)}</text>
             </navLabel>
@@ -200,7 +200,7 @@ a { text-decoration: none; }
                         else:
                             subchapter_file = chapter_file
                         
-                        ncx += f"""            <navPoint id="navpoint-{play_order}" playOrder="{play_order}">
+                        ncx += f"""            <navPoint id="navpoint-sub-{i}-{j}" playOrder="{play_order}">
                 <navLabel>
                     <text>{html.escape(sub_title)}</text>
                 </navLabel>
@@ -214,7 +214,7 @@ a { text-decoration: none; }
             
             # Add back matter if exists
             if structure.get("back_matter"):
-                ncx += f"""        <navPoint id="navpoint-{play_order}" playOrder="{play_order}">
+                ncx += f"""        <navPoint id="navpoint-backmatter" playOrder="{play_order}">
             <navLabel>
                 <text>Back Matter</text>
             </navLabel>

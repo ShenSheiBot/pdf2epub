@@ -13,6 +13,7 @@ from pathlib import Path
 from loguru import logger
 
 from .epub import EpubConfig, ContentConverter, EpubBuilder
+from .epub.footnotes import FootnoteManager
 from .utils.logging_config import configure_logging
 from .utils.common import load_config, load_book_structure, ensure_directory
 from .utils.zip_utils import create_password_protected_zip
@@ -142,9 +143,14 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
                         elif line.startswith("## ") and not line.startswith("### "):
                             # Extract subtitle without the ## marker
                             subtitle = line[3:].strip()
-                            if (
-                                subtitle and len(subtitle) <= 50
-                            ):  # Ignore empty or too long
+                            
+                            # Check if it's a numbered section (like "2.3 Section Title")
+                            starts_with_number = subtitle and subtitle[0].isdigit()
+                            ends_with_period = subtitle and subtitle.endswith('.')
+                            is_numbered_section = starts_with_number and not ends_with_period
+                            
+                            # Include if not empty AND (not too long OR is a numbered section)
+                            if subtitle and (len(subtitle) <= 50 or is_numbered_section):
                                 subchapters.append({"title": subtitle})
 
             except Exception as e:
@@ -748,8 +754,12 @@ def main():
     else:
         logger.info(f"Using configured language: {epub_config.language}")
 
+    # Initialize FootnoteManager to analyze footnote structure
+    logger.info("Analyzing footnote structure...")
+    footnote_manager = FootnoteManager(epub_config.markdown_dir)
+    
     # Initialize components
-    converter = ContentConverter(epub_config)
+    converter = ContentConverter(epub_config, footnote_manager)
     builder = EpubBuilder(
         epub_config, converter
     )  # Pass converter for file naming helpers

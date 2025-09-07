@@ -23,14 +23,16 @@ from ..markdown_to_html import convert_markdown_to_html
 class ContentConverter:
     """Handles all content conversion and preparation for EPUB generation."""
     
-    def __init__(self, config):
+    def __init__(self, config, footnote_manager=None):
         """
         Initialize the ContentConverter.
         
         Args:
             config: EpubConfig instance with all settings
+            footnote_manager: Optional FootnoteManager instance for handling cross-chapter footnotes
         """
         self.config = config
+        self.footnote_manager = footnote_manager
     
     def remove_duplicate_titles(self) -> int:
         """
@@ -188,7 +190,12 @@ class ContentConverter:
     
     def clean_invalid_headings(self) -> int:
         """
-        Remove empty or too-long (>50 chars) heading lines from markdown files.
+        Remove invalid heading lines from markdown files.
+        
+        Invalid headings are:
+        - Empty headings (just # markers with no text)
+        - Too-long headings (>50 chars) for level 2+ headings
+        - Exception: Numbered sections (like "2.3 Section Title") are kept regardless of length
         
         Returns:
             Number of headings removed
@@ -221,12 +228,18 @@ class ContentConverter:
                             title = heading_match.group(2).strip()
                             
                             # Remove if empty or too long (for level 2+ headings)
+                            # BUT keep if it starts with a number and doesn't end with a period (like "2.3 Section Title")
                             if len(markers) >= 2:  # ## or more
+                                # Check if title starts with a number and doesn't end with period
+                                starts_with_number = title and title[0].isdigit()
+                                ends_with_period = title and title.endswith('.')
+                                is_numbered_section = starts_with_number and not ends_with_period
+                                
                                 if not title:
                                     logger.debug(f"Removing empty heading in {md_file.name}: {stripped}")
                                     should_keep = False
                                     removed_count += 1
-                                elif len(title) > 50:
+                                elif len(title) > 50 and not is_numbered_section:
                                     logger.debug(f"Removing too-long heading ({len(title)} chars) in {md_file.name}: {title[:50]}...")
                                     should_keep = False
                                     removed_count += 1
@@ -465,7 +478,15 @@ class ContentConverter:
                 image_mapping = None
 
             # Convert markdown to HTML (just the body content, not a full document)
-            html_content = convert_markdown_to_html(markdown_content, standalone=False, image_mapping=image_mapping)
+            # Pass footnote_manager and source chapter for cross-chapter footnote support
+            source_chapter = markdown_path.stem  # e.g., "chapter_1" or "chapter_7"
+            html_content = convert_markdown_to_html(
+                markdown_content, 
+                standalone=False, 
+                image_mapping=image_mapping,
+                footnote_manager=self.footnote_manager,
+                source_chapter=source_chapter
+            )
 
             # Add/update anchors to subchapter headings if we have the info
             if chapter_index and subchapter_info:

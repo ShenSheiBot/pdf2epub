@@ -531,16 +531,4 @@ class BaseMarkdownProcessor(ABC):
                 lines = lines[:-1]
                 content = '\n'.join(lines)
         
-        # Remove invalid ## headers in the first line
-        # (empty or with title longer than 50 chars)
-        lines = content.strip().split('\n')
-        if lines and lines[0].strip().startswith('##'):
-            first_line = lines[0].strip()
-            # Extract the title part after ##
-            title = first_line[2:].strip()
-            # Remove if empty or longer than 50 chars
-            if not title or len(title) > 50:
-                lines = lines[1:]
-                content = '\n'.join(lines)
-        
         return content.strip()

@@ -332,11 +332,11 @@ class PolishProcessor(BaseMarkdownProcessor):
             )
 
             if is_deepseek:
-                max_tokens_per_part = 20000
-                logger.info("Using max_tokens_per_part=20000 (Deepseek detected)")
+                max_tokens_per_part = 15000
+                logger.info("Using max_tokens_per_part=15000 (Deepseek detected)")
             elif not has_limited_model:
-                max_tokens_per_part = 30000
-                logger.info("Using max_tokens_per_part=30000 (no limited-context models detected)")
+                max_tokens_per_part = 20000
+                logger.info("Using max_tokens_per_part=20000 (no limited-context models detected)")
             else:
                 logger.info("Using max_tokens_per_part=10000 (limited-context model detected)")
         
@@ -612,11 +612,18 @@ Your tasks for ACADEMIC content:
    - Preserve figure/table captions and numbering
 
 3. **Handle citations and footnotes CAREFULLY**:
-   - Convert ALL citation formats ($^1$, ¹, [1], etc.) to [^1]
-   - Convert footnote definitions to "[^1]: content" format
-   - CRITICAL: Only include footnotes ACTUALLY in the source
-   - Preserve exact footnote content and numbering
-   - Check for both inline and end-of-section footnotes
+   - INLINE CITATIONS: Convert citation markers ($^1$, ¹, {{ }}^{{1}}, etc.) to [^1] format
+   - IMPORTANT: Text immediately after a citation marker is NOT the footnote definition
+   - Example of WRONG interpretation:
+     * Input: "This is discussed by Smith$^5$ The next sentence continues..."
+     * WRONG: "This is discussed by Smith[^5]" then "[^5]: The next sentence continues..."
+     * RIGHT: "This is discussed by Smith[^5] The next sentence continues..."
+   - FOOTNOTE DEFINITIONS: Only create [^1]: format for ACTUAL footnotes found at:
+     * Bottom of pages (separated from main text)
+     * End of chapters in dedicated Notes/References sections
+     * Clearly marked footnote sections
+   - DO NOT convert regular paragraph text after citations into footnote definitions
+   - Preserve exact footnote numbering from the source
    - Never invent or add missing footnotes
 
 4. **Preserve academic elements**:

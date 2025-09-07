@@ -205,9 +205,14 @@ def process_ruby_text(markdown_content: str) -> str:
     return markdown_content
 
 
-def preprocess_markdown(markdown_content: str) -> str:
+def preprocess_markdown(markdown_content: str, footnote_manager=None, source_chapter: Optional[str] = None) -> str:
     """
     Pre-process markdown to fix various issues before conversion.
+    
+    Args:
+        markdown_content: The markdown text to process
+        footnote_manager: Optional FootnoteManager for cross-chapter footnote handling
+        source_chapter: The source chapter name for footnote linking
     """
     # First, process Japanese ruby text
     markdown_content = process_ruby_text(markdown_content)
@@ -258,18 +263,99 @@ def preprocess_markdown(markdown_content: str) -> str:
     markdown_content = re.sub(r'\$\{([a-zA-Z])\}\$', r'<sup>\1</sup>', markdown_content)
     
     # Now process footnotes
-    return preprocess_footnotes(markdown_content)
+    return preprocess_footnotes(markdown_content, footnote_manager, source_chapter)
 
 
-def preprocess_footnotes(markdown_content: str) -> str:
+def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_chapter: str) -> str:
+    """
+    Process footnotes in GLOBAL mode - handles cross-chapter footnote references.
+    
+    Args:
+        markdown_content: The markdown text to process
+        footnote_manager: FootnoteManager instance in GLOBAL mode
+        source_chapter: The source chapter name for footnote linking
+        
+    Returns:
+        Processed markdown with HTML footnote links
+    """
+    lines = markdown_content.split('\n')
+    processed_lines = []
+    in_notes_section = False
+    footnote_list = []
+    
+    for line in lines:
+        # Check if this is a heading
+        if line.strip().startswith('#'):
+            # Check if we're entering a Notes section
+            notes_keywords = ['Notes', 'Footnotes', '注释', '注解', '脚注', '註釋', '註解', '脚註']
+            if any(keyword in line for keyword in notes_keywords):
+                in_notes_section = True
+            else:
+                in_notes_section = False
+            processed_lines.append(line)
+            continue
+        
+        # Process footnote definitions [^1]:
+        if in_notes_section:
+            match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+            if match:
+                fn_key = match.group(1)
+                fn_text = match.group(2)
+                
+                # Only include this definition if it belongs to this chapter
+                if footnote_manager.should_include_definition(fn_key, source_chapter):
+                    # Create the footnote HTML
+                    footnote_list.append((fn_key, fn_text))
+                # Skip the line either way - we'll output formatted footnotes later
+                continue
+        
+        # Process footnote references [^1]
+        def replace_ref(match):
+            fn_key = match.group(1)
+            # Get the HTML from FootnoteManager which handles cross-chapter links
+            return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
+        
+        line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+        processed_lines.append(line)
+    
+    # Add footnote definitions at the end if any belong to this chapter
+    if footnote_list:
+        processed_lines.append('')
+        processed_lines.append('<div class="footnotes">')
+        processed_lines.append('<h2>Notes</h2>')
+        processed_lines.append('<ol>')
+        for fn_key, fn_text in footnote_list:
+            processed_lines.append(f'<li id="fn:{fn_key}">')
+            processed_lines.append(f'<p>{fn_text} <a class="footnote-backref" href="#fnref{fn_key}" title="Jump back to footnote {fn_key} in the text">↩</a></p>')
+            processed_lines.append('</li>')
+        processed_lines.append('</ol>')
+        processed_lines.append('</div>')
+    
+    return '\n'.join(processed_lines)
+
+
+def preprocess_footnotes(markdown_content: str, footnote_manager=None, source_chapter: Optional[str] = None) -> str:
     """
     Convert footnote definitions to HTML format and handle footnote references.
     
     Since we're not using the markdown footnotes extension, we need to manually
     convert [^1]: text to proper HTML footnote format.
     
-    Handle multiple sets of footnotes by making each occurrence unique.
+    If footnote_manager is provided and in GLOBAL mode, handles cross-chapter footnote links.
+    Otherwise, falls back to local footnote processing.
+    
+    Args:
+        markdown_content: The markdown text to process
+        footnote_manager: Optional FootnoteManager for cross-chapter footnote handling  
+        source_chapter: The source chapter name for footnote linking
     """
+    # Check if we should use global footnote handling
+    if footnote_manager and source_chapter:
+        from pdf2epub.epub.footnotes import FootnoteStyle
+        if footnote_manager.get_style() == FootnoteStyle.GLOBAL:
+            return preprocess_footnotes_global(markdown_content, footnote_manager, source_chapter)
+    
+    # Fall back to local processing (existing logic)
     lines = markdown_content.split('\n')
     
     # First pass: find all footnote references and definitions, make them unique
@@ -410,7 +496,9 @@ def convert_markdown_to_html(
     title: Optional[str] = None,
     include_css: bool = True,
     standalone: bool = True,
-    image_mapping: Optional[dict] = None
+    image_mapping: Optional[dict] = None,
+    footnote_manager=None,
+    source_chapter: Optional[str] = None
 ) -> str:
     """
     Convert markdown content to HTML.
@@ -421,9 +509,8 @@ def convert_markdown_to_html(
         include_css: Whether to include CSS styles
         standalone: Whether to create a complete HTML document
         image_mapping: Optional dict mapping original image names to new names
-        title: Optional title for the HTML document
-        include_css: Whether to include CSS in the HTML head
-        standalone: Whether to create a complete HTML document or just the body content
+        footnote_manager: Optional FootnoteManager for cross-chapter footnote handling
+        source_chapter: The source chapter name (e.g., "chapter_1") for footnote linking
     
     Returns:
         HTML string
@@ -435,7 +522,7 @@ def convert_markdown_to_html(
         raise
     
     # Pre-process markdown to fix various issues
-    markdown_content = preprocess_markdown(markdown_content)
+    markdown_content = preprocess_markdown(markdown_content, footnote_manager, source_chapter)
     
     # Update image references if mapping provided
     if image_mapping:

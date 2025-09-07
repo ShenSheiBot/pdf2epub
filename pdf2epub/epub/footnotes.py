@@ -328,6 +328,22 @@ class FootnoteManager:
                 # Check if definitions have different content
                 contents = set(d.content.strip() for d in definitions)
                 if len(contents) > 1:
+                    # Check if all definitions are in definition-only chapters
+                    # (chapters that have definitions but no references)
+                    definition_chapters = set(d.chapter for d in definitions)
+                    all_in_definition_only = all(
+                        ch in self.chapter_definitions and 
+                        (ch not in self.chapter_references or not self.chapter_references[ch])
+                        for ch in definition_chapters
+                    )
+                    
+                    if all_in_definition_only:
+                        # All definitions are in definition-only chapters
+                        # This is expected for global mode with multi-part definitions
+                        logger.debug(f"Footnote key '{key}' has multiple definitions in definition-only chapters (valid for global mode)")
+                        continue
+                    
+                    # Definitions in mixed chapters or reference chapters = conflict
                     logger.debug(f"Footnote key '{key}' has conflicting definitions")
                     return True
         return False

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 from pdf2epub.utils.llm_client import LLMClient
-from .utils.content_splitter import split_content_intelligently
+from .utils.content_splitter import split_content
 
 # Initialize tokenizer for accurate token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -189,13 +189,25 @@ class BaseMarkdownProcessor(ABC):
         # Get content type if available
         content_type = getattr(self, 'content_type', 'auto')
         
-        parts = split_content_intelligently(content, min(safe_token_limit, max_tokens), self.llm_client, model_configs, content_type)
+        parts = split_content(
+            content,
+            min(safe_token_limit, max_tokens),
+            self.llm_client,
+            model_configs,
+            content_type,
+        )
         
         # Force at least 2 parts if we still got only 1
         if len(parts) == 1:
             # Force split into 2 parts
             logger.info(f"Content estimated at ~{estimated_tokens} tokens, forcing split into 2 parts")
-            parts = split_content_intelligently(content, estimated_tokens // 2, self.llm_client, model_configs, content_type)
+            parts = split_content(
+                content,
+                estimated_tokens // 2,
+                self.llm_client,
+                model_configs,
+                content_type,
+            )
         
         logger.info(f"Split {file_name} into {len(parts)} parts")
         

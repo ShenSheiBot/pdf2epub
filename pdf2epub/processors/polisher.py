@@ -16,7 +16,7 @@ import tiktoken
 
 from .base import BaseMarkdownProcessor
 from .utils.truncation import NGramTruncationDetector
-from .utils.content_splitter import split_content_intelligently, split_content_simple
+from .utils.content_splitter import split_content
 from .utils.image_restore import restore_lost_images
 
 # Initialize tokenizer for accurate token counting
@@ -344,14 +344,13 @@ class PolishProcessor(BaseMarkdownProcessor):
     
     def _split_content(self, content: str, max_tokens: int) -> List[str]:
         """Split content into manageable parts."""
-        # Try intelligent splitting with the LLM client
-        try:
-            return split_content_intelligently(
-                content, max_tokens, self.llm_client, self.polish_models, self.content_type
-            )
-        except Exception as e:
-            logger.warning(f"Intelligent split failed: {e}, using simple split")
-            return split_content_simple(content, max_tokens)
+        return split_content(
+            content,
+            max_tokens,
+            self.llm_client,
+            self.polish_models,
+            self.content_type,
+        )
     
     def _process_and_validate_part(
         self,
@@ -368,7 +367,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         if self.polish_models:
             max_retries = self.polish_models[0].get('max_retries', 3)
         
-        last_error = None
+        # last_error = None
         best_attempt = None
         best_attempt_valid = False
         
@@ -394,7 +393,7 @@ class PolishProcessor(BaseMarkdownProcessor):
                     )
                     
                     if not is_valid:
-                        last_error = reason
+                        # last_error = reason
                         if attempt < max_retries - 1:
                             logger.warning(
                                 f"Part {part_idx}/{total_parts} validation failed (attempt {attempt + 1}/{max_retries}): {reason}"
@@ -418,7 +417,6 @@ class PolishProcessor(BaseMarkdownProcessor):
                 return polished_part, True
                 
             except Exception as e:
-                last_error = str(e)
                 if attempt < max_retries - 1:
                     logger.warning(
                         f"Error processing part {part_idx}/{total_parts} (attempt {attempt + 1}/{max_retries}): {e}"
@@ -628,12 +626,12 @@ Your tasks for ACADEMIC content:
    - Keep cross-references ("see Section 2.3")
 
 5. **Organize bibliography**:
-   - Move all footnotes to "## Notes" section if they exist
-   - Organize references under "## References" if present
+   - Move all footnotes to "### Notes" section if they exist (use ### to keep as subsection, not chapter)
+   - Organize references under "### References" if present
    - Format citations consistently:
      * Books: Author(s). (Year). *Title*. Publisher.
      * Articles: Author(s). (Year). "Title." *Journal*, Volume(Issue), pages.
-   - Final structure: Main Content → ## Notes → ## References
+   - Final structure: Main Content → ### Notes → ### References
 
 6. **Quality checks**:
    - Ensure all citations have corresponding footnotes
@@ -776,7 +774,7 @@ Polish the following content:"""
         images_to_remove = []
         
         for match in re.finditer(image_pattern, markdown):
-            alt_text = match.group(1)
+            # alt_text = match.group(1)
             image_path = match.group(2)
             
             # Skip URLs (http/https)

@@ -35,3 +35,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build]
 packages = ["pdf2epub"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]

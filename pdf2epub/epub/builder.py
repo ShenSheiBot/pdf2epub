@@ -117,8 +117,8 @@ a { text-decoration: none; }
             return False
     
     def create_toc_ncx(self, structure: Dict[str, Any], output_path: Path, 
-                      parts_info: Optional[Dict] = None, chapters_with_parts: Optional[set] = None,
-                      subchapter_locations: Optional[Dict] = None) -> bool:
+                       parts_info: Optional[Dict] = None, chapters_with_parts: Optional[set] = None,
+                       subchapter_locations: Optional[Dict] = None) -> bool:
         """
         Create the NCX navigation file for EPUB2 compatibility.
         
@@ -231,8 +231,8 @@ a { text-decoration: none; }
             return False
     
     def create_toc_html(self, structure: Dict[str, Any], output_path: Path,
-                       parts_info: Optional[Dict] = None, chapters_with_parts: Optional[set] = None,
-                       subchapter_locations: Optional[Dict] = None) -> bool:
+                        parts_info: Optional[Dict] = None, chapters_with_parts: Optional[set] = None,
+                        subchapter_locations: Optional[Dict] = None) -> bool:
         """
         Create an HTML table of contents page.
         
@@ -374,8 +374,8 @@ a { text-decoration: none; }
             return False
     
     def create_content_opf(self, structure: Dict[str, Any], epub_dir: Path, 
-                          output_path: Path, cover_image: Optional[str] = None,
-                          all_html_files: Optional[List[str]] = None) -> bool:
+                           output_path: Path, cover_image: Optional[str] = None,
+                           all_html_files: Optional[List[str]] = None) -> bool:
         """
         Create the content.opf file with manifest and spine.
         

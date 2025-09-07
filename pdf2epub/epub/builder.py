@@ -195,7 +195,7 @@ a { text-decoration: none; }
                         # Use converter's function to get proper file for subchapter location
                         if self.converter and subchapter_locations:
                             subchapter_file = self.converter.get_subchapter_html_file(
-                                chapter_index, j, subchapter_locations, chapter_file
+                                chapter_index, j, subchapter_locations, chapter_file, sub_title
                             )
                         else:
                             subchapter_file = chapter_file
@@ -300,7 +300,7 @@ a { text-decoration: none; }
                         # Use converter's function to get proper file for subchapter location
                         if self.converter and subchapter_locations:
                             subchapter_file = self.converter.get_subchapter_html_file(
-                                chapter_index, j, subchapter_locations, chapter_file
+                                chapter_index, j, subchapter_locations, chapter_file, sub_title
                             )
                         else:
                             subchapter_file = chapter_file

@@ -841,7 +841,13 @@ Original title: {epub_config.book_title}"""
         logger.info(f"Using translated title: {display_title}")
         # Update config with translated title
         epub_config.book_title = display_title
-
+        
+        # Rebuild structure from translated markdown to pick up any structural changes
+        logger.info("Rebuilding TOC from translated markdown files...")
+        structure = build_structure_from_markdown(
+            epub_config.markdown_dir, epub_config.book_title
+        )
+        
         # Update output path with translated title
         from .utils.common import sanitize_filename
 
@@ -1066,15 +1072,16 @@ Original title: {epub_config.book_title}"""
 
                 logger.info(f"Converting part {i} of chapter {chapter_index}")
 
-                # Get subchapters for this specific part
+                # Get subchapters for this specific part with their original indices
                 part_subchapters = []
                 if chapter.get("subchapters"):
-                    # Filter subchapters that belong to this part
-                    for subchapter in chapter.get("subchapters", []):
+                    # Filter subchapters that belong to this part, keeping original index
+                    for j, subchapter in enumerate(chapter.get("subchapters", []), 1):
                         location_key = f"{chapter_index}:{subchapter.get('title', '')}"
                         if location_key in subchapter_locations:
                             if subchapter_locations[location_key]["part"] == i:
-                                part_subchapters.append(subchapter)
+                                # Include the original index with the subchapter
+                                part_subchapters.append((j, subchapter.get('title', '')))
 
                 # Convert this part to HTML
                 converter.convert_markdown_to_chapter_html(

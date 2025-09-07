@@ -613,7 +613,12 @@ class ContentConverter:
             # Convert simple list of strings to tuples with indices
             subchapters = [(j, title) for j, title in enumerate(subchapter_info, 1)]
 
+        import html as html_module
+        
         for j, sub_title in subchapters:
+            # Decode HTML entities in the subtitle for better matching
+            sub_title_decoded = html_module.unescape(sub_title)
+            
             # Look for headings that might already have IDs from markdown conversion
             # Try different heading levels (h2, h3, h4)
             anchor_added = False
@@ -622,27 +627,36 @@ class ContentConverter:
                     break
 
                 # First, try to find heading with existing ID and replace the ID
-                pattern = f'<{h_level}[^>]*id="[^"]*"[^>]*>([^<]*{re.escape(sub_title)}[^<]*)</{h_level}>'
-                if re.search(pattern, html_content, flags=re.IGNORECASE):
-                    # Replace the existing ID
-                    replacement = f'<{h_level} id="{chapter_index}-{j}">\\1</{h_level}>'
-                    html_content = re.sub(
-                        pattern,
-                        replacement,
-                        html_content,
-                        count=1,
-                        flags=re.IGNORECASE,
-                    )
-                    anchor_added = True
-                    logger.debug(f"Replaced anchor with #{chapter_index}-{j} for '{sub_title}'")
+                # Try both the original and decoded versions
+                for title_variant in [sub_title, sub_title_decoded]:
+                    pattern = f'<{h_level}[^>]*id="[^"]*"[^>]*>([^<]*{re.escape(title_variant)}[^<]*)</{h_level}>'
+                    if re.search(pattern, html_content, flags=re.IGNORECASE):
+                        # Replace the existing ID
+                        replacement = f'<{h_level} id="{chapter_index}-{j}">\\1</{h_level}>'
+                        html_content = re.sub(
+                            pattern,
+                            replacement,
+                            html_content,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                        anchor_added = True
+                        logger.debug(f"Replaced anchor with #{chapter_index}-{j} for '{sub_title}'")
+                        break
+                
+                if anchor_added:
                     break
 
                 # If exact match fails, try fuzzy matching
                 heading_pattern = f'<{h_level}[^>]*id="([^"]*)"[^>]*>([^<]+)</{h_level}>'
                 for match in re.finditer(heading_pattern, html_content):
                     heading_text = match.group(2)
+                    # Decode HTML entities in heading text too
+                    heading_text_decoded = html_module.unescape(heading_text)
+                    
+                    # Compare both decoded versions for better matching
                     similarity = difflib.SequenceMatcher(
-                        None, sub_title.lower(), heading_text.lower()
+                        None, sub_title_decoded.lower(), heading_text_decoded.lower()
                     ).ratio()
                     if similarity > 0.8:  # 80% similarity threshold
                         # Replace this heading's ID
@@ -659,14 +673,19 @@ class ContentConverter:
                     break
 
                 # If no existing ID, try to find heading without ID
-                escaped_title = re.escape(sub_title)
-                pattern = f"<{h_level}>({escaped_title})</{h_level}>"
-                replacement = f'<{h_level} id="{chapter_index}-{j}">\\1</{h_level}>'
-                new_content = re.sub(pattern, replacement, html_content, count=1, flags=re.IGNORECASE)
-                if new_content != html_content:
-                    html_content = new_content
-                    anchor_added = True
-                    logger.debug(f"Added anchor #{chapter_index}-{j} to '{sub_title}'")
+                # Try both original and decoded versions
+                for title_variant in [sub_title, sub_title_decoded]:
+                    escaped_title = re.escape(title_variant)
+                    pattern = f"<{h_level}>({escaped_title})</{h_level}>"
+                    replacement = f'<{h_level} id="{chapter_index}-{j}">\\1</{h_level}>'
+                    new_content = re.sub(pattern, replacement, html_content, count=1, flags=re.IGNORECASE)
+                    if new_content != html_content:
+                        html_content = new_content
+                        anchor_added = True
+                        logger.debug(f"Added anchor #{chapter_index}-{j} to '{sub_title}'")
+                        break
+                
+                if anchor_added:
                     break
 
         return html_content

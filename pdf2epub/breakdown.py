@@ -410,6 +410,17 @@ def main():
         
         # Detect front matter and back matter automatically
         structure = detect_front_and_back_matter(structure, processed_pdf)
+        
+        # Validate and fix the structure (remove overlaps and add missing pages)
+        from pdf2epub.utils.structure_validator import validate_structure
+        
+        # Get total pages from PDF for missing page detection
+        import fitz
+        with fitz.open(processed_pdf) as pdf:
+            total_pages = len(pdf)
+        
+        logger.info("Validating and fixing book structure...")
+        structure = validate_structure(structure, fix=True, total_pages=total_pages)
 
         # Save the structured output to the output directory
         output_file = output_dir / "book_structure.json"

@@ -17,6 +17,10 @@ from pdf2epub.processors.utils.splitter_strategies import (
     SimpleSplitter,
     MarkdownStructureSplitter,
 )
+from pdf2epub.processors.utils.document_parser import (
+    analyze_document_structure,
+    find_split_positions,
+)
 
 # Initialize tokenizer for accurate token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -81,17 +85,27 @@ class BaseLLMSplitter(ContentSplitter):
         ]
 
     @abstractmethod
-    def get_prompt(self, content: str, max_tokens: int, num_parts: int) -> str:
+    def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
         """
         Returns the prompt for the LLM.
 
         Args:
-            content: The content to split.
+            structural_map: The structural analysis of the document.
             max_tokens: The maximum number of tokens per part.
             num_parts: The desired number of parts.
 
         Returns:
             The prompt string.
+        """
+        pass
+    
+    @abstractmethod
+    def get_content_type(self) -> str:
+        """
+        Returns the content type for document analysis.
+        
+        Returns:
+            The content type string ("general", "academic", "japanese")
         """
         pass
 
@@ -115,9 +129,19 @@ class BaseLLMSplitter(ContentSplitter):
         logger.info(
             f"Content has {actual_tokens:,} tokens, splitting into {num_parts} parts"
         )
+        
+        # Analyze document structure locally
+        content_type = self.get_content_type()
+        structural_map = analyze_document_structure(content, content_type)
+        
+        # Create lightweight prompt with structural map
+        split_prompt = self.get_prompt(structural_map, max_tokens, num_parts)
+        split_prompt += f"\n\nDocument structure:\n{json.dumps(structural_map, indent=2)}"
 
-        split_prompt = self.get_prompt(content, max_tokens, num_parts)
-        split_prompt += f"\n\nHere is the content to analyze:\n\n{content}"
+        # --- TEMP MODIFICATION: Record the prompt ---
+        with open("last_split_prompt.txt", "w", encoding="utf-8") as f:
+            f.write(split_prompt)
+        # --- END TEMP MODIFICATION ---
 
         try:
             response = self.llm_client.generate(
@@ -157,8 +181,8 @@ class BaseLLMSplitter(ContentSplitter):
 
             logger.debug(f"Parsing split response: {json_str[:200]}...")
             try:
-                split_sentences = json.loads(json_str.strip())
-                if not isinstance(split_sentences, list):
+                split_markers = json.loads(json_str.strip())
+                if not isinstance(split_markers, list):
                     raise ValueError("Response is not a list")
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(
@@ -166,31 +190,12 @@ class BaseLLMSplitter(ContentSplitter):
                 )
                 return SimpleSplitter().split(content, max_tokens)
 
+            # Find split positions using the markers and the structural map
+            split_positions = find_split_positions(
+                content, split_markers, structural_map
+            )
+
             parts = []
-            split_positions = [0]
-
-            for split_sentence in split_sentences:
-                cleaned_sentence = split_sentence
-                if cleaned_sentence.endswith("..."):
-                    cleaned_sentence = cleaned_sentence[:-3].rstrip()
-                if cleaned_sentence.endswith("…"):
-                    cleaned_sentence = cleaned_sentence[:-1].rstrip()
-
-                match_result = fuzzy_find_sentence(content, cleaned_sentence)
-
-                if match_result:
-                    split_pos = match_result[0]
-                    split_positions.append(split_pos)
-                    logger.debug(
-                        f"Found split point at beginning of: '{match_result[2][:50]}...'"
-                    )
-                else:
-                    logger.warning(
-                        f"Could not find split sentence: '{split_sentence[:50]}...'"
-                    )
-
-            split_positions.append(len(content))
-
             for i in range(len(split_positions) - 1):
                 part = content[split_positions[i] : split_positions[i + 1]].strip()
                 if part:
@@ -219,116 +224,88 @@ class BaseLLMSplitter(ContentSplitter):
 
 class GeneralLLMSplitter(BaseLLMSplitter):
     """LLM splitter for general content."""
+    
+    def get_content_type(self) -> str:
+        return "general"
 
-    def get_prompt(self, content: str, max_tokens: int, num_parts: int) -> str:
-        total_tokens = len(tokenizer.encode(content))
-        return f"""You are helping split a long document into smaller parts for processing.
+    def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        total_tokens = sum(section["tokens"] for section in structural_map)
+        return f"""You are a document planner. Based on the following structural analysis of a document, 
+group the sections into parts that are under {max_tokens:,} tokens each.
 
-The document has approximately {total_tokens:,} tokens. We need to split it into roughly {num_parts} parts.
-Each part should ideally be under {max_tokens:,} tokens.
+The document has {total_tokens:,} tokens total. Aim for approximately {num_parts} parts.
 
-SPLITTING RULES:
+RULES:
+1. Group sections to stay under {max_tokens:,} tokens per part
+2. Keep related sections together when possible
+3. Split at natural boundaries (section headings)
+4. Create the fewest parts necessary
 
-1. **Maintain Semantic Coherence**:
-   - Split at natural boundaries (section breaks, topic changes)
-   - Keep related paragraphs together
-   - Preserve the logical flow of ideas
+Return a JSON array of the exact "starts_with" strings for sections that should begin each new part 
+(starting from the SECOND part). The first part always starts at the beginning.
 
-2. **Respect Document Structure**:
-   - Split at heading boundaries when possible (##, ###)
-   - Keep lists and enumerations intact
-   - Don't split in the middle of examples or code blocks
-   - Notes sections should use ### (not ##) to avoid appearing as chapters
-
-3. **Balance Part Sizes**:
-   - Aim for roughly equal-sized parts
-   - It's OK if some parts are larger to maintain coherence
-
-Return a JSON array of the EXACT first sentences that mark the beginning of each new part (starting from the SECOND part).
-The first part always starts at the beginning, so we only need markers for part 2 onwards.
-Choose split points at natural breaks - typically the first sentence of a new section, new topic, or after a clear transition.
-
-Example response:
-["## Advanced Techniques", "Now that we understand the basics, let's explore more complex scenarios."]"""
+Example: If sections 1-3 should be Part 1, and section 4 should start Part 2, return the "starts_with" 
+value from section 4."""
 
 
 class JapaneseLLMSplitter(BaseLLMSplitter):
     """LLM splitter for Japanese content."""
+    
+    def get_content_type(self) -> str:
+        return "japanese"
 
-    def get_prompt(self, content: str, max_tokens: int, num_parts: int) -> str:
-        total_tokens = len(tokenizer.encode(content))
-        return f"""You are helping split a long Japanese novel/light novel chapter into smaller parts for processing.
+    def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        total_tokens = sum(section["tokens"] for section in structural_map)
+        return f"""You are a document planner for Japanese content. Based on the following structural analysis, 
+group the sections into parts that are under {max_tokens:,} tokens each.
 
-The chapter has approximately {total_tokens:,} tokens. We'd prefer parts under {max_tokens:,} tokens. 
+The document has {total_tokens:,} tokens total.
 
-Return a JSON array of the EXACT first sentences that mark the beginning of each new part (starting from the SECOND part).
-The first part always starts at the beginning, so we only need markers for part 2 onwards.
+RULES:
+1. Group sections to stay under {max_tokens:,} tokens per part
+2. Keep scene breaks and natural story flow intact
+3. Split at section boundaries when possible
+4. Create the fewest parts necessary
 
-Each part should ideally start with a new section, scene change, or natural break point.
-Ensure no sentences are split and important scenes remain intact."""
+Return a JSON array of the exact "starts_with" strings for sections that should begin each new part 
+(starting from the SECOND part)."""
 
 
 class AcademicLLMSplitter(BaseLLMSplitter):
     """LLM splitter for academic content."""
+    
+    def get_content_type(self) -> str:
+        return "academic"
 
-    def get_prompt(self, content: str, max_tokens: int, num_parts: int) -> str:
-        total_tokens = len(tokenizer.encode(content))
-        return f"""You are helping split a long academic chapter into smaller parts for processing.
+    def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        total_tokens = sum(section["tokens"] for section in structural_map)
+        ideal_part_size = total_tokens // num_parts
+        return f"""You are a document planner for academic texts. Below is a structural analysis of a chapter.
 
-The chapter has approximately {total_tokens:,} tokens. While we'd prefer parts under {max_tokens:,} tokens, 
-the MOST IMPORTANT criteria are semantic completeness and avoiding citation conflicts.
+The document has {total_tokens:,} tokens total and should be split into {num_parts} parts.
+The ideal size for each part is approximately {ideal_part_size:,} tokens.
 
-CRITICAL SPLITTING RULES (in order of priority):
+CRITICAL RULES:
 
-1. **Keep Citations with their Notes/References**:
-   - IMPORTANT: Footnotes can appear in two ways:
-     a) **Inline footnotes**: Definition appears immediately after citation in the text flow
-     b) **End-of-section footnotes**: Definitions collected at the end under "Notes" or "References"
-   - For inline footnotes: NEVER split between a citation and its nearby definition
-   - For end-of-section footnotes: Keep the entire section WITH its Notes/References in the same part
-   - If footnotes are inline, do NOT use them as split points - keep reading until you find a section boundary
-   - Split BEFORE a new section starts (not after the previous one ends)
+1. **Balanced Parts** (HIGHEST PRIORITY):
+   - Create parts that are as close to the ideal size ({ideal_part_size:,} tokens) as possible.
+   - Avoid creating one very large part and one very small part. Aim for reasonably equal sizes.
 
-2. **No Duplicate Citations**:
-   - Each footnote number (e.g., [^1], $^1$, ¹) must appear ONLY in one part
-   - Both the citation [^1] and its definition [^1]: must be in the SAME part
-   - Never split between a citation and its corresponding footnote definition
-   - If footnotes are inline (definition immediately follows citation), keep them together as a unit
-   - If you see patterns like [^1], [^2], [^3] in text, ensure ALL of them and their definitions stay together
+2. **Citation Integrity**:
+   - A section with `citations_made` MUST be in the same part as the section with the corresponding `footnotes_defined`.
+   - NEVER split citations from their definitions.
 
-3. **Section Integrity**:
-   - Split at major section boundaries (look for ## or ### headings)
-   - Keep entire sections together when possible
-   - If footnotes are inline within a section, the entire section must stay together
-   - Only split at points where NO citations span across the boundary
+3. **Token Limit**:
+   - No single part should exceed {max_tokens:,} tokens.
 
-4. **No Cross-References Between Parts**:
-   - A citation in one part should NEVER refer to a footnote definition in another part
-   - For inline footnotes, this means keeping the citation and its immediate definition together
-   - For end-of-section footnotes, this means keeping the entire section with its footnotes
-   - Never have orphaned citations or orphaned footnote definitions
+4. **Section Order**:
+   - Sections must remain in their original order.
 
-5. **Token Limits** (lowest priority):
-   - Aim for parts under {max_tokens:,} tokens if possible
-   - But it's OK to exceed this if needed to maintain semantic integrity
-   - Aim for roughly {num_parts} parts, but adjust based on content structure
+Analyze the document structure and token counts to find the best split points that create balanced parts while respecting all rules.
 
-Scan the chapter and identify:
-- Whether footnotes are inline (definitions immediately after citations) or collected at section ends
-- If inline: Find section boundaries where no footnotes are actively being defined
-- If at section ends: Identify which sections have citations and where their Notes/References are
-- Natural boundaries where no citations span across
-- Major section boundaries that don't break citation-reference pairs
-
-IMPORTANT: If you detect inline footnotes (e.g., [^1] followed shortly by [^1]: definition in the main text flow),
-do NOT split near these footnotes. Instead, find major section breaks or topic changes as split points.
-
-Return a JSON array of the EXACT first sentences that mark the beginning of each new part (starting from the SECOND part).
-The first part always starts at the beginning, so we only need markers for part 2 onwards.
-Choose split points that respect the above priorities - typically the first sentence of a new section or major topic.
-
-Example response:
-["## Chapter 3: Advanced Methods", "The theoretical framework we have established leads us to consider..."]"""
+Return a JSON array of the exact "starts_with" strings for sections that should begin each new part 
+(starting from the SECOND part).
+"""
 
 
 def get_splitter(

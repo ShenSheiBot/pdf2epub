@@ -158,6 +158,40 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
 
         structure["chapters"].append(chapter_info)
 
+    # Fallback for chapters with default titles
+    for chapter_info in structure["chapters"]:
+        chapter_num = chapter_info["index"]
+        if chapter_info["title"] == f"Chapter {chapter_num}":
+            files = chapter_files.get(chapter_num, {})
+            files_to_read = []
+            if "main" in files and len(files) == 1:
+                files_to_read = [files["main"]]
+            else:
+                for part_num in sorted([k for k in files.keys() if isinstance(k, int)]):
+                    files_to_read.append(files[part_num])
+
+            title_found = False
+            for file_path in files_to_read:
+                if title_found:
+                    break
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith("#"):
+                                title = re.sub(r"^#+\s*", "", line).strip()
+                                if title:
+                                    chapter_info["title"] = title
+                                    logger.info(
+                                        f"Updated Chapter {chapter_num} title to '{title}' from first available heading."
+                                    )
+                                    title_found = True
+                                    break
+                except Exception as e:
+                    logger.warning(
+                        f"Could not re-read {file_path} for fallback title search: {e}"
+                    )
+
     # Also check for front_matter and back_matter
     if (markdown_dir / "front_matter.md").exists():
         structure["front_matter"] = {"title": "Front Matter"}
@@ -550,6 +584,85 @@ def update_markdown_heading_levels(markdown_dir: Path, changes: dict):
     logger.success("Heading updates complete")
 
 
+def is_file_blank(file_path: Path) -> bool:
+    """
+    Check if a file is empty or contains only a single level 1 heading
+    and nothing else.
+    """
+    if not file_path.exists():
+        return True
+    if file_path.stat().st_size == 0:
+        return True
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    if not lines:
+        # File is empty or contains only whitespace
+        return True
+
+    if len(lines) == 1:
+        # Check if the only line is a level 1 heading
+        line = lines[0]
+        if line.startswith("# ") and not line.startswith("## "):
+            return True
+
+    # File has content other than a single H1 heading
+    return False
+
+
+def filter_blank_files_from_structure(structure: dict, markdown_dir: Path) -> dict:
+    """
+    Filter out blank markdown files from the book structure.
+    
+    Args:
+        structure: Book structure dictionary
+        markdown_dir: Directory containing markdown files
+        
+    Returns:
+        Filtered structure with blank files removed
+    """
+    # Filter front matter if blank
+    if structure.get("front_matter"):
+        front_matter_file = markdown_dir / "front_matter.md"
+        if is_file_blank(front_matter_file):
+            logger.info("Removing blank front_matter from structure")
+            del structure["front_matter"]
+    
+    # Filter back matter if blank
+    if structure.get("back_matter"):
+        back_matter_file = markdown_dir / "back_matter.md"
+        if is_file_blank(back_matter_file):
+            logger.info("Removing blank back_matter from structure")
+            del structure["back_matter"]
+    
+    # Filter blank chapters
+    if structure.get("chapters"):
+        filtered_chapters = []
+        for chapter in structure["chapters"]:
+            chapter_index = chapter.get("index")
+            # Check for multi-part files first
+            part_files = sorted(markdown_dir.glob(f"chapter_{chapter_index}.part*.md"))
+            
+            if part_files:
+                # Multi-part chapter exists, keep it
+                filtered_chapters.append(chapter)
+            else:
+                # Single file chapter - check if blank
+                chapter_file = markdown_dir / f"chapter_{chapter_index}.md"
+                if chapter_file.exists() and not is_file_blank(chapter_file):
+                    filtered_chapters.append(chapter)
+                else:
+                    logger.info(f"Removing chapter {chapter_index} (blank or missing)")
+        
+        original_chapter_count = len(structure["chapters"])
+        structure["chapters"] = filtered_chapters
+        if len(filtered_chapters) < original_chapter_count:
+            logger.info(f"Kept {len(filtered_chapters)} non-blank chapters out of {original_chapter_count} total")
+    
+    return structure
+
+
 def cleanup_old_files(epub_dir: Path):
     """Remove old EPUB files before generating new ones."""
     import shutil
@@ -653,6 +766,10 @@ def main():
     structure = build_structure_from_markdown(
         epub_config.markdown_dir, epub_config.book_title
     )
+    
+    # Filter out blank files from the structure
+    logger.info("Filtering out blank markdown files from structure...")
+    structure = filter_blank_files_from_structure(structure, epub_config.markdown_dir)
     epub_config.book_structure = structure
 
     # For translated version, determine the display title
@@ -753,6 +870,8 @@ Original title: {epub_config.book_title}"""
                 structure = build_structure_from_markdown(
                     epub_config.markdown_dir, epub_config.book_title
                 )
+                # Filter blank files again after re-leveling
+                structure = filter_blank_files_from_structure(structure, epub_config.markdown_dir)
                 epub_config.book_structure = structure
 
     # Clean up old EPUB files

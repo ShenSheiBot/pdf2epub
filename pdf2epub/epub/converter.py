@@ -34,8 +34,9 @@ class ContentConverter:
     
     def remove_duplicate_titles(self) -> int:
         """
-        Remove duplicate titles where a level 2 heading immediately follows a level 1 heading
-        with the same or similar text.
+        Remove duplicate titles in two cases:
+        1. Level 2 heading immediately follows level 1 heading with same/similar text
+        2. Consecutive headings at the same level with exactly the same title (keep first)
         
         Returns:
             Number of duplicate titles removed
@@ -59,7 +60,7 @@ class ContentConverter:
                 while i < len(lines):
                     current_line = lines[i]
                     
-                    # Check if current line is a level 1 heading
+                    # First check: level 1 -> level 2 duplicates (existing logic)
                     if current_line.strip().startswith('# ') and not current_line.strip().startswith('## '):
                         # Extract title from level 1 heading
                         title1 = current_line.strip()[2:].strip()
@@ -93,6 +94,78 @@ class ContentConverter:
                                 new_lines.append('\n')
                                 i = j + 1  # Skip the level 2 heading
                                 removed_count += 1
+                                continue
+                    
+                    # Second check: same-level consecutive duplicates
+                    if current_line.strip().startswith('#'):
+                        # Extract heading level and title
+                        stripped = current_line.strip()
+                        level = 0
+                        for char in stripped:
+                            if char == '#':
+                                level += 1
+                            else:
+                                break
+                        
+                        # Get the title (skip the # characters and following space)
+                        if level > 0 and len(stripped) > level and stripped[level] == ' ':
+                            current_title = stripped[level+1:].strip()
+                            
+                            # Look ahead for consecutive headings at the same level with same title
+                            j = i + 1
+                            duplicates_found = []
+                            
+                            while j < len(lines):
+                                next_line = lines[j]
+                                
+                                # Check if it's a heading at the same level
+                                if next_line.strip().startswith('#' * level + ' ') and \
+                                   not next_line.strip().startswith('#' * (level + 1)):
+                                    # Extract title from next heading
+                                    next_title = next_line.strip()[level+1:].strip()
+                                    
+                                    # Check if titles are exactly the same
+                                    if current_title == next_title:
+                                        duplicates_found.append(j)
+                                        logger.debug(f"Found same-level duplicate in {md_file.name}: "
+                                                   f"{'#' * level} {next_title} at line {j+1}")
+                                        j += 1
+                                        continue
+                                    else:
+                                        # Different title at same level, stop looking
+                                        break
+                                elif next_line.strip().startswith('#'):
+                                    # Different level heading, stop looking
+                                    break
+                                else:
+                                    # Non-heading line, continue looking
+                                    j += 1
+                                    # Don't look too far ahead
+                                    if j - i > 10:
+                                        break
+                            
+                            # If we found duplicates, skip them
+                            if duplicates_found:
+                                new_lines.append(current_line)  # Keep the first occurrence
+                                
+                                # Add all lines between current and first duplicate
+                                for k in range(i + 1, duplicates_found[0]):
+                                    new_lines.append(lines[k])
+                                
+                                # Skip all duplicate headings, but preserve content between them
+                                last_duplicate = duplicates_found[0]
+                                for dup_idx in duplicates_found:
+                                    # Add content between this duplicate and the next
+                                    if dup_idx != duplicates_found[-1]:
+                                        next_dup = duplicates_found[duplicates_found.index(dup_idx) + 1]
+                                        for k in range(dup_idx + 1, next_dup):
+                                            if not lines[k].strip().startswith('#' * level + ' '):
+                                                new_lines.append(lines[k])
+                                    removed_count += 1
+                                    last_duplicate = dup_idx
+                                
+                                # Continue from after the last duplicate
+                                i = last_duplicate + 1
                                 continue
                     
                     new_lines.append(current_line)
@@ -431,10 +504,10 @@ class ContentConverter:
         chapter_key = str(chapter_index)
         if chapters_with_parts and chapter_index in chapters_with_parts:
             # This chapter has part files - link to first part
-            return f"chapter_{chapter_index}.part1.html"
+            return f"chapter_{chapter_index}_part1.html"
         elif parts_info and chapter_key in parts_info and parts_info[chapter_key] > 1:
             # Multi-part chapter according to progress info - link to first part
-            return f"chapter_{chapter_index}.part1.html"
+            return f"chapter_{chapter_index}_part1.html"
         else:
             # Single file chapter
             return f"chapter_{chapter_index}.html"
@@ -491,7 +564,7 @@ class ContentConverter:
                 return f"chapter_{chapter_index}.html"
             else:
                 # In a specific part
-                return f"chapter_{chapter_index}.part{part_num}.html"
+                return f"chapter_{chapter_index}_part{part_num}.html"
         else:
             # Default to chapter file
             return chapter_file

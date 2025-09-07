@@ -292,8 +292,8 @@ class FootnoteManager:
         # Count definitions per chapter (including part files)
         chapter_def_counts = {}
         for chapter, keys in self.chapter_definitions.items():
-            # Group by base chapter name (e.g., chapter_7_part1 -> chapter_7)
-            base_chapter = chapter.split('_part')[0] if '_part' in chapter else chapter
+            # Group by base chapter name (e.g., chapter_7.part1 -> chapter_7)
+            base_chapter = chapter.split('.part')[0] if '.part' in chapter else chapter
             if base_chapter not in chapter_def_counts:
                 chapter_def_counts[base_chapter] = 0
             chapter_def_counts[base_chapter] += len(keys)

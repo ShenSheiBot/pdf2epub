@@ -217,6 +217,11 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
     # First, process Japanese ruby text
     markdown_content = process_ruby_text(markdown_content)
     
+    # Handle markdown italics: *text* -> <em>text</em>
+    # Use negative lookahead/lookbehind to avoid matching bold (**text**)
+    # and to avoid matching asterisks that are part of LaTeX or other constructs
+    markdown_content = re.sub(r'(?<!\*)\*(?!\*)([^\*\n]+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', markdown_content)
+    
     # Then fix LaTeX-style table footnote markers like ${e}$ 
     # Convert them to superscript letters
     latex_markers = {

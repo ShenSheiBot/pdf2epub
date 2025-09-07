@@ -362,9 +362,9 @@ Translate the following markdown content from {self.source_language} to {self.ta
 IMPORTANT REQUIREMENTS:
 1. **Preserve ALL markdown formatting**: Keep headers (#, ##, ###), emphasis (*italic*, **bold**), lists, quotes, code blocks, etc.
 2. **Keep image links unchanged**: Do not translate or modify image paths like ![...](../images/xxx.png)
-3. **Translate footnotes properly**: 
+3. **Don't touch footnote**: 
    - Keep the footnote format [^1], [^2], etc. unchanged
-   - Translate the footnote content but keep the reference numbers
+   - Don't add footnote that does not exist in the original text
 4. **Maintain document structure**: Keep the same paragraph breaks, section divisions, and overall layout
 5. **For academic texts**: Use appropriate academic terminology in the target language
 6. **For literary texts**: Preserve the style and tone of the original

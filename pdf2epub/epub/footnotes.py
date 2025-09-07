@@ -270,10 +270,11 @@ class FootnoteManager:
     def _chapter_sort_key(self, chapter_name: str) -> tuple:
         """
         Generate a sort key for chapter names to maintain proper order.
-        Handles chapter_N and chapter_N_partM formats.
+        Handles chapter_N and chapter_N.partM or chapter_N_partM formats.
         """
         import re
-        match = re.match(r'chapter_(\d+)(?:_part(\d+))?', chapter_name)
+        # Handle both .part and _part formats
+        match = re.match(r'chapter_(\d+)(?:[._]part(\d+))?', chapter_name)
         if match:
             chapter_num = int(match.group(1))
             part_num = int(match.group(2)) if match.group(2) else 0

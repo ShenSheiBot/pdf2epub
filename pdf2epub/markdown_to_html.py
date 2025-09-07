@@ -299,7 +299,9 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
     # For definition chapters, convert footnote definitions to HTML without renumbering
     if is_definition_chapter:
         logger.debug(f"Definition chapter {source_chapter}: converting footnotes without renumbering")
-        def_occurrence = {}  # Track occurrence numbers for definitions
+        
+        # Get global occurrence counter from FootnoteManager
+        global_def_occurrence = getattr(footnote_manager, '_global_def_occurrence', {})
         
         for line in lines:
             # Check for footnote definition [^1]:
@@ -308,11 +310,14 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
                 fn_key = def_match.group(1)
                 fn_text = def_match.group(2)
                 
-                # Track occurrence number for this definition
-                if fn_key not in def_occurrence:
-                    def_occurrence[fn_key] = 0
-                def_occurrence[fn_key] += 1
-                occurrence_num = def_occurrence[fn_key]
+                # Track occurrence number globally across all definition chapters
+                if fn_key not in global_def_occurrence:
+                    global_def_occurrence[fn_key] = 0
+                global_def_occurrence[fn_key] += 1
+                occurrence_num = global_def_occurrence[fn_key]
+                
+                # Store it back to FootnoteManager for persistence across files
+                footnote_manager._global_def_occurrence = global_def_occurrence
                 
                 # In global mode with occurrence mapping, keep the original numbering
                 # Add ID based on occurrence number for cross-chapter linking

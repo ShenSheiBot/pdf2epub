@@ -43,14 +43,18 @@ class EpubBuilder:
             True if successful
         """
         try:
+            # Get the language from config
+            language = self.config.language if hasattr(self.config, 'language') else 'en'
+            lang_class = f"lang-{language}"
+            
             cover_html = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}" lang="{language}">
 <head>
     <title>Cover</title>
     <link rel="stylesheet" href="../stylesheet.css" type="text/css"/>
 </head>
-<body>
+<body class="{lang_class}">
     <div class="cover">
         <img src="../images/{cover_image_filename}" alt="{html.escape(self.config.book_title)} Cover" />
     </div>
@@ -244,15 +248,19 @@ a { text-decoration: none; }
             True if successful
         """
         try:
+            # Get the language from config
+            language = self.config.language if hasattr(self.config, 'language') else 'en'
+            lang_class = f"lang-{language}"
+            
             toc_html = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}" lang="{language}">
 <head>
     <title>Table of Contents</title>
     <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
 </head>
-<body>
+<body class="{lang_class}">
     <div class="toc">
         <h1>Table of Contents</h1>
         <ul>

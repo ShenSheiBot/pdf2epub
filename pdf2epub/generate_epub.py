@@ -621,6 +621,19 @@ def main():
         return
 
     logger.info(f"Using markdown from: {epub_config.markdown_dir}")
+    
+    # Detect language from content
+    from .utils.common import guess_language
+    detected_language = guess_language(epub_config.markdown_dir)
+    logger.info(f"Auto-detected language: {detected_language}")
+    
+    # Update config with detected language (can be overridden by config file)
+    if config_dict.get("language") == "en" or not config_dict.get("language"):
+        # Only override if language is default or not set
+        epub_config.language = detected_language
+        logger.info(f"Using detected language: {detected_language}")
+    else:
+        logger.info(f"Using configured language: {epub_config.language}")
 
     # Initialize components
     converter = ContentConverter(epub_config)

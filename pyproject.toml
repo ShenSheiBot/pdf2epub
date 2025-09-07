@@ -24,6 +24,7 @@ dependencies = [
     "pytesseract>=0.3.13",
     "azure-ai-documentintelligence>=1.0.2",
     "openai>=1.102.0",
+    "langdetect>=1.0.9",
 ]
 
 [project.scripts]

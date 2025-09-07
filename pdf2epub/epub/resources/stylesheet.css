@@ -5,7 +5,6 @@
    Base Typography 
    ================================= */
 body {
-    font-family: "Hiragino Mincho ProN", "Noto Serif", "Crimson Text", "Georgia", serif;
     font-size: 1em;
     line-height: 1.75;
     max-width: 42em;
@@ -15,6 +14,80 @@ body {
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     hyphens: auto;
+}
+
+/* =================================
+   Language-Specific Font Stacks
+   ================================= */
+/* Default/English */
+body, 
+body.lang-en {
+    font-family: "Crimson Text", "Georgia", "Times New Roman", serif;
+}
+
+/* Japanese */
+body.lang-ja {
+    font-family: "Hiragino Mincho ProN", "Noto Serif JP", "Yu Mincho", "MS Mincho", serif;
+    line-height: 1.8;  /* Japanese benefits from slightly more line height */
+}
+
+/* Simplified Chinese */
+body.lang-zh-CN,
+body.lang-zh-cn {
+    font-family: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "SimSun", serif;
+    line-height: 1.85;
+}
+
+/* Traditional Chinese */
+body.lang-zh-TW,
+body.lang-zh-tw {
+    font-family: "Noto Serif TC", "Source Han Serif TC", "MingLiU", "PMingLiU", serif;
+    line-height: 1.85;
+}
+
+/* Korean */
+body.lang-ko {
+    font-family: "Noto Serif KR", "Batang", "Malgun Gothic", serif;
+    line-height: 1.8;
+}
+
+/* French */
+body.lang-fr {
+    font-family: "Crimson Text", "Garamond", "Georgia", serif;
+}
+
+/* German */
+body.lang-de {
+    font-family: "Crimson Text", "Book Antiqua", "Georgia", serif;
+}
+
+/* Spanish */
+body.lang-es {
+    font-family: "Crimson Text", "Georgia", "Times New Roman", serif;
+}
+
+/* Italian */
+body.lang-it {
+    font-family: "Crimson Text", "Palatino", "Georgia", serif;
+}
+
+/* Russian */
+body.lang-ru {
+    font-family: "Noto Serif", "PT Serif", "Georgia", serif;
+}
+
+/* Arabic */
+body.lang-ar {
+    font-family: "Noto Naskh Arabic", "Traditional Arabic", "Arabic Typesetting", serif;
+    direction: rtl;
+    text-align: right;
+    line-height: 2;
+}
+
+/* Hindi */
+body.lang-hi {
+    font-family: "Noto Serif Devanagari", "Mangal", "Kokila", serif;
+    line-height: 1.9;
 }
 
 /* =================================

@@ -225,7 +225,8 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     Keep the original language for all titles.
     
     Additionally, identify special chapter types:
-    - If a chapter consists primarily of footnotes, endnotes, or references for citations in other chapters (e.g., "Notes", "Endnotes", "References", "Bibliography"), add a "type": "notes" field
+    - If a chapter consists primarily of footnotes, endnotes, or references for citations in other chapters (e.g., "Notes", "Endnotes", "References"), add a "type": "notes" field
+    - A book contains at most one note chapter, if footnotes are local, then there should be none
     - Abbreviations, index, or summary table are not considered as notes as they are not cited
     - Regular content chapters should not have a "type" field
     

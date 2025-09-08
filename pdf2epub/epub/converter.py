@@ -274,9 +274,9 @@ class ContentConverter:
                                     )
                                     should_keep = False
                                     removed_count += 1
-                                elif len(title) > 50 and not is_numbered_section:
+                                elif len(title) > 200 and not is_numbered_section:
                                     logger.debug(
-                                        f"Removing too-long heading ({len(title)} chars) in {md_file.name}: {title[:50]}..."
+                                        f"Removing too-long heading ({len(title)} chars) in {md_file.name}: {title[:200]}..."
                                     )
                                     should_keep = False
                                     removed_count += 1

@@ -315,138 +315,120 @@ def process_chapter(
     location: str,
     output_dir: Path,
     images_dir: Path = None,
-    max_pages: int = 30
+    max_pages: int = 30,
+    max_size_mb: float = 20.0
 ) -> None:
-    """Process a single chapter, splitting if necessary."""
-    
+    """Process a chapter at the chapter level.
+    Treats the entire chapter as one unit, regardless of subchapter boundaries.
+    Only splits into chunks when exceeding max_pages or max_size_mb.
+
+    Args:
+        chapter: Chapter dictionary with title, start_page, end_page, and optional subchapters
+        chapter_index: Chapter number
+        pdf_path: Path to PDF file
+        session: Authorized session for API calls
+        project_id: GCP project ID
+        location: GCP location
+        output_dir: Output directory for markdown files
+        images_dir: Directory to save extracted images
+        max_pages: Maximum pages per OCR request (default: 30)
+        max_size_mb: Maximum size in MB per request before compression (default: 20.0)
+    """
+
     chapter_title = chapter["title"]
     start_page = chapter["start_page"]
     end_page = chapter["end_page"]
-    
-    logger.info(f"Processing Chapter {chapter_index}: {chapter_title} (pages {start_page}-{end_page})")
-    
-    # Split chapter if it exceeds max_pages
-    chunks = split_chapter_ranges(start_page, end_page, max_pages)
-    
-    if len(chunks) > 1:
-        logger.info(f"Chapter spans {end_page - start_page + 1} pages, splitting into {len(chunks)} chunks")
-    
-    markdown_parts = []
+    subchapters = chapter.get("subchapters", [])
+
+    total_pages = end_page - start_page + 1
+    logger.info(f"Processing Chapter {chapter_index}: {chapter_title} (pages {start_page}-{end_page}, {total_pages} pages total)")
+
+    if subchapters:
+        logger.info(f"  Contains {len(subchapters)} subchapters")
+
+    # Process the entire chapter as one unit, regardless of subchapters
+    # Build the chapter header
+    markdown_parts = [f"# {chapter_title}\n"]
     image_counter = 0
-    
-    for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks, 1):
-        chunk_info = f"Chapter {chapter_index}"
-        if len(chunks) > 1:
-            chunk_info += f" (chunk {chunk_idx}/{len(chunks)}, pages {chunk_start}-{chunk_end})"
-        else:
-            chunk_info += f" (pages {chunk_start}-{chunk_end})"
-        
-        # Extract PDF pages for this chunk
-        pdf_bytes = extract_pdf_pages(pdf_path, chunk_start, chunk_end)
-        
-        # OCR the chunk - don't catch exceptions, let them propagate up
+
+    # First try to process the entire chapter as a single chunk
+    pdf_bytes = extract_pdf_pages(pdf_path, start_page, end_page)
+    size_mb = len(pdf_bytes) / (1024 * 1024)
+
+    if total_pages <= max_pages and size_mb <= max_size_mb:
+        # Can process in one go
+        logger.info(f"  Processing entire chapter in one request ({total_pages} pages, {size_mb:.2f}MB)")
+
+        chunk_info = f"Chapter {chapter_index} (pages {start_page}-{end_page})"
         markdown, images, image_counter = ocr_pdf_chunk(
             pdf_bytes, session, project_id, location, chunk_info,
             images_dir, chapter_index, image_counter,
             max_retries=5, initial_backoff=2.0
         )
+
         markdown_parts.append(markdown)
-    
-    # Combine all parts
-    full_markdown = "\n\n".join(markdown_parts)
-    
-    # Add chapter header
-    final_markdown = f"# {chapter_title}\n\n{full_markdown}"
-    
-    # Save to file
-    output_file = output_dir / f"chapter_{chapter_index}.md"
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(final_markdown)
-    
-    logger.success(f"Saved Chapter {chapter_index} to {output_file}")
+    else:
+        # Need to split
+        logger.info(f"  Chapter exceeds limits ({total_pages} pages, {size_mb:.2f}MB), splitting...")
 
+        # Split based on pages first
+        chunks = split_chapter_ranges(start_page, end_page, max_pages)
+        logger.info(f"  Split into {len(chunks)} chunks")
 
-def process_subchapters(
-    chapter: Dict,
-    chapter_index: int,
-    pdf_path: Path,
-    session: AuthorizedSession,
-    project_id: str,
-    location: str,
-    output_dir: Path,
-    images_dir: Path = None,
-    max_pages: int = 30
-) -> None:
-    """Process subchapters within a chapter."""
-    
-    subchapters = chapter.get("subchapters", [])
-    
-    if not subchapters:
-        # No subchapters, process as a single chapter
-        process_chapter(chapter, chapter_index, pdf_path, session, project_id, location, output_dir, images_dir, max_pages)
-        return
-    
-    # Process main chapter header if it has its own content
-    chapter_title = chapter["title"]
-    chapter_start = chapter["start_page"]
-    
-    # Check if there's content before the first subchapter
-    first_subchapter_start = subchapters[0]["start_page"] if subchapters else chapter["end_page"] + 1
-    
-    markdown_parts = [f"# {chapter_title}\n"]
-    image_counter = 0
-    
-    if first_subchapter_start > chapter_start:
-        # There's content before the first subchapter
-        logger.info(f"Processing chapter {chapter_index} intro (pages {chapter_start}-{first_subchapter_start - 1})")
-        
-        pdf_bytes = extract_pdf_pages(pdf_path, chapter_start, first_subchapter_start - 1)
-        # Don't catch exceptions - let them propagate up
-        intro_markdown, intro_images, image_counter = ocr_pdf_chunk(
-            pdf_bytes, session, project_id, location, 
-            f"Chapter {chapter_index} intro",
-            images_dir, chapter_index, image_counter,
-            max_retries=5, initial_backoff=2.0
-        )
-        markdown_parts.append(intro_markdown)
-    
-    # Process each subchapter
-    for sub_idx, subchapter in enumerate(subchapters, 1):
-        sub_title = subchapter["title"]
-        sub_start = subchapter["start_page"]
-        sub_end = subchapter["end_page"]
-        
-        logger.info(f"Processing Subchapter {chapter_index}.{sub_idx}: {sub_title} (pages {sub_start}-{sub_end})")
-        
-        # Add subchapter header
-        markdown_parts.append(f"\n## {sub_title}\n")
-        
-        # Split subchapter if needed
-        chunks = split_chapter_ranges(sub_start, sub_end, max_pages)
-        
         for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks, 1):
-            chunk_info = f"Chapter {chapter_index}.{sub_idx}"
+            chunk_info = f"Chapter {chapter_index}"
             if len(chunks) > 1:
-                chunk_info += f" (chunk {chunk_idx}/{len(chunks)})"
-            
+                chunk_info += f" (chunk {chunk_idx}/{len(chunks)}, pages {chunk_start}-{chunk_end})"
+            else:
+                chunk_info += f" (pages {chunk_start}-{chunk_end})"
+
             pdf_bytes = extract_pdf_pages(pdf_path, chunk_start, chunk_end)
-            
-            # Don't catch exceptions here - let them propagate up
-            sub_markdown, sub_images, image_counter = ocr_pdf_chunk(
-                pdf_bytes, session, project_id, location, chunk_info,
-                images_dir, chapter_index, image_counter,
-                max_retries=5, initial_backoff=2.0
-            )
-            markdown_parts.append(sub_markdown)
-    
+
+            # Check size and potentially split further if still too large
+            chunk_size_mb = len(pdf_bytes) / (1024 * 1024)
+            if chunk_size_mb > max_size_mb:
+                # Need to split this chunk further
+                logger.warning(f"    Chunk {chunk_idx} is {chunk_size_mb:.2f}MB, needs further splitting")
+
+                # Calculate how many sub-chunks we need
+                chunk_pages = chunk_end - chunk_start + 1
+                estimated_pages_per_sub = max(1, int(chunk_pages * (max_size_mb / chunk_size_mb) * 0.9))  # 90% to be safe
+
+                sub_chunks = split_chapter_ranges(chunk_start, chunk_end, estimated_pages_per_sub)
+                logger.info(f"    Further split into {len(sub_chunks)} sub-chunks")
+
+                for sub_idx, (sub_start, sub_end) in enumerate(sub_chunks, 1):
+                    sub_info = f"Chapter {chapter_index} (chunk {chunk_idx}.{sub_idx}/{len(chunks)}.{len(sub_chunks)}, pages {sub_start}-{sub_end})"
+
+                    sub_pdf_bytes = extract_pdf_pages(pdf_path, sub_start, sub_end)
+                    sub_markdown, sub_images, image_counter = ocr_pdf_chunk(
+                        sub_pdf_bytes, session, project_id, location, sub_info,
+                        images_dir, chapter_index, image_counter,
+                        max_retries=5, initial_backoff=2.0
+                    )
+
+                    markdown_parts.append(sub_markdown)
+            else:
+                # Size is OK, process normally
+                chunk_markdown, chunk_images, image_counter = ocr_pdf_chunk(
+                    pdf_bytes, session, project_id, location, chunk_info,
+                    images_dir, chapter_index, image_counter,
+                    max_retries=5, initial_backoff=2.0
+                )
+
+                markdown_parts.append(chunk_markdown)
+
     # Combine all parts and save
     full_markdown = "\n\n".join(markdown_parts)
     output_file = output_dir / f"chapter_{chapter_index}.md"
-    
+
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(full_markdown)
-    
-    logger.success(f"Saved Chapter {chapter_index} with {len(subchapters)} subchapters to {output_file}")
+
+    logger.success(f"Saved Chapter {chapter_index} to {output_file}")
+
+
+# process_subchapters function removed - functionality merged into process_chapter
 
 
 def load_or_create_progress(progress_file: Path, structure: Dict) -> Dict:
@@ -657,14 +639,14 @@ def main():
             continue
         
         try:
-            # Process chapter with subchapters if they exist
-            process_subchapters(
-                chapter, 
-                chapter_idx, 
-                pdf_path, 
-                session, 
-                project_id, 
-                location, 
+            # Process chapter (handles subchapters internally)
+            process_chapter(
+                chapter,
+                chapter_idx,
+                pdf_path,
+                session,
+                project_id,
+                location,
                 output_dir,
                 images_dir,
                 args.max_pages

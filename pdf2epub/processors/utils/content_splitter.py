@@ -146,7 +146,7 @@ class BaseLLMSplitter(ContentSplitter):
                 if i == 0:
                     section_tokens = section["cumulative_tokens"]
                 else:
-                    section_tokens = section["cumulative_tokens"] - structural_map[i-1]["cumulative_tokens"]
+                    section_tokens = section["cumulative_tokens"] - structural_map[i - 1]["cumulative_tokens"]
                 max_section_tokens = max(max_section_tokens, section_tokens)
 
         if max_section_tokens > max_tokens * 1.5 or len(structural_map) < num_parts * 1.5:

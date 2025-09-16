@@ -184,43 +184,56 @@ def extract_entities_command(args):
     # Load configuration
     config = load_entity_config(args.config)
     book_title = config.get("title")
-    
+
     if not book_title:
-        # Use PDF filename as fallback
-        book_title = Path(args.input).stem
-        logger.warning(f"No title in config, using: {book_title}")
-    
+        if args.input:
+            # Use PDF filename as fallback
+            book_title = Path(args.input).stem
+            logger.warning(f"No title in config, using: {book_title}")
+        else:
+            logger.error("No title found in config.yaml and no input file specified")
+            return 1
+
     # Get API key
     api_key = config.get("google_api_key")
     if not api_key:
         logger.error("Google API key not found in config.yaml")
         return 1
-    
+
     logger.info(f"Extracting entities from: {book_title}")
     logger.info(f"Language pair: {args.source_lang} → {args.target_lang}")
-    
+
     # Initialize Gemini client
     gemini_client = GeminiClient(api_key)
-    
+
     # Setup paths
-    pdf_path = Path(args.input)
     output_dir = Path("output") / book_title
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # Determine PDF path
+    if args.input:
+        pdf_path = Path(args.input)
+    else:
+        # Default to input.pdf in the book's output directory
+        pdf_path = output_dir / "input.pdf"
+
     # Check if PDF exists
     if not pdf_path.exists():
-        # Try output directory - prefer processed input.pdf over original
+        # Try alternative paths in output directory
         processed_path = output_dir / "input.pdf"
         original_path = output_dir / "input_original.pdf"
-        
-        if processed_path.exists():
+
+        if processed_path.exists() and pdf_path != processed_path:
             pdf_path = processed_path
             logger.info(f"Using processed PDF from: {pdf_path}")
         elif original_path.exists():
             pdf_path = original_path
             logger.info(f"Using original PDF from: {pdf_path}")
         else:
-            logger.error(f"PDF not found: {args.input}")
+            if args.input:
+                logger.error(f"PDF not found: {args.input}")
+            else:
+                logger.error(f"PDF not found in {output_dir}/. Expected input.pdf or input_original.pdf")
             return 1
     
     try:
@@ -517,8 +530,8 @@ Examples:
     )
     entity_parser.add_argument(
         "-i", "--input",
-        required=True,
-        help="Path to input PDF file"
+        default=None,  # Will be resolved to book_folder/input.pdf in the command
+        help="Path to input PDF file (default: output/<book_title>/input.pdf)"
     )
     entity_parser.add_argument(
         "--source-lang",

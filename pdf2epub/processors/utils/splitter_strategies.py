@@ -25,11 +25,12 @@ class ContentSplitter(ABC):
 
 
 class SimpleSplitter(ContentSplitter):
-    """A simple content splitter."""
+    """A simple content splitter with intelligent paragraph detection."""
 
     def split(self, content: str, max_tokens: int) -> List[str]:
         """
         Simple content splitter that divides content into roughly equal parts.
+        Uses intelligent paragraph detection to avoid splitting at OCR line-wrap artifacts.
 
         Args:
             content: The content to split
@@ -44,15 +45,23 @@ class SimpleSplitter(ContentSplitter):
             return [content]
 
         num_parts = (actual_tokens // max_tokens) + 1
-        paragraphs = content.split("\n\n")
 
-        if len(paragraphs) < num_parts * 2:
-            paragraphs = content.split("\n")
+        # Multi-level fallback for finding real paragraph boundaries
+        paragraphs = self._find_paragraphs(content, num_parts)
 
         parts = []
         target_tokens_per_part = actual_tokens // num_parts
         current_part = []
         current_tokens = 0
+
+        # Determine separator based on what we found
+        separator = "\n\n"
+        if "\n\n\n" in content:
+            separator = "\n\n\n"
+        elif "\n\n" not in content and "\n" in content:
+            separator = "\n"
+        elif "\n" not in content:
+            separator = " "
 
         for para in paragraphs:
             para_tokens = len(tokenizer.encode(para))
@@ -60,11 +69,7 @@ class SimpleSplitter(ContentSplitter):
                 current_tokens + para_tokens > target_tokens_per_part * 1.2
                 and current_part
             ):
-                parts.append(
-                    "\n\n".join(current_part)
-                    if "\n\n" in content
-                    else "\n".join(current_part)
-                )
+                parts.append(separator.join(current_part))
                 current_part = [para]
                 current_tokens = para_tokens
             else:
@@ -72,13 +77,136 @@ class SimpleSplitter(ContentSplitter):
                 current_tokens += para_tokens
 
         if current_part:
-            parts.append(
-                "\n\n".join(current_part)
-                if "\n\n" in content
-                else "\n".join(current_part)
-            )
+            parts.append(separator.join(current_part))
 
         return parts if parts else [content]
+
+    def _find_paragraphs(self, content: str, min_paragraphs_needed: int) -> List[str]:
+        """
+        Find real paragraphs using multi-level fallback.
+
+        Fallback order:
+        1. Triple newlines (\n\n\n) - clear section breaks
+        2. Double newlines (\n\n) - standard paragraph breaks
+        3. Single newlines ending with punctuation - filtered for real breaks
+        4. Sentence boundaries (periods, !, ?) - if no newlines
+        5. Raw string split - extreme fallback
+
+        Args:
+            content: The content to analyze
+            min_paragraphs_needed: Minimum number of paragraphs we need
+
+        Returns:
+            List of paragraphs
+        """
+        import re
+
+        # Try triple newlines first (clear section breaks)
+        if "\n\n\n" in content:
+            paragraphs = content.split("\n\n\n")
+            if len(paragraphs) >= min_paragraphs_needed:
+                return [p.strip() for p in paragraphs if p.strip()]
+
+        # Try double newlines (standard paragraph breaks)
+        if "\n\n" in content:
+            paragraphs = content.split("\n\n")
+            if len(paragraphs) >= min_paragraphs_needed * 2:
+                return [p.strip() for p in paragraphs if p.strip()]
+
+        # Try single newlines, but filter for real paragraph endings
+        if "\n" in content:
+            lines = content.split("\n")
+            paragraphs = []
+            current_para = []
+
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    # Empty line - might be a paragraph break
+                    if current_para:
+                        paragraphs.append(" ".join(current_para))
+                        current_para = []
+                    continue
+
+                current_para.append(line)
+
+                # Check if this line ends a paragraph
+                # A line ends a paragraph if:
+                # 1. It ends with sentence-ending punctuation (including CJK)
+                # 2. The next line starts with capital letter, number, or CJK character (new sentence)
+
+                # Western and CJK sentence-ending punctuation
+                sentence_endings = '.!?。！？」』】）)」』'  # Including quotation closers that often end sentences
+
+                if line and line[-1] in sentence_endings:
+                    next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                    if next_line:
+                        # Check if next line starts a new sentence
+                        # For Western text: capital letter or number
+                        # For CJK text: any CJK character (they don't have case)
+                        first_char = next_line[0]
+                        is_cjk = '\u4e00' <= first_char <= '\u9fff' or \
+                                '\u3040' <= first_char <= '\u309f' or \
+                                '\u30a0' <= first_char <= '\u30ff' or \
+                                '\uac00' <= first_char <= '\ud7af'  # Korean
+
+                        if first_char.isupper() or first_char.isdigit() or is_cjk:
+                            # This looks like a real paragraph ending
+                            paragraphs.append(" ".join(current_para))
+                            current_para = []
+
+            if current_para:
+                paragraphs.append(" ".join(current_para))
+
+            if len(paragraphs) >= min_paragraphs_needed * 2:
+                return [p for p in paragraphs if p]
+
+        # Fallback to sentence boundaries if no good newline breaks
+        if "\n" not in content or len(paragraphs) < min_paragraphs_needed * 2:
+            # Split by sentence-ending punctuation (Western and CJK)
+            # Western: period/exclamation/question followed by space and capital
+            # CJK: CJK sentence endings (no space needed in CJK)
+            sentences = re.split(
+                r'(?<=[.!?])\s+(?=[A-Z0-9])|'  # Western sentences
+                r'(?<=[。！？」』】）])',  # CJK sentence endings
+                content
+            )
+
+            if len(sentences) > min_paragraphs_needed * 3:
+                # Group sentences into pseudo-paragraphs
+                paragraphs = []
+                sentences_per_para = max(3, len(sentences) // (min_paragraphs_needed * 2))
+
+                for i in range(0, len(sentences), sentences_per_para):
+                    para = " ".join(sentences[i:i + sentences_per_para])
+                    if para.strip():
+                        paragraphs.append(para.strip())
+
+                return paragraphs
+
+        # Ultimate fallback: split by character count if nothing else works
+        if len(paragraphs) < min_paragraphs_needed:
+            # This is the extreme case - no structure at all
+            chars_per_part = len(content) // (min_paragraphs_needed * 2)
+            if chars_per_part > 100:
+                paragraphs = []
+                for i in range(0, len(content), chars_per_part):
+                    # Try to break at a space at least
+                    end = min(i + chars_per_part, len(content))
+                    if end < len(content):
+                        # Look for nearest space
+                        space_idx = content.rfind(' ', i, end)
+                        if space_idx > i:
+                            end = space_idx
+
+                    part = content[i:end].strip()
+                    if part:
+                        paragraphs.append(part)
+
+                return paragraphs
+
+        # Return what we have
+        return [p for p in paragraphs if p] if paragraphs else [content]
 
 
 class MarkdownStructureSplitter(ContentSplitter):

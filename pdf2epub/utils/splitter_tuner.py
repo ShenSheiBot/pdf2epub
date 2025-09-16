@@ -154,18 +154,6 @@ def tune_content_splitter(
                 strategy=content_type,
             )
             
-            # Load the saved split prompt (if it exists from our temp modification)
-            split_prompt_file = Path("last_split_prompt.txt")
-            split_prompt = None
-            if split_prompt_file.exists():
-                with open(split_prompt_file, 'r', encoding='utf-8') as f:
-                    split_prompt = f.read()
-                # Clean up the prompt - remove the large structural map for readability
-                if "Document structure:" in split_prompt:
-                    split_prompt = split_prompt[:split_prompt.index("Document structure:")]
-                    split_prompt += "[Document structure omitted for brevity]"
-                results["split_prompts"][chapter_name] = split_prompt
-            
             # Calculate part statistics
             part_stats = []
             for i, part in enumerate(parts, 1):
@@ -232,11 +220,6 @@ def tune_content_splitter(
     
     logger.info(f"\nResults saved to: {output_path}")
     logger.info(f"Summary: {summary_file}")
-    
-    # Clean up temp file
-    split_prompt_file = Path("last_split_prompt.txt")
-    if split_prompt_file.exists():
-        split_prompt_file.unlink()
     
     return results
 

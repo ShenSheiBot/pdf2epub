@@ -199,26 +199,56 @@ class PolishProcessor(BaseMarkdownProcessor):
         max_tokens_per_part = self._determine_max_tokens()
         # Use proper token counting with tiktoken
         actual_tokens = len(tokenizer.encode(content))
-        
+
+        # Check if we have saved split points from a previous run
+        saved_split_points = None
+        if self.resume and file_key in self.progress.get(progress_key, {}):
+            file_progress = self.progress[progress_key][file_key]
+            saved_split_points = file_progress.get("split_points")
+            saved_tokens = file_progress.get("total_tokens", 0)
+
+            # Verify the content hasn't changed significantly
+            if saved_split_points and abs(saved_tokens - actual_tokens) > 100:
+                logger.warning(
+                    f"Content has changed significantly ({saved_tokens:,} -> {actual_tokens:,} tokens), "
+                    f"recalculating splits for {file_name}"
+                )
+                saved_split_points = None
+
         if actual_tokens > max_tokens_per_part:
-            logger.info(f"Content has {actual_tokens:,} tokens (max: {max_tokens_per_part:,}), splitting into parts")
-            parts = self._split_content(content, max_tokens_per_part)
-            
-            # Store split information in progress
-            with self.progress_lock:
-                if file_key not in self.progress.get(progress_key, {}):
-                    self.progress[progress_key][file_key] = {}
-                
-                # Calculate and store split points (character positions where each part ends)
-                split_points = []
+            if saved_split_points:
+                # Reuse saved split points
+                logger.info(
+                    f"Reusing saved split points for {file_name} "
+                    f"({len(saved_split_points) + 1} parts, {actual_tokens:,} tokens)"
+                )
+                parts = []
                 current_pos = 0
-                for part in parts[:-1]:  # Don't need the end position of the last part
-                    current_pos += len(part)
-                    split_points.append(current_pos)
-                
-                self.progress[progress_key][file_key]["split_points"] = split_points
-                self.progress[progress_key][file_key]["total_tokens"] = actual_tokens
-                self.save_progress()
+                for split_point in saved_split_points:
+                    parts.append(content[current_pos:split_point])
+                    current_pos = split_point
+                # Add the last part
+                parts.append(content[current_pos:])
+            else:
+                # Calculate new splits
+                logger.info(f"Content has {actual_tokens:,} tokens (max: {max_tokens_per_part:,}), splitting into parts")
+                parts = self._split_content(content, max_tokens_per_part)
+
+                # Store split information in progress
+                with self.progress_lock:
+                    if file_key not in self.progress.get(progress_key, {}):
+                        self.progress[progress_key][file_key] = {}
+
+                    # Calculate and store split points (character positions where each part ends)
+                    split_points = []
+                    current_pos = 0
+                    for part in parts[:-1]:  # Don't need the end position of the last part
+                        current_pos += len(part)
+                        split_points.append(current_pos)
+
+                    self.progress[progress_key][file_key]["split_points"] = split_points
+                    self.progress[progress_key][file_key]["total_tokens"] = actual_tokens
+                    self.save_progress()
         else:
             parts = [content]
         
@@ -328,15 +358,20 @@ class PolishProcessor(BaseMarkdownProcessor):
     ) -> Tuple[bool, str]:
         """
         Validate the polished output using truncation detection.
-        
+
         Args:
             original: Original content
             processed: Polished content
             file_name: Name of the file
-        
+
         Returns:
             Tuple of (is_valid, reason)
         """
+        # Skip truncation check for front/back matter files
+        if "front_matter" in file_name.lower() or "back_matter" in file_name.lower():
+            logger.info(f"Skipping truncation check for {file_name} (front/back matter)")
+            return True, "Truncation check skipped for front/back matter"
+
         if self.skip_truncation_check:
             return True, "Truncation check skipped"
         

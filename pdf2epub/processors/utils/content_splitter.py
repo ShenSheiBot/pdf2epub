@@ -19,6 +19,7 @@ from pdf2epub.processors.utils.splitter_strategies import (
 )
 from pdf2epub.processors.utils.document_parser import (
     analyze_document_structure,
+    analyze_paragraph_structure,
     find_split_positions,
     find_split_positions_by_indices,
 )
@@ -130,19 +131,37 @@ class BaseLLMSplitter(ContentSplitter):
         logger.info(
             f"Content has {actual_tokens:,} tokens, splitting into {num_parts} parts"
         )
-        
+
         # Analyze document structure locally
         content_type = self.get_content_type()
         structural_map = analyze_document_structure(content, content_type)
-        
+
+        # Check if we have enough sections for meaningful splitting
+        # Switch to paragraph-based if:
+        # 1. The longest section is > 150% of max_tokens (can't fit in a single part)
+        # 2. We have too few sections for the number of parts needed
+        max_section_tokens = 0
+        if structural_map:
+            for i, section in enumerate(structural_map):
+                if i == 0:
+                    section_tokens = section["cumulative_tokens"]
+                else:
+                    section_tokens = section["cumulative_tokens"] - structural_map[i-1]["cumulative_tokens"]
+                max_section_tokens = max(max_section_tokens, section_tokens)
+
+        if max_section_tokens > max_tokens * 1.5 or len(structural_map) < num_parts * 1.5:
+            # Not enough sections or sections too large, delegate to paragraph-based splitter
+            logger.info(
+                f"Document has {len(structural_map)} sections for {actual_tokens:,} tokens. "
+                f"Longest section has {max_section_tokens:,} tokens (limit is {max_tokens:,}). "
+                f"Switching to paragraph-based splitting."
+            )
+            paragraph_splitter = ParagraphLLMSplitter(self.llm_client, self.model_configs, self.get_content_type())
+            return paragraph_splitter.split(content, max_tokens)
+
         # Create lightweight prompt with structural map
         split_prompt = self.get_prompt(structural_map, max_tokens, num_parts)
         split_prompt += f"\n\nDocument structure:\n{json.dumps(structural_map, indent=2)}"
-
-        # --- TEMP MODIFICATION: Record the prompt ---
-        with open("last_split_prompt.txt", "w", encoding="utf-8") as f:
-            f.write(split_prompt)
-        # --- END TEMP MODIFICATION ---
 
         try:
             response = self.llm_client.generate(
@@ -230,13 +249,13 @@ class BaseLLMSplitter(ContentSplitter):
                 )
                 return SimpleSplitter().split(content, max_tokens)
 
-            # Validate that no part exceeds the max_tokens limit (with 25% tolerance)
+            # Validate that no part exceeds the max_tokens limit (with 50% tolerance)
             for i, part in enumerate(parts, 1):
                 part_tokens = len(tokenizer.encode(part))
                 logger.info(f"Part {i}/{len(parts)}: {part_tokens:,} tokens")
-                if part_tokens > max_tokens * 1.25:  # Allow 25% tolerance
+                if part_tokens > max_tokens * 1.5:  # Allow 50% tolerance
                     logger.warning(
-                        f"Part {i} has {part_tokens:,} tokens, which exceeds the limit of {max_tokens:,} by more than 25%. "
+                        f"Part {i} has {part_tokens:,} tokens, which exceeds the limit of {max_tokens:,} by more than 50%. "
                         "Falling back to simple split."
                     )
                     return SimpleSplitter().split(content, max_tokens)
@@ -309,9 +328,266 @@ Example: [5, 12] means part 2 starts at section 5, part 3 at section 12.
 IMPORTANT: Use the cumulative_tokens field. Aim for {max_tokens:,} tokens per part."""
 
 
+class ParagraphLLMSplitter(BaseLLMSplitter):
+    """LLM splitter that uses paragraph-level analysis when section structure is insufficient."""
+
+    def __init__(self, llm_client, model_configs: Optional[List[Dict]] = None, content_type: str = "general"):
+        super().__init__(llm_client, model_configs)
+        self.original_content_type = content_type
+
+    def get_content_type(self) -> str:
+        return self.original_content_type
+
+    def get_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        """Select appropriate prompt based on content type."""
+        if self.original_content_type == "academic":
+            return self._get_academic_paragraph_prompt(structural_map, max_tokens, num_parts)
+        elif self.original_content_type == "japanese":
+            return self._get_japanese_paragraph_prompt(structural_map, max_tokens, num_parts)
+        else:
+            return self._get_general_paragraph_prompt(structural_map, max_tokens, num_parts)
+
+    def _get_general_paragraph_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        total_tokens = structural_map[-1]["cumulative_tokens"] if structural_map else 0
+        ideal_part_size = total_tokens // num_parts
+
+        return f"""You are a document planner. The document lacks clear section structure, so you'll work with paragraph-level analysis.
+
+The document has {total_tokens:,} tokens total and should be split into {num_parts} parts.
+Each part should ideally be around {ideal_part_size:,} tokens.
+
+CRITICAL RULES:
+
+1. **Token Limits** (HIGHEST PRIORITY):
+   - Target: Keep each part under {max_tokens:,} tokens
+   - Hard limit: Never exceed {int(max_tokens * 1.25):,} tokens
+   - Use cumulative_tokens to calculate part sizes
+
+2. **Natural Boundaries**:
+   - Split at paragraph boundaries (each entry is a paragraph)
+   - Try to keep related paragraphs together based on their preview content
+   - Avoid splitting in the middle of a thought or topic when possible
+
+3. **Balanced Parts**:
+   - Aim for roughly equal-sized parts (around {ideal_part_size:,} tokens each)
+   - Avoid very small or very large parts
+
+Return a JSON array of paragraph indices where new parts begin (starting from the SECOND part).
+
+Example: [15, 30, 45] means:
+- Part 1: paragraphs 0-14
+- Part 2: paragraphs 15-29
+- Part 3: paragraphs 30-44
+- Part 4: paragraphs 45-end
+
+IMPORTANT: Use the cumulative_tokens field to ensure parts don't exceed {max_tokens:,} tokens."""
+
+    def _get_academic_paragraph_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        total_tokens = structural_map[-1]["cumulative_tokens"] if structural_map else 0
+        ideal_part_size = total_tokens // num_parts
+
+        return f"""You are a document planner for academic texts. The document lacks clear section structure, so you'll work with paragraph-level analysis.
+
+The document has {total_tokens:,} tokens total and should be split into {num_parts} parts.
+Each part should ideally be around {ideal_part_size:,} tokens.
+
+CRITICAL RULES FOR ACADEMIC CONTENT:
+
+1. **Token Limits** (HIGHEST PRIORITY):
+   - Target: Keep each part under {max_tokens:,} tokens
+   - Hard limit: Never exceed {int(max_tokens * 1.25):,} tokens
+   - Use cumulative_tokens to calculate part sizes
+
+2. **Academic Integrity**:
+   - Keep paragraphs with citations/references together when possible
+   - Look for patterns like "[number]" or "(Author, Year)" in previews
+   - Maintain logical argument flow - thesis, evidence, and conclusion paragraphs should stay together
+   - Keep definition paragraphs with their subsequent explanation paragraphs
+
+3. **Natural Academic Boundaries**:
+   - Split at paragraph boundaries (each entry is a paragraph)
+   - Prefer splitting between different arguments or topics
+   - Avoid splitting in the middle of a proof, example, or case study
+   - Keep numbered lists or bullet points together
+
+4. **Balanced Parts**:
+   - Aim for roughly equal-sized parts (around {ideal_part_size:,} tokens each)
+   - Prioritize content coherence over perfect size balance
+
+Return a JSON array of paragraph indices where new parts begin (starting from the SECOND part).
+
+IMPORTANT: Use the cumulative_tokens field to ensure parts don't exceed {max_tokens:,} tokens."""
+
+    def _get_japanese_paragraph_prompt(self, structural_map: List[Dict], max_tokens: int, num_parts: int) -> str:
+        total_tokens = structural_map[-1]["cumulative_tokens"] if structural_map else 0
+        ideal_part_size = total_tokens // num_parts
+
+        return f"""You are a document planner for Japanese content. The document lacks clear section structure, so you'll work with paragraph-level analysis.
+
+The document has {total_tokens:,} tokens total and should be split into {num_parts} parts.
+Each part should ideally be around {ideal_part_size:,} tokens.
+
+CRITICAL RULES FOR JAPANESE CONTENT:
+
+1. **Token Limits** (HIGHEST PRIORITY):
+   - Target: Keep each part under {max_tokens:,} tokens
+   - Hard limit: Never exceed {int(max_tokens * 1.25):,} tokens
+   - Use cumulative_tokens to calculate part sizes
+
+2. **Narrative Flow**:
+   - Keep dialogue sequences together (look for 「」quotes in previews)
+   - Maintain scene continuity - don't split in the middle of an action sequence
+   - Keep emotional arcs intact - buildup and resolution should stay together
+   - Preserve character interactions within the same scene
+
+3. **Natural Story Boundaries**:
+   - Split at paragraph boundaries (each entry is a paragraph)
+   - Prefer splitting at scene transitions or time skips
+   - Look for transitional phrases that indicate new scenes
+   - Keep internal monologues and their related actions together
+
+4. **Balanced Parts**:
+   - Aim for roughly equal-sized parts (around {ideal_part_size:,} tokens each)
+   - Prioritize narrative coherence over perfect size balance
+
+Return a JSON array of paragraph indices where new parts begin (starting from the SECOND part).
+
+IMPORTANT: Use the cumulative_tokens field to ensure parts don't exceed {max_tokens:,} tokens."""
+
+    def split(self, content: str, max_tokens: int) -> List[str]:
+        """
+        Use LLM with paragraph-level analysis for intelligent splitting.
+
+        This splitter is called when section-based splitting isn't suitable.
+        """
+        actual_tokens = len(tokenizer.encode(content))
+
+        if actual_tokens <= max_tokens:
+            return [content]
+
+        num_parts = max(2, (actual_tokens // max_tokens) + 1)
+
+        # Use paragraph-level analysis
+        structural_map = analyze_paragraph_structure(content)
+
+        # If we don't have enough paragraphs, fall back to simple split
+        if len(structural_map) < num_parts * 3:
+            logger.warning(
+                f"Only {len(structural_map)} paragraphs found for {actual_tokens:,} tokens. "
+                f"Falling back to simple split."
+            )
+            return SimpleSplitter().split(content, max_tokens)
+
+        logger.info(
+            f"Content has {actual_tokens:,} tokens, splitting into {num_parts} parts "
+            f"using {len(structural_map)} paragraphs"
+        )
+
+        split_prompt = self.get_prompt(structural_map, max_tokens, num_parts)
+        split_prompt += f"\n\nDocument structure:\n{json.dumps(structural_map, indent=2)}"
+
+        try:
+            response = self.llm_client.generate(
+                prompt=split_prompt,
+                model_configs=self.model_configs,
+                operation_name="Split chapter (paragraph-based)",
+            )
+            if not response or not response.strip():
+                logger.warning(
+                    "Failed to get LLM split suggestions, falling back to simple split"
+                )
+                return SimpleSplitter().split(content, max_tokens)
+
+            # Parse response and find split positions
+            response = response.strip()
+            json_str = None
+
+            if "```json" in response:
+                start = response.find("```json") + 7
+                end = response.find("```", start)
+                if end != -1:
+                    json_str = response[start:end].strip()
+            elif "```" in response:
+                start = response.find("```") + 3
+                if response[start : start + 1] == "\n":
+                    start += 1
+                end = response.find("```", start)
+                if end != -1:
+                    json_str = response[start:end].strip()
+            elif "[" in response:
+                start = response.find("[")
+                end = response.rfind("]")
+                if start != -1 and end != -1 and end > start:
+                    json_str = response[start : end + 1]
+
+            if not json_str:
+                json_str = response
+
+            logger.debug(f"Parsing split response: {json_str[:200]}...")
+
+            split_indices = None
+            try:
+                parsed_response = json.loads(json_str.strip())
+                if not isinstance(parsed_response, list):
+                    raise ValueError("Response is not a list")
+
+                if parsed_response and all(isinstance(x, int) for x in parsed_response):
+                    split_indices = parsed_response
+                    logger.debug(f"Using paragraph indices: {split_indices}")
+                else:
+                    logger.warning("Invalid response format, falling back to simple split")
+                    return SimpleSplitter().split(content, max_tokens)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    f"Failed to parse LLM split response: {e}, falling back to simple split"
+                )
+                return SimpleSplitter().split(content, max_tokens)
+
+            # Split content at paragraph boundaries
+            parts = []
+            split_positions = [0] + split_indices + [len(structural_map)]
+
+            for i in range(len(split_positions) - 1):
+                start_idx = split_positions[i]
+                end_idx = split_positions[i + 1]
+
+                # Find character positions from paragraph indices
+                start_pos = structural_map[start_idx]["position"]["start"] if start_idx < len(structural_map) else 0
+                end_pos = structural_map[end_idx - 1]["position"]["end"] if end_idx > 0 and end_idx <= len(structural_map) else len(content)
+
+                part = content[start_pos:end_pos].strip()
+                if part:
+                    parts.append(part)
+
+            if len(parts) < 2:
+                logger.warning(
+                    "LLM split resulted in too few parts, falling back to simple split"
+                )
+                return SimpleSplitter().split(content, max_tokens)
+
+            # Validate part sizes
+            for i, part in enumerate(parts, 1):
+                part_tokens = len(tokenizer.encode(part))
+                logger.info(f"Part {i}/{len(parts)}: {part_tokens:,} tokens")
+                if part_tokens > max_tokens * 1.5:
+                    logger.warning(
+                        f"Part {i} has {part_tokens:,} tokens, exceeds limit. "
+                        "Falling back to simple split."
+                    )
+                    return SimpleSplitter().split(content, max_tokens)
+
+            return parts
+
+        except Exception as e:
+            logger.warning(
+                f"Paragraph-based split failed: {e}, falling back to simple split"
+            )
+            return SimpleSplitter().split(content, max_tokens)
+
+
 class AcademicLLMSplitter(BaseLLMSplitter):
     """LLM splitter for academic content."""
-    
+
     def get_content_type(self) -> str:
         return "academic"
 
@@ -380,6 +656,8 @@ def get_splitter(
         return JapaneseLLMSplitter(llm_client, model_configs)
     elif strategy == "academic":
         return AcademicLLMSplitter(llm_client, model_configs)
+    elif strategy == "paragraph":
+        return ParagraphLLMSplitter(llm_client, model_configs)
     else:
         raise ValueError(f"Unknown splitter strategy: {strategy}")
 

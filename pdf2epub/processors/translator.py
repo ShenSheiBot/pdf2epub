@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 from pathlib import Path
 from loguru import logger
 import re
+import random
 
 from .base import BaseMarkdownProcessor
 from .utils.truncation import LLMTruncationDetector
@@ -149,7 +150,7 @@ class TranslateProcessor(BaseMarkdownProcessor):
         
         # Correct footnote colon syntax for all translations
         translated_content = self._correct_footnote_colons(translated_content)
-        
+
         return translated_content
     
     def process_content(
@@ -180,12 +181,25 @@ class TranslateProcessor(BaseMarkdownProcessor):
         if part_files:
             logger.info(f"Found {len(part_files)} part files for {file_name}, translating separately")
             translated_parts = []
-            
+            output_dir = Path(self.output_dir)
+            base_name = Path(file_name).stem
+
             for part_idx, part_file in enumerate(part_files, 1):
+                # Check if this part was already translated (for resume)
+                translated_part_file = output_dir / f"{base_name}.part{part_idx}.md"
+
+                if self.resume and translated_part_file.exists():
+                    # Part already translated, load it
+                    logger.info(f"Skipping {file_name} part {part_idx}/{len(part_files)} (already translated)")
+                    with open(translated_part_file, 'r', encoding='utf-8') as f:
+                        translated_part = f.read()
+                    translated_parts.append(translated_part)
+                    continue
+
                 # Read part content
                 with open(part_file, 'r', encoding='utf-8') as f:
                     part_content = f.read()
-                
+
                 # Translate the part
                 translated_part = self._translate_part(
                     content=part_content,
@@ -193,27 +207,24 @@ class TranslateProcessor(BaseMarkdownProcessor):
                     part_idx=part_idx,
                     total_parts=len(part_files)
                 )
-                
+
                 # Validate this part
                 is_valid, reason = self.validate_output(
                     original=part_content,
                     processed=translated_part,
                     file_name=f"{file_name} part {part_idx}/{len(part_files)}"
                 )
-                
+
                 if not is_valid:
                     logger.warning(f"Part {part_idx}/{len(part_files)} validation failed: {reason}")
-                
+
                 translated_parts.append(translated_part)
-                
+
                 # Save translated part file
-                output_dir = Path(self.output_dir)
-                base_name = Path(file_name).stem
-                translated_part_file = output_dir / f"{base_name}.part{part_idx}.md"
                 with open(translated_part_file, 'w', encoding='utf-8') as f:
                     f.write(translated_part)
                 logger.debug(f"Saved translated part: {translated_part_file.name}")
-            
+
             # Combine all parts
             combined = "\n\n".join(translated_parts)
             return combined
@@ -228,31 +239,43 @@ class TranslateProcessor(BaseMarkdownProcessor):
         file_name: str
     ) -> Tuple[bool, str]:
         """
-        Validate the translated output using LLM-based truncation detection.
-        
+        Validate the translated output using LLM-based truncation detection and target language validation.
+
         Args:
             original: Original content
             processed: Translated content
             file_name: Name of the file
-        
+
         Returns:
             Tuple of (is_valid, reason)
         """
-        is_truncated, reason, details = self.truncation_detector.detect(
+        # First check for truncation
+        is_truncated, truncation_reason, details = self.truncation_detector.detect(
             original=original,
             processed=processed,
             source_language=self.source_language,
             target_language=self.target_language
         )
-        
-        # Log the summary
-        summary = self.truncation_detector.get_summary(is_truncated, reason, details)
+
+        # Log the truncation check summary
+        summary = self.truncation_detector.get_summary(is_truncated, truncation_reason, details)
         if is_truncated:
             logger.warning(f"{file_name} translation truncation detected:\n{summary}")
+            return False, truncation_reason
         else:
             logger.info(f"{file_name} translation validated:\n{summary}")
-        
-        return not is_truncated, reason
+
+        # Then validate Chinese content if target language is Chinese
+        if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            is_valid_chinese, chinese_validation_msg = self._validate_chinese_translation(processed)
+            if not is_valid_chinese:
+                logger.error(f"Chinese validation failed for {file_name}: {chinese_validation_msg}")
+                logger.warning("LLM returned English or non-Chinese content when Chinese was requested")
+                return False, f"Chinese validation failed: {chinese_validation_msg}"
+            else:
+                logger.debug(f"Chinese translation validated for {file_name}: {chinese_validation_msg}")
+
+        return True, "Validation passed"
     
     def process_file(
         self,
@@ -300,6 +323,75 @@ class TranslateProcessor(BaseMarkdownProcessor):
             logger.info("Run 'extract-entities' command first to generate entity reference")
             return None
     
+    def _validate_chinese_translation(self, text: str) -> Tuple[bool, str]:
+        """
+        Validate that the translation contains Chinese characters.
+
+        Randomly samples 5 sections of 500 characters each and checks if they contain Chinese.
+        Considers valid if at least 4 out of 5 sections contain Chinese.
+
+        Args:
+            text: The translated text to validate
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        # Remove markdown formatting and whitespace for better sampling
+        clean_text = re.sub(r'[#\*\[\]\(\)!`\n\s]+', '', text)
+
+        window_size = 500  # Extended window for better sampling
+
+        if len(clean_text) < window_size:
+            # Text too short, check if it has any Chinese characters at all
+            has_chinese = bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', clean_text))
+            if not has_chinese:
+                return False, "Text contains no Chinese characters"
+            return True, "Text contains Chinese characters (short text)"
+
+        # Sample 5 random positions
+        sample_size = min(5, len(clean_text) // window_size)
+        if sample_size == 0:
+            sample_size = 1
+
+        sections_checked = []
+        sections_with_chinese = 0
+
+        for _ in range(sample_size):
+            # Get random starting position
+            max_start = len(clean_text) - window_size
+            start = random.randint(0, max(0, max_start))
+            end = min(start + window_size, len(clean_text))
+            section = clean_text[start:end]
+
+            # Check if this section contains Chinese characters
+            # Unicode ranges for Chinese characters:
+            # - Common CJK Unified Ideographs: U+4E00-U+9FFF
+            # - CJK Extension A: U+3400-U+4DBF
+            has_chinese = bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', section))
+
+            sections_checked.append({
+                'position': f"chars {start}-{end}",
+                'sample': section[:30] + "..." if len(section) > 30 else section,
+                'has_chinese': has_chinese
+            })
+
+            if has_chinese:
+                sections_with_chinese += 1
+
+        # Check if enough sampled sections contain Chinese (4 out of 5 is acceptable)
+        min_required = max(1, sample_size - 1) if sample_size > 1 else 1  # At least 4/5, or all if less than 5
+
+        if sections_with_chinese == 0:
+            details = "\n".join([f"  - {s['position']}: No Chinese found in '{s['sample']}'"
+                                for s in sections_checked])
+            return False, f"No Chinese characters found in any of {sample_size} sampled sections:\n{details}"
+        elif sections_with_chinese < min_required:
+            details = "\n".join([f"  - {s['position']}: {'✓' if s['has_chinese'] else '✗'} Chinese in '{s['sample']}'"
+                                for s in sections_checked])
+            return False, f"Only {sections_with_chinese}/{sample_size} sections contain Chinese (need at least {min_required}):\n{details}"
+
+        return True, f"{sections_with_chinese}/{sample_size} sampled sections contain Chinese characters"
+
     def _correct_footnote_colons(self, text: str) -> str:
         """
         Correct full-width colons in footnote definitions to standard ASCII colons.
@@ -355,14 +447,32 @@ class TranslateProcessor(BaseMarkdownProcessor):
     
     def _create_translation_prompt(self) -> str:
         """Create the prompt for translation."""
-        prompt = f"""You are a professional translator specializing in academic and literary texts.
+        # Use Chinese prompt if target language is Chinese
+        if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            prompt = f"""你是一位专业的学术和文学文本翻译专家。
+
+请将以下markdown内容从{self.source_language}翻译成简体中文。
+
+重要要求：
+1. **保留所有markdown格式**：保持标题(#, ##, ###)、强调(*斜体*, **粗体**)、列表、引用、代码块等格式不变
+2. **图片链接保持不变**：不要翻译或修改图片路径，如 ![...](../images/xxx.png)
+3. **脚注处理**：
+   - 保持脚注格式 [^1], [^2] 等不变
+   - 不要添加原文中不存在的脚注
+4. **维持文档结构**：保持相同的段落分隔、章节划分和整体布局
+5. **学术文本**：使用准确的中文学术术语
+6. **文学文本**：保留原文的风格和语调
+7. **不要添加说明**：只返回翻译后的markdown内容，不要添加任何解释或评论
+8. **必须输出简体中文**：请确保翻译结果是简体中文，不要返回英文或其他语言"""
+        else:
+            prompt = f"""You are a professional translator specializing in academic and literary texts.
 
 Translate the following markdown content from {self.source_language} to {self.target_language}.
 
 IMPORTANT REQUIREMENTS:
 1. **Preserve ALL markdown formatting**: Keep headers (#, ##, ###), emphasis (*italic*, **bold**), lists, quotes, code blocks, etc.
 2. **Keep image links unchanged**: Do not translate or modify image paths like ![...](../images/xxx.png)
-3. **Don't touch footnote**: 
+3. **Don't touch footnote**:
    - Keep the footnote format [^1], [^2], etc. unchanged
    - Don't add footnote that does not exist in the original text
 4. **Maintain document structure**: Keep the same paragraph breaks, section divisions, and overall layout
@@ -372,11 +482,23 @@ IMPORTANT REQUIREMENTS:
         
         # Add specific rules for Japanese to Chinese translation
         if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
-            prompt += """
+            # Add rules in Chinese since the prompt is in Chinese
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                prompt += """
+
+日译中特殊规则：
+9. **删除不必要的注音**：不要包含类似 谦逊（けんそん）的日文读音标注，中文读者不需要日文读音
+10. **正确处理日文语气词**：
+   - 删除或调整句尾的っ
+   - 「っ，呜，呜嗯っ……呜，呜」应该翻译为「呜，呜嗯……呜，呜」
+   - 不要直接将っ翻译成中文字符
+11. **自然的中文表达**：确保译文符合中文表达习惯，没有日文语言痕迹"""
+            else:
+                prompt += """
 
 SPECIFIC RULES FOR JAPANESE TO CHINESE:
 8. **Remove unnecessary ruby annotations**: Do NOT include pronunciation guides like 谦逊（けんそん）. Chinese readers don't need Japanese readings.
-9. **Handle Japanese particles properly**: 
+9. **Handle Japanese particles properly**:
    - Remove or adapt っ at the end of sentences/exclamations
    - 「っ，呜，呜嗯っ……呜，呜」 should become 「呜，呜嗯……呜，呜」
    - Do not literally translate っ as a character
@@ -385,22 +507,35 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         # Add entity reference if available
         if self.entities:
             prompt += self._create_entity_reference_section()
-        
-        prompt += "\n\nTranslate the following content:"
+
+        # Final instruction in appropriate language
+        if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            prompt += "\n\n请翻译以下内容："
+        else:
+            prompt += "\n\nTranslate the following content:"
         return prompt
     
     def _create_entity_reference_section(self) -> str:
         """Create the entity reference section for the prompt."""
         if not self.entities:
             return ""
-        
-        reference = "\n\n**TRANSLATION CONSISTENCY REFERENCE:**\n"
-        reference += "Use these established translations for consistency:\n"
-        reference += "IMPORTANT: Always use the provided translations for character names AND their nicknames.\n\n"
+
+        # Use Chinese headers if target language is Chinese
+        if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            reference = "\n\n**翻译一致性参考：**\n"
+            reference += "请使用以下既定译名以保持一致性：\n"
+            reference += "重要：请始终使用提供的人物名称及其昵称的翻译。\n\n"
+        else:
+            reference = "\n\n**TRANSLATION CONSISTENCY REFERENCE:**\n"
+            reference += "Use these established translations for consistency:\n"
+            reference += "IMPORTANT: Always use the provided translations for character names AND their nicknames.\n\n"
         
         # Add characters
         if "characters" in self.entities and self.entities["characters"]:
-            reference += "**Characters:**\n"
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                reference += "**人物：**\n"
+            else:
+                reference += "**Characters:**\n"
             for char in self.entities["characters"]:
                 reference += f"- {char['japanese']}"
                 if char.get('reading'):
@@ -422,28 +557,40 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         
         # Add places
         if "places" in self.entities and self.entities["places"]:
-            reference += "**Places:**\n"
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                reference += "**地点：**\n"
+            else:
+                reference += "**Places:**\n"
             for place in self.entities["places"]:
                 reference += f"- {place['japanese']} → {place['chinese']}\n"
             reference += "\n"
         
         # Add important terms
         if "terms" in self.entities and self.entities["terms"]:
-            reference += "**Special Terms:**\n"
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                reference += "**专有名词：**\n"
+            else:
+                reference += "**Special Terms:**\n"
             for term in self.entities["terms"]:
                 reference += f"- {term['japanese']} → {term['chinese']}\n"
             reference += "\n"
         
         # Add organizations
         if "organizations" in self.entities and self.entities["organizations"]:
-            reference += "**Organizations:**\n"
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                reference += "**组织：**\n"
+            else:
+                reference += "**Organizations:**\n"
             for org in self.entities["organizations"]:
                 reference += f"- {org['japanese']} → {org['chinese']}\n"
             reference += "\n"
         
         # Add races if present
         if "races" in self.entities and self.entities["races"]:
-            reference += "**Races/Species:**\n"
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                reference += "**种族/物种：**\n"
+            else:
+                reference += "**Races/Species:**\n"
             for race in self.entities["races"]:
                 reference += f"- {race['japanese']} → {race['chinese']}"
                 if race.get('chinese_plural'):
@@ -451,13 +598,19 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
                 reference += "\n"
             reference += "\n"
         
-        # Add items if present  
+        # Add items if present
         if "items" in self.entities and self.entities["items"]:
-            reference += "**Items:**\n"
+            if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                reference += "**物品：**\n"
+            else:
+                reference += "**Items:**\n"
             for item in self.entities["items"]:
                 reference += f"- {item['japanese']} → {item['chinese']}\n"
             reference += "\n"
         
-        reference += "**IMPORTANT:** Maintain these translations consistently throughout the text.\n"
+        if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            reference += "**重要提示：** 请在整个文本中保持这些译名的一致性。\n"
+        else:
+            reference += "**IMPORTANT:** Maintain these translations consistently throughout the text.\n"
         
         return reference

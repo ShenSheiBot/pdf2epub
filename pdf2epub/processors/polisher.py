@@ -179,18 +179,20 @@ class PolishProcessor(BaseMarkdownProcessor):
             Polished markdown content
         """
         # Check if we should clean up part files
-        # Only clean up if we're not resuming, or if the file isn't marked as completed
+        # Only clean up if we're not resuming, or if the file isn't marked as completed or has parts
         file_key = Path(file_name).stem
         progress_key = self.get_progress_key()
         should_cleanup = True
-        
+
         if self.resume and file_key in self.progress.get(progress_key, {}):
             file_progress = self.progress[progress_key][file_key]
-            if file_progress.get("completed", False):
-                # File is already completed, don't clean up part files
+            # Preserve part files if:
+            # 1. File is already completed
+            # 2. File has parts being processed (even if not completed)
+            if file_progress.get("completed", False) or file_progress.get("parts"):
                 should_cleanup = False
-                logger.debug(f"Preserving existing part files for completed file: {file_name}")
-        
+                logger.debug(f"Preserving existing part files for file with progress: {file_name}")
+
         if should_cleanup:
             # Clean up any existing part files from previous failed attempts
             self._cleanup_part_files(file_name)

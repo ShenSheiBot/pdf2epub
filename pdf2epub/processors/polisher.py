@@ -78,7 +78,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         
         # Thread lock for progress updates
         self.progress_lock = threading.Lock()
-        
+
         # Log global footnote detection
         if self.use_global_footnotes:
             logger.info("Detected Notes chapter - using global footnote mode for academic content")
@@ -319,7 +319,7 @@ class PolishProcessor(BaseMarkdownProcessor):
                         polished_parts[part_idx - 1] = ""  # Empty string for failed parts
             
             # Check if all parts were processed
-            if not all_parts_valid and not self.skip_truncation_check:
+            if not all_parts_valid and not self.skip_truncation_check and not self.use_longest_on_failure:
                 logger.warning(f"Some parts of {file_name} failed validation")
         else:
             # Single part - process normally
@@ -336,7 +336,7 @@ class PolishProcessor(BaseMarkdownProcessor):
             all_parts_valid = is_valid
         
         # If not all parts are valid, we might want to handle this differently
-        if not all_parts_valid and not self.skip_truncation_check:
+        if not all_parts_valid and not self.skip_truncation_check and not self.use_longest_on_failure:
             logger.warning(f"Some parts of {file_name} failed validation")
         
         # Combine all parts and return the full content
@@ -432,79 +432,73 @@ class PolishProcessor(BaseMarkdownProcessor):
         original_content: str,
         file_name: str
     ) -> Tuple[str, bool]:
-        """Process and validate a single part with retry logic."""
-        # Get max retries from model config
-        max_retries = 3
-        if self.polish_models:
-            max_retries = self.polish_models[0].get('max_retries', 3)
-        
-        # last_error = None
-        best_attempt = None
-        best_attempt_valid = False
-        
-        for attempt in range(max_retries):
-            try:
-                # Polish the part
-                polished_part = self._polish_part(
-                    part_content=part_content,
-                    chapter_name=chapter_name,
-                    part_idx=part_idx,
-                    total_parts=total_parts,
-                    original_content=original_content,
-                    file_name=file_name
+        """
+        Process and validate a single part using the new centralized retry logic.
+
+        All retry and validation logic is now handled by LLMClient.generate_with_validation.
+        This method focuses purely on the business logic of polishing.
+
+        Returns:
+            Tuple of (polished_content, is_valid)
+        """
+        # Create the polishing prompt with content for auto-detection
+        prompt = self._create_polish_prompt(
+            chapter_name, part_idx, total_parts, part_content, file_name
+        )
+
+        # Create multi-part content for the LLM
+        multi_part_content = [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": part_content}
+        ]
+
+        # Create operation name for logging
+        if total_parts > 1:
+            operation_name = f"{chapter_name} part {part_idx}/{total_parts}"
+        else:
+            operation_name = chapter_name
+
+        # Define validator function if not skipping truncation check
+        validator = None
+        if not self.skip_truncation_check:
+            def validator(response: str) -> Tuple[bool, str]:
+                # Clean the response before validation
+                cleaned_response = self.clean_markdown_response(response)
+                # Use the existing validate_output method
+                return self.validate_output(
+                    original=part_content,
+                    processed=cleaned_response,
+                    file_name=f"{file_name} part {part_idx}/{total_parts}" if total_parts > 1 else file_name
                 )
-                
-                # Validate this part
-                is_valid = True
-                if not self.skip_truncation_check:
-                    is_valid, reason = self.validate_output(
-                        original=part_content,
-                        processed=polished_part,
-                        file_name=f"{file_name} part {part_idx}/{total_parts}" if total_parts > 1 else file_name
-                    )
-                    
-                    if not is_valid:
-                        # last_error = reason
-                        if attempt < max_retries - 1:
-                            logger.warning(
-                                f"Part {part_idx}/{total_parts} validation failed (attempt {attempt + 1}/{max_retries}): {reason}"
-                            )
-                            logger.info(f"Retrying part {part_idx}/{total_parts}...")
-                            # Store best attempt so far
-                            if best_attempt is None or len(polished_part) > len(best_attempt):
-                                best_attempt = polished_part
-                            continue
-                        else:
-                            logger.error(
-                                f"Part {part_idx}/{total_parts} validation failed after {max_retries} attempts: {reason}"
-                            )
-                            # Use best attempt if we have one
-                            if best_attempt and self.use_longest_on_failure:
-                                logger.warning(f"Using longest response for part {part_idx}/{total_parts}")
-                                return best_attempt, False
-                            return polished_part, False
-                
-                # Success!
-                return polished_part, True
-                
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Error processing part {part_idx}/{total_parts} (attempt {attempt + 1}/{max_retries}): {e}"
-                    )
-                    continue
-                else:
-                    logger.error(
-                        f"Failed to process part {part_idx}/{total_parts} after {max_retries} attempts: {e}"
-                    )
-                    if best_attempt:
-                        return best_attempt, False
-                    raise
-        
-        # Should not reach here, but just in case
-        if best_attempt:
-            return best_attempt, best_attempt_valid
-        raise ValueError(f"Failed to process part {part_idx} after all attempts")
+
+        try:
+            # Use the new generate_with_validation method
+            # All retry logic is now handled within the LLMClient
+            polished_part = self.llm_client.generate_with_validation(
+                prompt=multi_part_content,
+                model_configs=self.polish_models,
+                validator=validator,
+                validation_strategy=self.validation_strategy,
+                operation_name=operation_name
+            )
+
+            # Clean and post-process
+            polished_part = self.clean_markdown_response(polished_part)
+            polished_part = self._post_process_markdown(polished_part)
+
+            # Restore lost images if single part
+            if total_parts == 1:
+                from .utils.image_restore import restore_lost_images
+                polished_part = restore_lost_images(original_content, polished_part)
+
+            # Content was successfully generated and validated
+            return polished_part, True
+
+        except Exception as e:
+            # If all attempts failed, the LLMClient will have already applied
+            # the fallback strategy (use_longest_on_failure) if configured
+            logger.error(f"Failed to process {operation_name}: {e}")
+            raise
     
     def _save_part_file(self, file_name: str, part_idx: int, content: str) -> None:
         """Save a part file separately."""

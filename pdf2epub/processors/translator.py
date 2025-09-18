@@ -118,40 +118,69 @@ class TranslateProcessor(BaseMarkdownProcessor):
         return part_files
     
     def _translate_part(self, content: str, file_name: str, part_idx: int = None, total_parts: int = None) -> str:
-        """Translate a single part of content."""
+        """Translate a single part of content using the new centralized retry logic."""
         # Create the translation prompt
         prompt = self._create_translation_prompt()
-        
+
         # Create multi-part content for the LLM
         multi_part_content = [
             {"type": "text", "text": prompt},
             {"type": "text", "text": content}
         ]
-        
+
         # Generate operation name
         if part_idx and total_parts:
             operation_name = f"{self.get_operation_name(file_name)} part {part_idx}/{total_parts}"
         else:
             operation_name = self.get_operation_name(file_name)
-        
-        # Generate translation
-        translated_content = self.llm_client.generate(
-            prompt=multi_part_content,
-            model_configs=self.translation_models,
-            operation_name=operation_name
-        )
-        
-        # Clean the response
-        translated_content = self.clean_markdown_response(translated_content)
-        
-        # Apply Japanese to Chinese specific post-processing
-        if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
-            translated_content = self._clean_japanese_artifacts(translated_content)
-        
-        # Correct footnote colon syntax for all translations
-        translated_content = self._correct_footnote_colons(translated_content)
 
-        return translated_content
+        # Define validator function that includes all our translation validations
+        def validator(response: str) -> Tuple[bool, str]:
+            # Clean the response first
+            cleaned = self.clean_markdown_response(response)
+
+            # Apply language-specific post-processing for validation
+            if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                cleaned = self._clean_japanese_artifacts(cleaned)
+
+            # Correct footnote colons
+            cleaned = self._correct_footnote_colons(cleaned)
+
+            # Validate using existing method (checks for truncation)
+            is_valid, reason = self.validate_output(
+                original=content,
+                processed=cleaned,
+                file_name=f"{file_name} part {part_idx}/{total_parts}" if part_idx and total_parts else file_name
+            )
+
+            return is_valid, reason
+
+        try:
+            # Use the new generate_with_validation method
+            # All retry logic is now handled within the LLMClient
+            translated_content = self.llm_client.generate_with_validation(
+                prompt=multi_part_content,
+                model_configs=self.translation_models,
+                validator=validator,
+                validation_strategy=self.validation_strategy,
+                operation_name=operation_name
+            )
+
+            # Clean and post-process the final response
+            translated_content = self.clean_markdown_response(translated_content)
+
+            # Apply Japanese to Chinese specific post-processing
+            if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+                translated_content = self._clean_japanese_artifacts(translated_content)
+
+            # Correct footnote colon syntax for all translations
+            translated_content = self._correct_footnote_colons(translated_content)
+
+            return translated_content
+
+        except Exception as e:
+            logger.error(f"Failed to translate {operation_name}: {e}")
+            raise
     
     def process_content(
         self,

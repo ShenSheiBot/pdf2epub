@@ -3,7 +3,7 @@ Unified LLM client interface for model-agnostic API calls.
 Handles provider-specific logic and retry strategies internally.
 """
 
-from typing import Union, List, Dict, Optional, Any
+from typing import Union, List, Dict, Optional, Any, Callable, Tuple
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
 from .network_utils import (
@@ -178,7 +178,172 @@ class LLMClient:
             raise Exception(f"{error_msg}. Last error: {last_error}")
         else:
             raise Exception(error_msg)
-    
+
+    def generate_with_validation(
+        self,
+        prompt: Union[str, List[Dict]],
+        model_configs: Optional[List[Dict]] = None,
+        validator: Optional[Callable[[str], Tuple[bool, str]]] = None,
+        validation_strategy: Optional['ValidationStrategy'] = None,
+        operation_name: str = "LLM generation"
+    ) -> str:
+        """
+        Generate content with validation and retry logic.
+
+        This method handles:
+        1. API-level retries (for transient errors)
+        2. Validation retries (when output doesn't meet criteria)
+        3. Model fallback (trying alternative models)
+        4. Best response selection (when all attempts fail)
+
+        Args:
+            prompt: The prompt (string or list of content parts)
+            model_configs: List of model configurations with api_retries and validation_retries
+            validator: Optional validation function that returns (is_valid, reason)
+            validation_strategy: Strategy for handling validation failures
+            operation_name: Name for logging
+
+        Returns:
+            Generated and validated text
+
+        Raises:
+            Exception: If all models and retries fail
+        """
+        # Import here to avoid circular dependency
+        from ..processors.validation_strategy import ValidationStrategy
+
+        # Use provided strategy or create default
+        if validation_strategy is None:
+            validation_strategy = ValidationStrategy()
+
+        # Use model configs from parameter or config file
+        if model_configs is None:
+            model_configs = self.config.get("polish_models", [
+                {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 1},
+                {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+            ])
+
+        validation_strategy.clear_attempts()
+        last_error = None
+
+        for model_idx, model_config in enumerate(model_configs):
+            provider = model_config["provider"]
+            model = model_config["model"]
+
+            # Parse retry configuration with backward compatibility
+            api_retries, validation_retries = validation_strategy.parse_model_config(model_config)
+
+            # Skip if provider was blocked for this specific operation
+            if provider in self._safety_blocked_operations:
+                if operation_name in self._safety_blocked_operations[provider]:
+                    logger.info(f"Skipping {provider} for {operation_name} (blocked on this operation)")
+                    continue
+
+            # Try validation retries for this specific model
+            for val_attempt in range(validation_retries + 1):
+                try:
+                    logger.info(
+                        f"Trying {provider} model {model} for {operation_name} "
+                        f"(validation attempt {val_attempt + 1}/{validation_retries + 1})"
+                    )
+
+                    # Generate with API retries handled internally
+                    if provider == "gemini" and self._gemini_client:
+                        response = self._generate_with_gemini(
+                            prompt=prompt,
+                            model=model,
+                            max_retries=api_retries,
+                            operation_name=operation_name
+                        )
+                    elif provider == "anthropic" and self._anthropic_client:
+                        response = self._generate_with_anthropic(
+                            prompt=prompt,
+                            model=model,
+                            max_retries=api_retries,
+                            operation_name=operation_name
+                        )
+                    elif provider == "openai" and self._openai_client:
+                        response = self._generate_with_openai(
+                            prompt=prompt,
+                            model=model,
+                            max_retries=api_retries,
+                            operation_name=operation_name
+                        )
+                    else:
+                        logger.warning(f"Provider {provider} not available or not configured")
+                        break  # Skip to next model
+
+                    # Validate if validator provided
+                    if validator:
+                        is_valid, reason = validator(response)
+                        validation_strategy.record_attempt(
+                            response=response,
+                            model_config=model_config,
+                            is_valid=is_valid,
+                            validation_reason=reason,
+                            attempt_number=val_attempt + 1
+                        )
+
+                        if is_valid:
+                            logger.success(
+                                f"Successfully generated and validated with {provider} "
+                                f"for {operation_name}"
+                            )
+                            return response
+
+                        # Check if should retry validation with same model
+                        if validation_strategy.should_retry_validation(
+                            model_idx, val_attempt, validation_retries, is_valid, reason
+                        ):
+                            continue  # Retry with same model
+                        else:
+                            break  # Move to next model
+                    else:
+                        # No validation needed
+                        logger.success(f"Successfully generated with {provider} for {operation_name}")
+                        return response
+
+                except SafetyBlockError as e:
+                    # Track which operations have safety blocks
+                    self._safety_blocked_operations[provider].add(operation_name)
+                    logger.warning(f"Safety block from {provider} for {operation_name}: {str(e)}")
+                    break  # Move to next model, don't retry safety blocks
+
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Error with {provider} model {model} (attempt {val_attempt + 1}): {e}"
+                    )
+                    if val_attempt < validation_retries:
+                        continue  # Retry if we have attempts left
+                    else:
+                        break  # Move to next model
+
+            # Check if should try next model
+            all_attempts_failed = not any(
+                a.is_valid for a in validation_strategy.current_attempts
+                if a.model_config == model_config
+            )
+
+            if not validation_strategy.should_try_next_model(
+                model_idx, len(model_configs), all_attempts_failed
+            ):
+                break  # Don't try next model
+
+        # All models exhausted - apply fallback strategy
+        logger.warning(validation_strategy.get_summary())
+
+        best_response = validation_strategy.select_best_response()
+        if best_response:
+            return best_response
+
+        # Complete failure
+        error_msg = f"All models failed validation for {operation_name}"
+        if last_error:
+            raise Exception(f"{error_msg}. Last error: {last_error}")
+        else:
+            raise Exception(error_msg)
+
     def _generate_with_gemini(
         self,
         prompt: Union[str, List[Dict]],

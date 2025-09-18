@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 from pdf2epub.utils.llm_client import LLMClient
 from .utils.content_splitter import split_content
+from .validation_strategy import ValidationStrategy
 
 # Initialize tokenizer for accurate token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -51,7 +52,12 @@ class BaseMarkdownProcessor(ABC):
         self.max_workers = max_workers
         self.resume = resume
         self.use_longest_on_failure = use_longest_on_failure
-        
+
+        # Initialize validation strategy
+        validation_config = config.get('validation_strategy', {})
+        validation_config['use_longest_on_failure'] = use_longest_on_failure
+        self.validation_strategy = ValidationStrategy(validation_config)
+
         # Setup directories
         self.input_dir = Path("output") / book_title / input_dir
         self.output_dir = Path("output") / book_title / output_dir
@@ -159,83 +165,49 @@ class BaseMarkdownProcessor(ABC):
     ) -> bool:
         """
         Process a single markdown file.
-        
+
+        This method orchestrates the file processing workflow without retry logic.
+        All retry and validation logic is now handled by the LLMClient.
+
         Args:
             input_path: Path to input markdown file
             output_path: Path to output markdown file
             **kwargs: Additional processor-specific arguments
-        
+
         Returns:
             True if successful, False otherwise
         """
         file_name = input_path.name
         logger.info(f"Processing {file_name}")
-        
+
         # Read the content
         with open(input_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         if not content.strip():
             logger.warning(f"File {file_name} is empty, skipping")
             return False
-        
-        # Get max validation retries from config (default to 3)
-        max_validation_attempts = 3
-        if hasattr(self, 'translation_models') and self.translation_models:
-            # For translator, use max_retries from model config
-            max_validation_attempts = self.translation_models[0].get('max_retries', 3)
-        elif hasattr(self, 'polish_models') and self.polish_models:
-            # For polisher, use max_retries from model config
-            max_validation_attempts = self.polish_models[0].get('max_retries', 3)
-        
-        last_error = None
-        for attempt in range(max_validation_attempts):
-            try:
-                # Process the content (Tenacity handles API retries internally)
-                processed_content = self.process_content(
-                    content=content,
-                    file_name=file_name,
-                    **kwargs
-                )
-                
-                # Validate the output
-                is_valid, reason = self.validate_output(
-                    original=content,
-                    processed=processed_content,
-                    file_name=file_name
-                )
-                
-                if not is_valid:
-                    # Validation failed - retry
-                    if attempt < max_validation_attempts - 1:
-                        logger.warning(f"Validation failed for {file_name}: {reason}")
-                        logger.info(f"Retrying {file_name} (attempt {attempt + 2}/{max_validation_attempts})...")
-                        continue
-                    else:
-                        # All validation attempts failed
-                        last_error = ValueError(f"All {max_validation_attempts} validation attempts failed: {reason}")
-                        break
-                
-                # Save the processed file
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(processed_content)
-                
-                logger.success(f"Successfully processed {file_name}")
-                return True
-                
-            except Exception as e:
-                # API or other error - also retry
-                last_error = e
-                if attempt < max_validation_attempts - 1:
-                    logger.warning(f"Attempt {attempt + 1} failed for {file_name}: {e}")
-                    logger.info(f"Retrying {file_name} (attempt {attempt + 2}/{max_validation_attempts})...")
-                    continue
-                else:
-                    break
-        
-        # All attempts failed
-        logger.error(f"Failed to process {file_name} after {max_validation_attempts} attempts: {last_error}")
-        return False
+
+        try:
+            # Process the content - all retry logic is handled within process_content
+            # via the LLMClient's generate_with_validation method
+            processed_content = self.process_content(
+                content=content,
+                file_name=file_name,
+                **kwargs
+            )
+
+            # Save the processed file
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(processed_content)
+
+            logger.success(f"Successfully processed {file_name}")
+            return True
+
+        except Exception as e:
+            # Log the error - detailed retry information is already logged by LLMClient
+            logger.error(f"Failed to process {file_name}: {e}")
+            return False
     
     def process_all_files(self) -> Dict[str, Any]:
         """

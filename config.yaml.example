@@ -41,18 +41,42 @@ vision_ocr_settings:
   trim_step_percent: 0.005  # Step size for border trimming (0.005-0.1)
   min_black_pixels: 200  # Minimum non-white pixels to consider as content
 
-# Polish model configuration
+# Model retry configuration
+# ========================
+# NEW: You can now specify separate retry counts for API errors vs validation failures
+#
+# api_retries: Number of times to retry on transient API errors (network, rate limits)
+# validation_retries: Number of times to retry the same model when output fails validation
+# max_retries: (Legacy) Used for api_retries if new fields aren't specified
+#
 # Models are tried in order until one succeeds
-# If a model triggers safety errors, all models from that provider are skipped
+
 polish_models:
   - provider: anthropic
     model: claude-sonnet-4-20250514
-    max_retries: 2  # Number of retries for transient errors
+    api_retries: 2          # Retry API/network errors twice
+    validation_retries: 1   # Retry once if output fails validation
+    # Or use legacy format:
+    # max_retries: 2        # Backward compatible - sets api_retries=2, validation_retries=0
 
 translation_models:
   - provider: openai
     model: deepseek-chat
-    max_retries: 2  # Number of retries for transient errors
+    api_retries: 3          # More tolerant of API errors
+    validation_retries: 0   # Don't retry validation failures (faster)
+  # Example with fallback model:
+  # - provider: anthropic
+  #   model: claude-sonnet-4-20250514
+  #   api_retries: 2
+  #   validation_retries: 1
+
+# Validation strategy configuration
+# ==================================
+# Controls how validation failures are handled across all processors
+validation_strategy:
+  max_attempts: 2                  # Global max validation attempts per file
+  use_longest_on_failure: false    # If true, use longest response when all attempts fail
+  fallback_between_models: true    # If true, try next model when current fails validation
 
 ## Deprecated
 # ocr_models:

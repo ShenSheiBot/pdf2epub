@@ -95,20 +95,42 @@ def add_page_number_patches(pdf_path, output_path=None):
         page_count = len(doc)
         
         # Save the modified PDF
-        if same_file:
-            # When overwriting the same file, we need to use a temp file
-            temp_fd, temp_path = tempfile.mkstemp(suffix=".pdf", dir=Path(output_path).parent)
-            os.close(temp_fd)  # Close the file descriptor
-            
-            doc.save(temp_path)
-            doc.close()
-            
-            # Replace the original with the temp file
-            os.replace(temp_path, output_path)
-        else:
-            # Different files, can save directly
-            doc.save(output_path)
-            doc.close()
+        # Try to save with garbage collection for PDFs with malformed dictionaries
+        save_successful = False
+        save_options = [
+            {"garbage": 4, "clean": True},  # Most aggressive cleanup
+            {"garbage": 3},  # Medium cleanup
+            {"garbage": 0},  # No cleanup (for clean PDFs)
+        ]
+
+        for opts in save_options:
+            try:
+                if same_file:
+                    # When overwriting the same file, we need to use a temp file
+                    temp_fd, temp_path = tempfile.mkstemp(suffix=".pdf", dir=Path(output_path).parent)
+                    os.close(temp_fd)  # Close the file descriptor
+
+                    doc.save(temp_path, **opts)
+                    doc.close()
+
+                    # Replace the original with the temp file
+                    os.replace(temp_path, output_path)
+                else:
+                    # Different files, can save directly
+                    doc.save(output_path, **opts)
+                    doc.close()
+
+                save_successful = True
+                break
+            except Exception as save_error:
+                if "invalid key in dict" in str(save_error):
+                    logger.debug(f"Retrying save with different options due to: {save_error}")
+                    continue
+                else:
+                    raise save_error
+
+        if not save_successful:
+            raise Exception("Could not save PDF with any garbage collection option")
         
         logger.info(f"Added page number patches to {page_count} pages")
         return Path(output_path)
@@ -144,8 +166,14 @@ def preprocess_pdf(input_pdf, output_dir):
 
     # Add page number patches to create input.pdf
     logger.info("Adding page number patches to PDF...")
-    add_page_number_patches(original_pdf, processed_pdf)
-    
+    patched_pdf = add_page_number_patches(original_pdf, processed_pdf)
+
+    # If patching failed, use the original PDF
+    if patched_pdf != processed_pdf:
+        logger.warning("PDF patching failed, using original PDF without patches")
+        # Copy the original to processed_pdf location
+        shutil.copy2(original_pdf, processed_pdf)
+
     # Get file size in MB
     file_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
 

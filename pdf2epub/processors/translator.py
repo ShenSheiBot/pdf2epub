@@ -158,11 +158,17 @@ class TranslateProcessor(BaseMarkdownProcessor):
         try:
             # Use the new generate_with_validation method
             # All retry logic is now handled within the LLMClient
+            # Create a new ValidationStrategy instance for thread safety
+            from ..processors.validation_strategy import ValidationStrategy
+            validation_config = self.config.get('validation_strategy', {})
+            validation_config['use_longest_on_failure'] = self.use_longest_on_failure
+            thread_local_strategy = ValidationStrategy(validation_config)
+
             translated_content = self.llm_client.generate_with_validation(
                 prompt=multi_part_content,
                 model_configs=self.translation_models,
                 validator=validator,
-                validation_strategy=self.validation_strategy,
+                validation_strategy=thread_local_strategy,
                 operation_name=operation_name
             )
 
@@ -278,21 +284,29 @@ class TranslateProcessor(BaseMarkdownProcessor):
         Returns:
             Tuple of (is_valid, reason)
         """
-        # First check for truncation
-        is_truncated, truncation_reason, details = self.truncation_detector.detect(
-            original=original,
-            processed=processed,
-            source_language=self.source_language,
-            target_language=self.target_language
-        )
+        # Skip truncation validation for front and back matter files
+        # These files often have non-standard structures that can trigger false positives
+        base_name = Path(file_name).stem.lower()
+        skip_truncation = 'front_matter' in base_name or 'back_matter' in base_name
 
-        # Log the truncation check summary
-        summary = self.truncation_detector.get_summary(is_truncated, truncation_reason, details)
-        if is_truncated:
-            logger.warning(f"{file_name} translation truncation detected:\n{summary}")
-            return False, truncation_reason
+        if skip_truncation:
+            logger.info(f"Skipping truncation validation for {file_name} (front/back matter)")
         else:
-            logger.info(f"{file_name} translation validated:\n{summary}")
+            # Check for truncation
+            is_truncated, truncation_reason, details = self.truncation_detector.detect(
+                original=original,
+                processed=processed,
+                source_language=self.source_language,
+                target_language=self.target_language
+            )
+
+            # Log the truncation check summary
+            summary = self.truncation_detector.get_summary(is_truncated, truncation_reason, details)
+            if is_truncated:
+                logger.warning(f"{file_name} translation truncation detected:\n{summary}")
+                return False, truncation_reason
+            else:
+                logger.info(f"{file_name} translation validated:\n{summary}")
 
         # Then validate Chinese content if target language is Chinese
         if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:

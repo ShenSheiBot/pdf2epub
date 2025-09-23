@@ -165,38 +165,6 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
         structure["chapters"].append(chapter_info)
 
     # Fallback for chapters with default titles
-    for chapter_info in structure["chapters"]:
-        chapter_num = chapter_info["index"]
-        if chapter_info["title"] == f"Chapter {chapter_num}":
-            files = chapter_files.get(chapter_num, {})
-            files_to_read = []
-            if "main" in files and len(files) == 1:
-                files_to_read = [files["main"]]
-            else:
-                for part_num in sorted([k for k in files.keys() if isinstance(k, int)]):
-                    files_to_read.append(files[part_num])
-
-            title_found = False
-            for file_path in files_to_read:
-                if title_found:
-                    break
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line.startswith("#"):
-                                title = re.sub(r"^#+\s*", "", line).strip()
-                                if title:
-                                    chapter_info["title"] = title
-                                    logger.info(
-                                        f"Updated Chapter {chapter_num} title to '{title}' from first available heading."
-                                    )
-                                    title_found = True
-                                    break
-                except Exception as e:
-                    logger.warning(
-                        f"Could not re-read {file_path} for fallback title search: {e}"
-                    )
 
     # Also check for front_matter and back_matter
     if (markdown_dir / "front_matter.md").exists():

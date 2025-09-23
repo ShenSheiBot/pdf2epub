@@ -474,11 +474,17 @@ class PolishProcessor(BaseMarkdownProcessor):
         try:
             # Use the new generate_with_validation method
             # All retry logic is now handled within the LLMClient
+            # Create a new ValidationStrategy instance for thread safety
+            from .validation_strategy import ValidationStrategy
+            validation_config = self.config.get('validation_strategy', {})
+            validation_config['use_longest_on_failure'] = self.use_longest_on_failure
+            thread_local_strategy = ValidationStrategy(validation_config)
+
             polished_part = self.llm_client.generate_with_validation(
                 prompt=multi_part_content,
                 model_configs=self.polish_models,
                 validator=validator,
-                validation_strategy=self.validation_strategy,
+                validation_strategy=thread_local_strategy,
                 operation_name=operation_name
             )
 

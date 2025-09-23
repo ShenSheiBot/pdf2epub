@@ -261,7 +261,7 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     }
 
 
-def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False):
+def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False, use_markdown=True):
     """Calls the Azure Document Intelligence API and returns the result."""
     from azure.core.exceptions import AzureError
     
@@ -279,8 +279,13 @@ def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False):
         
         # Add features if using layout
         if use_layout:
-            api_kwargs["features"] = ["languages"]
-        
+            # Request styleFont for bold detection and better structure
+            api_kwargs["features"] = ["languages", "styleFont"]
+
+        # Request Markdown output for better paragraph structure
+        if use_markdown:
+            api_kwargs["output_content_format"] = "markdown"
+
         # Add figure extraction output if requested
         if extract_figures and use_layout:
             api_kwargs["output"] = ["figures"]
@@ -773,6 +778,7 @@ def _format_clean_output(reconstructed_lines, verbose=False):
     return '\n'.join(output_lines)
 
 
+
 def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, client=None, use_layout=True, verbose=False, extract_figures=False) -> Tuple[str, Any, List[Dict]]:
     """
     Analyzes Azure Document Intelligence OCR with Japanese text from image bytes.
@@ -803,10 +809,77 @@ def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, clien
     
     # 2. API Call
     try:
-        result = _call_azure_api(client, img_bytes, use_layout, extract_figures)
+        result = _call_azure_api(client, img_bytes, use_layout, extract_figures, use_markdown=True)
     except Exception:
         return None, None, []
         
+    # Check if we have markdown content from Azure
+    if hasattr(result, 'content') and result.content:
+        # We'll use Azure's markdown for paragraph structure
+        # But also run furigana detection to clean it up
+
+        # Extract line data for furigana analysis
+        all_lines_data, _ = _extract_line_data(result, img.height, False)
+
+        # Run furigana detection
+        main_text_lines, furigana_lines, threshold, hist_data = _classify_lines_by_width(all_lines_data, img.width, False)
+
+        # Collect all furigana text to remove from markdown
+        furigana_texts = []
+        for furi_line in furigana_lines:
+            if furi_line.get('text'):
+                furigana_texts.append(furi_line['text'].strip())
+
+        # Also group furigana words for better detection
+        grouped_furigana = _group_furigana_words(furigana_lines, main_text_lines, threshold, False)
+        for group in grouped_furigana:
+            if group.get('text'):
+                furigana_texts.append(group['text'].strip())
+
+        # Clean the markdown by removing furigana (both standalone lines and inline)
+        clean_text = result.content
+
+        # First remove standalone furigana lines
+        lines = clean_text.split('\n')
+        cleaned_lines = []
+
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+
+            # Skip if this entire line is just furigana
+            is_furigana_line = False
+            for furi in furigana_texts:
+                if furi and (line_stripped == furi or line_stripped.replace(' ', '') == furi.replace(' ', '')):
+                    is_furigana_line = True
+                    if verbose:
+                        logger.info(f"Removing furigana line: '{line_stripped}'")
+                    break
+
+            if not is_furigana_line:
+                # Also clean inline furigana from the line
+                cleaned_line = line
+                for furi in furigana_texts:
+                    if furi and furi in cleaned_line:
+                        # Remove furigana with surrounding spaces
+                        cleaned_line = cleaned_line.replace(f' {furi} ', ' ')
+                        cleaned_line = cleaned_line.replace(f' {furi}', '')
+                        cleaned_line = cleaned_line.replace(furi, '')
+
+                cleaned_lines.append(cleaned_line)
+
+        clean_text = '\n'.join(cleaned_lines)
+
+        if verbose:
+            print("\n" + "="*80)
+            print("HYBRID APPROACH: Azure Markdown + Furigana Removal")
+            print("="*80)
+            print(f"Detected {len(furigana_texts)} furigana texts to remove")
+            print(f"Furigana: {furigana_texts[:10]}")  # Show first 10
+            print("\nCleaned markdown:")
+            print(clean_text[:1000])
+
+        return clean_text, result, all_lines_data
+
     # 3. Verbose Summary (only prints if verbose=True)
     model_id = "prebuilt-layout" if use_layout else "prebuilt-read"
     _print_verbose_azure_summary(result, model_id, verbose)

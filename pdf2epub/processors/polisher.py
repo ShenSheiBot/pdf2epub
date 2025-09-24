@@ -393,24 +393,24 @@ class PolishProcessor(BaseMarkdownProcessor):
     
     def _determine_max_tokens(self) -> int:
         """Determine maximum tokens per part based on model configuration."""
-        max_tokens_per_part = 8000  # Conservative default
-        
+        max_tokens_per_part = 4000  # Conservative default
+
         if self.polish_models:
             # Check if any model has limited context
             limited_model_patterns = ["flash", "haiku", "-mini", "seek"]
-            
+
             has_limited_model = any(
-                any(pattern in model_config.get("model", "").lower() 
+                any(pattern in model_config.get("model", "").lower()
                     for pattern in limited_model_patterns)
                 for model_config in self.polish_models
             )
 
             if not has_limited_model:
-                max_tokens_per_part = 20000
-                logger.info("Using max_tokens_per_part=20000 (no limited-context models detected)")
+                max_tokens_per_part = 8000
+                logger.info("Using max_tokens_per_part=8000 (no limited-context models detected)")
             else:
-                logger.info("Using max_tokens_per_part=8000 (limited-context model detected)")
-        
+                logger.info("Using max_tokens_per_part=4000 (limited-context model detected)")
+
         return max_tokens_per_part
     
     def _split_content(self, content: str, max_tokens: int) -> List[str]:

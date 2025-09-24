@@ -106,11 +106,7 @@ class NGramTruncationDetector(BaseTruncationDetector):
         if token_ratio >= 0.85 and token_ratio <= 1.05:
             return False, f"High token retention ({token_ratio:.1%})", details
 
-        # 2. If tail is incomplete (mid-sentence), likely truncated
-        if not tail_complete and "No proper ending" in tail_reason:
-            return True, f"Text ends mid-sentence: {tail_reason}", details
-
-        # 3. Excellent unique recall - definitely not truncated
+        # 2. Excellent unique recall - definitely not truncated
         if avg_unique_recall >= 0.8:
             return (
                 False,
@@ -194,10 +190,6 @@ class NGramTruncationDetector(BaseTruncationDetector):
                 f"Character n-grams: {cm['unique_removed']:,} unique lost, "
                 f"{cm['duplicate_removed']:,} duplicates removed"
             )
-
-        # Tail integrity warning
-        if "tail_complete" in details and not details["tail_complete"]:
-            summary_parts.append(f"⚠️ Tail issue: {details['tail_reason']}")
 
         return "\n".join(summary_parts)
 

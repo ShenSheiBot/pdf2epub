@@ -833,19 +833,18 @@ def _extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int
 
         # Check if we have reasonable paragraphs
         if len(paragraphs_with_positions) >= 10:
-            # Check if paragraphs are reasonably sized
-            sizes = [len(p[0]) for p in paragraphs_with_positions]
-            max_size = max(sizes) if sizes else 0
-            median_size = sorted(sizes)[len(sizes)//2] if sizes else 0
+            # Check if paragraphs are reasonably sized using token counts
+            token_sizes = [len(tokenizer.encode(p[0])) for p in paragraphs_with_positions]
+            max_tokens = max(token_sizes) if token_sizes else 0
+            median_tokens = sorted(token_sizes)[len(token_sizes)//2] if token_sizes else 0
 
-            # Use a token-based check similar to section switching
-            # Assuming ~4 chars per token on average (rough estimate for English)
-            # So 8000 tokens ≈ 32000 chars, 150% = 48000 chars
-            max_acceptable_chars = 48000  # ~12000 tokens at 150% of 8000
+            # Use token-based limits for consistency across languages
+            # 150% of 4000 tokens = 6000 tokens max for a single paragraph
+            max_acceptable_tokens = 6000
 
             # If the largest paragraph is too big, continue to single newlines
-            # Or if median is too small (many tiny fragments)
-            if max_size <= max_acceptable_chars and median_size > 200:
+            # Or if median is too small (many tiny fragments - less than ~50 tokens)
+            if max_tokens <= max_acceptable_tokens and median_tokens > 50:
                 return paragraphs_with_positions
 
     # Try single newlines with intelligent filtering

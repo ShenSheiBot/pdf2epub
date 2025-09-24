@@ -3,6 +3,45 @@ Validation and retry strategy management for processors.
 
 This module provides a clean separation of validation logic from retry logic,
 allowing for flexible and predictable handling of LLM output validation.
+
+Error Handling Behavior Matrix
+==============================
+
+| Error Type           | Retry Same Model? | Try Next Model? | Use Fallback? | Notes |
+|---------------------|------------------|----------------|--------------|--------|
+| Truncation          | Yes*             | Yes**          | Yes***       | Partial content, may succeed on retry |
+| Wrong Language      | Yes*             | Yes**          | No           | Randomness may fix it on retry |
+| Empty Response      | Yes*             | Yes**          | No           | Likely transient error |
+| Safety Block        | No               | Yes            | No           | Content flagged by provider |
+| Rate Limit          | Yes (api level)  | Yes            | N/A          | Handled by api_retries |
+| Network Error       | Yes (api level)  | Yes            | N/A          | Handled by api_retries |
+
+* If validation_retries > 0 for the current model
+** If fallback_between_models = True
+*** If use_longest_on_failure = True (only applies to truncation errors)
+
+Configuration Options
+====================
+
+Model-level (per model in model list):
+- api_retries: Number of retries for transient API errors
+- validation_retries: Number of retries when validation fails
+
+Strategy-level (global):
+- max_attempts: Maximum validation attempts per file across all models
+- use_longest_on_failure: Use longest response as fallback for truncation errors
+- fallback_between_models: Try next model when current model validation fails
+
+Fallback Behavior
+=================
+
+When use_longest_on_failure = True:
+- Only applies to truncation-type errors (partial content is better than none)
+- Does NOT apply to wrong language or empty responses (invalid content is worse than failure)
+
+When use_longest_on_failure = False:
+- All invalid responses are rejected
+- Process fails with exception rather than using invalid content
 """
 
 from typing import Dict, List, Optional, Tuple, Any
@@ -192,23 +231,40 @@ class ValidationStrategy:
             # Return the first valid response (could be enhanced to pick best valid)
             return valid_attempts[0].response
 
-        # No valid responses - apply fallback strategy
+        # No valid responses - apply fallback strategy if configured
         if self.use_longest_on_failure:
-            # Select the longest response
-            longest = max(attempts, key=lambda a: a.content_length)
-            logger.info(
-                f"Using longest response ({longest.content_length} chars) from "
-                f"{longest.model_config.get('model')} after all validations failed"
-            )
-            return longest.response
+            # Check if any attempts have truncation-type errors (partial content)
+            # Only use fallback for truncation, not for wrong language or empty responses
+            truncation_attempts = [
+                a for a in attempts
+                if "truncat" in a.validation_reason.lower() or
+                   "incomplete" in a.validation_reason.lower() or
+                   "mid-sentence" in a.validation_reason.lower()
+            ]
+
+            if truncation_attempts:
+                # Select the longest response from truncated attempts
+                longest = max(truncation_attempts, key=lambda a: a.content_length)
+                logger.info(
+                    f"Using longest response ({longest.content_length} chars) from "
+                    f"{longest.model_config.get('model')} after all validations failed (truncation fallback)"
+                )
+                return longest.response
+            else:
+                # No truncation errors, just other validation failures (wrong language, empty)
+                # These should not use fallback even if configured
+                logger.warning(
+                    f"All {len(attempts)} validation attempts failed with non-truncation errors. "
+                    f"Cannot use longest fallback for: {attempts[-1].validation_reason}"
+                )
+                return None
         else:
-            # Default: use the last attempt
-            last = attempts[-1]
-            logger.info(
-                f"Using last attempt from {last.model_config.get('model')} "
-                f"after all validations failed"
+            # No fallback strategy configured - reject all invalid responses
+            logger.warning(
+                f"All {len(attempts)} validation attempts failed and use_longest_on_failure=False. "
+                f"Rejecting all responses. Last failure: {attempts[-1].validation_reason}"
             )
-            return last.response
+            return None
 
     def clear_attempts(self) -> None:
         """Clear the recorded attempts for a new operation."""

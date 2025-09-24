@@ -261,7 +261,7 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     }
 
 
-def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False, use_markdown=True):
+def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False):
     """Calls the Azure Document Intelligence API and returns the result."""
     from azure.core.exceptions import AzureError
     
@@ -279,13 +279,8 @@ def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False, u
         
         # Add features if using layout
         if use_layout:
-            # Request styleFont for bold detection and better structure
-            api_kwargs["features"] = ["languages", "styleFont"]
-
-        # Request Markdown output for better paragraph structure
-        if use_markdown:
-            api_kwargs["output_content_format"] = "markdown"
-
+            api_kwargs["features"] = ["languages"]
+        
         # Add figure extraction output if requested
         if extract_figures and use_layout:
             api_kwargs["output"] = ["figures"]
@@ -635,75 +630,143 @@ def _group_furigana_words(furigana_lines, main_text_lines, threshold, verbose=Fa
     return grouped_furigana_words
 
 
-def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words):
-    """Matches furigana groups to words in main text lines."""
+def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furigana_lines=None):
+    """Matches furigana groups to words in main text lines, allowing cross-line matching."""
     if not main_text_lines or not grouped_furigana_words:
         return {}, set()
-
-    main_widths = [l['width'] for l in main_text_lines]
-    median_main_width = np.median(main_widths) if main_widths else 50
-    max_furigana_distance = median_main_width * 1.5
 
     line_reconstructions = {}
     used_furigana_groups = set()
 
+    # Process each main text line
     for line in main_text_lines:
-        if not line.get('words'): 
+        if not line.get('words'):
             continue
-        
+
         matched_groups = []
+
+        # Try to match each furigana group with words in this line
         for furi_group in grouped_furigana_words:
-            if id(furi_group) in used_furigana_groups: 
+            if id(furi_group) in used_furigana_groups:
                 continue
-            
-            matching_main_words = []
+
+            # Check if furigana could match this line based on X position
+            # For vertical text, furigana should be to the right of main text
+            x_dist_min = furi_group['x_avg'] - line['x_max']
+
+            # Get the furigana width from the original line it came from
+            furi_width = 50  # Default fallback
+            if furigana_lines:
+                for furi_line in furigana_lines:
+                    if furi_line['idx'] == furi_group.get('line_idx'):
+                        furi_width = furi_line['width']
+                        break
+
+            # Allow some overlap or distance up to the furigana line width
+            if not (-furi_width * 0.5 <= x_dist_min <= furi_width):
+                continue
+
+            # Find all words in this line that have meaningful Y overlap with the furigana group
+            overlapping_words = []
+            for idx, main_word in enumerate(line['words']):
+                y_overlap_start = max(furi_group['y_min'], main_word['y_min'])
+                y_overlap_end = min(furi_group['y_max'], main_word['y_max'])
+                y_overlap = max(0, y_overlap_end - y_overlap_start)
+
+                # Only include words with meaningful overlap (>10% of word height)
+                # to avoid OCR precision issues
+                word_height = main_word['y_max'] - main_word['y_min']
+                if y_overlap > word_height * 0.1:
+                    overlapping_words.append((idx, main_word, y_overlap))
+
+            if not overlapping_words:
+                continue
+
+            # Sort by index to maintain reading order
+            overlapping_words.sort(key=lambda x: x[0])
+
+            # Find the minimal contiguous range of words that covers all furigana
+            # Check each furigana word to ensure it has overlap with the selected range
+            all_furi_covered = True
             for furi_word in furi_group['words']:
-                closest_word, closest_idx, min_dist = None, -1, float('inf')
-                for idx, main_word in enumerate(line['words']):
-                    x_dist = furi_word['x_center'] - main_word['x_center']
-                    if not (0 < x_dist < max_furigana_distance): 
-                        continue
-                    
-                    y_dist = abs(main_word['y_center'] - furi_word['y_center'])
-                    if y_dist < min_dist:
-                        min_dist, closest_word, closest_idx = y_dist, main_word, idx
-                
-                if closest_word and min_dist < 50:  # Matching threshold
-                    matching_main_words.append((closest_idx, closest_word))
+                has_overlap = False
+                for _, main_word, _ in overlapping_words:
+                    y_overlap = max(0, min(furi_word['y_max'], main_word['y_max']) -
+                                    max(furi_word['y_min'], main_word['y_min']))
+                    if y_overlap > 0:
+                        has_overlap = True
+                        break
+                if not has_overlap:
+                    all_furi_covered = False
+                    break
 
-            if len(matching_main_words) == len(furi_group['words']):
-                # Sort all potential matches by their index first
-                matching_main_words.sort(key=lambda x: x[0])
+            if not all_furi_covered:
+                continue
 
-                # CORRECT WAY to deduplicate: Use a set to track seen indices
-                unique_matches = []
-                seen_indices = set()
-                for idx, word in matching_main_words:
-                    if idx not in seen_indices:
-                        unique_matches.append((idx, word))
-                        seen_indices.add(idx)
-                
-                if unique_matches:
-                    matched_groups.append({
-                        'furigana_group': furi_group,
-                        'matched_main_words': [w for _, w in unique_matches],
-                        'start_idx': unique_matches[0][0],
-                        'end_idx': unique_matches[-1][0]
-                    })
-                    used_furigana_groups.add(id(furi_group))
-        
+            # Find contiguous sequences within overlapping words
+            contiguous_groups = []
+            current_group = [overlapping_words[0]]
+
+            for i in range(1, len(overlapping_words)):
+                if overlapping_words[i][0] == current_group[-1][0] + 1:
+                    current_group.append(overlapping_words[i])
+                else:
+                    contiguous_groups.append(current_group)
+                    current_group = [overlapping_words[i]]
+
+            if current_group:
+                contiguous_groups.append(current_group)
+
+            # Use the longest contiguous group that covers the furigana
+            best_group = None
+            for group in contiguous_groups:
+                group_y_min = min(w[1]['y_min'] for w in group)
+                group_y_max = max(w[1]['y_max'] for w in group)
+
+                # Check if this group covers all furigana characters
+                # A furigana character is "covered" if it has meaningful overlap (>10%) with the group
+                covers_all_furigana = True
+                for furi_word in furi_group['words']:
+                    # Check if this furigana word has meaningful overlap with the group
+                    y_overlap = max(0, min(furi_word['y_max'], group_y_max) -
+                                   max(furi_word['y_min'], group_y_min))
+                    furi_height = furi_word['y_max'] - furi_word['y_min']
+
+                    # Require at least 10% overlap to count as meaningful
+                    # This avoids OCR precision issues where boundaries barely touch
+                    if y_overlap < furi_height * 0.1:
+                        covers_all_furigana = False
+                        break
+
+                if covers_all_furigana:
+                    if best_group is None or len(group) > len(best_group):
+                        best_group = group
+
+            if best_group:
+                matched_groups.append({
+                    'furigana_group': furi_group,
+                    'matched_main_words': [w[1] for w in best_group],
+                    'start_idx': best_group[0][0],
+                    'end_idx': best_group[-1][0]
+                })
+                used_furigana_groups.add(id(furi_group))
+
+        # Reconstruct the line with furigana annotations
         if matched_groups:
             reconstructed_parts = []
             word_idx = 0
             for group in sorted(matched_groups, key=lambda g: g['start_idx']):
+                # Add text before the furigana match
                 reconstructed_parts.append(''.join(w['text'] for w in line['words'][word_idx:group['start_idx']]))
+                # Add the matched text with furigana
                 main_text = ''.join(w['text'] for w in group['matched_main_words'])
                 furigana_text = group['furigana_group']['text']
                 reconstructed_parts.append(f"{main_text}({furigana_text})")
                 word_idx = group['end_idx'] + 1
+            # Add remaining text
             reconstructed_parts.append(''.join(w['text'] for w in line['words'][word_idx:]))
             line_reconstructions[line['idx']] = ''.join(reconstructed_parts)
-    
+
     return line_reconstructions, used_furigana_groups
 
 
@@ -778,7 +841,6 @@ def _format_clean_output(reconstructed_lines, verbose=False):
     return '\n'.join(output_lines)
 
 
-
 def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, client=None, use_layout=True, verbose=False, extract_figures=False) -> Tuple[str, Any, List[Dict]]:
     """
     Analyzes Azure Document Intelligence OCR with Japanese text from image bytes.
@@ -809,77 +871,10 @@ def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, clien
     
     # 2. API Call
     try:
-        result = _call_azure_api(client, img_bytes, use_layout, extract_figures, use_markdown=True)
+        result = _call_azure_api(client, img_bytes, use_layout, extract_figures)
     except Exception:
         return None, None, []
         
-    # Check if we have markdown content from Azure
-    if hasattr(result, 'content') and result.content:
-        # We'll use Azure's markdown for paragraph structure
-        # But also run furigana detection to clean it up
-
-        # Extract line data for furigana analysis
-        all_lines_data, _ = _extract_line_data(result, img.height, False)
-
-        # Run furigana detection
-        main_text_lines, furigana_lines, threshold, hist_data = _classify_lines_by_width(all_lines_data, img.width, False)
-
-        # Collect all furigana text to remove from markdown
-        furigana_texts = []
-        for furi_line in furigana_lines:
-            if furi_line.get('text'):
-                furigana_texts.append(furi_line['text'].strip())
-
-        # Also group furigana words for better detection
-        grouped_furigana = _group_furigana_words(furigana_lines, main_text_lines, threshold, False)
-        for group in grouped_furigana:
-            if group.get('text'):
-                furigana_texts.append(group['text'].strip())
-
-        # Clean the markdown by removing furigana (both standalone lines and inline)
-        clean_text = result.content
-
-        # First remove standalone furigana lines
-        lines = clean_text.split('\n')
-        cleaned_lines = []
-
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
-
-            # Skip if this entire line is just furigana
-            is_furigana_line = False
-            for furi in furigana_texts:
-                if furi and (line_stripped == furi or line_stripped.replace(' ', '') == furi.replace(' ', '')):
-                    is_furigana_line = True
-                    if verbose:
-                        logger.info(f"Removing furigana line: '{line_stripped}'")
-                    break
-
-            if not is_furigana_line:
-                # Also clean inline furigana from the line
-                cleaned_line = line
-                for furi in furigana_texts:
-                    if furi and furi in cleaned_line:
-                        # Remove furigana with surrounding spaces
-                        cleaned_line = cleaned_line.replace(f' {furi} ', ' ')
-                        cleaned_line = cleaned_line.replace(f' {furi}', '')
-                        cleaned_line = cleaned_line.replace(furi, '')
-
-                cleaned_lines.append(cleaned_line)
-
-        clean_text = '\n'.join(cleaned_lines)
-
-        if verbose:
-            print("\n" + "="*80)
-            print("HYBRID APPROACH: Azure Markdown + Furigana Removal")
-            print("="*80)
-            print(f"Detected {len(furigana_texts)} furigana texts to remove")
-            print(f"Furigana: {furigana_texts[:10]}")  # Show first 10
-            print("\nCleaned markdown:")
-            print(clean_text[:1000])
-
-        return clean_text, result, all_lines_data
-
     # 3. Verbose Summary (only prints if verbose=True)
     model_id = "prebuilt-layout" if use_layout else "prebuilt-read"
     _print_verbose_azure_summary(result, model_id, verbose)
@@ -896,7 +891,7 @@ def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, clien
     grouped_furigana_words = _group_furigana_words(furigana_lines, main_text_lines, threshold, verbose)
 
     # 7. Furigana Matching
-    line_reconstructions, used_furigana = _match_furigana_to_main_text(main_text_lines, grouped_furigana_words)
+    line_reconstructions, used_furigana = _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furigana_lines)
 
     # 8. Text Assembly
     reconstructed_lines = _assemble_reconstructed_text(main_text_lines, horizontal_body_lines,

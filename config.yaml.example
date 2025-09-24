@@ -29,6 +29,7 @@ jp_ocr_backend: azure  # Options: 'azure' or 'vision'
 
 azure_endpoint: https://your-azure-endpoint.cognitiveservices.azure.com/
 azure_key: your-azure-key-here
+azure_use_markdown: true  # Use markdown (prebuilt-layout) for rich formatting. Set to false for cheaper text-only mode
 
 # Vision API OCR Configuration
 service_account_key_path: sa-keys.json  # Path to Google Cloud service account key file
@@ -69,6 +70,12 @@ translation_models:
   #   model: claude-sonnet-4-20250514
   #   api_retries: 2
   #   validation_retries: 1
+
+# Polish processing mode
+# =======================
+polish_processing_mode: parallel  # Options: 'parallel' or 'sequential'
+                                 # parallel: Process all parts concurrently (faster, default)
+                                 # sequential: Process parts one by one, injecting previous part as context (better continuity)
 
 # Validation strategy configuration
 # ==================================

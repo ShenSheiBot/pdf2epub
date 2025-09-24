@@ -250,8 +250,8 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     
     # Call analyze_azure_ocr directly with figure extraction if enabled
     # Use 'prebuilt-layout' if we need figures, otherwise 'prebuilt-read' for cost savings
-    # Always request markdown when using layout model
-    use_markdown = True  # Always use markdown for better formatting
+    # Check config for markdown preference (default to True for backward compatibility)
+    use_markdown = config.get('azure_use_markdown', True)
     clean_text, azure_result, all_lines_data = analyze_azure_ocr(
         img_bytes=img_bytes,
         page_num=page_num,

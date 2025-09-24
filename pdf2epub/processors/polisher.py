@@ -66,6 +66,9 @@ class PolishProcessor(BaseMarkdownProcessor):
         self.polish_models = polish_models or config.get("polish_models")
         self.content_type = content_type
         self.book_structure = book_structure or {}
+
+        # Get processing mode from config (default to parallel for backward compatibility)
+        self.processing_mode = config.get("polish_processing_mode", "parallel")
         
         # Check if book has global notes chapter
         self.use_global_footnotes = self._has_notes_chapter()
@@ -254,70 +257,84 @@ class PolishProcessor(BaseMarkdownProcessor):
         else:
             parts = [content]
         
-        logger.info(f"Processing {len(parts)} part(s) for {file_name}")
-        
-        # Process parts in parallel if multiple
+        logger.info(f"Processing {len(parts)} part(s) for {file_name} in {self.processing_mode} mode")
+
+        # Process parts based on mode
         chapter_name = self.get_operation_name(file_name)
         file_key = Path(file_name).stem
         progress_key = self.get_progress_key()
-        
+
         if len(parts) > 1:
-            # Process multiple parts in parallel
-            polished_parts = [None] * len(parts)  # Pre-allocate list to maintain order
-            all_parts_valid = True
-            
-            # Determine max workers for parts (use half of configured workers or at least 2)
-            part_workers = max(2, self.max_workers // 2)
-            
-            with ThreadPoolExecutor(max_workers=part_workers) as executor:
-                futures = {}
-                
-                for part_idx, part_content in enumerate(parts, 1):
-                    # Check if this part was already processed (for resume)
-                    if self.resume and file_key in self.progress[progress_key]:
-                        part_info = self.progress[progress_key][file_key].get("parts", {}).get(str(part_idx), {})
-                        if part_info.get("completed", False):
-                            # Load the already processed part
-                            part_file = self.output_dir / f"{file_key}.part{part_idx}.md"
-                            if part_file.exists():
-                                with open(part_file, 'r', encoding='utf-8') as f:
-                                    polished_parts[part_idx - 1] = f.read()
-                                logger.info(f"Skipping {file_name} part {part_idx}/{len(parts)} (already processed)")
-                                continue
-                    
-                    # Submit part for processing
-                    future = executor.submit(
-                        self._process_and_validate_part,
-                        part_content=part_content,
-                        chapter_name=chapter_name,
-                        part_idx=part_idx,
-                        total_parts=len(parts),
-                        original_content=content,
-                        file_name=file_name
-                    )
-                    futures[future] = part_idx
-                
-                # Process completed futures
-                for future in as_completed(futures):
-                    part_idx = futures[future]
-                    try:
-                        polished_part, is_valid = future.result()
-                        polished_parts[part_idx - 1] = polished_part
-                        
-                        if not is_valid:
+            # Choose processing mode
+            if self.processing_mode == "sequential":
+                # Sequential processing with context injection
+                polished_parts = self._process_parts_sequentially(
+                    parts=parts,
+                    chapter_name=chapter_name,
+                    file_name=file_name,
+                    file_key=file_key,
+                    progress_key=progress_key,
+                    original_content=content
+                )
+                all_parts_valid = all(p is not None and p != "" for p in polished_parts)
+            else:
+                # Parallel processing (existing logic)
+                polished_parts = [None] * len(parts)  # Pre-allocate list to maintain order
+                all_parts_valid = True
+
+                # Determine max workers for parts (use half of configured workers or at least 2)
+                part_workers = max(2, self.max_workers // 2)
+
+                with ThreadPoolExecutor(max_workers=part_workers) as executor:
+                    futures = {}
+
+                    for part_idx, part_content in enumerate(parts, 1):
+                        # Check if this part was already processed (for resume)
+                        if self.resume and file_key in self.progress[progress_key]:
+                            part_info = self.progress[progress_key][file_key].get("parts", {}).get(str(part_idx), {})
+                            if part_info.get("completed", False):
+                                # Load the already processed part
+                                part_file = self.output_dir / f"{file_key}.part{part_idx}.md"
+                                if part_file.exists():
+                                    with open(part_file, 'r', encoding='utf-8') as f:
+                                        polished_parts[part_idx - 1] = f.read()
+                                    logger.info(f"Skipping {file_name} part {part_idx}/{len(parts)} (already processed)")
+                                    continue
+
+                        # Submit part for processing
+                        future = executor.submit(
+                            self._process_and_validate_part,
+                            part_content=part_content,
+                            chapter_name=chapter_name,
+                            part_idx=part_idx,
+                            total_parts=len(parts),
+                            original_content=content,
+                            file_name=file_name,
+                            previous_part_context=None  # No context in parallel mode
+                        )
+                        futures[future] = part_idx
+
+                    # Process completed futures
+                    for future in as_completed(futures):
+                        part_idx = futures[future]
+                        try:
+                            polished_part, is_valid = future.result()
+                            polished_parts[part_idx - 1] = polished_part
+
+                            if not is_valid:
+                                all_parts_valid = False
+
+                            # Save part file
+                            self._save_part_file(file_name, part_idx, polished_part)
+                            # Update progress for this part with original content tokens
+                            original_part = parts[part_idx - 1]
+                            self._update_part_progress(file_name, part_idx, len(parts), success=is_valid, part_content=original_part)
+
+                        except Exception as e:
+                            logger.error(f"Failed to process part {part_idx}/{len(parts)}: {e}")
                             all_parts_valid = False
-                        
-                        # Save part file
-                        self._save_part_file(file_name, part_idx, polished_part)
-                        # Update progress for this part with original content tokens
-                        original_part = parts[part_idx - 1]
-                        self._update_part_progress(file_name, part_idx, len(parts), success=is_valid, part_content=original_part)
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to process part {part_idx}/{len(parts)}: {e}")
-                        all_parts_valid = False
-                        polished_parts[part_idx - 1] = ""  # Empty string for failed parts
-            
+                            polished_parts[part_idx - 1] = ""  # Empty string for failed parts
+
             # Check if all parts were processed
             if not all_parts_valid and not self.skip_truncation_check and not self.use_longest_on_failure:
                 logger.warning(f"Some parts of {file_name} failed validation")
@@ -330,7 +347,8 @@ class PolishProcessor(BaseMarkdownProcessor):
                 part_idx=1,
                 total_parts=1,
                 original_content=content,
-                file_name=file_name
+                file_name=file_name,
+                previous_part_context=None  # No context for single part
             )
             polished_parts = [polished_part]
             all_parts_valid = is_valid
@@ -423,6 +441,85 @@ class PolishProcessor(BaseMarkdownProcessor):
             self.content_type,
         )
     
+    def _process_parts_sequentially(
+        self,
+        parts: List[str],
+        chapter_name: str,
+        file_name: str,
+        file_key: str,
+        progress_key: str,
+        original_content: str
+    ) -> List[str]:
+        """
+        Process parts sequentially, injecting previous part's polished version as context.
+
+        Args:
+            parts: List of content parts to process
+            chapter_name: Name of the chapter for logging
+            file_name: Name of the file being processed
+            file_key: Key for progress tracking
+            progress_key: Progress dictionary key
+            original_content: Full original content
+
+        Returns:
+            List of polished parts
+        """
+        polished_parts = []
+        previous_part_context = None
+
+        for part_idx, part_content in enumerate(parts, 1):
+            # Check if this part was already processed (for resume)
+            if self.resume and file_key in self.progress.get(progress_key, {}):
+                part_info = self.progress[progress_key][file_key].get("parts", {}).get(str(part_idx), {})
+                if part_info.get("completed", False):
+                    # Load the already processed part
+                    part_file = self.output_dir / f"{file_key}.part{part_idx}.md"
+                    if part_file.exists():
+                        with open(part_file, 'r', encoding='utf-8') as f:
+                            polished_part = f.read()
+                            polished_parts.append(polished_part)
+                            # Use this as context for next part
+                            previous_part_context = {
+                                "original": part_content,
+                                "polished": polished_part
+                            }
+                            logger.info(f"Skipping {file_name} part {part_idx}/{len(parts)} (already processed)")
+                            continue
+
+            # Process part with context from previous part
+            try:
+                logger.info(f"Processing {file_name} part {part_idx}/{len(parts)} sequentially")
+                polished_part, is_valid = self._process_and_validate_part(
+                    part_content=part_content,
+                    chapter_name=chapter_name,
+                    part_idx=part_idx,
+                    total_parts=len(parts),
+                    original_content=original_content,
+                    file_name=file_name,
+                    previous_part_context=previous_part_context
+                )
+
+                polished_parts.append(polished_part)
+
+                # Save part file
+                self._save_part_file(file_name, part_idx, polished_part)
+
+                # Update progress for this part
+                self._update_part_progress(file_name, part_idx, len(parts), success=is_valid, part_content=part_content)
+
+                # Update context for next part
+                if polished_part:
+                    previous_part_context = {
+                        "original": part_content,
+                        "polished": polished_part
+                    }
+
+            except Exception as e:
+                logger.error(f"Failed to process part {part_idx}/{len(parts)}: {e}")
+                polished_parts.append("")  # Empty string for failed parts
+
+        return polished_parts
+
     def _process_and_validate_part(
         self,
         part_content: str,
@@ -430,7 +527,8 @@ class PolishProcessor(BaseMarkdownProcessor):
         part_idx: int,
         total_parts: int,
         original_content: str,
-        file_name: str
+        file_name: str,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> Tuple[str, bool]:
         """
         Process and validate a single part using the new centralized retry logic.
@@ -443,7 +541,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         """
         # Create the polishing prompt with content for auto-detection
         prompt = self._create_polish_prompt(
-            chapter_name, part_idx, total_parts, part_content, file_name
+            chapter_name, part_idx, total_parts, part_content, file_name, previous_part_context
         )
 
         # Create multi-part content for the LLM
@@ -573,7 +671,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         """Polish a single part of content."""
         # Create the polish prompt with content for auto-detection
         prompt = self._create_polish_prompt(
-            chapter_name, part_idx, total_parts, part_content, file_name
+            chapter_name, part_idx, total_parts, part_content, file_name, None  # No context for _polish_part (deprecated method)
         )
         
         # Create multi-part content for the LLM
@@ -642,7 +740,8 @@ class PolishProcessor(BaseMarkdownProcessor):
         part_idx: int,
         total_parts: int,
         part_content: str = None,
-        file_name: str = None
+        file_name: str = None,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> str:
         """Create the prompt for polishing content based on content type."""
         # Get chapter information using file_name if provided, otherwise fall back to chapter_name
@@ -675,19 +774,20 @@ class PolishProcessor(BaseMarkdownProcessor):
         if content_type == "academic":
             # Choose between global and local academic prompts
             if self.use_global_footnotes:
-                return self._create_academic_global_prompt(chapter_name, part_idx, total_parts)
+                return self._create_academic_global_prompt(chapter_name, part_idx, total_parts, previous_part_context)
             else:
-                return self._create_academic_polish_prompt(chapter_name, part_idx, total_parts)
+                return self._create_academic_polish_prompt(chapter_name, part_idx, total_parts, previous_part_context)
         elif content_type == "japanese":
-            return self._create_japanese_polish_prompt(chapter_name, part_idx, total_parts)
+            return self._create_japanese_polish_prompt(chapter_name, part_idx, total_parts, previous_part_context)
         else:
-            return self._create_general_polish_prompt(chapter_name, part_idx, total_parts)
+            return self._create_general_polish_prompt(chapter_name, part_idx, total_parts, previous_part_context)
     
     def _create_academic_polish_prompt(
         self,
         chapter_name: str,
         part_idx: int,
-        total_parts: int
+        total_parts: int,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> str:
         """Create prompt specifically for academic content with references."""
         book_info = f' from the book titled "{self.book_title}"' if self.book_title else ""
@@ -751,7 +851,16 @@ CONTEXT: This is part {part_idx} of {total_parts} of a multi-part chapter."""
             if part_idx > 1:
                 prompt += """
 IMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2).
-Convert any # (H1) headings to ## (H2)."""
+Convert any # (H1) headings to ## (H2). You don't necessarily need to start with ##."""
+
+                # Add context from previous part if in sequential mode
+                if previous_part_context:
+                    prompt += f"""
+
+CONTEXT FROM PREVIOUS PART: The previous part has been polished and ends with:
+...{previous_part_context['polished'][-500:]}
+
+Please ensure continuity with the previous part."""
         
         prompt += """
 
@@ -766,7 +875,8 @@ Polish the following academic content:"""
         self,
         chapter_name: str,
         part_idx: int,
-        total_parts: int
+        total_parts: int,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> str:
         """Create prompt for academic content when footnotes are in separate Notes chapter."""
         book_info = f' from the book titled "{self.book_title}"' if self.book_title else ""
@@ -812,6 +922,15 @@ CONTEXT: This is part {part_idx} of {total_parts} of a multi-part chapter."""
                 prompt += """
 IMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2).
 Convert any # (H1) headings to ## (H2)."""
+
+                # Add context from previous part if in sequential mode
+                if previous_part_context:
+                    prompt += f"""
+
+CONTEXT FROM PREVIOUS PART: The previous part has been polished and ends with:
+...{previous_part_context['polished'][-500:]}
+
+Please ensure continuity with the previous part."""
         
         prompt += """
 
@@ -826,7 +945,8 @@ Polish the following academic content:"""
         self,
         chapter_name: str,
         part_idx: int,
-        total_parts: int
+        total_parts: int,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> str:
         """Create prompt specifically for Notes/References chapters."""
         book_info = f' from "{self.book_title}"' if self.book_title else ""
@@ -869,7 +989,15 @@ Your tasks:
             prompt += f"""
 
 CONTEXT: This is part {part_idx} of {total_parts} of the Notes section."""
-        
+
+            if part_idx > 1 and previous_part_context:
+                prompt += f"""
+
+CONTEXT FROM PREVIOUS PART: The previous part ends with:
+...{previous_part_context['polished'][-500:]}
+
+Please ensure continuity with the previous part."""
+
         prompt += """
 
 IMPORTANT: Return ONLY the formatted markdown.
@@ -882,7 +1010,8 @@ Format the following Notes/References content:"""
         self,
         chapter_name: str,
         part_idx: int,
-        total_parts: int
+        total_parts: int,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> str:
         """Create prompt specifically for Japanese content with furigana."""
         book_info = f' from "{self.book_title}"' if self.book_title else ""
@@ -922,6 +1051,15 @@ CONTEXT: This is part {part_idx} of {total_parts} of a multi-part chapter."""
                 prompt += """
 IMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2).
 Convert any # (H1) headings to ## (H2)."""
+
+                # Add context from previous part if in sequential mode
+                if previous_part_context:
+                    prompt += f"""
+
+CONTEXT FROM PREVIOUS PART: The previous part has been polished and ends with:
+...{previous_part_context['polished'][-500:]}
+
+Please ensure continuity with the previous part."""
         
         prompt += """
 
@@ -936,7 +1074,8 @@ Polish the following Japanese content:"""
         self,
         chapter_name: str,
         part_idx: int,
-        total_parts: int
+        total_parts: int,
+        previous_part_context: Optional[Dict[str, str]] = None
     ) -> str:
         """Create prompt for general content (fallback)."""
         book_info = f' from "{self.book_title}"' if self.book_title else ""
@@ -974,7 +1113,16 @@ CONTEXT: This is part {part_idx} of {total_parts} of a multi-part chapter."""
             if part_idx > 1:
                 prompt += """
 IMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2)."""
-        
+
+                # Add context from previous part if in sequential mode
+                if previous_part_context:
+                    prompt += f"""
+
+CONTEXT FROM PREVIOUS PART: The previous part has been polished and ends with:
+...{previous_part_context['polished'][-500:]}
+
+Please ensure continuity with the previous part."""
+
         prompt += """
 
 Return ONLY the polished markdown.

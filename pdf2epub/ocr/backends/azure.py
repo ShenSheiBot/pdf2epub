@@ -8,9 +8,14 @@ import io
 import numpy as np
 from PIL import Image
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import (
+    DocumentContentFormat,
+    DocumentAnalysisFeature
+)
 from azure.core.credentials import AzureKeyCredential
 import base64
-from typing import Dict, Tuple, Any, List
+from typing import Dict, Tuple, Any, List, Optional
+from dataclasses import dataclass
 from loguru import logger
 
 from pdf2epub.utils.logging_config import configure_logging
@@ -18,6 +23,30 @@ from ..illustration_extractor import extract_illustrations
 
 # Configure logger
 logger = configure_logging()
+
+
+# Data structures for span-based furigana mapping
+@dataclass
+class Span:
+    """Represents a character range in the content string."""
+    start: int  # offset
+    end: int    # offset + length
+
+
+@dataclass
+class RubyPair:
+    """Represents a furigana-base text pair with their spans."""
+    rb_spans: List[Span]  # main text (kanji) word spans
+    rt_spans: List[Span]  # furigana word spans
+    rt_text: str          # furigana text for convenience
+
+
+@dataclass
+class Edit:
+    """Represents a text edit operation."""
+    start: int
+    end: int
+    text: str  # replacement; insertion if start==end, deletion if text==""
 
 
 def _extract_azure_figures(client: DocumentIntelligenceClient, azure_result, page_num: int, base_output_dir: Path = None, config: Dict = None) -> List[Dict]:
@@ -221,15 +250,18 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     
     # Call analyze_azure_ocr directly with figure extraction if enabled
     # Use 'prebuilt-layout' if we need figures, otherwise 'prebuilt-read' for cost savings
+    # Always request markdown when using layout model
+    use_markdown = True  # Always use markdown for better formatting
     clean_text, azure_result, all_lines_data = analyze_azure_ocr(
         img_bytes=img_bytes,
         page_num=page_num,
         output_dir=images_dir,
         config=config,
         client=client,
-        use_layout=use_azure_illustrations,
+        use_layout=use_azure_illustrations or use_markdown,  # Use layout for markdown
         verbose=verbose,
-        extract_figures=use_azure_illustrations
+        extract_figures=use_azure_illustrations,
+        use_markdown=use_markdown
     )
     
     # Check if Azure returned figures
@@ -261,30 +293,40 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
     }
 
 
-def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False):
+def _call_azure_api(client, img_bytes, use_layout=True, extract_figures=False, use_markdown=True):
     """Calls the Azure Document Intelligence API and returns the result."""
     from azure.core.exceptions import AzureError
-    
+
     logger.info("Calling Azure Document Intelligence API...")
     try:
-        model_id = "prebuilt-layout" if use_layout else "prebuilt-read"
+        # Markdown only works with layout model
+        model_id = "prebuilt-layout" if (use_layout or use_markdown) else "prebuilt-read"
         img_base64 = base64.b64encode(img_bytes).decode('utf-8')
 
         # Prepare kwargs for the API call
         api_kwargs = {
             "model_id": model_id,
             "body": {"base64Source": img_base64},
-            "locale": "ja-JP"
+            "locale": "ja-JP",
+            "string_index_type": "textElements"  # Makes spans easy to slice
         }
-        
+
         # Add features if using layout
-        if use_layout:
-            api_kwargs["features"] = ["languages"]
-        
+        if model_id == "prebuilt-layout":
+            features = [DocumentAnalysisFeature.LANGUAGES]
+            # Add style font feature for bold/italic spans
+            if use_markdown:
+                features.append(DocumentAnalysisFeature.STYLE_FONT)
+            api_kwargs["features"] = features
+
+        # Add markdown output format if requested (requires Layout model)
+        if use_markdown and model_id == "prebuilt-layout":
+            api_kwargs["output_content_format"] = DocumentContentFormat.MARKDOWN  # snake_case!
+
         # Add figure extraction output if requested
-        if extract_figures and use_layout:
+        if extract_figures and model_id == "prebuilt-layout":
             api_kwargs["output"] = ["figures"]
-        
+
         poller = client.begin_analyze_document(**api_kwargs)
         
         # Store the operation ID before getting result for figure extraction
@@ -458,10 +500,24 @@ def _extract_line_data(result, img_height, verbose=False):
                 if hasattr(word, 'content') and hasattr(word, 'polygon') and len(word.polygon) >= 8:
                     w_x = [word.polygon[i] for i in range(0, len(word.polygon), 2)]
                     w_y = [word.polygon[i] for i in range(1, len(word.polygon), 2)]
+
+                    # Extract span information from word
+                    word_spans = []
+                    if hasattr(word, 'spans') and word.spans:
+                        for s in word.spans:
+                            if hasattr(s, 'offset') and hasattr(s, 'length'):
+                                word_spans.append(Span(start=s.offset, end=s.offset + s.length))
+                    elif hasattr(word, 'span') and word.span:
+                        s = word.span
+                        if hasattr(s, 'offset') and hasattr(s, 'length'):
+                            word_spans.append(Span(start=s.offset, end=s.offset + s.length))
+
                     words_data.append({
                         'text': word.content, 'y_min': min(w_y), 'y_max': max(w_y),
                         'y_center': (min(w_y) + max(w_y)) / 2, 'x_min': min(w_x),
-                        'x_max': max(w_x), 'x_center': (min(w_x) + max(w_x)) / 2
+                        'x_max': max(w_x), 'x_center': (min(w_x) + max(w_x)) / 2,
+                        'spans': word_spans,  # Add span information
+                        'azure_word': word    # Keep reference to original word
                     })
             
             line_data = {
@@ -612,6 +668,8 @@ def _group_furigana_words(furigana_lines, main_text_lines, threshold, verbose=Fa
             groups.append(current_group)
 
         for group in groups:
+            # Ensure each word in the group has span information
+            # (Words come from line data which should have spans)
             grouped_furigana_words.append({
                 'words': group,
                 'text': ''.join(w['text'] for w in group),
@@ -631,12 +689,17 @@ def _group_furigana_words(furigana_lines, main_text_lines, threshold, verbose=Fa
 
 
 def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furigana_lines=None):
-    """Matches furigana groups to words in main text lines, allowing cross-line matching."""
+    """Matches furigana groups to words in main text lines, allowing cross-line matching.
+
+    Returns:
+        tuple: (line_reconstructions dict, used_furigana_groups set, ruby_pairs list)
+    """
     if not main_text_lines or not grouped_furigana_words:
-        return {}, set()
+        return {}, set(), []
 
     line_reconstructions = {}
     used_furigana_groups = set()
+    ruby_pairs = []  # List of RubyPair objects for span-based editing
 
     # Process each main text line
     for line in main_text_lines:
@@ -686,8 +749,11 @@ def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furiga
             overlapping_words.sort(key=lambda x: x[0])
 
             # Find the minimal contiguous range of words that covers all furigana
-            # Check each furigana word to ensure it has overlap with the selected range
-            all_furi_covered = True
+            # Check how many furigana words have overlap with the selected range
+            # Be lenient due to OCR precision issues - require 80% coverage
+            furi_with_overlap = 0
+            total_furi_words = len(furi_group['words'])
+
             for furi_word in furi_group['words']:
                 has_overlap = False
                 for _, main_word, _ in overlapping_words:
@@ -696,11 +762,12 @@ def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furiga
                     if y_overlap > 0:
                         has_overlap = True
                         break
-                if not has_overlap:
-                    all_furi_covered = False
-                    break
+                if has_overlap:
+                    furi_with_overlap += 1
 
-            if not all_furi_covered:
+            # Require at least 80% of furigana words to have overlap (allows for OCR precision issues)
+            coverage_ratio = furi_with_overlap / total_furi_words if total_furi_words > 0 else 0
+            if coverage_ratio < 0.8:
                 continue
 
             # Find contiguous sequences within overlapping words
@@ -723,29 +790,51 @@ def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furiga
                 group_y_min = min(w[1]['y_min'] for w in group)
                 group_y_max = max(w[1]['y_max'] for w in group)
 
-                # Check if this group covers all furigana characters
-                # A furigana character is "covered" if it has meaningful overlap (>10%) with the group
-                covers_all_furigana = True
+                # Check if this group covers most furigana characters (80% threshold)
+                # Be lenient due to OCR precision issues
+                furi_covered = 0
                 for furi_word in furi_group['words']:
                     # Check if this furigana word has meaningful overlap with the group
                     y_overlap = max(0, min(furi_word['y_max'], group_y_max) -
                                    max(furi_word['y_min'], group_y_min))
                     furi_height = furi_word['y_max'] - furi_word['y_min']
 
-                    # Require at least 10% overlap to count as meaningful
-                    # This avoids OCR precision issues where boundaries barely touch
-                    if y_overlap < furi_height * 0.1:
-                        covers_all_furigana = False
-                        break
+                    # Count as covered if at least 10% overlap
+                    if y_overlap >= furi_height * 0.1:
+                        furi_covered += 1
 
-                if covers_all_furigana:
+                # Accept if 80% of furigana is covered (same as earlier check)
+                coverage = furi_covered / len(furi_group['words']) if furi_group['words'] else 0
+                if coverage >= 0.8:
                     if best_group is None or len(group) > len(best_group):
                         best_group = group
 
             if best_group:
+                matched_main_words = [w[1] for w in best_group]
+
+                # Create RubyPair with spans
+                rb_spans = []
+                for word in matched_main_words:
+                    if 'spans' in word and word['spans']:
+                        rb_spans.extend(word['spans'])
+
+                rt_spans = []
+                # Get spans from furigana words
+                for furi_word in furi_group['words']:
+                    if 'spans' in furi_word and furi_word['spans']:
+                        rt_spans.extend(furi_word['spans'])
+
+                if rb_spans and rt_spans:
+                    ruby_pair = RubyPair(
+                        rb_spans=rb_spans,
+                        rt_spans=rt_spans,
+                        rt_text=furi_group['text']
+                    )
+                    ruby_pairs.append(ruby_pair)
+
                 matched_groups.append({
                     'furigana_group': furi_group,
-                    'matched_main_words': [w[1] for w in best_group],
+                    'matched_main_words': matched_main_words,
                     'start_idx': best_group[0][0],
                     'end_idx': best_group[-1][0]
                 })
@@ -767,7 +856,7 @@ def _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furiga
             reconstructed_parts.append(''.join(w['text'] for w in line['words'][word_idx:]))
             line_reconstructions[line['idx']] = ''.join(reconstructed_parts)
 
-    return line_reconstructions, used_furigana_groups
+    return line_reconstructions, used_furigana_groups, ruby_pairs
 
 
 def _assemble_reconstructed_text(main_text_lines, horizontal_body_lines, grouped_furigana_words, 
@@ -841,14 +930,112 @@ def _format_clean_output(reconstructed_lines, verbose=False):
     return '\n'.join(output_lines)
 
 
-def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, client=None, use_layout=True, verbose=False, extract_figures=False) -> Tuple[str, Any, List[Dict]]:
+# Markdown editing helper functions
+def apply_edits(content: str, edits: List[Edit]) -> str:
+    """Apply non-overlapping edits safely by sorting them in descending order."""
+    for e in sorted(edits, key=lambda x: (x.start, x.end), reverse=True):
+        content = content[:e.start] + e.text + content[e.end:]
+    return content
+
+
+def build_reflow_edits(result) -> List[Edit]:
+    """Build edits to reflow text by removing unnecessary line breaks within paragraphs."""
+    import re
+
+    edits = []
+    content = result.content if hasattr(result, 'content') else ""
+
+    if not content:
+        return edits
+
+    # Roles to skip when reflowing
+    SKIP_ROLES = {"title", "sectionHeading", "pageHeader", "pageFooter", "pageNumber", "footnote", "formulaBlock"}
+
+    # 1) Remove headers/footers/page numbers completely
+    for p in (getattr(result, "paragraphs", []) or []):
+        role = getattr(p, "role", None)
+        if role in {"pageHeader", "pageFooter", "pageNumber"}:
+            for s in (p.spans or []):
+                if hasattr(s, 'offset') and hasattr(s, 'length'):
+                    edits.append(Edit(start=s.offset, end=s.offset + s.length, text=""))
+
+    # 2) Unwrap lines inside normal paragraphs
+    # Get table cell spans to avoid reflowing table content
+    blocked_ranges = []
+    for t in (getattr(result, "tables", []) or []):
+        for cell in (getattr(t, "cells", []) or []):
+            for s in (getattr(cell, "spans", []) or []):
+                if hasattr(s, 'offset') and hasattr(s, 'length'):
+                    blocked_ranges.append((s.offset, s.offset + s.length))
+
+    for p in (getattr(result, "paragraphs", []) or []):
+        role = getattr(p, "role", None)
+        if role in SKIP_ROLES:
+            continue
+
+        for s in (p.spans or []):
+            if not (hasattr(s, 'offset') and hasattr(s, 'length')):
+                continue
+
+            seg_start = s.offset
+            seg_end = s.offset + s.length
+
+            # Skip if this overlaps with table content
+            if any(not (seg_end <= start or seg_start >= end) for start, end in blocked_ranges):
+                continue
+
+            seg_text = content[seg_start:seg_end]
+
+            # Remove single newlines (not double newlines which are paragraph breaks)
+            # For Japanese text, we don't want spaces between lines
+            unwrapped = re.sub(r'(?<!\n)\n(?!\n)', '', seg_text)
+
+            # Also clean up any stray double newlines within the same paragraph
+            unwrapped = re.sub(r'\n{2,}', '\n', unwrapped)
+
+            if unwrapped != seg_text:
+                edits.append(Edit(start=seg_start, end=seg_end, text=unwrapped))
+
+    return edits
+
+
+def build_delete_furigana_edits(pairs: List[RubyPair]) -> List[Edit]:
+    """Build edits to delete all furigana text."""
+    edits = []
+    for pair in pairs:
+        for span in pair.rt_spans:
+            edits.append(Edit(start=span.start, end=span.end, text=""))
+    return edits
+
+
+def build_attach_furigana_edits(pairs: List[RubyPair]) -> List[Edit]:
+    """Build edits to attach furigana as (かな) after base text."""
+    edits = []
+    for pair in pairs:
+        # Delete furigana spans
+        for span in pair.rt_spans:
+            edits.append(Edit(start=span.start, end=span.end, text=""))
+
+        # Insert (furigana) after base text
+        if pair.rb_spans:
+            # Get the end position of the last base span
+            insert_pos = max(span.end for span in pair.rb_spans)
+            edits.append(Edit(start=insert_pos, end=insert_pos, text=f"({pair.rt_text})"))
+
+    return edits
+
+
+def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, client=None, use_layout=True, verbose=False, extract_figures=False, use_markdown=True) -> Tuple[str, Any, List[Dict]]:
     """
     Analyzes Azure Document Intelligence OCR with Japanese text from image bytes.
     This function orchestrates the process: API call -> Data Extraction -> Analysis -> Reconstruction.
-    
+
+    Args:
+        use_markdown: If True, returns markdown-formatted content with furigana handling
+
     Returns:
         A tuple containing:
-        - clean_text (str): The reconstructed text.
+        - clean_text (str): The reconstructed text (markdown if use_markdown=True).
         - result (Any): The raw Azure result object.
         - all_lines_data (List[Dict]): The processed line data for visualization.
     """
@@ -871,7 +1058,7 @@ def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, clien
     
     # 2. API Call
     try:
-        result = _call_azure_api(client, img_bytes, use_layout, extract_figures)
+        result = _call_azure_api(client, img_bytes, use_layout, extract_figures, use_markdown)
     except Exception:
         return None, None, []
         
@@ -891,13 +1078,61 @@ def analyze_azure_ocr(img_bytes, page_num=1, output_dir=None, config=None, clien
     grouped_furigana_words = _group_furigana_words(furigana_lines, main_text_lines, threshold, verbose)
 
     # 7. Furigana Matching
-    line_reconstructions, used_furigana = _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furigana_lines)
+    line_reconstructions, used_furigana, ruby_pairs = _match_furigana_to_main_text(main_text_lines, grouped_furigana_words, furigana_lines)
 
-    # 8. Text Assembly
-    reconstructed_lines = _assemble_reconstructed_text(main_text_lines, horizontal_body_lines,
-                                                       grouped_furigana_words, line_reconstructions, used_furigana)
-                                                       
-    # 9. Final Output Formatting
-    clean_text = _format_clean_output(reconstructed_lines, verbose)
-    
-    return clean_text, result, all_lines_data
+    if verbose:
+        logger.info(f"Created {len(ruby_pairs)} ruby pairs")
+        for rp in ruby_pairs:
+            logger.info(f"  Ruby pair: {rp.rt_text}")
+
+    # 8. Check if we should use markdown with furigana handling
+    if use_markdown and use_layout and hasattr(result, 'content'):
+        # Use markdown content with furigana handling
+        markdown_text = result.content
+        edits = []
+
+        # First: Apply furigana edits based on config
+        furigana_mode = config.get('furigana_mode', 'attach') if config else 'attach'
+
+        if ruby_pairs:  # Only apply edits if we found furigana pairs
+            if furigana_mode == 'delete':
+                edits.extend(build_delete_furigana_edits(ruby_pairs))
+            elif furigana_mode == 'attach':
+                edits.extend(build_attach_furigana_edits(ruby_pairs))
+            else:
+                # Default to attach mode
+                edits.extend(build_attach_furigana_edits(ruby_pairs))
+
+        # Apply furigana edits first
+        if edits:
+            markdown_text = apply_edits(markdown_text, edits)
+
+        # Then apply reflow as a simple regex operation after furigana is handled
+        # This avoids span confusion
+        import re
+        # Remove page headers/footers
+        markdown_text = re.sub(r'<!-- Page(?:Header|Footer)="[^"]*" -->\n?', '', markdown_text)
+
+        # Join lines that were incorrectly split within sentences
+        # For Japanese text, remove single newlines (keep paragraph breaks)
+        markdown_text = re.sub(r'(?<!\n)\n(?!\n)', '', markdown_text)
+
+        # Final cleanup
+        import re
+        # Remove any remaining HTML comments (shouldn't be necessary after reflow_edits)
+        markdown_text = re.sub(r'<!-- [^>]+ -->\n?', '', markdown_text)
+        # Remove multiple consecutive blank lines
+        markdown_text = re.sub(r'\n{3,}', '\n\n', markdown_text)
+        # Remove leading/trailing whitespace
+        markdown_text = markdown_text.strip()
+
+        return markdown_text, result, all_lines_data
+    else:
+        # Fallback to original text assembly (for non-markdown or when markdown not available)
+        reconstructed_lines = _assemble_reconstructed_text(main_text_lines, horizontal_body_lines,
+                                                           grouped_furigana_words, line_reconstructions, used_furigana)
+
+        # 9. Final Output Formatting
+        clean_text = _format_clean_output(reconstructed_lines, verbose)
+
+        return clean_text, result, all_lines_data

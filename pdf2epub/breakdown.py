@@ -253,9 +253,10 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     Keep the original language for all titles.
     
     Additionally, identify special chapter types:
-    - If a chapter consists primarily of footnotes, endnotes, or references for citations in other chapters (e.g., "Notes", "Endnotes", "References"), add a "type": "notes" field
-    - A book contains at most one note chapter, if footnotes are local, then there should be none
-    - Abbreviations, index, or summary table are not considered as notes as they are not cited
+    - If a chapter consists ONLY of footnotes, endnotes, or references for citations in other chapters, add a "type": "notes" field
+    - If any chapter's notes are at the end of itself, then there should be NO note chapter.
+    - A book contains at most one note chapter.
+    - Abbreviations, Bibliography, Index, or Summary Table are NOT considered as notes. Only literal `Notes` with [1], [2], [3]... are considered as notes.
     - Regular content chapters should not have a "type" field
     
     Return the result in the following JSON structure:
@@ -317,7 +318,7 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     ]
 
     # Get model from config
-    model = config.get("model", "gemini-2.5-pro")
+    model = config.get("breakdown_model", config.get("model", "gemini-2.5-pro"))
     
     # Get default config from client and modify for JSON response  
     generation_config = client.get_default_config(temperature=0.1)

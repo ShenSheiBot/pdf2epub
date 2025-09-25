@@ -15,7 +15,7 @@ from loguru import logger
 import tiktoken
 
 from .base import BaseMarkdownProcessor
-from .utils.truncation import NGramTruncationDetector
+from .utils.truncation import NGramTruncationDetector, LLMTruncationDetector
 from .utils.content_splitter import split_content
 from .utils.image_restore import restore_lost_images
 
@@ -73,11 +73,17 @@ class PolishProcessor(BaseMarkdownProcessor):
         # Check if book has global notes chapter
         self.use_global_footnotes = self._has_notes_chapter()
         
-        # Initialize truncation detector
-        self.truncation_detector = NGramTruncationDetector(
+        # Initialize truncation detectors
+        self.ngram_detector = NGramTruncationDetector(
             min_unique_preserved_ratio=0.60,
             allow_deduplication=True
         )
+        self.llm_detector = LLMTruncationDetector(
+            llm_client=self.llm_client,
+            num_lines=5  # Check last 5 lines for polishing completion
+        )
+        # Use self as the composite detector (we'll implement detect method)
+        self.truncation_detector = self
         
         # Thread lock for progress updates
         self.progress_lock = threading.Lock()
@@ -362,7 +368,12 @@ class PolishProcessor(BaseMarkdownProcessor):
         valid_parts = [p for p in polished_parts if p]
         if not valid_parts:
             raise ValueError("All parts failed to process")
-        
+
+        # If not all parts are valid and we're not using fallback, fail the entire file
+        if not all_parts_valid and not self.skip_truncation_check and not self.use_longest_on_failure:
+            failed_parts = [i+1 for i, p in enumerate(polished_parts) if not p]
+            raise ValueError(f"Parts {failed_parts} failed validation and use_longest_on_failure=False")
+
         # Return combined content
         if len(valid_parts) == 1:
             return valid_parts[0]
@@ -370,6 +381,77 @@ class PolishProcessor(BaseMarkdownProcessor):
             # Join parts with double newlines
             return "\n\n".join(valid_parts)
     
+    def detect(
+        self,
+        original: str,
+        processed: str,
+        **kwargs
+    ) -> Tuple[bool, str, Dict]:
+        """
+        Composite truncation detection with LLM fallback.
+
+        First tries n-gram detection, then falls back to LLM verdict
+        if n-gram detection suggests truncation due to unique content loss.
+        """
+        # First try n-gram detection
+        is_truncated, reason, details = self.ngram_detector.detect(
+            original=original,
+            processed=processed
+        )
+
+        # If n-gram detector says it's truncated due to unique content loss, try LLM as fallback
+        if is_truncated and "unique content lost" in reason.lower():
+            logger.info("N-gram detector flagged truncation, checking with LLM verdict...")
+
+            try:
+                # Use cheapest model for LLM check
+                from ..utils.model_utils import get_cheapest_model_configs
+                cheapest_models = get_cheapest_model_configs(
+                    self.llm_client.config,
+                    max_models=1
+                )
+
+                if not cheapest_models:
+                    cheapest_models = [
+                        {"provider": "gemini", "model": "gemini-2.0-flash", "max_retries": 1}
+                    ]
+
+                # Try the LLM truncation detector
+                llm_is_truncated, llm_reason, llm_details = self.llm_detector.detect(
+                    original=original,
+                    processed=processed
+                )
+
+                if not llm_is_truncated:
+                    # LLM says it's complete, override n-gram detector
+                    logger.info("LLM verdict: Content is complete despite n-gram concerns")
+                    details['llm_verdict'] = 'complete'
+                    details['llm_override'] = True
+                    return False, "LLM verified content is complete (n-gram override)", details
+                else:
+                    # LLM agrees it's truncated
+                    details['llm_verdict'] = 'truncated'
+                    return True, f"{reason} (LLM confirmed)", details
+
+            except Exception as e:
+                logger.warning(f"LLM verdict check failed: {e}")
+                details['llm_error'] = str(e)
+                # Fall back to original n-gram result
+                return is_truncated, reason, details
+
+        # If n-gram says it's complete, trust it
+        return is_truncated, reason, details
+
+    def get_summary(self, is_truncated: bool, reason: str, details: Dict) -> str:
+        """Get summary of truncation detection."""
+        # Use n-gram detector's summary method if available
+        if hasattr(self.ngram_detector, 'get_summary'):
+            summary = self.ngram_detector.get_summary(is_truncated, reason, details)
+            if details.get('llm_verdict'):
+                summary += f"\n  LLM verdict: {details['llm_verdict']}"
+            return summary
+        return reason
+
     def validate_output(
         self,
         original: str,
@@ -415,7 +497,7 @@ class PolishProcessor(BaseMarkdownProcessor):
 
         if self.polish_models:
             # Check if any model has limited context
-            limited_model_patterns = ["flash", "haiku", "-mini", "seek"]
+            limited_model_patterns = ["haiku", "-mini", "seek"]
 
             has_limited_model = any(
                 any(pattern in model_config.get("model", "").lower()
@@ -541,14 +623,36 @@ class PolishProcessor(BaseMarkdownProcessor):
         """
         # Create the polishing prompt with content for auto-detection
         prompt = self._create_polish_prompt(
-            chapter_name, part_idx, total_parts, part_content, file_name, previous_part_context
+            chapter_name, part_idx, total_parts, part_content, file_name, previous_part_context=None  # Don't include context in prompt
         )
 
         # Create multi-part content for the LLM
-        multi_part_content = [
-            {"type": "text", "text": prompt},
-            {"type": "text", "text": part_content}
-        ]
+        if previous_part_context and part_idx > 1:
+            # Structure as a proper conversation with roles
+            # Build the user content for the previous part
+            prev_user_content = [
+                {"type": "text", "text": prompt + "\n\nContent to polish (part " + str(part_idx-1) + "/" + str(total_parts) + "):"},
+                {"type": "text", "text": previous_part_context['original']}  # Full previous original content
+            ]
+
+            # Build the current user content
+            current_user_content = [
+                {"type": "text", "text": f"Now polish part {part_idx}/{total_parts} (continuation of the same chapter).\n\nIMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2). Convert any # (H1) headings to ## (H2).\n\nContent to polish:"},
+                {"type": "text", "text": part_content}
+            ]
+
+            # Create conversation history with roles
+            multi_part_content = [
+                {"role": "user", "content": prev_user_content},
+                {"role": "assistant", "content": previous_part_context['polished']},  # Full previous polished content
+                {"role": "user", "content": current_user_content}
+            ]
+        else:
+            # No previous context, use standard format
+            multi_part_content = [
+                {"type": "text", "text": prompt},
+                {"type": "text", "text": part_content}
+            ]
 
         # Create operation name for logging
         if total_parts > 1:
@@ -562,12 +666,25 @@ class PolishProcessor(BaseMarkdownProcessor):
             def validator(response: str) -> Tuple[bool, str]:
                 # Clean the response before validation
                 cleaned_response = self.clean_markdown_response(response)
-                # Use the existing validate_output method
-                return self.validate_output(
+
+                # Validate the output
+                is_valid, reason = self.validate_output(
                     original=part_content,
                     processed=cleaned_response,
                     file_name=f"{file_name} part {part_idx}/{total_parts}" if total_parts > 1 else file_name
                 )
+
+                # If validation fails (truncation detected), save the truncated output for debugging
+                if not is_valid and "truncat" in reason.lower():
+                    self._save_truncated_output(
+                        file_name=file_name,
+                        part_idx=part_idx,
+                        total_parts=total_parts,
+                        content=cleaned_response,
+                        reason=reason
+                    )
+
+                return is_valid, reason
 
         try:
             # Use the new generate_with_validation method
@@ -609,11 +726,30 @@ class PolishProcessor(BaseMarkdownProcessor):
         output_dir = Path(self.output_dir)
         base_name = Path(file_name).stem
         part_file = output_dir / f"{base_name}.part{part_idx}.md"
-        
+
         with open(part_file, 'w', encoding='utf-8') as f:
             f.write(content)
-        
+
         logger.debug(f"Saved part file: {part_file.name}")
+
+    def _save_truncated_output(self, file_name: str, part_idx: int, total_parts: int, content: str, reason: str) -> None:
+        """Save truncated output for debugging purposes."""
+        output_dir = Path(self.output_dir)
+        truncated_dir = output_dir / "truncated_outputs"
+        truncated_dir.mkdir(exist_ok=True)
+
+        base_name = Path(file_name).stem
+        if total_parts > 1:
+            truncated_file = truncated_dir / f"{base_name}.part{part_idx}_TRUNCATED.md"
+        else:
+            truncated_file = truncated_dir / f"{base_name}_TRUNCATED.md"
+
+        # Save the truncated content with metadata
+        with open(truncated_file, 'w', encoding='utf-8') as f:
+            f.write(f"<!-- TRUNCATION DETECTED: {reason} -->\n\n")
+            f.write(content)
+
+        logger.warning(f"Saved truncated output for debugging: {truncated_file.name}")
     
     def _update_part_progress(self, file_name: str, part_idx: int, total_parts: int, success: bool, part_content: str = None) -> None:
         """Update progress for a specific part."""

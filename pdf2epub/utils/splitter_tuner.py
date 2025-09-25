@@ -82,12 +82,12 @@ def tune_content_splitter(
     if not model_configs:
         # Default to flash model for testing
         model_configs = [
-            {"provider": "gemini", "model": "gemini-1.5-flash", "max_retries": 2}
+            {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 2}
         ]
     
     # Determine max tokens based on models (same logic as PolishProcessor)
     max_tokens_per_part = 8000  # Conservative default
-    limited_model_patterns = ["flash", "haiku", "-mini", "seek"]
+    limited_model_patterns = ["haiku", "-mini", "seek"]
     
     has_limited_model = any(
         any(pattern in model_config.get("model", "").lower() 

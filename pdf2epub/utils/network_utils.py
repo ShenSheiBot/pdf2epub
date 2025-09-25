@@ -277,16 +277,31 @@ class AnthropicClient:
         temperature: float = 0.1,
         operation_name: str = "Anthropic API call"
     ) -> str:
-        """Generate content with automatic retry for transient errors."""
+        """Generate content with automatic retry for transient errors.
+
+        Args:
+            prompt: Can be:
+                - str: Simple text prompt
+                - List[Dict]: Either content blocks or messages with roles
+                  - Content blocks: [{"type": "text", "text": "..."}]
+                  - Messages: [{"role": "user"|"assistant", "content": "..."}]
+        """
         logger.info(f"Calling Anthropic API for {operation_name}")
-        
-        # Process content for images
-        content = self._process_content(prompt)
-        
+
+        # Check if prompt is a list of messages with roles
+        messages = None
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict) and "role" in prompt[0]:
+            # It's a conversation history with roles
+            messages = prompt
+        else:
+            # Process content for images and create single user message
+            content = self._process_content(prompt)
+            messages = [{"role": "user", "content": content}]
+
         # Create message with streaming
         stream = self.client.messages.create(
             model=model,
-            messages=[{"role": "user", "content": content}],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=True

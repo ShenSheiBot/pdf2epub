@@ -12,6 +12,7 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 from loguru import logger
 from .utils.logging_config import configure_logging
+from .ocr_backends import ocr_pdf_chunk_mistral, ocr_pdf_chunk_vertex
 from .utils.common import load_config, load_book_structure
 from .pdf_compressor import compress_pdf
 
@@ -122,35 +123,80 @@ def split_chapter_ranges(start_page: int, end_page: int, max_pages: int = 25) ->
 
 
 def ocr_pdf_chunk(
-    pdf_bytes: bytes, 
-    session: AuthorizedSession, 
-    project_id: str, 
-    location: str,
+    pdf_bytes: bytes,
+    session: AuthorizedSession = None,
+    project_id: str = None,
+    location: str = None,
     chunk_info: str = "",
     images_dir: Path = None,
     chapter_index: int = 1,
     image_counter: int = 0,
     max_retries: int = 5,
-    initial_backoff: float = 1.0
+    initial_backoff: float = 4.0,
+    backend: str = "vertex",
+    api_key: str = None
 ) -> Tuple[str, List[Dict], int]:
-    """OCR a PDF chunk using Mistral OCR API with exponential backoff for rate limits.
-    
+    """OCR a PDF chunk using selected backend (Vertex AI or Mistral API).
+
+    Routes to the appropriate backend based on configuration.
+
     Args:
         pdf_bytes: PDF content as bytes
-        session: Authorized session for API calls
-        project_id: GCP project ID
-        location: GCP location
+        session: Authorized session for Vertex AI (required for vertex backend)
+        project_id: GCP project ID (required for vertex backend)
+        location: GCP location (required for vertex backend)
         chunk_info: Description of the chunk being processed
         images_dir: Directory to save extracted images
         chapter_index: Chapter number for image naming
         image_counter: Starting counter for image numbering
         max_retries: Maximum number of retry attempts for 429 errors
         initial_backoff: Initial backoff time in seconds
-    
+        backend: OCR backend to use ('vertex' or 'mistral')
+        api_key: Mistral API key (required for mistral backend)
+
     Returns:
         Tuple of (markdown_content, images_info, updated_image_counter)
     """
-    
+
+    # Route to appropriate backend
+    if backend == "mistral":
+        if not api_key:
+            raise ValueError("Mistral API key is required for mistral backend")
+
+        return ocr_pdf_chunk_mistral(
+            pdf_bytes=pdf_bytes,
+            api_key=api_key,
+            chunk_info=chunk_info,
+            images_dir=images_dir,
+            chapter_index=chapter_index,
+            image_counter=image_counter,
+            max_retries=max_retries,
+            initial_backoff=initial_backoff
+        )
+
+    elif backend == "vertex":
+        if not session or not project_id or not location:
+            raise ValueError("session, project_id, and location are required for vertex backend")
+
+        return ocr_pdf_chunk_vertex(
+            pdf_bytes=pdf_bytes,
+            session=session,
+            project_id=project_id,
+            location=location,
+            chunk_info=chunk_info,
+            images_dir=images_dir,
+            chapter_index=chapter_index,
+            image_counter=image_counter,
+            max_retries=max_retries,
+            initial_backoff=initial_backoff
+        )
+
+    else:
+        raise ValueError(f"Unknown OCR backend: {backend}")
+
+    # The original Vertex AI implementation follows below
+    # This code is now unreachable but kept for reference
+
     # Check size and compress if needed
     size_mb = len(pdf_bytes) / (1024 * 1024)
     logger.debug(f"PDF size for {chunk_info}: {size_mb:.2f}MB")
@@ -310,13 +356,15 @@ def process_chapter(
     chapter: Dict,
     chapter_index: int,
     pdf_path: Path,
-    session: AuthorizedSession,
-    project_id: str,
-    location: str,
-    output_dir: Path,
+    session: AuthorizedSession = None,
+    project_id: str = None,
+    location: str = None,
+    output_dir: Path = None,
     images_dir: Path = None,
     max_pages: int = 30,
-    max_size_mb: float = 20.0
+    max_size_mb: float = 20.0,
+    backend: str = "vertex",
+    api_key: str = None
 ) -> None:
     """Process a chapter at the chapter level.
     Treats the entire chapter as one unit, regardless of subchapter boundaries.
@@ -363,7 +411,8 @@ def process_chapter(
         markdown, images, image_counter = ocr_pdf_chunk(
             pdf_bytes, session, project_id, location, chunk_info,
             images_dir, chapter_index, image_counter,
-            max_retries=5, initial_backoff=2.0
+            max_retries=5, initial_backoff=4.0,
+            backend=backend, api_key=api_key
         )
 
         markdown_parts.append(markdown)
@@ -404,7 +453,8 @@ def process_chapter(
                     sub_markdown, sub_images, image_counter = ocr_pdf_chunk(
                         sub_pdf_bytes, session, project_id, location, sub_info,
                         images_dir, chapter_index, image_counter,
-                        max_retries=5, initial_backoff=2.0
+                        max_retries=5, initial_backoff=4.0,
+                        backend=backend, api_key=api_key
                     )
 
                     markdown_parts.append(sub_markdown)
@@ -413,7 +463,8 @@ def process_chapter(
                 chunk_markdown, chunk_images, image_counter = ocr_pdf_chunk(
                     pdf_bytes, session, project_id, location, chunk_info,
                     images_dir, chapter_index, image_counter,
-                    max_retries=5, initial_backoff=2.0
+                    max_retries=5, initial_backoff=4.0,
+                    backend=backend, api_key=api_key
                 )
 
                 markdown_parts.append(chunk_markdown)
@@ -455,13 +506,15 @@ def process_matter_pages(
     start_page: int,
     end_page: int,
     pdf_path: Path,
-    session: AuthorizedSession,
-    project_id: str,
-    location: str,
-    output_dir: Path,
-    images_dir: Path,
-    matter_type: str,
-    max_pages: int = 30
+    session: AuthorizedSession = None,
+    project_id: str = None,
+    location: str = None,
+    output_dir: Path = None,
+    images_dir: Path = None,
+    matter_type: str = "front",
+    max_pages: int = 30,
+    backend: str = "vertex",
+    api_key: str = None
 ) -> None:
     """Process front matter or back matter pages.
     
@@ -500,7 +553,8 @@ def process_matter_pages(
         markdown, images, image_counter = ocr_pdf_chunk(
             pdf_bytes, session, project_id, location, chunk_info,
             images_dir, 0, image_counter,  # Use 0 as chapter index for matter pages
-            max_retries=5, initial_backoff=2.0
+            max_retries=5, initial_backoff=4.0,
+            backend=backend, api_key=api_key
         )
         markdown_parts.append(markdown)
     
@@ -552,30 +606,52 @@ def main():
     progress_file = output_dir / "ocr_progress.json"
     progress = load_or_create_progress(progress_file, structure)
     
-    # Setup Google Cloud authentication
-    sa_key_path = config.get("service_account_key_path", "sa-keys.json")
-    
-    if not Path(sa_key_path).exists():
-        raise FileNotFoundError(f"Service account key file not found: {sa_key_path}")
-    
-    # Load project ID from service account JSON
-    with open(sa_key_path, "r") as f:
-        sa_key_data = json.load(f)
-    
-    project_id = sa_key_data.get("project_id")
-    if not project_id:
-        raise ValueError(f"No project_id found in service account key file: {sa_key_path}")
-    
-    location = config.get("gcp_location", "us-central1")
-    
-    logger.info(f"Using GCP project: {project_id}, location: {location}")
-    
-    # Create authenticated session
-    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
-    credentials = service_account.Credentials.from_service_account_file(
-        sa_key_path, scopes=scopes
-    )
-    session = AuthorizedSession(credentials)
+    # Determine OCR backend
+    ocr_backend = config.get("ocr_backend", "vertex").lower()
+    logger.info(f"Using OCR backend: {ocr_backend}")
+
+    # Setup backend-specific configuration
+    session = None
+    project_id = None
+    location = None
+    api_key = None
+
+    if ocr_backend == "vertex":
+        # Setup Google Cloud authentication
+        sa_key_path = config.get("service_account_key_path", "sa-keys.json")
+
+        if not Path(sa_key_path).exists():
+            raise FileNotFoundError(f"Service account key file not found: {sa_key_path}")
+
+        # Load project ID from service account JSON
+        with open(sa_key_path, "r") as f:
+            sa_key_data = json.load(f)
+
+        project_id = sa_key_data.get("project_id")
+        if not project_id:
+            raise ValueError(f"No project_id found in service account key file: {sa_key_path}")
+
+        location = config.get("gcp_location", "us-central1")
+
+        logger.info(f"Using GCP project: {project_id}, location: {location}")
+
+        # Create authenticated session
+        scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+        credentials = service_account.Credentials.from_service_account_file(
+            sa_key_path, scopes=scopes
+        )
+        session = AuthorizedSession(credentials)
+
+    elif ocr_backend == "mistral":
+        # Get Mistral API key
+        api_key = config.get("mistral_api_key")
+        if not api_key:
+            raise ValueError("mistral_api_key not found in config.yaml")
+
+        logger.info(f"Using Mistral API with key: {api_key[:8]}...")
+
+    else:
+        raise ValueError(f"Unknown OCR backend: {ocr_backend}. Use 'vertex' or 'mistral'")
     
     # Determine PDF path
     if args.input:
@@ -618,7 +694,9 @@ def main():
                     output_dir,
                     images_dir,
                     "front",
-                    args.max_pages
+                    args.max_pages,
+                    backend=ocr_backend,
+                    api_key=api_key
                 )
                 
                 # Update progress
@@ -649,7 +727,9 @@ def main():
                 location,
                 output_dir,
                 images_dir,
-                args.max_pages
+                args.max_pages,
+                backend=ocr_backend,
+                api_key=api_key
             )
             
             # Update progress
@@ -679,7 +759,9 @@ def main():
                     output_dir,
                     images_dir,
                     "back",
-                    args.max_pages
+                    args.max_pages,
+                    backend=ocr_backend,
+                    api_key=api_key
                 )
                 
                 # Update progress

@@ -352,19 +352,38 @@ class LLMClient:
         operation_name: str
     ) -> str:
         """Generate content with Gemini, handling retries internally."""
-        
+
         # Convert prompt format for Gemini
+        contents = None
         if isinstance(prompt, list):
-            # Convert from Anthropic-style format to Gemini format
-            contents = []
-            for part in prompt:
-                if isinstance(part, dict):
-                    if part.get("type") == "text":
-                        contents.append({"text": part["text"]})
+            # Check if it's a conversation history with roles
+            if prompt and isinstance(prompt[0], dict) and "role" in prompt[0]:
+                # Convert conversation history to Gemini format
+                # Gemini uses a different format for conversations
+                from google.genai.types import Content, Part
+                contents = []
+                for msg in prompt:
+                    role = "user" if msg["role"] == "user" else "model"
+                    if isinstance(msg["content"], str):
+                        contents.append(Content(role=role, parts=[Part(text=msg["content"])]))
+                    elif isinstance(msg["content"], list):
+                        # Handle multi-part content
+                        parts = []
+                        for part in msg["content"]:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                parts.append(Part(text=part["text"]))
+                        contents.append(Content(role=role, parts=parts))
+            else:
+                # Convert from Anthropic-style format to Gemini format
+                contents = []
+                for part in prompt:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            contents.append({"text": part["text"]})
+                        else:
+                            contents.append(part)
                     else:
                         contents.append(part)
-                else:
-                    contents.append(part)
         else:
             contents = prompt
         

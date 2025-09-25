@@ -83,7 +83,7 @@ class BaseLLMSplitter(ContentSplitter):
     def __init__(self, llm_client, model_configs: Optional[List[Dict]] = None):
         self.llm_client = llm_client
         self.model_configs = model_configs or [
-            {"provider": "gemini", "model": "gemini-1.5-flash", "max_retries": 2}
+            {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 2}
         ]
 
     @abstractmethod

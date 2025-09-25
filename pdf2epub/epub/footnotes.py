@@ -66,7 +66,11 @@ class FootnoteManager:
         # For occurrence-based mapping in GLOBAL mode
         self.reference_occurrence_count: Dict[Tuple[str, str], int] = {}  # (key, chapter) -> occurrence number
         self.definition_by_occurrence: Dict[Tuple[str, int], FootnoteDefinition] = {}  # (key, occurrence_num) -> definition
-        
+
+        # For LOCAL mode with multi-part chapters
+        self.local_chapter_groups: Dict[str, List[str]] = {}  # base_chapter -> list of part files
+        self.local_occurrence_mapping: Dict[str, Dict] = {}  # base_chapter -> occurrence mappings
+
         # Analyze the footnote structure
         self._analyze_footnote_structure()
     
@@ -103,17 +107,22 @@ class FootnoteManager:
         for md_file in filtered_files:
             self._scan_file_for_footnotes(md_file)
         
+        # Build chapter groups for multi-part handling
+        self._build_chapter_groups(filtered_files)
+
         # Determine style based on the pattern
         self._determine_footnote_style()
-        
-        # If force_global, identify primary definition chapters
-        if self.force_global:
-            self._identify_primary_definition_chapters()
-        
-        # Build occurrence mapping for all global styles
-        if self.style == FootnoteStyle.GLOBAL:
+
+        # Build appropriate mappings based on style
+        if self.style == FootnoteStyle.LOCAL:
+            self._build_local_occurrence_mappings()
+        elif self.style == FootnoteStyle.GLOBAL:
+            # If force_global, identify primary definition chapters
+            if self.force_global:
+                self._identify_primary_definition_chapters()
+            # Build occurrence mapping for all global styles
             self._build_occurrence_mapping()
-        
+
         # Log the analysis results
         self._log_analysis_results()
     
@@ -267,6 +276,109 @@ class FootnoteManager:
         
         logger.debug(f"Built occurrence mapping: {len(ref_counts)} unique ref keys, {len(def_counts)} unique def keys")
     
+    def _build_chapter_groups(self, files: List[Path]) -> None:
+        """
+        Build groups of files that belong to the same chapter.
+        For example, chapter_5.part1.md and chapter_5.part2.md belong to the same chapter group.
+        """
+        for file_path in files:
+            chapter_name = file_path.stem
+            # Extract base chapter name
+            base_match = re.match(r'(chapter_\d+)(?:[._]part\d+)?', chapter_name)
+            if base_match:
+                base_chapter = base_match.group(1)
+                if base_chapter not in self.local_chapter_groups:
+                    self.local_chapter_groups[base_chapter] = []
+                self.local_chapter_groups[base_chapter].append(chapter_name)
+
+        # Sort the part files within each group
+        for base_chapter in self.local_chapter_groups:
+            self.local_chapter_groups[base_chapter].sort(key=self._chapter_sort_key)
+
+        logger.debug(f"Built chapter groups: {self.local_chapter_groups}")
+
+    def _build_local_occurrence_mappings(self) -> None:
+        """
+        Build occurrence mappings for LOCAL mode with multi-part chapters using position-based mapping.
+        Maps each reference to its corresponding definition by position (1st ref -> 1st def, etc).
+        """
+        for base_chapter, part_files in self.local_chapter_groups.items():
+            if len(part_files) <= 1:
+                # Single file chapter, no cross-part references needed
+                continue
+
+            # Build position-based mapping for this chapter group
+            chapter_mapping = {
+                'reference_positions': {},  # (key, part_file, line_num) -> position
+                'definition_positions': {},  # (key, part_file, line_num) -> position
+                'position_to_definition': {},  # (key, position) -> definition
+                'reference_to_position': {},  # (key, part_file) -> position (for first ref in file)
+                # Keep legacy fields for compatibility
+                'reference_occurrence_count': {},
+                'definition_by_occurrence': {},
+            }
+
+            # Group references by key
+            refs_by_key = {}
+            for part_file in part_files:
+                if part_file in self.chapter_references:
+                    for key in self.chapter_references[part_file]:
+                        if key in self.references:
+                            if key not in refs_by_key:
+                                refs_by_key[key] = []
+                            for ref in self.references[key]:
+                                if ref.chapter == part_file:
+                                    refs_by_key[key].append((part_file, ref.line_num))
+
+            # Sort references within each key and assign positions
+            for key in refs_by_key:
+                refs_by_key[key].sort(key=lambda x: (self._chapter_sort_key(x[0]), x[1]))
+                for position, (part_file, line_num) in enumerate(refs_by_key[key], 1):
+                    chapter_mapping['reference_positions'][(key, part_file, line_num)] = position
+                    # Store first occurrence for each part file (for get_footnote_html)
+                    if (key, part_file) not in chapter_mapping['reference_to_position']:
+                        chapter_mapping['reference_to_position'][(key, part_file)] = position
+                    # Legacy field
+                    chapter_mapping['reference_occurrence_count'][(key, part_file)] = position
+
+            # Group definitions by key
+            defs_by_key = {}
+            for part_file in part_files:
+                if part_file in self.chapter_definitions:
+                    for key in self.chapter_definitions[part_file]:
+                        if key in self.definitions:
+                            if key not in defs_by_key:
+                                defs_by_key[key] = []
+                            for defn in self.definitions[key]:
+                                if defn.chapter == part_file:
+                                    defs_by_key[key].append(defn)
+
+            # Sort definitions within each key and assign positions
+            for key in defs_by_key:
+                defs_by_key[key].sort(key=lambda x: (self._chapter_sort_key(x.chapter), x.line_num))
+                for position, defn in enumerate(defs_by_key[key], 1):
+                    chapter_mapping['definition_positions'][(key, defn.chapter, defn.line_num)] = position
+                    chapter_mapping['position_to_definition'][(key, position)] = defn
+                    # Legacy field
+                    chapter_mapping['definition_by_occurrence'][(key, position)] = defn
+
+            # Validate ref/def counts match
+            unique_ref_keys = set(refs_by_key.keys())
+            unique_def_keys = set(defs_by_key.keys())
+            for key in unique_ref_keys | unique_def_keys:
+                ref_count = len(refs_by_key.get(key, []))
+                def_count = len(defs_by_key.get(key, []))
+                if ref_count != def_count:
+                    logger.warning(
+                        f"Footnote count mismatch in {base_chapter} for [{key}]: "
+                        f"{ref_count} references, {def_count} definitions"
+                    )
+
+            self.local_occurrence_mapping[base_chapter] = chapter_mapping
+            total_refs = sum(len(refs) for refs in refs_by_key.values())
+            total_defs = sum(len(defs) for defs in defs_by_key.values())
+            logger.debug(f"Built position-based mapping for {base_chapter}: {total_refs} refs, {total_defs} defs")
+
     def _chapter_sort_key(self, chapter_name: str) -> tuple:
         """
         Generate a sort key for chapter names to maintain proper order.
@@ -404,17 +516,53 @@ class FootnoteManager:
     def get_footnote_html(self, key: str, source_chapter: str) -> Optional[str]:
         """
         Get the HTML for a footnote reference.
-        
+
         Args:
             key: The footnote key (e.g., "1", "note")
             source_chapter: The chapter containing the reference
-            
+
         Returns:
             HTML string for the footnote reference, or None if not found
         """
         if self.style == FootnoteStyle.LOCAL:
-            # Use local anchors within the same file
-            return f'<sup id="fnref{key}"><a class="footnote-ref" href="#fn:{key}">[{key}]</a></sup>'
+            # Check if this chapter is part of a multi-part chapter
+            base_match = re.match(r'(chapter_\d+)(?:[._]part\d+)?', source_chapter)
+            if base_match:
+                base_chapter = base_match.group(1)
+
+                # Check if this is a multi-part chapter with local mappings
+                if base_chapter in self.local_occurrence_mapping and len(self.local_chapter_groups.get(base_chapter, [])) > 1:
+                    # Multi-part chapter - use occurrence-based mapping
+                    chapter_mapping = self.local_occurrence_mapping[base_chapter]
+                    occurrence_num = chapter_mapping['reference_occurrence_count'].get((key, source_chapter))
+
+                    if occurrence_num and (key, occurrence_num) in chapter_mapping['definition_by_occurrence']:
+                        definition = chapter_mapping['definition_by_occurrence'][(key, occurrence_num)]
+                        target_chapter = definition.chapter
+
+                        if target_chapter == source_chapter:
+                            # Same file, use local anchor with unique ID
+                            fnref_id = f"fnref-{source_chapter}-{key}"
+                            # Use file name even for same-file references in LOCAL style, with occurrence number
+                            source_chapter_html = source_chapter.replace('.part', '_part')
+                            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_chapter_html}.html#fn:{key}:{occurrence_num}">[{key}]</a></sup>'
+                        else:
+                            # Cross-part reference within the same chapter
+                            fn_id = f"fn:{key}:{occurrence_num}"
+                            fnref_id = f"fnref-{source_chapter}-{key}"
+                            # Fix chapter name for split chapters (e.g., chapter_19.part1 -> chapter_19_part1)
+                            html_target = target_chapter.replace('.part', '_part')
+                            return (
+                                f'<sup id="{fnref_id}">'
+                                f'<a class="footnote-ref" href="{html_target}.html#{fn_id}">[{key}]</a>'
+                                f'</sup>'
+                            )
+
+            # Single file chapter or no multi-part mapping - still use file name for consistency
+            fnref_id = f"fnref-{source_chapter}-{key}"
+            source_chapter_html = source_chapter.replace('.part', '_part')
+            # For single-file chapters, occurrence is always 1
+            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_chapter_html}.html#fn:{key}:1">[{key}]</a></sup>'
         
         # Global style: find where the footnote is defined using occurrence mapping
         if key in self.definitions:
@@ -441,26 +589,51 @@ class FootnoteManager:
             target_chapter = definition.chapter
             
             if target_chapter == source_chapter:
-                # Same file, use local anchor
-                return f'<sup id="fnref{key}"><a class="footnote-ref" href="#fn:{key}">[{key}]</a></sup>'
+                # Same file reference - still use file name for consistency
+                fnref_id = f"fnref-{source_chapter}-{key}"
+                # Use file name even for same-file references, with occurrence number
+                html_target = source_chapter.replace('.part', '_part')
+                # Use occurrence number if available, otherwise default to 1
+                occ_num = occurrence_num if occurrence_num else 1
+                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}.html#fn:{key}:{occ_num}">[{key}]</a></sup>'
             else:
-                # Cross-file reference - use occurrence-based ID
-                # Get the occurrence number from the mapping
-                occurrence_num = self.reference_occurrence_count.get((key, source_chapter), 1)
-                fn_id = f"fn:{key}:{occurrence_num}"
-                
+                # Cross-file reference in LOCAL mode with multi-part chapters
+                # Use position-based mapping to find the correct occurrence number
+                base_source = re.match(r'(chapter_\d+)(?:[._]part\d+)?', source_chapter)
+                base_source_chapter = base_source.group(1) if base_source else source_chapter
+
+                if base_source_chapter in self.local_occurrence_mapping:
+                    mapping = self.local_occurrence_mapping[base_source_chapter]
+
+                    # Use new position-based mapping if available
+                    if 'reference_to_position' in mapping:
+                        # Get the position for this reference
+                        ref_position = mapping['reference_to_position'].get((key, source_chapter), 1)
+                        fn_id = f"fn:{key}:{ref_position}"
+                    else:
+                        # Fallback to legacy mapping
+                        ref_occurrence = mapping['reference_occurrence_count'].get((key, source_chapter), 1)
+                        fn_id = f"fn:{key}:{ref_occurrence}"
+                else:
+                    # Fallback for non-mapped chapters
+                    fn_id = f"fn:{key}:1"
+                    logger.debug(f"No mapping found for {base_source_chapter}, using default ID")
+
+                fnref_id = f"fnref-{source_chapter}-{key}"
+
                 # Fix chapter name for split chapters (e.g., chapter_19.part1 -> chapter_19_part1)
                 html_target = target_chapter.replace('.part', '_part')
-                
+
                 return (
-                    f'<sup id="fnref{key}">'
+                    f'<sup id="{fnref_id}">'
                     f'<a class="footnote-ref" href="{html_target}.html#{fn_id}">[{key}]</a>'
                     f'</sup>'
                 )
-        
-        # Footnote not found - return a plain reference
+
+        # Footnote not found - return a plain reference with unique ID
         logger.warning(f"Footnote '{key}' referenced in {source_chapter} but not defined")
-        return f'<sup>[{key}]</sup>'
+        fnref_id = f"fnref-{source_chapter}-{key}"
+        return f'<sup id="{fnref_id}">[{key}]</sup>'
     
     def get_definition_content(self, key: str) -> Optional[str]:
         """

@@ -271,6 +271,144 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
     return preprocess_footnotes(markdown_content, footnote_manager, source_chapter)
 
 
+def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_chapter: str) -> str:
+    """
+    Process footnotes in LOCAL mode with multi-part chapter support.
+
+    Handles footnotes within a chapter, including cross-part references.
+
+    Args:
+        markdown_content: The markdown text to process
+        footnote_manager: FootnoteManager instance in LOCAL mode
+        source_chapter: The source chapter name for footnote linking
+
+    Returns:
+        Processed markdown with HTML footnote links
+    """
+    import re
+    from loguru import logger
+
+    lines = markdown_content.split('\n')
+    processed_lines = []
+
+    # Extract base chapter name
+    base_match = re.match(r'(chapter_\d+)(?:[._]part\d+)?', source_chapter)
+    base_chapter = base_match.group(1) if base_match else source_chapter
+
+    # Check if this is a multi-part chapter
+    is_multi_part = False
+    local_mapping = None
+    if base_chapter in footnote_manager.local_occurrence_mapping:
+        chapter_parts = footnote_manager.local_chapter_groups.get(base_chapter, [])
+        if len(chapter_parts) > 1:
+            is_multi_part = True
+            local_mapping = footnote_manager.local_occurrence_mapping[base_chapter]
+            logger.debug(f"Processing {source_chapter} as part of multi-part chapter {base_chapter}")
+
+    # Process each line
+    for line in lines:
+        # Check for footnote definition [^key]:
+        def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+        if def_match:
+            fn_key = def_match.group(1)
+            fn_text = def_match.group(2)
+
+            if is_multi_part and local_mapping:
+                # For multi-part chapters, use position-based mapping
+                # Find the position of this definition
+                occurrence_num = None
+
+                # Look up this definition's position directly
+                if 'definition_positions' in local_mapping:
+                    # Find this specific definition by matching chapter and line number
+                    for (key, chapter, line_num), position in local_mapping['definition_positions'].items():
+                        if key == fn_key and chapter == source_chapter:
+                            # We found a definition for this key in this chapter
+                            # Use its position as the occurrence number
+                            occurrence_num = position
+                            break
+
+                # Fallback to legacy mapping if new fields not available
+                if occurrence_num is None and 'definition_by_occurrence' in local_mapping:
+                    for key, defn in local_mapping['definition_by_occurrence'].items():
+                        if key[0] == fn_key and defn.chapter == source_chapter:
+                            occurrence_num = key[1]
+                            break
+
+                # If still not found, default to 1
+                if occurrence_num is None:
+                    occurrence_num = 1
+                    logger.debug(f"Using default occurrence 1 for footnote {fn_key} in {source_chapter}")
+
+                fn_id = f"fn:{fn_key}:{occurrence_num}"
+
+                # Find which part file(s) have references to this footnote
+                ref_chapters = []
+                for ref_key, ref_chapter in local_mapping['reference_occurrence_count'].keys():
+                    if ref_key == fn_key:
+                        # Check if this reference occurrence maps to this definition
+                        ref_occurrence = local_mapping['reference_occurrence_count'][(ref_key, ref_chapter)]
+                        if (fn_key, ref_occurrence) in local_mapping['definition_by_occurrence']:
+                            mapped_def = local_mapping['definition_by_occurrence'][(fn_key, ref_occurrence)]
+                            if mapped_def.chapter == source_chapter:
+                                if ref_chapter not in ref_chapters:
+                                    ref_chapters.append(ref_chapter)
+
+                # Generate backref link with unique ID - always use file name for consistency
+                if ref_chapters:
+                    # Link back to the first referencing chapter
+                    backref_chapter = ref_chapters[0]
+                    fnref_id = f"fnref-{backref_chapter}-{fn_key}"
+                    # Always use file name, even for same-file backrefs
+                    backref_chapter_html = backref_chapter.replace('.part', '_part')
+                    backref_link = f"{backref_chapter_html}.html#{fnref_id}"
+                else:
+                    # Fallback - still use file name
+                    fnref_id = f"fnref-{source_chapter}-{fn_key}"
+                    source_chapter_html = source_chapter.replace('.part', '_part')
+                    backref_link = f"{source_chapter_html}.html#{fnref_id}"
+            else:
+                # Single-part chapter, use simple ID with unique prefix
+                fn_id = f"fn:{fn_key}"
+                fnref_id = f"fnref-{source_chapter}-{fn_key}"
+                # Use file name even for single-part chapters
+                source_chapter_html = source_chapter.replace('.part', '_part')
+                backref_link = f"{source_chapter_html}.html#{fnref_id}"
+
+            # Convert to HTML footnote definition (using same format as GLOBAL mode)
+            processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
+            processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text} <a class="footnote-backref" href="{backref_link}" title="Jump back to footnote {fn_key} in the text">↩</a></p>')
+            processed_lines.append('</div>')
+        else:
+            # Process footnote references [^key]
+            def replace_ref(match):
+                fn_key = match.group(1)
+
+                if is_multi_part and local_mapping:
+                    # Get the HTML from FootnoteManager for cross-part references
+                    html = footnote_manager.get_footnote_html(fn_key, source_chapter)
+                    if html:
+                        # Extract just the inner HTML (remove the outer sup tags if we're replacing inline)
+                        # The get_footnote_html already returns the full HTML we need
+                        return html
+
+                # Default local reference - use file name for consistency
+                fnref_id = f"fnref-{source_chapter}-{fn_key}"
+                source_chapter_html = source_chapter.replace('.part', '_part')
+                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_chapter_html}.html#fn:{fn_key}">[{fn_key}]</a></sup>'
+
+            # Replace footnote references
+            line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+
+            # Replace backticks with proper apostrophes/quotes
+            # This prevents markdown from interpreting them as code blocks
+            # Single backticks are typically used as quotes in this context
+            line = line.replace("`", "'")
+            processed_lines.append(line)
+
+    return '\n'.join(processed_lines)
+
+
 def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_chapter: str) -> str:
     """
     Process footnotes in GLOBAL mode - handles cross-chapter footnote references.
@@ -371,13 +509,16 @@ def preprocess_footnotes(markdown_content: str, footnote_manager=None, source_ch
         footnote_manager: Optional FootnoteManager for cross-chapter footnote handling  
         source_chapter: The source chapter name for footnote linking
     """
-    # Check if we should use global footnote handling
+    # Check if we should use footnote manager
     if footnote_manager and source_chapter:
         from pdf2epub.epub.footnotes import FootnoteStyle
         if footnote_manager.get_style() == FootnoteStyle.GLOBAL:
             return preprocess_footnotes_global(markdown_content, footnote_manager, source_chapter)
-    
-    # Fall back to local processing (existing logic)
+        elif footnote_manager.get_style() == FootnoteStyle.LOCAL:
+            # Use new local handler with multi-part support
+            return preprocess_footnotes_local(markdown_content, footnote_manager, source_chapter)
+
+    # Fall back to simple local processing (existing logic for backward compatibility)
     lines = markdown_content.split('\n')
     
     # First pass: find all footnote references and definitions, make them unique

@@ -167,12 +167,30 @@ def ocr_pdf_chunk_mistral(
                 f.write(img_bytes)
 
             # Replace image reference in markdown
+            # Mistral can return references in different formats:
+            # - ![img-0.jpeg](img-0.jpeg)
+            # - ![Image](img-0.jpeg)
+            # - ![](img-0.jpeg)
             img_id = img_info['id']
-            old_ref = f"![Image]({img_id})"
             new_ref = f"![Image](../images/{img_filename})"
-            combined_markdown = combined_markdown.replace(old_ref, new_ref)
 
-            logger.debug(f"Saved image: {img_filename}, replaced {img_id}")
+            # Try different possible formats
+            possible_refs = [
+                f"![{img_id}]({img_id})",  # ![img-0.jpeg](img-0.jpeg)
+                f"![Image]({img_id})",      # ![Image](img-0.jpeg)
+                f"![]({img_id})",           # ![](img-0.jpeg)
+            ]
+
+            replaced = False
+            for old_ref in possible_refs:
+                if old_ref in combined_markdown:
+                    combined_markdown = combined_markdown.replace(old_ref, new_ref)
+                    logger.debug(f"Saved image: {img_filename}, replaced {old_ref} with {new_ref}")
+                    replaced = True
+                    break
+
+            if not replaced:
+                logger.warning(f"Could not find reference for {img_id} in markdown")
             image_counter += 1
 
         logger.info(f"Saved {len(all_images)} images for {chunk_info}")
@@ -350,12 +368,30 @@ def ocr_pdf_chunk_vertex(
                 f.write(img_bytes)
 
             # Replace image reference in markdown
+            # Mistral can return references in different formats:
+            # - ![img-0.jpeg](img-0.jpeg)
+            # - ![Image](img-0.jpeg)
+            # - ![](img-0.jpeg)
             img_id = img_info['id']
-            old_ref = f"![Image]({img_id})"
             new_ref = f"![Image](../images/{img_filename})"
-            combined_markdown = combined_markdown.replace(old_ref, new_ref)
 
-            logger.debug(f"Saved image: {img_filename}, replaced {img_id}")
+            # Try different possible formats
+            possible_refs = [
+                f"![{img_id}]({img_id})",  # ![img-0.jpeg](img-0.jpeg)
+                f"![Image]({img_id})",      # ![Image](img-0.jpeg)
+                f"![]({img_id})",           # ![](img-0.jpeg)
+            ]
+
+            replaced = False
+            for old_ref in possible_refs:
+                if old_ref in combined_markdown:
+                    combined_markdown = combined_markdown.replace(old_ref, new_ref)
+                    logger.debug(f"Saved image: {img_filename}, replaced {old_ref} with {new_ref}")
+                    replaced = True
+                    break
+
+            if not replaced:
+                logger.warning(f"Could not find reference for {img_id} in markdown")
             image_counter += 1
 
         logger.info(f"Saved {len(all_images)} images for {chunk_info}")

@@ -388,13 +388,25 @@ def process_chapter(
     end_page = chapter["end_page"]
     subchapters = chapter.get("subchapters", [])
 
-    total_pages = end_page - start_page + 1
-    logger.info(f"Processing Chapter {chapter_index}: {chapter_title} (pages {start_page}-{end_page}, {total_pages} pages total)")
-
+    # If there are subchapters, extend the end page to include all subchapter pages
     if subchapters:
+        # Find the last page of the last subchapter
+        last_subchapter_end = max(sub["end_page"] for sub in subchapters)
+        actual_end_page = max(end_page, last_subchapter_end)
+        logger.info(f"Processing Chapter {chapter_index}: {chapter_title}")
+        logger.info(f"  Chapter header pages: {start_page}-{end_page}")
         logger.info(f"  Contains {len(subchapters)} subchapters")
+        for i, sub in enumerate(subchapters, 1):
+            logger.info(f"    Subchapter {i}: pages {sub['start_page']}-{sub['end_page']}")
+        logger.info(f"  Total pages to process: {start_page}-{actual_end_page}")
+        end_page = actual_end_page
+    else:
+        logger.info(f"Processing Chapter {chapter_index}: {chapter_title} (pages {start_page}-{end_page})")
 
-    # Process the entire chapter as one unit, regardless of subchapters
+    total_pages = end_page - start_page + 1
+    logger.info(f"  Total pages: {total_pages}")
+
+    # Process the entire chapter including all subchapters as one unit
     # Build the chapter header
     markdown_parts = [f"# {chapter_title}\n"]
     image_counter = 0

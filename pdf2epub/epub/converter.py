@@ -709,9 +709,9 @@ class ContentConverter:
             sub_title_decoded = html_module.unescape(sub_title)
 
             # Look for headings that might already have IDs from markdown conversion
-            # Try different heading levels (h2, h3, h4)
+            # Try different heading levels (h1, h2, h3, h4)
             anchor_added = False
-            for h_level in ["h2", "h3", "h4"]:
+            for h_level in ["h1", "h2", "h3", "h4"]:
                 if anchor_added:
                     break
 

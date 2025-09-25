@@ -40,15 +40,34 @@ def build_subchapter_locations(markdown_dir, parts_info):
                         lines = f.readlines()
 
                     # Find all subchapter headings in this part
+                    # We need to identify subchapters, which are:
+                    # 1. Level 2 headings (##)
+                    # 2. Level 1 headings that are NOT the main chapter title
+                    #    (e.g., "2 高强度市场中的媒体分析" or "3 理想的商品？")
+
                     for line in lines:
-                        if line.strip().startswith(
-                            "##"
-                        ) and not line.strip().startswith("###"):
+                        heading = None
+
+                        # Check for level 1 headings that look like numbered subchapters
+                        if line.strip().startswith("#") and not line.strip().startswith("##"):
+                            # Extract the heading text
+                            heading_text = re.sub(r"^#\s*", "", line).strip()
+
+                            # Check if this looks like a numbered subchapter (starts with a number)
+                            # or is clearly not a main chapter title
+                            if re.match(r"^\d+\s+", heading_text):  # Starts with number
+                                heading = heading_text
+                            elif "第" not in heading_text and "部分" not in heading_text:
+                                # Not a main part/chapter title (like "第一部分")
+                                heading = heading_text
+
+                        # Also check for level 2 headings
+                        elif line.strip().startswith("##") and not line.strip().startswith("###"):
                             # Extract the heading text
                             heading = re.sub(r"^##\s*", "", line).strip()
 
+                        if heading:
                             # Store which part this subchapter is in
-                            # We'll store multiple keys for fuzzy matching later
                             location_key = f"{chapter_index}:{heading}"
                             subchapter_locations[location_key] = {
                                 "chapter": chapter_index,
@@ -121,6 +140,7 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
         # Extract headings from files
         chapter_title = f"Chapter {chapter_num}"
         subchapters = []
+        first_h1_found = False  # Track if we've seen the first level 1 heading
 
         for file_path in files_to_read:
             try:
@@ -136,19 +156,25 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
                         if line.startswith("# ") and not line.startswith("## "):
                             # Extract title without the # marker
                             title = line[2:].strip()
-                            if title:  # Only update if not empty
-                                chapter_title = title
+                            if title:  # Only process if not empty
+                                if not first_h1_found:
+                                    # First level 1 heading becomes the chapter title
+                                    chapter_title = title
+                                    first_h1_found = True
+                                else:
+                                    # Subsequent level 1 headings become subchapters
+                                    subchapters.append({"title": title})
 
                         # Check for level 2 heading
                         elif line.startswith("## ") and not line.startswith("### "):
                             # Extract subtitle without the ## marker
                             subtitle = line[3:].strip()
-                            
+
                             # Check if it's a numbered section (like "2.3 Section Title")
                             starts_with_number = subtitle and subtitle[0].isdigit()
                             ends_with_period = subtitle and subtitle.endswith('.')
                             is_numbered_section = starts_with_number and not ends_with_period
-                            
+
                             # Include if not empty AND (not too long OR is a numbered section)
                             if subtitle and (len(subtitle) <= 50 or is_numbered_section):
                                 subchapters.append({"title": subtitle})
@@ -923,7 +949,6 @@ Original title: {epub_config.book_title}"""
     # Detect multi-part chapters for proper TOC generation
     chapters_with_parts = set()
     parts_info = {}
-    subchapter_locations = {}
 
     for chapter in structure.get("chapters", []):
         chapter_index = chapter.get("index")
@@ -935,9 +960,11 @@ Original title: {epub_config.book_title}"""
             chapters_with_parts.add(chapter_index)
             parts_info[str(chapter_index)] = len(part_files)
 
-            # Track where each subchapter is located (in which part)
-            # This would need more detailed analysis of the markdown files
-            # For now, we'll assume they're evenly distributed
+    # Build detailed subchapter location mapping BEFORE creating TOC
+    # This determines which part contains which subchapter
+    subchapter_locations = build_subchapter_locations(
+        epub_config.markdown_dir, parts_info
+    )
 
     # Create NCX TOC with multi-part info
     builder.create_toc_ncx(
@@ -998,33 +1025,13 @@ Original title: {epub_config.book_title}"""
                                     "total_parts"
                                 ]
 
-    # Update parts_info with detected parts
-    for chapter_num in parts_info:
-        parts_info[chapter_num] = parts_info_for_toc.get(
-            chapter_num, parts_info[chapter_num]
-        )
+    # Update parts_info with detected parts from progress files
+    for chapter_num in parts_info_for_toc:
+        if chapter_num not in parts_info:
+            parts_info[chapter_num] = parts_info_for_toc[chapter_num]
 
-    # Build detailed subchapter location mapping (which part contains which subchapter)
-    subchapter_locations = build_subchapter_locations(
-        epub_config.markdown_dir, parts_info
-    )
-
-    # Update TOC generation with complete info
-    builder.create_toc_ncx(
-        structure,
-        epub_config.epub_dir / "toc.ncx",
-        parts_info=parts_info,
-        chapters_with_parts=chapters_with_parts,
-        subchapter_locations=subchapter_locations,
-    )
-
-    builder.create_toc_html(
-        structure,
-        text_dir / "toc.html",
-        parts_info=parts_info,
-        chapters_with_parts=chapters_with_parts,
-        subchapter_locations=subchapter_locations,
-    )
+    # Note: subchapter_locations was already built earlier and TOC was generated
+    # No need to regenerate here
 
     # Convert markdown files to HTML with proper multi-part handling
     # Track all HTML files created for manifest and spine
@@ -1062,16 +1069,13 @@ Original title: {epub_config.book_title}"""
 
                 logger.info(f"Converting part {i} of chapter {chapter_index}")
 
-                # Get subchapters for this specific part with their original indices
-                part_subchapters = []
+                # Get ALL subchapters from the entire chapter for anchor generation
+                # We pass all subchapters to ensure anchors are generated correctly
+                # even if a subchapter appears in a different part than expected
+                all_subchapters = []
                 if chapter.get("subchapters"):
-                    # Filter subchapters that belong to this part, keeping original index
                     for j, subchapter in enumerate(chapter.get("subchapters", []), 1):
-                        location_key = f"{chapter_index}:{subchapter.get('title', '')}"
-                        if location_key in subchapter_locations:
-                            if subchapter_locations[location_key]["part"] == i:
-                                # Include the original index with the subchapter
-                                part_subchapters.append((j, subchapter.get('title', '')))
+                        all_subchapters.append((j, subchapter.get('title', '')))
 
                 # Convert this part to HTML
                 converter.convert_markdown_to_chapter_html(
@@ -1079,7 +1083,7 @@ Original title: {epub_config.book_title}"""
                     text_dir / part_output_file,
                     f"{chapter.get('title', f'Chapter {chapter_index}')} (Part {i})",
                     chapter_index=chapter_index,
-                    subchapter_info=part_subchapters,
+                    subchapter_info=all_subchapters,
                     image_mapping=image_mapping,
                 )
                 all_html_files.append(part_output_file)

@@ -45,6 +45,14 @@ def polish_command(args):
         logger.info("Loaded book structure for context-aware polishing")
     
     # Initialize the polish processor
+    # Get use_longest_on_failure from config if not explicitly set in CLI
+    validation_config = config.get('validation_strategy', {})
+    # Use config value as default, CLI flag overrides if provided
+    if hasattr(args, 'use_longest_on_failure') and args.use_longest_on_failure is not None:
+        use_longest_on_failure = args.use_longest_on_failure
+    else:
+        use_longest_on_failure = validation_config.get('use_longest_on_failure', False)
+
     processor = PolishProcessor(
         config=config,
         book_title=book_title,
@@ -53,7 +61,7 @@ def polish_command(args):
         skip_truncation_check=args.skip_truncation_check,
         polish_models=config.get("polish_models"),
         content_type=args.content_type,
-        use_longest_on_failure=args.use_longest_on_failure,
+        use_longest_on_failure=use_longest_on_failure,
         book_structure=book_structure
     )
     
@@ -333,7 +341,7 @@ def translate_command(args):
         resume=args.resume,
         translation_models=config.get("translation_models"),
         use_entities=use_entities,
-        use_longest_on_failure=args.use_longest_on_failure
+        use_longest_on_failure=args.use_longest_on_failure if args.use_longest_on_failure is not None else config.get('validation_strategy', {}).get('use_longest_on_failure', False)
     )
     
     # Process all files
@@ -475,7 +483,14 @@ Examples:
     polish_parser.add_argument(
         "--use-longest-on-failure",
         action="store_true",
-        help="Use longest response when all validation attempts fail (default: skip file)"
+        default=None,
+        help="Use longest response when all validation attempts fail (default: from config.yaml)"
+    )
+    polish_parser.add_argument(
+        "--no-use-longest-on-failure",
+        dest="use_longest_on_failure",
+        action="store_false",
+        help="Don't use longest response on failure (overrides config.yaml)"
     )
     polish_parser.set_defaults(func=polish_command)
     
@@ -518,7 +533,14 @@ Examples:
     translate_parser.add_argument(
         "--use-longest-on-failure",
         action="store_true",
-        help="Use longest response when all validation attempts fail (default: skip file)"
+        default=None,
+        help="Use longest response when all validation attempts fail (default: from config.yaml)"
+    )
+    translate_parser.add_argument(
+        "--no-use-longest-on-failure",
+        dest="use_longest_on_failure",
+        action="store_false",
+        help="Don't use longest response on failure (overrides config.yaml)"
     )
     translate_parser.set_defaults(func=translate_command)
     

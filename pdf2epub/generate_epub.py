@@ -753,16 +753,22 @@ def main():
     else:
         logger.info(f"Using configured language: {epub_config.language}")
 
-    # Load book structure to check for notes chapters
+    # Load book structure to check for notes chapters and get author
     book_structure = load_book_structure(epub_config.book_title)
     has_notes_chapter = False
-    
+
     if book_structure:
         # Check if any chapter is marked as a notes chapter
         has_notes_chapter = any(
-            chapter.get('type') == 'notes' 
+            chapter.get('type') == 'notes'
             for chapter in book_structure.get('chapters', [])
         )
+
+        # Update author from structure if not specified in config
+        # Priority: config.yaml > book_structure.json > "Unknown Author"
+        if epub_config.author == "Unknown Author" and 'author' in book_structure and book_structure['author']:
+            epub_config.author = book_structure['author']
+            logger.info(f"Using author from book structure: {epub_config.author}")
     
     # Auto-enable global footnotes if notes chapter detected
     force_global_mode = args.global_footnotes or has_notes_chapter

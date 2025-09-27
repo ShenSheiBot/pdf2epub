@@ -1169,7 +1169,13 @@ Your tasks for JAPANESE content:
    - DO NOT remove furigana from the original text
    - DO NOT remove ルビ芸 like 妄想 in「何もないからこ(妄)ういう(想)話に逃(に)げてんじゃん!」
 
-3. **Images and illustrations**:
+3. **Tables**:
+   - Convert HTML tables (<table>, <tr>, <td>, <th>) to markdown tables
+   - Use proper markdown table syntax with | for columns and --- for headers
+   - Preserve table structure, merging cells where appropriate
+   - For complex tables with merged cells, use simplified markdown representation
+
+4. **Images and illustrations**:
    - PRESERVE ALL IMAGE LINKS EXACTLY AS THEY ARE
    - Keep markdown image syntax: ![Image](../images/filename.png)
    - DO NOT replace image links with [illustration] or any other placeholder

@@ -243,24 +243,26 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     prompt = f"""
     Analyze this book PDF with title "{book_title}" and provide a detailed breakdown of its structure.
     Include the following elements:
-    1. Cover page (page number)
-    2. Table of contents (page numbers)
-    3. All chapters and subchapters as referenced in the table of contents
-    4. Back cover page (page number)
-    
+    1. Author name(s) - Extract from the cover page, title page, or copyright page
+    2. Cover page (page number)
+    3. Table of contents (page numbers)
+    4. All chapters and subchapters as referenced in the table of contents
+    5. Back cover page (page number)
+
     Important: Use the PDF page numbers (not the printed page numbers that might appear in the table of contents).
     Note that nearby chapters may overlap if there are no page breaks.
-    Keep the original language for all titles.
-    
+    Keep the original language for all titles and author names.
+
     Additionally, identify special chapter types:
     - If a chapter consists ONLY of footnotes, endnotes, or references for citations in other chapters, add a "type": "notes" field
     - If any chapter's notes are at the end of itself, then there should be NO note chapter.
     - A book contains at most one note chapter.
     - Abbreviations, Bibliography, Index, or Summary Table are NOT considered as notes. Only literal `Notes` with [1], [2], [3]... are considered as notes.
     - Regular content chapters should not have a "type" field
-    
+
     Return the result in the following JSON structure:
     {{
+        "author": string,  # Author name(s) as they appear in the book. If multiple authors, separate with commas. If no author found, use "Unknown Author"
         "cover_page": {{
             "page_number": int
         }},

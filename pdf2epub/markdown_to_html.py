@@ -205,16 +205,33 @@ def process_ruby_text(markdown_content: str) -> str:
     return markdown_content
 
 
-def preprocess_markdown(markdown_content: str, footnote_manager=None, source_chapter: Optional[str] = None) -> str:
+def preprocess_markdown(markdown_content: str, footnote_manager=None, source_chapter: Optional[str] = None, image_mapping: Optional[dict] = None) -> str:
     """
     Pre-process markdown to fix various issues before conversion.
-    
+
     Args:
         markdown_content: The markdown text to process
         footnote_manager: Optional FootnoteManager for cross-chapter footnote handling
         source_chapter: The source chapter name for footnote linking
+        image_mapping: Optional dict mapping original image names to new names
     """
-    # First, process Japanese ruby text
+    # First, apply image mapping to markdown images if provided
+    if image_mapping:
+        for original_name, new_name in image_mapping.items():
+            # Handle various image reference patterns in markdown
+            markdown_content = markdown_content.replace(f']({original_name})', f']({new_name})')
+            markdown_content = markdown_content.replace(f'](../{original_name})', f'](../{new_name})')
+            markdown_content = markdown_content.replace(f'](../images/{original_name})', f'](../images/{new_name})')
+            markdown_content = markdown_content.replace(f'](images/{original_name})', f'](images/{new_name})')
+
+    # Then, convert markdown images inside HTML tags (like <figure>) to HTML img tags
+    markdown_content = re.sub(
+        r'!\[([^\]]*)\]\(([^\)]+)\)',
+        r'<img alt="\1" src="\2" />',
+        markdown_content
+    )
+
+    # Then, process Japanese ruby text
     markdown_content = process_ruby_text(markdown_content)
     
     # Handle markdown italics: *text* -> <em>text</em>
@@ -684,18 +701,8 @@ def convert_markdown_to_html(
         logger.error("markdown library not installed. Run: poetry add markdown")
         raise
     
-    # Pre-process markdown to fix various issues
-    markdown_content = preprocess_markdown(markdown_content, footnote_manager, source_chapter)
-    
-    # Update image references if mapping provided
-    if image_mapping:
-        for original_name, new_name in image_mapping.items():
-            # Handle various image reference patterns
-            # Standard markdown: ![alt](path/image.png)
-            markdown_content = markdown_content.replace(f']({original_name})', f']({new_name})')
-            markdown_content = markdown_content.replace(f'](../{original_name})', f'](../{new_name})')
-            markdown_content = markdown_content.replace(f'](../images/{original_name})', f'](../images/{new_name})')
-            markdown_content = markdown_content.replace(f'](images/{original_name})', f'](images/{new_name})')
+    # Pre-process markdown to fix various issues (including image mapping)
+    markdown_content = preprocess_markdown(markdown_content, footnote_manager, source_chapter, image_mapping)
     
     # Configure markdown extensions
     extensions = [

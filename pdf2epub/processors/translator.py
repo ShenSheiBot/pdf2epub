@@ -57,6 +57,10 @@ class TranslateProcessor(BaseMarkdownProcessor):
         
         self.source_language = source_language
         self.target_language = target_language
+
+        # Get validation settings from config
+        validation_config = config.get('validation_strategy', {})
+        self.validate_chinese = validation_config.get('validate_chinese_translation', True)
         
         # Set default translation models if not provided
         self.translation_models = translation_models or [
@@ -308,8 +312,8 @@ class TranslateProcessor(BaseMarkdownProcessor):
             else:
                 logger.info(f"{file_name} translation validated:\n{summary}")
 
-        # Then validate Chinese content if target language is Chinese
-        if self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+        # Then validate Chinese content if target language is Chinese and validation is enabled
+        if self.validate_chinese and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
             is_valid_chinese, chinese_validation_msg = self._validate_chinese_translation(processed)
             if not is_valid_chinese:
                 logger.error(f"Chinese validation failed for {file_name}: {chinese_validation_msg}")

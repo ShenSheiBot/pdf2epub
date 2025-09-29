@@ -816,7 +816,7 @@ def main():
                 original_structure, 
                 config_dict
             )
-            display_title = translated_structure.get("book_title", epub_config.book_title)
+            display_title = translated_structure.get("book_title") or translated_structure.get("title", epub_config.book_title)
             logger.info(f"Translated structure loaded with title: {display_title}")
         else:
             # Fallback: Check for existing translated structure or translation progress
@@ -827,7 +827,7 @@ def main():
                 logger.info("Loading translated title from existing structure...")
                 with open(translated_structure_path, "r", encoding="utf-8") as f:
                     translated_structure = json.load(f)
-                    display_title = translated_structure.get("book_title", epub_config.book_title)
+                    display_title = translated_structure.get("book_title") or translated_structure.get("title", epub_config.book_title)
             else:
                 # Try to get language settings from translation_progress.json
                 translation_progress_path = epub_config.input_dir / "translated" / "translation_progress.json"

@@ -356,6 +356,34 @@ def translate_command(args):
     return 0 if summary.get("success_rate", 0) == 1.0 else 1
 
 
+def patch_paper_command(args):
+    """Execute the patch-paper command."""
+    from .patch_paper_structure import patch_paper_structure
+    from .utils.common import load_config
+
+    # Load config to get book title
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No book title found in config.yaml")
+        return 1
+
+    logger.info(f"Patching structure for: {book_title}")
+
+    success = patch_paper_structure(
+        book_title=book_title,
+        chapter_name=args.chapter_name,
+        preserve_toc=not args.no_preserve_toc
+    )
+
+    if success:
+        logger.success("Structure patched successfully!")
+        logger.info("You can now run 'pdf2epub ocr' to process the document as a single chapter")
+
+    return 0 if success else 1
+
+
 def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
@@ -598,7 +626,24 @@ Examples:
         help="Force global footnotes (use last definition, ignore previous definitions)"
     )
     epub_parser.set_defaults(func=epub_command)
-    
+
+    # Patch paper structure subcommand
+    patch_parser = subparsers.add_parser(
+        "patch-paper",
+        help="Patch book structure for academic papers (single chapter mode)",
+        description="Modify book_structure.json to treat entire document as one chapter"
+    )
+    patch_parser.add_argument(
+        "--chapter-name",
+        help="Name for the single chapter (default: use document title)"
+    )
+    patch_parser.add_argument(
+        "--no-preserve-toc",
+        action="store_true",
+        help="Don't preserve original TOC entries as metadata"
+    )
+    patch_parser.set_defaults(func=patch_paper_command)
+
     # Parse arguments
     args = parser.parse_args()
     

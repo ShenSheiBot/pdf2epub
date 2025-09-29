@@ -102,23 +102,32 @@ class NGramTruncationDetector(BaseTruncationDetector):
 
         # Decision logic based on n-gram analysis
 
-        # 1. If token ratio is very high (≥85%), definitely not truncated
+        # 1. Check for abnormally high token ratio (likely hallucination or repetition)
+        if token_ratio > 1.5:  # Output is more than 150% of input
+            return (
+                True,
+                f"Output significantly longer than input ({token_ratio:.1%}) - likely hallucination",
+                details,
+            )
+
+        # 2. If token ratio is very high (≥85% and ≤105%), definitely not truncated
         if token_ratio >= 0.85 and token_ratio <= 1.05:
             return False, f"High token retention ({token_ratio:.1%})", details
 
-        # 2. Excellent unique recall - definitely not truncated
-        if avg_unique_recall >= 0.8:
+        # 3. Excellent unique recall - definitely not truncated (but only if token ratio is reasonable)
+        if avg_unique_recall >= 0.8 and token_ratio <= 1.3:
             return (
                 False,
                 f"Excellent unique content preservation ({avg_unique_recall:.1%})",
                 details,
             )
 
-        # 4. Good unique recall with high deduplication - acceptable
+        # 4. Good unique recall with high deduplication - acceptable (if token ratio is reasonable)
         if (
             avg_unique_recall >= 0.7
             and avg_dup_ratio >= 0.7
             and self.allow_deduplication
+            and token_ratio <= 1.3
         ):
             return (
                 False,
@@ -126,11 +135,12 @@ class NGramTruncationDetector(BaseTruncationDetector):
                 details,
             )
 
-        # 5. Moderate unique recall but very high deduplication - probably OK
+        # 5. Moderate unique recall but very high deduplication - probably OK (if token ratio is reasonable)
         if (
             avg_unique_recall >= 0.75
             and avg_dup_ratio >= 0.85
             and self.allow_deduplication
+            and token_ratio <= 1.3
         ):
             return (
                 False,

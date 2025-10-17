@@ -278,12 +278,131 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
     # Handle years in parentheses like $(1983)$
     markdown_content = re.sub(r'\$\((\d{4})\)\$', r'(\1)', markdown_content)
     
-    # Handle escaped dollar signs: $\$ -> $
-    markdown_content = re.sub(r'\$\\\$', '$', markdown_content)
-    
-    # Handle remaining single letter variables like ${d}$ or ${D}$ that might have been missed
-    markdown_content = re.sub(r'\$\{([a-zA-Z])\}\$', r'<sup>\1</sup>', markdown_content)
-    
+    # Handle escaped dollar signs: $\$ -> placeholder
+    markdown_content = re.sub(r'\$\\\$', '<<<ESCAPED_DOLLAR>>>', markdown_content)
+
+    # Handle standalone escaped dollar signs: \$ -> placeholder
+    # IMPORTANT: Use placeholder to avoid interfering with $...$ LaTeX block matching
+    markdown_content = markdown_content.replace(r'\$', '<<<ESCAPED_DOLLAR>>>')
+
+    # === DISPLAY MATH: Convert $$...$$ blocks to MathML ===
+    # Process display math BEFORE inline math to avoid conflicts
+    from latex2mathml import converter
+
+    def process_display_math(match):
+        """
+        Convert display math $$...$$ to MathML using latex2mathml.
+
+        Display math is rendered as block-level centered mathematical expressions.
+        """
+        latex_code = match.group(1).strip()
+
+        if not latex_code:
+            # Empty display math block, return placeholder
+            return '<div class="math-display"></div>'
+
+        try:
+            # Convert LaTeX to MathML
+            mathml = converter.convert(latex_code)
+
+            # Wrap in a centered div for display math
+            return f'<div class="math-display" style="text-align: center; margin: 1em 0;">{mathml}</div>'
+        except Exception as e:
+            logger.warning(f"Failed to convert display math to MathML: {latex_code[:50]}... Error: {e}")
+            # Fallback: keep original LaTeX in a styled div
+            return f'<div class="math-display" style="text-align: center; margin: 1em 0; font-style: italic;">$${latex_code}$$</div>'
+
+    # Match $$...$$ blocks (multiline, non-greedy)
+    # Use DOTALL flag to allow matching across newlines
+    markdown_content = re.sub(r'\$\$\s*\n?(.*?)\n?\s*\$\$', process_display_math, markdown_content, flags=re.DOTALL)
+
+    # === INLINE MATH: Use unicodeitplus for LaTeX to Unicode conversion ===
+    # Fallback to MathML for complex expressions
+    from unicodeitplus import replace as latex_to_unicode
+
+    def process_latex_block(match):
+        r"""
+        Process a single $...$ LaTeX block with Unicode-first, MathML-fallback strategy.
+
+        Strategy:
+        1. Try preprocessing for known patterns
+        2. Try unicodeitplus for Unicode conversion
+        3. If conversion incomplete (still has LaTeX commands), use MathML
+        4. If MathML fails, keep original LaTeX
+
+        Preprocessing:
+        - \qquad → double space (unicodeitplus doesn't handle this)
+        - ^{\prime} → \prime (for prime symbol conversion)
+        - \underline{X} → <u>X</u> (for HTML underline instead of Unicode combining)
+        - \operatorname{X} → X (unicodeitplus doesn't handle this well)
+
+        Unicodeitplus handles:
+        - Greek letters (\alpha, \Delta, etc.)
+        - Superscripts and subscripts (x^{2}, x_{i})
+        - Math symbols (\cdot, \cdots, \ldots, \quad, \%)
+        - Text commands (\mathrm{X}, \text{X})
+        - Bar notation (\bar{x})
+
+        MathML fallback for:
+        - Fractions (\frac{a}{b})
+        - Square roots (\sqrt{x})
+        - Complex expressions that unicodeitplus can't handle
+        """
+        content = match.group(1)  # Get content between $ and $
+        original_content = content  # Keep original for fallback
+
+        # === Preprocessing for patterns unicodeitplus doesn't handle well ===
+
+        # 1. \qquad → double space (unicodeitplus leaves it unchanged)
+        content = content.replace(r'\qquad', '  ')
+
+        # 2. Convert ^{\prime} or ^{\prime X} to \prime X (unicodeitplus converts \prime but not ^{\prime})
+        # Also handle cases like { }^{\prime 1} where prime is in superscript with other content
+        content = re.sub(r'\^\{\\prime\s*([^}]*)\}', r'\\prime\1', content)
+        content = re.sub(r'\^\\prime\b', r'\\prime', content)
+
+        # 3. \underline{X} -> <u>X</u> (for HTML underline instead of Unicode combining characters)
+        # Do this BEFORE unicodeitplus to avoid it converting to Unicode combining underline
+        content = re.sub(r'\\underline\{([^}]+)\}', r'<u>\1</u>', content)
+
+        # 4. \operatorname{X} -> X (unicodeitplus doesn't handle this well)
+        content = re.sub(r'\\operatorname\{([^}]+)\}', r'\1', content)
+
+        # === Try unicodeitplus for standard LaTeX to Unicode conversion ===
+        try:
+            result = latex_to_unicode(content)
+
+            # Check if conversion was complete
+            # If result still contains backslash commands (except in HTML tags like <u>),
+            # it means unicodeitplus couldn't convert everything
+            # Remove HTML tags temporarily for checking
+            check_result = re.sub(r'<[^>]+>', '', result)
+
+            if '\\' in check_result:
+                # Conversion incomplete, fallback to MathML
+                logger.debug(f"Unicode conversion incomplete for: {original_content[:50]}... Trying MathML")
+                raise ValueError("Incomplete conversion, use MathML")
+
+            return result
+
+        except Exception as e:
+            # === Fallback to MathML for complex expressions ===
+            try:
+                mathml = converter.convert(original_content)
+                logger.debug(f"Using MathML for inline math: {original_content[:50]}...")
+                return f'<span class="math-inline">{mathml}</span>'
+            except Exception as e2:
+                # Last resort: keep original LaTeX with styling
+                logger.warning(f"Failed to convert inline math: {original_content[:50]}... Error: {e2}")
+                return f'<span style="font-style: italic;">${original_content}$</span>'
+
+    # Apply the callback to all $...$ blocks (inline only, not across newlines)
+    # Use [^$\n]+ to match only within a single line
+    markdown_content = re.sub(r'\$([^$\n]+)\$', process_latex_block, markdown_content)
+
+    # Convert placeholders back to actual dollar signs
+    markdown_content = markdown_content.replace('<<<ESCAPED_DOLLAR>>>', '$')
+
     # Now process footnotes
     return preprocess_footnotes(markdown_content, footnote_manager, source_chapter)
 
@@ -738,10 +857,10 @@ def convert_markdown_to_html(
     
     # Convert markdown to HTML
     html_body = md.convert(markdown_content)
-    
+
     # Post-process HTML
     html_body = post_process_html(html_body)
-    
+
     if not standalone:
         return html_body
     

@@ -45,28 +45,7 @@ class EpubConfig:
     
     def __post_init__(self):
         """Initialize paths based on book title if not provided."""
-        if self.input_dir is None:
-            self.input_dir = Path("output") / self.book_title
-        
-        if self.output_dir is None:
-            self.output_dir = self.input_dir
-        
-        if self.markdown_dir is None:
-            if self.use_translated:
-                self.markdown_dir = self.input_dir / "translated"
-            else:
-                self.markdown_dir = self.input_dir / "polished_markdown"
-        
-        if self.images_dir is None:
-            self.images_dir = self.input_dir / "images"
-        
-        if self.epub_dir is None:
-            self.epub_dir = self.output_dir / "epub"
-        
-        if self.output_epub_path is None:
-            self.output_epub_path = self.output_dir / f"{self.book_title}.epub"
-        
-        # Convert string paths to Path objects
+        # Convert string paths to Path objects first
         if isinstance(self.input_dir, str):
             self.input_dir = Path(self.input_dir)
         if isinstance(self.output_dir, str):
@@ -83,16 +62,38 @@ class EpubConfig:
             self.cover_path = Path(self.cover_path)
         if self.input_pdf_path and isinstance(self.input_pdf_path, str):
             self.input_pdf_path = Path(self.input_pdf_path)
+
+        # Set default paths if not provided
+        if self.input_dir is None:
+            self.input_dir = Path("output") / self.book_title
+
+        if self.output_dir is None:
+            self.output_dir = self.input_dir
+
+        if self.markdown_dir is None:
+            if self.use_translated:
+                self.markdown_dir = self.input_dir / "translated"
+            else:
+                self.markdown_dir = self.input_dir / "polished_markdown"
+
+        if self.images_dir is None:
+            self.images_dir = self.input_dir / "images"
+
+        if self.epub_dir is None:
+            self.epub_dir = self.output_dir / "epub"
+
+        if self.output_epub_path is None:
+            self.output_epub_path = self.output_dir / f"{self.book_title}.epub"
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any], **kwargs) -> "EpubConfig":
         """
         Create an EpubConfig from a dictionary (e.g., from config.yaml).
-        
+
         Args:
             config_dict: Dictionary with configuration values
             **kwargs: Additional keyword arguments to override config
-            
+
         Returns:
             EpubConfig instance
         """
@@ -101,8 +102,10 @@ class EpubConfig:
             book_title=config_dict.get("title", "Untitled"),
             author=config_dict.get("author", "Unknown Author"),
             language=config_dict.get("language", "en"),
+            input_dir=config_dict.get("input_dir"),
+            output_dir=config_dict.get("output_dir"),
             api_config=config_dict,
             **kwargs
         )
-        
+
         return config

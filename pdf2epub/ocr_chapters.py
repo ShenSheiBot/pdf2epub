@@ -12,7 +12,7 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 from loguru import logger
 from .utils.logging_config import configure_logging
-from .ocr_backends import ocr_pdf_chunk_mistral, ocr_pdf_chunk_vertex
+from .ocr_backends import ocr_pdf_chunk_mistral, ocr_pdf_chunk_vertex, ocr_pdf_chunk_vllm
 from .utils.common import load_config, load_book_structure
 from .pdf_compressor import compress_pdf
 
@@ -183,6 +183,22 @@ def ocr_pdf_chunk(
             session=session,
             project_id=project_id,
             location=location,
+            chunk_info=chunk_info,
+            images_dir=images_dir,
+            chapter_index=chapter_index,
+            image_counter=image_counter,
+            max_retries=max_retries,
+            initial_backoff=initial_backoff
+        )
+
+    elif backend == "vllm":
+        # Load config for vllm backend
+        from .utils.common import load_config
+        config = load_config()
+
+        return ocr_pdf_chunk_vllm(
+            pdf_bytes=pdf_bytes,
+            config=config,
             chunk_info=chunk_info,
             images_dir=images_dir,
             chapter_index=chapter_index,
@@ -662,8 +678,12 @@ def main():
 
         logger.info(f"Using Mistral API with key: {api_key[:8]}...")
 
+    elif ocr_backend == "vllm":
+        # VLLM backend uses init_client from vllm.py
+        logger.info("Using VLLM backend")
+
     else:
-        raise ValueError(f"Unknown OCR backend: {ocr_backend}. Use 'vertex' or 'mistral'")
+        raise ValueError(f"Unknown OCR backend: {ocr_backend}. Use 'vertex', 'mistral', or 'vllm'")
     
     # Determine PDF path
     if args.input:

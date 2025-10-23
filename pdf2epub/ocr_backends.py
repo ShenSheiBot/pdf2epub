@@ -398,3 +398,119 @@ def ocr_pdf_chunk_vertex(
 
     logger.success(f"OCR completed for {chunk_info} ({len(pages)} pages, {len(all_images)} images)")
     return combined_markdown, all_images, image_counter
+
+def ocr_pdf_chunk_vllm(
+    pdf_bytes: bytes,
+    config: Dict,
+    chunk_info: str,
+    images_dir: Optional[Path] = None,
+    chapter_index: int = 0,
+    image_counter: int = 0,
+    max_retries: int = 5,
+    initial_backoff: float = 4.0
+) -> Tuple[str, List[Dict], int]:
+    """
+    OCR a PDF chunk using VLLM backend (processes page by page).
+
+    Args:
+        pdf_bytes: PDF content as bytes
+        config: Configuration dictionary
+        chunk_info: Description of the chunk for logging
+        images_dir: Directory to save extracted images
+        chapter_index: Index of current chapter
+        image_counter: Current image counter
+        max_retries: Maximum retry attempts (not used for vllm)
+        initial_backoff: Initial backoff time (not used for vllm)
+
+    Returns:
+        Tuple of (markdown_content, images_info, updated_image_counter)
+    """
+    import io
+    import re
+    import fitz  # PyMuPDF
+    from PIL import Image
+    from pdf2epub.ocr.backends.vllm import init_client
+
+    logger.info(f"Starting VLLM OCR for {chunk_info}")
+
+    # Initialize VLLM client
+    client = init_client(config)
+
+    # Open PDF from bytes
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    markdown_parts = []
+    all_images = []
+
+    # Process each page
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        logger.info(f"  Processing page {page_idx + 1}/{len(doc)}")
+
+        # Render page to image
+        mat = fitz.Matrix(2, 2)  # 2x zoom for better quality
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+        img = Image.open(io.BytesIO(img_bytes))
+
+        # Perform OCR
+        try:
+            text = client.ocr(img)
+            markdown_parts.append(text)
+        except Exception as e:
+            logger.error(f"OCR failed for page {page_idx + 1}: {e}")
+            markdown_parts.append(f"\n\n[OCR Error on page {page_idx + 1}]\n\n")
+
+    doc.close()
+
+    # Combine all pages
+    combined_markdown = "\n\n".join(markdown_parts)
+
+    # Extract and save base64 images from markdown
+    if images_dir:
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pattern to match ![...](data:image/...;base64,...)
+        pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^\)]+)\)'
+
+        def replace_image(match):
+            nonlocal image_counter
+            alt_text = match.group(1)
+            image_format = match.group(2)
+            base64_data = match.group(3)
+
+            # Create filename
+            img_filename = f"chapter_{chapter_index}_img_{image_counter:03d}.{image_format}"
+            img_path = images_dir / img_filename
+
+            try:
+                # Decode and save image
+                img_data = base64.b64decode(base64_data)
+                with open(img_path, 'wb') as f:
+                    f.write(img_data)
+
+                logger.debug(f"Saved image: {img_path} ({len(img_data) / 1024:.2f} KB)")
+
+                # Track image info
+                all_images.append({
+                    "filename": img_filename,
+                    "format": image_format,
+                    "size": len(img_data)
+                })
+
+                image_counter += 1
+
+                # Return new markdown reference
+                return f"![{alt_text}](../images/{img_filename})"
+            except Exception as e:
+                logger.error(f"Failed to save image: {e}")
+                return match.group(0)
+
+        # Replace all base64 images with file references
+        combined_markdown = re.sub(pattern, replace_image, combined_markdown)
+
+        if all_images:
+            logger.info(f"Extracted and saved {len(all_images)} images for {chunk_info}")
+
+    logger.success(f"VLLM OCR completed for {chunk_info} ({len(markdown_parts)} pages, {len(all_images)} images)")
+    return combined_markdown, all_images, image_counter

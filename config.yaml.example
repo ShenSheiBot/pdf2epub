@@ -9,6 +9,17 @@ google_api_key: your-google-api-key-here
 openai_api_key: your-openai-api-key-here
 openai_base_url: https://api.openai.com/v1
 openai_model: gpt-4o
+mistral_api_key: your-mistral-api-key-here
+
+# OCR Backend Selection
+ocr_backend: vertex  # Options: 'vertex', 'mistral', 'azure', or 'vllm'
+
+# GCP Configuration (for vertex OCR backend)
+gcp_location: us-central1
+
+# Specialized model settings
+breakdown_model: gemini-2.5-pro  # Model for PDF structure analysis
+entity_extraction_model: gemini-2.5-flash  # Model for entity extraction
 
 # Translation config
 target_language: English  # Target language for translation
@@ -26,6 +37,9 @@ max_concurrent_workers: 8  # Maximum number of concurrent API calls (adjust base
 
 # Japanese Vertical OCR Backend Selection
 jp_ocr_backend: azure  # Options: 'azure' or 'vision'
+
+# Furigana handling mode
+furigana_mode: attach  # Options: 'attach' (add as (かな)) or 'delete' (remove furigana)
 
 azure_endpoint: https://your-azure-endpoint.cognitiveservices.azure.com/
 azure_key: your-azure-key-here
@@ -84,9 +98,19 @@ validation_strategy:
   max_attempts: 2                  # Global max validation attempts per file
   use_longest_on_failure: false    # If true, use longest response when all attempts fail
   fallback_between_models: true    # If true, try next model when current fails validation
+  validate_chinese_translation: false  # If true, validate Chinese translations contain Chinese characters
 
-## Deprecated
-# ocr_models:
-#   - provider: anthropic
-#     model: claude-sonnet-4-20250514
-#     max_retries: 2  # Number of retries for transient errors
+# VLLM OCR Models Configuration
+# ==============================
+# Used when ocr_backend is set to 'vllm'
+# For Anthropic/Gemini providers, uses top-level API credentials
+# For DeepSeek or other custom providers, specify api_key and base_url here
+ocr_vllm_models:
+  - provider: anthropic
+    model: claude-sonnet-4-20250514
+  # - provider: gemini
+  #   model: gemini-2.5-pro
+  # - provider: deepseek
+  #   model: deepseek-ai/DeepSeek-OCR
+  #   api_key: your-deepseek-api-key
+  #   base_url: https://your-deepseek-endpoint/v1

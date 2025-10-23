@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any
 import anthropic
 from google import genai
 from google.genai.types import Part
+from openai import OpenAI
 from PIL import Image
 import io
 import yaml
@@ -24,52 +25,69 @@ logger = configure_logging()
 class OCRClient:
     """Client for performing OCR using different vision models."""
     
-    def __init__(self, model_type: str = "gemini", api_key: Optional[str] = None, config_path: str = "config.yaml"):
+    def __init__(self, model_type: str = "gemini", api_key: Optional[str] = None, config_path: str = "config.yaml", config_dict: Optional[Dict] = None):
         """
         Initialize the OCR client.
-        
+
         Args:
-            model_type: Either "gemini" or "anthropic"
-            api_key: API key for the model. If not provided, will look in config.yaml then env vars.
+            model_type: Either "gemini", "anthropic", or "deepseek"
+            api_key: API key for the model. If not provided, will look in config then env vars.
             config_path: Path to config.yaml file
+            config_dict: Configuration dictionary. If provided, used instead of reading config_path.
         """
         self.model_type = model_type.lower()
-        
-        # Try to load config
-        config = {}
-        if Path(config_path).exists():
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-        
+
+        # Use provided config dict or load from file
+        if config_dict is not None:
+            config = config_dict
+        else:
+            config = {}
+            if Path(config_path).exists():
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+
         if self.model_type == "gemini":
             # Try: provided key -> config.yaml -> env var
             key = api_key or config.get('google_api_key') or os.getenv("GEMINI_API_KEY")
             if not key:
                 raise ValueError("Gemini API key not provided in arguments, config.yaml, or GEMINI_API_KEY env var")
-            
+
             # Initialize Gemini client
             self.client = genai.Client(api_key=key)
-            
+
             # Default model name for Gemini
             self.model_name = 'gemini-2.5-pro'
-            
+
         elif self.model_type == "anthropic":
             # Try: provided key -> config.yaml -> env var
             key = api_key or config.get('anthropic_api_key') or os.getenv("ANTHROPIC_API_KEY")
             if not key:
                 raise ValueError("Anthropic API key not provided in arguments, config.yaml, or ANTHROPIC_API_KEY env var")
-            
+
             # Check if custom base URL is provided in config
             base_url = config.get('anthropic_base_url')
             if base_url:
                 self.client = anthropic.Anthropic(api_key=key, base_url=base_url)
             else:
                 self.client = anthropic.Anthropic(api_key=key)
-            
+
             # Store model name from config for later use
             self.anthropic_model = config.get('anthropic_model', 'claude-3-5-sonnet-20241022')
+
+        elif self.model_type == "deepseek":
+            # Try: provided key -> config.yaml -> env var
+            key = api_key or config.get('deepseek_api_key') or os.getenv("DEEPSEEK_API_KEY")
+            if not key:
+                raise ValueError("DeepSeek API key not provided in arguments, config.yaml, or DEEPSEEK_API_KEY env var")
+
+            # Get base URL and model from config
+            base_url = config.get('deepseek_base_url', 'https://deepseek-ocr.shenshei.fans/v1')
+            self.deepseek_model = config.get('deepseek_model', 'deepseek-ai/DeepSeek-OCR')
+
+            # Initialize OpenAI-compatible client for DeepSeek
+            self.client = OpenAI(api_key=key, base_url=base_url)
         else:
-            raise ValueError(f"Unknown model type: {model_type}. Use 'gemini' or 'anthropic'")
+            raise ValueError(f"Unknown model type: {model_type}. Use 'gemini', 'anthropic', or 'deepseek'")
     
     def image_to_base64(self, image: Image.Image) -> str:
         """Convert PIL Image to base64 string."""
@@ -98,7 +116,7 @@ class OCRClient:
     def ocr_anthropic(self, image: Image.Image, prompt: str) -> str:
         """Perform OCR using Anthropic Claude model."""
         base64_image = self.image_to_base64(image)
-        
+
         message = self.client.messages.create(
             model=self.anthropic_model,
             max_tokens=4096,
@@ -123,11 +141,38 @@ class OCRClient:
             ]
         )
         return message.content[0].text
+
+    def ocr_deepseek(self, image: Image.Image, prompt: str) -> str:
+        """Perform OCR using DeepSeek model via OpenAI-compatible API."""
+        base64_image = self.image_to_base64(image)
+
+        response = self.client.chat.completions.create(
+            model=self.deepseek_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1
+        )
+        return response.choices[0].message.content
     
     def ocr(self, image: Image.Image, prompt: Optional[str] = None) -> str:
         """
         Perform OCR on an image.
-        
+
         Args:
             image: PIL Image to perform OCR on
             prompt: Custom prompt for the model. If not provided, uses default.
@@ -139,11 +184,13 @@ Include all furigana (ruby text) inline with parentheses after the kanji.
 Example format: 漢字(かんじ)
 
 Please extract the complete text maintaining the original structure."""
-        
+
         if self.model_type == "gemini":
             return self.ocr_gemini(image, prompt)
-        else:
+        elif self.model_type == "anthropic":
             return self.ocr_anthropic(image, prompt)
+        else:  # deepseek
+            return self.ocr_deepseek(image, prompt)
     
 
 
@@ -151,10 +198,10 @@ Please extract the complete text maintaining the original structure."""
 def init_client(config: Dict) -> OCRClient:
     """
     Initialize VLLM OCR client for use with ocr_chapters_jp.py.
-    
+
     Args:
         config: Configuration dictionary from config.yaml
-        
+
     Returns:
         OCRClient instance configured based on ocr_vllm_models in config
     """
@@ -162,27 +209,42 @@ def init_client(config: Dict) -> OCRClient:
     vllm_models = config.get('ocr_vllm_models', [])
     if not vllm_models:
         raise ValueError("No ocr_vllm_models configured in config.yaml")
-    
+
     # Use the first configured model
     model_config = vllm_models[0]
     provider = model_config.get('provider', 'anthropic')
-    
-    # Map provider to model type for OCRClient
+
+    # Create a modified config dict for OCRClient
+    client_config = config.copy()
+
+    # Map provider to model type and inject model-specific config
     if provider == 'anthropic':
         model_type = 'anthropic'
-        # Set the model name in config for OCRClient to use
-        config['anthropic_model'] = model_config.get('model', 'claude-sonnet-4-20250514')
+        # Use top-level credentials, override model name from ocr_vllm_models
+        client_config['anthropic_model'] = model_config.get('model', 'claude-sonnet-4-20250514')
     elif provider == 'google' or provider == 'gemini':
         model_type = 'gemini'
-        # Get the model name from model_config
+        # Use top-level credentials, will set model name after client creation
         model_name = model_config.get('model', 'gemini-2.5-pro')
+    elif provider == 'deepseek':
+        model_type = 'deepseek'
+        # For DeepSeek, inject credentials from ocr_vllm_models into config
+        client_config['deepseek_api_key'] = model_config.get('api_key')
+        client_config['deepseek_base_url'] = model_config.get('base_url', 'https://deepseek-ocr.shenshei.fans/v1')
+        client_config['deepseek_model'] = model_config.get('model', 'deepseek-ai/DeepSeek-OCR')
+
+        if not client_config.get('deepseek_api_key'):
+            raise ValueError("DeepSeek API key not found in ocr_vllm_models configuration")
     else:
         raise ValueError(f"Unsupported VLLM provider: {provider}")
-    
-    # Create client with appropriate model name
-    client = OCRClient(model_type=model_type, config_path='config.yaml')
-    if model_type == 'gemini':
+
+    # Create client with config dict
+    client = OCRClient(model_type=model_type, config_dict=client_config)
+
+    # Set model name for Gemini
+    if provider == 'gemini' or provider == 'google':
         client.model_name = model_name
+
     return client
 
 

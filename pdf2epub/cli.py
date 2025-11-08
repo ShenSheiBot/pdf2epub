@@ -140,6 +140,72 @@ def breakdown_command(args):
     return 0
 
 
+def epub_input_command(args):
+    """Handle the EPUB input subcommand (breakdown + conversion)."""
+    from pdf2epub.epub_breakdown import breakdown_epub
+    from pdf2epub.epub_to_markdown import convert_epub_to_markdown
+    from pathlib import Path
+
+    epub_path = Path(args.input)
+
+    if not epub_path.exists():
+        logger.error(f"EPUB file not found: {epub_path}")
+        return 1
+
+    # Determine output directory
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        # Auto-detect from EPUB metadata
+        from pdf2epub.epub_input.epub_parser import EPUBParser
+        temp_parser = EPUBParser(str(epub_path))
+        book_title = temp_parser.metadata['title']
+        # Clean title for directory name
+        import re
+        clean_title = re.sub(r'[^\w\s-]', '', book_title)
+        clean_title = re.sub(r'[-\s]+', '_', clean_title)
+        output_dir = Path("output") / clean_title
+
+    logger.info(f"Processing EPUB: {epub_path}")
+    logger.info(f"Output directory: {output_dir}")
+
+    # Step 1: Breakdown (analyze structure)
+    logger.info("Step 1/2: Analyzing EPUB structure...")
+    try:
+        structure = breakdown_epub(
+            str(epub_path),
+            str(output_dir),
+            skip_patterns=args.skip_patterns,
+            front_matter_position_threshold=args.front_matter_threshold,
+            back_matter_position_threshold=args.back_matter_threshold
+        )
+    except Exception as e:
+        logger.error(f"Failed to analyze EPUB structure: {e}")
+        return 1
+
+    # Step 2: Convert to Markdown
+    logger.info("Step 2/2: Converting to Markdown...")
+    try:
+        convert_epub_to_markdown(
+            str(epub_path),
+            structure_file=str(output_dir / "book_structure.json"),
+            output_dir=str(output_dir),
+            resume=args.resume
+        )
+    except Exception as e:
+        logger.error(f"Failed to convert EPUB to Markdown: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    logger.success(f"EPUB processing complete! Output: {output_dir / 'polished_markdown'}")
+    logger.info("Next steps:")
+    logger.info("  - For translation: pdf2epub translate --target-language <language>")
+    logger.info("  - For EPUB generation: pdf2epub epub")
+
+    return 0
+
+
 def ocr_command(args):
     """Handle the OCR subcommand."""
     import sys
@@ -391,12 +457,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Complete pipeline for a book:
+  # Complete pipeline for a PDF book:
   pdf2epub breakdown -i mybook.pdf
   pdf2epub ocr
   pdf2epub polish
   pdf2epub epub
-  
+
+  # EPUB as input (already clean text):
+  pdf2epub epub-input -i mybook.epub
+  pdf2epub translate --target-language Chinese  # Optional
+  pdf2epub epub
+
+  # EPUB with custom filtering:
+  pdf2epub epub-input -i mybook.epub --skip-pattern "^Cover$" --skip-pattern "Copyright"
+
   # Japanese book with translation:
   pdf2epub breakdown -i manga.pdf
   pdf2epub extract-entities -i manga.pdf  # Extract for consistency
@@ -404,7 +478,7 @@ Examples:
   pdf2epub polish --content-type japanese
   pdf2epub translate --target-language Chinese  # Auto-uses entities
   pdf2epub epub
-  
+
   # Academic book with translation:
   pdf2epub breakdown -i thesis.pdf
   pdf2epub ocr
@@ -445,7 +519,47 @@ Examples:
         help="Force reprocessing even if files exist"
     )
     breakdown_parser.set_defaults(func=breakdown_command)
-    
+
+    # EPUB Input subcommand
+    epub_input_parser = subparsers.add_parser(
+        "epub-input",
+        help="Process EPUB file as input (extract to polished markdown)",
+        description="Analyze EPUB structure and convert to polished markdown, ready for translation or EPUB generation"
+    )
+    epub_input_parser.add_argument(
+        "-i", "--input",
+        required=True,
+        help="Path to input EPUB file"
+    )
+    epub_input_parser.add_argument(
+        "-o", "--output",
+        help="Output directory (default: auto-detect from EPUB title)"
+    )
+    epub_input_parser.add_argument(
+        "--skip-pattern",
+        action="append",
+        dest="skip_patterns",
+        help="Regex pattern to skip chapters (can be used multiple times)"
+    )
+    epub_input_parser.add_argument(
+        "--front-matter-threshold",
+        type=int,
+        default=5,
+        help="First N spine items to mark as front matter (default: 5)"
+    )
+    epub_input_parser.add_argument(
+        "--back-matter-threshold",
+        type=int,
+        default=3,
+        help="Last N spine items to mark as back matter (default: 3)"
+    )
+    epub_input_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress"
+    )
+    epub_input_parser.set_defaults(func=epub_input_command)
+
     # OCR subcommand
     ocr_parser = subparsers.add_parser(
         "ocr",

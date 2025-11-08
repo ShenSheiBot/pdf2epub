@@ -804,6 +804,11 @@ def main():
     structure = filter_blank_files_from_structure(structure, epub_config.markdown_dir)
     epub_config.book_structure = structure
 
+    # Merge cover_page info from book_structure.json if available
+    if book_structure and 'cover_page' in book_structure:
+        structure['cover_page'] = book_structure['cover_page']
+        logger.debug(f"Merged cover_page from book_structure.json: {book_structure['cover_page']}")
+
     # For translated version, determine the display title
     display_title = epub_config.book_title  # Default to original title
     if args.translated:
@@ -935,10 +940,6 @@ Original title: {epub_config.book_title}"""
         if cover_image:
             logger.info(f"Cover extracted: {cover_image}")
 
-    # Create cover HTML
-    if cover_image:
-        builder.create_cover_html(cover_image, text_dir / "cover.html")
-
     # Create stylesheet
     builder.create_stylesheet(epub_config.epub_dir / "stylesheet.css")
 
@@ -951,6 +952,30 @@ Original title: {epub_config.book_title}"""
     # Copy chapter images
     logger.info("Copying chapter images...")
     _, image_mapping = converter.copy_chapter_images(images_dir)
+
+    # For EPUB input: detect cover image after images are copied
+    logger.debug(f"Cover image check: cover_image={cover_image}, has_cover_page={bool(structure.get('cover_page'))}")
+
+    if not cover_image and structure.get("cover_page"):
+        cover_href = structure["cover_page"].get("href", "")
+        logger.info(f"EPUB input detected - looking for cover image (cover_page: {cover_href})")
+
+        # Look for common cover image patterns in the EPUB images directory
+        import glob
+        for pattern in ["chapter_1_img_0.*", "cover.*", "Chapter_1_img_0.*"]:
+            matches = glob.glob(str(images_dir / pattern))
+            logger.debug(f"Searching {images_dir / pattern}: {len(matches)} matches")
+            if matches:
+                cover_image = Path(matches[0]).name
+                logger.info(f"Found cover image for EPUB input: {cover_image}")
+                break
+
+        if not cover_image:
+            logger.warning("Cover page specified but no cover image found in images directory")
+
+    # Create cover HTML if cover image exists
+    if cover_image:
+        builder.create_cover_html(cover_image, text_dir / "cover.html")
 
     # Detect multi-part chapters for proper TOC generation
     chapters_with_parts = set()

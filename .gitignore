@@ -30,4 +30,5 @@ secrets.yaml
 
 # Claude-related files
 *.claude
-.claude/
+.claude/test_*.py
+test_*.md

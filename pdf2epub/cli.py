@@ -13,6 +13,7 @@ from pathlib import Path
 from loguru import logger
 from pdf2epub.utils.logging_config import configure_logging
 from pdf2epub.utils.common import load_config
+from pdf2epub.utils.safety import check_output_directory_conflict
 from pdf2epub.processors import PolishProcessor, TranslateProcessor
 
 # Configure logger
@@ -109,11 +110,21 @@ def breakdown_command(args):
         logger.warning(f"No title found in config, using PDF filename: {book_title}")
     
     logger.info(f"Processing PDF breakdown for: {book_title}")
-    
+
     # Define output directory
     output_dir = Path("output") / Path(book_title)
+
+    # Check for conflicts with existing output
+    output_dir = check_output_directory_conflict(output_dir, input_pdf)
+
+    # If directory was renamed, update book_title
+    actual_book_title = output_dir.name
+    if actual_book_title != book_title:
+        logger.info(f"Using renamed directory: {actual_book_title}")
+        book_title = actual_book_title
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Setup Gemini API
     gemini_client = GeminiClient(api_key)
     

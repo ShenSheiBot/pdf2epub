@@ -25,9 +25,23 @@ import base64
 import hashlib
 from urllib.parse import unquote, urljoin
 from bs4 import BeautifulSoup
+import tiktoken
+import yaml
 
 from .epub_input.epub_parser import EPUBParser
 from .epub_input.custom_converters import convert_html_to_markdown
+from .epub_input.semantic_enrichment import SemanticEnricher, semantic_pipeline
+from .processors.utils.content_splitter import split_content
+from .utils.llm_client import LLMClient
+
+# Initialize tokenizer for accurate token counting
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
+def load_config(config_path="config.yaml"):
+    """Load configuration from config file."""
+    with open(config_path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
 
 
 def save_progress(progress_file: Path, progress: Dict):
@@ -146,10 +160,21 @@ def process_chapter(
     chapter_idx: int,
     epub_parser: EPUBParser,
     output_dir: Path,
-    images_dir: Path
+    images_dir: Path,
+    llm_client=None,
+    max_tokens_per_part: int = 8000,
+    semantic_enricher: Optional[SemanticEnricher] = None,
+    use_semantic_pipeline: bool = True
 ) -> bool:
     """
     Process a single chapter: convert XHTML to Markdown.
+
+    Automatically splits long chapters into parts if they exceed max_tokens_per_part.
+
+    Pipeline:
+    1. Playwright: Inject semantic headings based on CSS styles
+    2. Trafilatura: Clean and linearize HTML
+    3. Markdownify: Convert to Markdown
 
     Args:
         chapter: Chapter dictionary from book_structure.json
@@ -157,6 +182,10 @@ def process_chapter(
         epub_parser: EPUBParser instance
         output_dir: Output directory for markdown
         images_dir: Directory for images
+        llm_client: LLM client for intelligent splitting (optional)
+        max_tokens_per_part: Maximum tokens per part (default: 8000)
+        semantic_enricher: Reusable SemanticEnricher instance (for batch processing)
+        use_semantic_pipeline: Enable Playwright+Trafilatura pipeline (default: True)
 
     Returns:
         True if successful
@@ -174,6 +203,18 @@ def process_chapter(
             return False
 
         html_content = item.get_content().decode('utf-8')
+
+        # **STAGE 1 & 2: Semantic enrichment pipeline**
+        # Playwright: Inject semantic headings based on visual styles
+        # Trafilatura: Clean and linearize HTML
+        if use_semantic_pipeline:
+            logger.debug(f"Applying semantic pipeline to {chapter_href}")
+            html_content = semantic_pipeline(
+                html_content,
+                use_playwright=True,
+                use_trafilatura=False,  # Disabled: Trafilatura destroys semantic headings
+                enricher=semantic_enricher
+            )
 
         # Parse HTML
         soup = BeautifulSoup(html_content, 'lxml')
@@ -193,7 +234,8 @@ def process_chapter(
 
         logger.info(f"Extracted {img_count} images")
 
-        # Convert to Markdown
+        # **STAGE 3: Convert to Markdown**
+        # Markdownify will now recognize semantic <h2>, <h3> tags
         markdown = convert_html_to_markdown(
             str(soup),
             preserve_mathml=True
@@ -203,41 +245,112 @@ def process_chapter(
         if not markdown.startswith('#'):
             markdown = f"# {chapter_title}\n\n{markdown}"
 
-        # Process subchapters (append to same file)
-        for subchapter in chapter.get('subchapters', []):
-            sub_href = subchapter['href']
-            sub_title = subchapter['title']
+        # Recursive function to process all levels of subchapters
+        def process_subchapters_recursive(subchapters_list, parent_href):
+            """Recursively process subchapters at all levels.
 
-            # Check if subchapter is in same file or different file
-            if sub_href != chapter_href:
-                # Different file, need to read and append
-                logger.debug(f"Processing subchapter from different file: {sub_href}")
-                sub_item = epub_parser.get_item_by_href(sub_href)
-                if sub_item:
-                    sub_html = sub_item.get_content().decode('utf-8')
-                    sub_soup = BeautifulSoup(sub_html, 'lxml')
+            With semantic pipeline enabled, headings are auto-detected from HTML styles.
+            We don't manually add markdown headings - they come from semantic enrichment.
 
-                    # Remove navigation
-                    for nav in sub_soup.find_all('nav'):
-                        nav.decompose()
+            Args:
+                subchapters_list: List of subchapter dictionaries
+                parent_href: Parent file href for path resolution
+            """
+            result_markdown = ""
+            for subchapter in subchapters_list:
+                sub_href = subchapter['href']
+                sub_title = subchapter['title']
 
-                    # Extract images
-                    sub_img_count = extract_and_save_images(
-                        sub_soup,
-                        chapter_idx,
-                        epub_parser,
-                        images_dir,
-                        sub_href
-                    )
+                # Check if subchapter is in same file or different file
+                if sub_href != parent_href:
+                    # Different file, need to read and append
+                    logger.debug(f"Processing subchapter from different file: {sub_href}")
+                    sub_item = epub_parser.get_item_by_href(sub_href)
+                    if sub_item:
+                        sub_html = sub_item.get_content().decode('utf-8')
 
-                    sub_markdown = convert_html_to_markdown(str(sub_soup))
-                    markdown += f"\n\n{sub_markdown}"
+                        # Apply semantic pipeline to subchapter
+                        if use_semantic_pipeline:
+                            logger.debug(f"Applying semantic pipeline to subchapter {sub_href}")
+                            sub_html = semantic_pipeline(
+                                sub_html,
+                                use_playwright=True,
+                                use_trafilatura=False,  # Disabled: Trafilatura destroys semantic headings
+                                enricher=semantic_enricher
+                            )
 
-        # Save Markdown file
-        md_filename = output_dir / f"chapter_{chapter_idx}.md"
-        md_filename.write_text(markdown, encoding='utf-8')
+                        sub_soup = BeautifulSoup(sub_html, 'lxml')
 
-        logger.success(f"Saved: {md_filename.name}")
+                        # Remove navigation
+                        for nav in sub_soup.find_all('nav'):
+                            nav.decompose()
+
+                        # Extract images
+                        sub_img_count = extract_and_save_images(
+                            sub_soup,
+                            chapter_idx,
+                            epub_parser,
+                            images_dir,
+                            sub_href
+                        )
+
+                        # Convert to markdown (headings already semantic from pipeline)
+                        sub_markdown = convert_html_to_markdown(str(sub_soup))
+                        result_markdown += f"\n\n{sub_markdown}"
+
+                # Recursively process nested subchapters
+                if 'subchapters' in subchapter and subchapter['subchapters']:
+                    nested_markdown = process_subchapters_recursive(subchapter['subchapters'], sub_href)
+                    result_markdown += nested_markdown
+
+            return result_markdown
+
+        # Process subchapters (append to same file) - now recursively with semantic pipeline
+        subchapters_markdown = process_subchapters_recursive(chapter.get('subchapters', []), chapter_href)
+        markdown += subchapters_markdown
+
+        # Check if chapter needs to be split
+        actual_tokens = len(tokenizer.encode(markdown))
+
+        if actual_tokens > max_tokens_per_part:
+            logger.info(f"Chapter {chapter_idx} has {actual_tokens:,} tokens (max: {max_tokens_per_part:,}), splitting into parts")
+
+            # Split content using intelligent splitter if llm_client available
+            if llm_client:
+                # Auto-detect content type for splitting strategy
+                import re
+                japanese_chars = re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', markdown[:5000])
+                if len(japanese_chars) > 500:
+                    strategy = "japanese"
+                else:
+                    # Check for academic indicators
+                    academic_indicators = [r'\[\^\d+\]', r'References\s*\n', r'Bibliography\s*\n']
+                    if any(re.search(pattern, markdown[:5000]) for pattern in academic_indicators):
+                        strategy = "academic"
+                    else:
+                        strategy = "general"
+
+                logger.info(f"Using '{strategy}' splitting strategy")
+                parts = split_content(markdown, max_tokens_per_part, llm_client, strategy=strategy)
+            else:
+                # Fallback: simple splitting by section
+                from .processors.utils.content_splitter import SimpleSplitter
+                parts = SimpleSplitter().split(markdown, max_tokens_per_part)
+
+            # Save each part
+            for part_idx, part_content in enumerate(parts, 1):
+                part_tokens = len(tokenizer.encode(part_content))
+                part_filename = output_dir / f"chapter_{chapter_idx}.part{part_idx}.md"
+                part_filename.write_text(part_content, encoding='utf-8')
+                logger.success(f"Saved: {part_filename.name} ({part_tokens:,} tokens)")
+
+            logger.info(f"Split chapter {chapter_idx} into {len(parts)} parts")
+        else:
+            # Save as single file
+            md_filename = output_dir / f"chapter_{chapter_idx}.md"
+            md_filename.write_text(markdown, encoding='utf-8')
+            logger.success(f"Saved: {md_filename.name} ({actual_tokens:,} tokens)")
+
         return True
 
     except Exception as e:
@@ -251,16 +364,22 @@ def convert_epub_to_markdown(
     epub_path: str,
     structure_file: Optional[str] = None,
     output_dir: Optional[str] = None,
-    resume: bool = False
+    resume: bool = False,
+    config_path: str = "config.yaml",
+    max_tokens_per_part: int = 8000
 ):
     """
     Convert EPUB to Markdown based on book_structure.json.
+
+    Automatically splits long chapters into parts if they exceed max_tokens_per_part.
 
     Args:
         epub_path: Path to EPUB file
         structure_file: Path to book_structure.json (auto-detected if None)
         output_dir: Output directory (auto-detected if None)
         resume: If True, resume from previous progress
+        config_path: Path to config file (default: config.yaml)
+        max_tokens_per_part: Maximum tokens per part for splitting (default: 8000)
     """
     epub_path = Path(epub_path)
 
@@ -307,36 +426,52 @@ def convert_epub_to_markdown(
     else:
         progress = {"chapters_processed": [], "total_chapters": len(structure['chapters'])}
 
+    # Load config and create LLM client for intelligent splitting
+    llm_client = None
+    try:
+        config = load_config(config_path)
+        llm_client = LLMClient(config)
+        logger.info("LLM client initialized for intelligent chapter splitting")
+    except Exception as e:
+        logger.warning(f"Failed to initialize LLM client: {e}. Will use simple splitting if needed.")
+
     # Parse EPUB
     logger.info(f"Loading EPUB: {epub_path}")
     epub_parser = EPUBParser(str(epub_path))
 
-    # Process each chapter
-    chapters = structure['chapters']
-    progress['total_chapters'] = len(chapters)
+    # Initialize semantic enricher (reuse browser for all chapters)
+    logger.info("Initializing semantic enrichment pipeline (Playwright + Trafilatura)")
+    with SemanticEnricher(headless=True) as semantic_enricher:
+        # Process each chapter
+        chapters = structure['chapters']
+        progress['total_chapters'] = len(chapters)
 
-    for chapter_idx, chapter in enumerate(chapters, 1):
-        # Skip if already processed
-        if resume and chapter_idx in progress['chapters_processed']:
-            logger.info(f"Skipping Chapter {chapter_idx} (already processed)")
-            continue
+        for chapter_idx, chapter in enumerate(chapters, 1):
+            # Skip if already processed
+            if resume and chapter_idx in progress['chapters_processed']:
+                logger.info(f"Skipping Chapter {chapter_idx} (already processed)")
+                continue
 
-        # Process chapter
-        success = process_chapter(
-            chapter,
-            chapter_idx,
-            epub_parser,
-            markdown_dir,
-            images_dir
-        )
+            # Process chapter with semantic enrichment
+            success = process_chapter(
+                chapter,
+                chapter_idx,
+                epub_parser,
+                markdown_dir,
+                images_dir,
+                llm_client=llm_client,
+                max_tokens_per_part=max_tokens_per_part,
+                semantic_enricher=semantic_enricher,  # Reuse enricher
+                use_semantic_pipeline=True
+            )
 
-        if success:
-            # Update progress
-            progress['chapters_processed'].append(chapter_idx)
-            save_progress(progress_file, progress)
-        else:
-            logger.error(f"Failed to process chapter {chapter_idx}, stopping")
-            break
+            if success:
+                # Update progress
+                progress['chapters_processed'].append(chapter_idx)
+                save_progress(progress_file, progress)
+            else:
+                logger.error(f"Failed to process chapter {chapter_idx}, stopping")
+                break
 
     # Summary
     logger.success(f"\nConversion complete!")
@@ -366,6 +501,17 @@ def main():
         action="store_true",
         help="Resume from previous progress"
     )
+    parser.add_argument(
+        "-c", "--config",
+        default="config.yaml",
+        help="Path to config file (default: config.yaml)"
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8000,
+        help="Maximum tokens per part for splitting long chapters (default: 8000)"
+    )
 
     args = parser.parse_args()
 
@@ -373,7 +519,9 @@ def main():
         args.epub_path,
         structure_file=args.structure,
         output_dir=args.output,
-        resume=args.resume
+        resume=args.resume,
+        config_path=args.config,
+        max_tokens_per_part=args.max_tokens
     )
 
 

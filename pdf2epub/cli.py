@@ -201,7 +201,9 @@ def epub_input_command(args):
             str(epub_path),
             structure_file=str(output_dir / "book_structure.json"),
             output_dir=str(output_dir),
-            resume=args.resume
+            resume=args.resume,
+            config_path=args.config,
+            max_tokens_per_part=8000  # Use default for now
         )
     except Exception as e:
         logger.error(f"Failed to convert EPUB to Markdown: {e}")

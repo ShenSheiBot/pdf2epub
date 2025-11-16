@@ -20,7 +20,8 @@ def ocr_pdf_chunk_mistral(
     chapter_index: int = 0,
     image_counter: int = 0,
     max_retries: int = 5,
-    initial_backoff: float = 4.0
+    initial_backoff: float = 4.0,
+    base_url: str = "https://api.mistral.ai/v1"
 ) -> Tuple[str, List[Dict], int]:
     """
     OCR a PDF chunk using Mistral's official API.
@@ -34,6 +35,7 @@ def ocr_pdf_chunk_mistral(
         image_counter: Current image counter
         max_retries: Maximum retry attempts for 429 errors
         initial_backoff: Initial backoff time in seconds
+        base_url: Base URL for Mistral API (default: https://api.mistral.ai/v1)
 
     Returns:
         Tuple of (markdown_content, images_info, updated_image_counter)
@@ -44,7 +46,7 @@ def ocr_pdf_chunk_mistral(
     data_url = f"data:application/pdf;base64,{pdf_b64}"
 
     # Mistral OCR API endpoint
-    url = "https://api.mistral.ai/v1/ocr"
+    url = f"{base_url}/ocr"
 
     # Headers with Bearer token
     headers = {

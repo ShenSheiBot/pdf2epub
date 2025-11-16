@@ -134,7 +134,8 @@ def ocr_pdf_chunk(
     max_retries: int = 5,
     initial_backoff: float = 4.0,
     backend: str = "vertex",
-    api_key: str = None
+    api_key: str = None,
+    base_url: str = None
 ) -> Tuple[str, List[Dict], int]:
     """OCR a PDF chunk using selected backend (Vertex AI or Mistral API).
 
@@ -153,6 +154,7 @@ def ocr_pdf_chunk(
         initial_backoff: Initial backoff time in seconds
         backend: OCR backend to use ('vertex' or 'mistral')
         api_key: Mistral API key (required for mistral backend)
+        base_url: Mistral API base URL (optional for mistral backend)
 
     Returns:
         Tuple of (markdown_content, images_info, updated_image_counter)
@@ -163,16 +165,21 @@ def ocr_pdf_chunk(
         if not api_key:
             raise ValueError("Mistral API key is required for mistral backend")
 
-        return ocr_pdf_chunk_mistral(
-            pdf_bytes=pdf_bytes,
-            api_key=api_key,
-            chunk_info=chunk_info,
-            images_dir=images_dir,
-            chapter_index=chapter_index,
-            image_counter=image_counter,
-            max_retries=max_retries,
-            initial_backoff=initial_backoff
-        )
+        kwargs = {
+            "pdf_bytes": pdf_bytes,
+            "api_key": api_key,
+            "chunk_info": chunk_info,
+            "images_dir": images_dir,
+            "chapter_index": chapter_index,
+            "image_counter": image_counter,
+            "max_retries": max_retries,
+            "initial_backoff": initial_backoff
+        }
+
+        if base_url:
+            kwargs["base_url"] = base_url
+
+        return ocr_pdf_chunk_mistral(**kwargs)
 
     elif backend == "vertex":
         if not session or not project_id or not location:
@@ -380,7 +387,8 @@ def process_chapter(
     max_pages: int = 30,
     max_size_mb: float = 20.0,
     backend: str = "vertex",
-    api_key: str = None
+    api_key: str = None,
+    base_url: str = None
 ) -> None:
     """Process a chapter at the chapter level.
     Treats the entire chapter as one unit, regardless of subchapter boundaries.
@@ -440,7 +448,7 @@ def process_chapter(
             pdf_bytes, session, project_id, location, chunk_info,
             images_dir, chapter_index, image_counter,
             max_retries=5, initial_backoff=4.0,
-            backend=backend, api_key=api_key
+            backend=backend, api_key=api_key, base_url=base_url
         )
 
         markdown_parts.append(markdown)
@@ -482,7 +490,7 @@ def process_chapter(
                         sub_pdf_bytes, session, project_id, location, sub_info,
                         images_dir, chapter_index, image_counter,
                         max_retries=5, initial_backoff=4.0,
-                        backend=backend, api_key=api_key
+                        backend=backend, api_key=api_key, base_url=base_url
                     )
 
                     markdown_parts.append(sub_markdown)
@@ -492,7 +500,7 @@ def process_chapter(
                     pdf_bytes, session, project_id, location, chunk_info,
                     images_dir, chapter_index, image_counter,
                     max_retries=5, initial_backoff=4.0,
-                    backend=backend, api_key=api_key
+                    backend=backend, api_key=api_key, base_url=base_url
                 )
 
                 markdown_parts.append(chunk_markdown)
@@ -542,7 +550,8 @@ def process_matter_pages(
     matter_type: str = "front",
     max_pages: int = 30,
     backend: str = "vertex",
-    api_key: str = None
+    api_key: str = None,
+    base_url: str = None
 ) -> None:
     """Process front matter or back matter pages.
     
@@ -582,7 +591,7 @@ def process_matter_pages(
             pdf_bytes, session, project_id, location, chunk_info,
             images_dir, 0, image_counter,  # Use 0 as chapter index for matter pages
             max_retries=5, initial_backoff=4.0,
-            backend=backend, api_key=api_key
+            backend=backend, api_key=api_key, base_url=base_url
         )
         markdown_parts.append(markdown)
     
@@ -609,7 +618,7 @@ def main():
     parser.add_argument("-i", "--input", help="Path to input PDF file (default: output/{book_title}/input.pdf)")
     parser.add_argument("-c", "--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--resume", action="store_true", help="Resume from previous progress")
-    parser.add_argument("--max-pages", type=int, default=25, help="Maximum pages per OCR request (default: 25)")
+    parser.add_argument("--max-pages", type=int, default=5, help="Maximum pages per OCR request (default: 5)")
     
     args = parser.parse_args()
     
@@ -643,6 +652,7 @@ def main():
     project_id = None
     location = None
     api_key = None
+    base_url = None
 
     if ocr_backend == "vertex":
         # Setup Google Cloud authentication
@@ -671,12 +681,13 @@ def main():
         session = AuthorizedSession(credentials)
 
     elif ocr_backend == "mistral":
-        # Get Mistral API key
+        # Get Mistral API key and base URL
         api_key = config.get("mistral_api_key")
         if not api_key:
             raise ValueError("mistral_api_key not found in config.yaml")
 
-        logger.info(f"Using Mistral API with key: {api_key[:8]}...")
+        base_url = config.get("mistral_base_url", "https://api.mistral.ai/v1")
+        logger.info(f"Using Mistral API with key: {api_key[:8]}... at {base_url}")
 
     elif ocr_backend == "vllm":
         # VLLM backend uses init_client from vllm.py
@@ -728,7 +739,8 @@ def main():
                     "front",
                     args.max_pages,
                     backend=ocr_backend,
-                    api_key=api_key
+                    api_key=api_key,
+                    base_url=base_url if ocr_backend == "mistral" else None
                 )
                 
                 # Update progress
@@ -761,7 +773,8 @@ def main():
                 images_dir,
                 args.max_pages,
                 backend=ocr_backend,
-                api_key=api_key
+                api_key=api_key,
+                base_url=base_url if ocr_backend == "mistral" else None
             )
             
             # Update progress
@@ -793,7 +806,8 @@ def main():
                     "back",
                     args.max_pages,
                     backend=ocr_backend,
-                    api_key=api_key
+                    api_key=api_key,
+                    base_url=base_url if ocr_backend == "mistral" else None
                 )
                 
                 # Update progress

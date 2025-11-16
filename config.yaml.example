@@ -10,6 +10,7 @@ openai_api_key: your-openai-api-key-here
 openai_base_url: https://api.openai.com/v1
 openai_model: gpt-4o
 mistral_api_key: your-mistral-api-key-here
+mistral_base_url: https://api.mistral.ai/v1
 
 # OCR Backend Selection
 ocr_backend: vertex  # Options: 'vertex', 'mistral', 'azure', or 'vllm'

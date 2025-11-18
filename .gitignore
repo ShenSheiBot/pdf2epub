@@ -32,3 +32,4 @@ secrets.yaml
 *.claude
 .claude/test_*.py
 test_*.md
+temp_test/

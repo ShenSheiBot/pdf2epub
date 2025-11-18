@@ -169,14 +169,13 @@ def ocr_pdf_chunk_mistral(
                 f.write(img_bytes)
 
             # Replace image reference in markdown
-            # Mistral can return references in different formats:
-            # - ![img-0.jpeg](img-0.jpeg)
-            # - ![Image](img-0.jpeg)
-            # - ![](img-0.jpeg)
+            # PaddleOCR can return references in different formats:
+            # - Markdown: ![img-0.jpeg](img-0.jpeg), ![Image](img-0.jpeg), ![](img-0.jpeg)
+            # - HTML: <img src="imgs/img_in_image_box_XXX.jpg" ... />
             img_id = img_info['id']
             new_ref = f"![Image](../images/{img_filename})"
 
-            # Try different possible formats
+            # Try Markdown formats first
             possible_refs = [
                 f"![{img_id}]({img_id})",  # ![img-0.jpeg](img-0.jpeg)
                 f"![Image]({img_id})",      # ![Image](img-0.jpeg)
@@ -190,6 +189,27 @@ def ocr_pdf_chunk_mistral(
                     logger.debug(f"Saved image: {img_filename}, replaced {old_ref} with {new_ref}")
                     replaced = True
                     break
+
+            # If not found, try HTML format with regex
+            if not replaced:
+                import re
+                # Match <img src="imgs/XXX.jpg" ... />
+                # Extract the filename from HTML img tag
+                html_pattern = re.compile(r'<img\s+src="imgs/([^"]+)"[^>]*>')
+                matches = html_pattern.findall(combined_markdown)
+
+                if matches:
+                    # Replace the first unmatched image (assume order matches)
+                    for html_filename in matches:
+                        # Check if this hasn't been replaced yet
+                        old_html_tag = f'<img src="imgs/{html_filename}"'
+                        if old_html_tag in combined_markdown and '../images/' not in combined_markdown[combined_markdown.find(old_html_tag):combined_markdown.find(old_html_tag)+200]:
+                            # Replace this specific img tag
+                            new_html_tag = f'<img src="../images/{img_filename}"'
+                            combined_markdown = combined_markdown.replace(old_html_tag, new_html_tag, 1)
+                            logger.debug(f"Saved image: {img_filename}, replaced HTML img tag for {html_filename}")
+                            replaced = True
+                            break
 
             if not replaced:
                 logger.warning(f"Could not find reference for {img_id} in markdown")
@@ -370,14 +390,13 @@ def ocr_pdf_chunk_vertex(
                 f.write(img_bytes)
 
             # Replace image reference in markdown
-            # Mistral can return references in different formats:
-            # - ![img-0.jpeg](img-0.jpeg)
-            # - ![Image](img-0.jpeg)
-            # - ![](img-0.jpeg)
+            # PaddleOCR can return references in different formats:
+            # - Markdown: ![img-0.jpeg](img-0.jpeg), ![Image](img-0.jpeg), ![](img-0.jpeg)
+            # - HTML: <img src="imgs/img_in_image_box_XXX.jpg" ... />
             img_id = img_info['id']
             new_ref = f"![Image](../images/{img_filename})"
 
-            # Try different possible formats
+            # Try Markdown formats first
             possible_refs = [
                 f"![{img_id}]({img_id})",  # ![img-0.jpeg](img-0.jpeg)
                 f"![Image]({img_id})",      # ![Image](img-0.jpeg)
@@ -391,6 +410,27 @@ def ocr_pdf_chunk_vertex(
                     logger.debug(f"Saved image: {img_filename}, replaced {old_ref} with {new_ref}")
                     replaced = True
                     break
+
+            # If not found, try HTML format with regex
+            if not replaced:
+                import re
+                # Match <img src="imgs/XXX.jpg" ... />
+                # Extract the filename from HTML img tag
+                html_pattern = re.compile(r'<img\s+src="imgs/([^"]+)"[^>]*>')
+                matches = html_pattern.findall(combined_markdown)
+
+                if matches:
+                    # Replace the first unmatched image (assume order matches)
+                    for html_filename in matches:
+                        # Check if this hasn't been replaced yet
+                        old_html_tag = f'<img src="imgs/{html_filename}"'
+                        if old_html_tag in combined_markdown and '../images/' not in combined_markdown[combined_markdown.find(old_html_tag):combined_markdown.find(old_html_tag)+200]:
+                            # Replace this specific img tag
+                            new_html_tag = f'<img src="../images/{img_filename}"'
+                            combined_markdown = combined_markdown.replace(old_html_tag, new_html_tag, 1)
+                            logger.debug(f"Saved image: {img_filename}, replaced HTML img tag for {html_filename}")
+                            replaced = True
+                            break
 
             if not replaced:
                 logger.warning(f"Could not find reference for {img_id} in markdown")

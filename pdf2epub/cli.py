@@ -222,37 +222,18 @@ def epub_input_command(args):
 def ocr_command(args):
     """Handle the OCR subcommand."""
     import sys
-    from pdf2epub.utils.common import load_config
     original_argv = sys.argv
-    
-    # Load config to get max_concurrent_workers default
-    config = load_config(args.config)
-    max_workers = args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4)
-    
+
     try:
-        if args.japanese or args.backend:
-            # Use Japanese OCR
-            from pdf2epub.ocr_chapters_jp import main as ocr_main
-            
-            # Build argv for ocr_chapters_jp main
-            new_argv = ['ocr_chapters_jp.py']
-            if args.backend:
-                new_argv.extend(['--backend', args.backend])
-            if hasattr(args, 'resume') and args.resume:
-                new_argv.append('--resume')
-            new_argv.extend(['--max-workers', str(max_workers)])
-            if hasattr(args, 'azure_illustrations') and args.azure_illustrations:
-                new_argv.append('--azure-illustrations')
-                logger.info("Adding --azure-illustrations flag to Japanese OCR")
-        else:
-            # Use regular OCR
-            from pdf2epub.ocr_chapters import main as ocr_main
-            
-            # Build argv for regular ocr_chapters main
-            new_argv = ['ocr_chapters.py']
-            if hasattr(args, 'resume') and args.resume:
-                new_argv.append('--resume')
-        
+        from pdf2epub.ocr_chapters import main as ocr_main
+
+        # Build argv for ocr_chapters main
+        new_argv = ['ocr_chapters.py']
+        if hasattr(args, 'resume') and args.resume:
+            new_argv.append('--resume')
+        if hasattr(args, 'aggregate_only') and args.aggregate_only:
+            new_argv.append('--aggregate-only')
+
         sys.argv = new_argv
         return ocr_main()
     finally:
@@ -484,10 +465,10 @@ Examples:
   # EPUB with custom filtering:
   pdf2epub epub-input -i mybook.epub --skip-pattern "^Cover$" --skip-pattern "Copyright"
 
-  # Japanese book with translation:
+  # Japanese book with translation (set ocr_backend: vision in config.yaml):
   pdf2epub breakdown -i manga.pdf
   pdf2epub extract-entities -i manga.pdf  # Extract for consistency
-  pdf2epub ocr --japanese --backend vision
+  pdf2epub ocr
   pdf2epub polish --content-type japanese
   pdf2epub translate --target-language Chinese  # Auto-uses entities
   pdf2epub epub
@@ -580,30 +561,14 @@ Examples:
         description="Process PDF pages with OCR to extract text content"
     )
     ocr_parser.add_argument(
-        "--japanese",
-        action="store_true",
-        help="Use Japanese OCR processing"
-    )
-    ocr_parser.add_argument(
-        "--backend",
-        choices=['azure', 'vision', 'vllm'],
-        help="OCR backend for Japanese (overrides config)"
-    )
-    ocr_parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from previous progress"
     )
     ocr_parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=None,
-        help="Maximum number of concurrent workers (default: from config or 4)"
-    )
-    ocr_parser.add_argument(
-        "--azure-illustrations",
+        "--aggregate-only",
         action="store_true",
-        help="Use Azure's native figure detection to extract illustrations (Azure backend only)"
+        help="Only aggregate existing pages into chapters (skip OCR)"
     )
     ocr_parser.set_defaults(func=ocr_command)
     

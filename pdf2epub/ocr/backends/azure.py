@@ -203,9 +203,9 @@ def _extract_azure_figures(client: DocumentIntelligenceClient, azure_result, pag
     return illustrations
 
 
-# Interface functions for ocr_chapters_jp.py
+# Interface functions for OCR page processing
 def init_client(config: Dict) -> DocumentIntelligenceClient:
-    """Initialize Azure Document Intelligence client for use with ocr_chapters_jp.py."""
+    """Initialize Azure Document Intelligence client for OCR page processing."""
     azure_endpoint = config.get('azure_endpoint', os.getenv('AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT'))
     azure_key = config.get('azure_key', os.getenv('AZURE_DOCUMENT_INTELLIGENCE_KEY'))
     
@@ -225,7 +225,7 @@ def init_client(config: Dict) -> DocumentIntelligenceClient:
 def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num: int, config: Dict, base_output_dir: Path = None, verbose: bool = False) -> Dict:
     """
     Process a single page using Azure Document Intelligence.
-    Interface function for ocr_chapters_jp.py.
+    Interface function for OCR page processing.
     
     Args:
         base_output_dir: Base output directory (typically output/{book_title})

@@ -13,7 +13,7 @@ mistral_api_key: your-mistral-api-key-here
 mistral_base_url: https://api.mistral.ai/v1
 
 # OCR Backend Selection
-ocr_backend: vertex  # Options: 'vertex', 'mistral', 'azure', or 'vllm'
+ocr_backend: vertex  # Options: 'vertex', 'mistral', 'vllm', 'azure', 'vision'
 
 # GCP Configuration (for vertex OCR backend)
 gcp_location: us-central1
@@ -36,10 +36,7 @@ num_retries: 3
 max_backoff_seconds: 30
 max_concurrent_workers: 8  # Maximum number of concurrent API calls (adjust based on your API rate limits)
 
-# Japanese Vertical OCR Backend Selection
-jp_ocr_backend: azure  # Options: 'azure' or 'vision'
-
-# Furigana handling mode
+# Furigana handling mode (for azure/vision backends)
 furigana_mode: attach  # Options: 'attach' (add as (かな)) or 'delete' (remove furigana)
 
 azure_endpoint: https://your-azure-endpoint.cognitiveservices.azure.com/

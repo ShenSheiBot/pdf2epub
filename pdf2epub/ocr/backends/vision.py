@@ -20,9 +20,9 @@ from ..illustration_extractor import extract_illustrations
 logger = configure_logging()
 
 
-# Interface functions for ocr_chapters_jp.py
+# Interface functions for OCR page processing
 def init_client(config: Dict) -> vision.ImageAnnotatorClient:
-    """Initialize Google Cloud Vision client for use with ocr_chapters_jp.py."""
+    """Initialize Google Cloud Vision client for OCR page processing."""
     # Look for credentials in config, then environment variables
     key_path = config.get(
         "service_account_key_path", os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -52,7 +52,7 @@ def process_page(
 ) -> Dict:
     """
     Process a single page using Google Cloud Vision.
-    Interface function for ocr_chapters_jp.py.
+    Interface function for OCR page processing.
 
     Args:
         base_output_dir: Base output directory (typically output/{book_title})

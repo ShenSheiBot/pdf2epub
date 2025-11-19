@@ -87,7 +87,7 @@ cp config.yaml.example config.yaml
 #### Azure Document Intelligence
 ```yaml
 # config.yaml
-jp_ocr_backend: azure  # 使用Azure后端
+ocr_backend: azure  # 使用Azure后端
 
 # Azure配置
 azure_endpoint: https://your-resource.cognitiveservices.azure.com/
@@ -97,7 +97,7 @@ azure_api_key: your-azure-api-key
 #### Google Cloud Vision
 ```yaml
 # config.yaml
-jp_ocr_backend: vision  # 使用Vision后端
+ocr_backend: vision  # 使用Vision后端
 
 # Google Cloud配置
 service_account_key_path: /path/to/sa-keys.json
@@ -107,7 +107,7 @@ service_account_key_path: /path/to/sa-keys.json
 #### Vision Language Models (VLLM)
 ```yaml
 # config.yaml
-jp_ocr_backend: vllm  # 使用VLLM后端
+ocr_backend: vllm  # 使用VLLM后端
 
 # VLLM模型配置
 ocr_vllm_models:
@@ -143,8 +143,8 @@ openai_api_key: your-openai-api-key  # 可选，支持兼容API如DeepSeek
 openai_base_url: https://api.deepseek.com/v1  # 可选，自定义端点
 openai_model: deepseek-chat  # 可选，模型名称
 
-# 选择日语OCR后端 (azure/vision/vllm)
-jp_ocr_backend: vision
+# 选择OCR后端 (mistral/vertex/vllm/azure/vision)
+ocr_backend: vision  # 日语推荐azure或vision
 
 # 高级配置
 num_retries: 1  # API重试次数
@@ -182,20 +182,15 @@ uv run pdf2epub breakdown -i input.pdf
 
 #### 步骤 2: OCR 转换
 
-**对于普通书籍：**
 ```bash
 uv run pdf2epub ocr
 ```
 
-**对于日语纵排书籍：**
-```bash
-uv run pdf2epub ocr --japanese --backend vision
-```
-
 参数说明：
-- `--backend [azure|vision|vllm]`: 覆盖配置文件中的后端选择
 - `--resume`: 从上次中断处继续
-- `--max-workers N`: 设置并行处理线程数（默认4）
+- `--aggregate-only`: 仅聚合已OCR的页面（跳过OCR）
+
+OCR后端在 `config.yaml` 中通过 `ocr_backend` 配置。
 
 #### 步骤 3: 内容润色
 ```bash

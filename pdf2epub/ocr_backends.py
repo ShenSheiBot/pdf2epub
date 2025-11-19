@@ -10,6 +10,34 @@ from typing import Dict, List, Optional, Tuple, Any
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryCallState
+
+
+def is_rate_limit_error(exception):
+    """Check if the exception is a rate limit error (HTTP 429)."""
+    if isinstance(exception, requests.exceptions.HTTPError):
+        return exception.response.status_code == 429
+    if isinstance(exception, requests.exceptions.RequestException):
+        return "429" in str(exception)
+    return False
+
+
+def is_retryable_error(exception):
+    """Check if the exception should trigger a retry."""
+    # Rate limit errors (429)
+    if is_rate_limit_error(exception):
+        return True
+    # Other HTTP errors
+    if isinstance(exception, requests.exceptions.HTTPError):
+        status_code = exception.response.status_code
+        # Retry on server errors (5xx) and some client errors
+        return status_code >= 500 or status_code == 429
+    # Network errors
+    if isinstance(exception, (requests.exceptions.ConnectionError,
+                             requests.exceptions.Timeout,
+                             requests.exceptions.RequestException)):
+        return True
+    return False
 
 
 def ocr_pdf_chunk_mistral(
@@ -66,54 +94,41 @@ def ocr_pdf_chunk_mistral(
 
     logger.info(f"Sending OCR request to Mistral API for {chunk_info}...")
 
-    # Retry logic with exponential backoff for rate limits
-    backoff = initial_backoff
-    result = None
+    # Calculate max wait time for exponential backoff
+    max_wait = int(initial_backoff * (2 ** max_retries))
 
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=300)
+    # Define retry decorator with exponential backoff
+    @retry(
+        retry=retry_if_exception_type((requests.exceptions.HTTPError, requests.exceptions.RequestException)),
+        stop=stop_after_attempt(max_retries),
+        wait=wait_exponential(multiplier=initial_backoff, max=max_wait),
+        before_sleep=lambda retry_state: logger.warning(
+            f"Retry {retry_state.attempt_number}/{max_retries} for {chunk_info}: {retry_state.outcome.exception()}"
+        ),
+        reraise=True
+    )
+    def _make_ocr_request():
+        """Make OCR request with automatic retry on failures."""
+        resp = requests.post(url, headers=headers, json=payload, timeout=300)
 
-            # Check for rate limit error
+        # Check for errors
+        if resp.status_code != 200:
             if resp.status_code == 429:
-                if attempt < max_retries - 1:
-                    # Calculate exponential backoff with jitter
-                    wait_time = backoff * (2 ** attempt) + (backoff * 0.1 * (0.5 - time.time() % 1))
-                    logger.warning(
-                        f"Rate limit hit for {chunk_info} (attempt {attempt + 1}/{max_retries}). "
-                        f"Waiting {wait_time:.2f} seconds before retry..."
-                    )
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"HTTP 429 for {chunk_info} after {max_retries} attempts")
-                    logger.error(f"Response: {resp.text[:500]}")
-
-            # Log other error responses
-            if resp.status_code != 200:
+                logger.warning(f"Rate limit hit for {chunk_info}")
+            else:
                 logger.error(f"HTTP {resp.status_code} for {chunk_info}")
                 logger.error(f"Response: {resp.text[:500]}")
 
-            resp.raise_for_status()
-            result = resp.json()
-            break  # Success, exit retry loop
+            resp.raise_for_status()  # Will raise HTTPError
 
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1 and "429" in str(e):
-                wait_time = backoff * (2 ** attempt) + (backoff * 0.1 * (0.5 - time.time() % 1))
-                logger.warning(
-                    f"Request exception with rate limit for {chunk_info} (attempt {attempt + 1}/{max_retries}). "
-                    f"Error: {e}. Waiting {wait_time:.2f} seconds before retry..."
-                )
-                time.sleep(wait_time)
-                continue
-            else:
-                # Re-raise if not a rate limit error or if we've exhausted retries
-                raise
+        return resp.json()
 
-    # Process the result if we got one
-    if result is None:
-        raise Exception(f"Failed to get OCR response for {chunk_info} after {max_retries} attempts")
+    # Execute request with retry logic
+    try:
+        result = _make_ocr_request()
+    except Exception as e:
+        logger.error(f"Failed after {max_retries} retries for {chunk_info}: {e}")
+        raise
 
     # Extract markdown and images from all pages
     pages = result.get("pages", [])
@@ -287,54 +302,41 @@ def ocr_pdf_chunk_vertex(
 
     logger.info(f"Sending OCR request to Vertex AI for {chunk_info}...")
 
-    # Retry logic with exponential backoff for rate limits
-    backoff = initial_backoff
-    result = None
+    # Calculate max wait time for exponential backoff
+    max_wait = int(initial_backoff * (2 ** max_retries))
 
-    for attempt in range(max_retries):
-        try:
-            resp = session.post(url, json=payload, timeout=300)
+    # Define retry decorator with exponential backoff
+    @retry(
+        retry=retry_if_exception_type((requests.exceptions.HTTPError, requests.exceptions.RequestException)),
+        stop=stop_after_attempt(max_retries),
+        wait=wait_exponential(multiplier=initial_backoff, max=max_wait),
+        before_sleep=lambda retry_state: logger.warning(
+            f"Retry {retry_state.attempt_number}/{max_retries} for {chunk_info}: {retry_state.outcome.exception()}"
+        ),
+        reraise=True
+    )
+    def _make_ocr_request():
+        """Make OCR request with automatic retry on failures."""
+        resp = session.post(url, json=payload, timeout=300)
 
-            # Check for rate limit error
+        # Check for errors
+        if resp.status_code != 200:
             if resp.status_code == 429:
-                if attempt < max_retries - 1:
-                    # Calculate exponential backoff with jitter
-                    wait_time = backoff * (2 ** attempt) + (backoff * 0.1 * (0.5 - time.time() % 1))
-                    logger.warning(
-                        f"Rate limit hit for {chunk_info} (attempt {attempt + 1}/{max_retries}). "
-                        f"Waiting {wait_time:.2f} seconds before retry..."
-                    )
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"HTTP 429 for {chunk_info} after {max_retries} attempts")
-                    logger.error(f"Response: {resp.text[:500]}")
-
-            # Log other error responses
-            if resp.status_code != 200:
+                logger.warning(f"Rate limit hit for {chunk_info}")
+            else:
                 logger.error(f"HTTP {resp.status_code} for {chunk_info}")
                 logger.error(f"Response: {resp.text[:500]}")
 
-            resp.raise_for_status()
-            result = resp.json()
-            break  # Success, exit retry loop
+            resp.raise_for_status()  # Will raise HTTPError
 
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1 and "429" in str(e):
-                wait_time = backoff * (2 ** attempt) + (backoff * 0.1 * (0.5 - time.time() % 1))
-                logger.warning(
-                    f"Request exception with rate limit for {chunk_info} (attempt {attempt + 1}/{max_retries}). "
-                    f"Error: {e}. Waiting {wait_time:.2f} seconds before retry..."
-                )
-                time.sleep(wait_time)
-                continue
-            else:
-                # Re-raise if not a rate limit error or if we've exhausted retries
-                raise
+        return resp.json()
 
-    # Process the result if we got one
-    if result is None:
-        raise Exception(f"Failed to get OCR response for {chunk_info} after {max_retries} attempts")
+    # Execute request with retry logic
+    try:
+        result = _make_ocr_request()
+    except Exception as e:
+        logger.error(f"Failed after {max_retries} retries for {chunk_info}: {e}")
+        raise
 
     # Extract markdown and images from all pages
     pages = result.get("pages", [])
@@ -461,8 +463,8 @@ def ocr_pdf_chunk_vllm(
         images_dir: Directory to save extracted images
         chapter_index: Index of current chapter
         image_counter: Current image counter
-        max_retries: Maximum retry attempts (not used for vllm)
-        initial_backoff: Initial backoff time (not used for vllm)
+        max_retries: Maximum retry attempts for OCR calls
+        initial_backoff: Initial backoff time in seconds
 
     Returns:
         Tuple of (markdown_content, images_info, updated_image_counter)
@@ -484,6 +486,9 @@ def ocr_pdf_chunk_vllm(
     markdown_parts = []
     all_images = []
 
+    # Calculate max wait time for exponential backoff
+    max_wait = int(initial_backoff * (2 ** max_retries))
+
     # Process each page
     for page_idx in range(len(doc)):
         page = doc[page_idx]
@@ -495,12 +500,26 @@ def ocr_pdf_chunk_vllm(
         img_bytes = pix.tobytes("png")
         img = Image.open(io.BytesIO(img_bytes))
 
-        # Perform OCR
+        # Define retry decorator for this page
+        @retry(
+            retry=retry_if_exception_type(Exception),
+            stop=stop_after_attempt(max_retries),
+            wait=wait_exponential(multiplier=initial_backoff, max=max_wait),
+            before_sleep=lambda retry_state: logger.warning(
+                f"Retry {retry_state.attempt_number}/{max_retries} for page {page_idx + 1}: {retry_state.outcome.exception()}"
+            ),
+            reraise=True
+        )
+        def _ocr_page():
+            """OCR a single page with automatic retry."""
+            return client.ocr(img)
+
+        # Perform OCR with retry
         try:
-            text = client.ocr(img)
+            text = _ocr_page()
             markdown_parts.append(text)
         except Exception as e:
-            logger.error(f"OCR failed for page {page_idx + 1}: {e}")
+            logger.error(f"OCR failed for page {page_idx + 1} after {max_retries} retries: {e}")
             markdown_parts.append(f"\n\n[OCR Error on page {page_idx + 1}]\n\n")
 
     doc.close()

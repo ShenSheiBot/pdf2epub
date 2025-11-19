@@ -178,10 +178,15 @@ class OCRClient:
             prompt: Custom prompt for the model. If not provided, uses default.
         """
         if prompt is None:
-            prompt = """Extract all Japanese text from this image, preserving the exact layout and reading order.
-For vertical Japanese text (read right-to-left), maintain the column structure.
-Include all furigana (ruby text) inline with parentheses after the kanji.
-Example format: 漢字(かんじ)
+            prompt = """Extract all text from this image, preserving the exact layout and reading order.
+
+Guidelines:
+- For vertical text (e.g., Japanese, Chinese), read right-to-left and maintain column structure
+- For horizontal text, read left-to-right, top-to-bottom
+- Include all ruby text/furigana inline with parentheses after the base text
+  Example: 漢字(かんじ)
+- Preserve paragraph breaks and formatting
+- If the image contains only illustrations with no text, respond with: [illustration]
 
 Please extract the complete text maintaining the original structure."""
 
@@ -194,10 +199,10 @@ Please extract the complete text maintaining the original structure."""
     
 
 
-# Interface functions for ocr_chapters_jp.py compatibility
+# Interface functions for OCR page processing
 def init_client(config: Dict) -> OCRClient:
     """
-    Initialize VLLM OCR client for use with ocr_chapters_jp.py.
+    Initialize VLLM OCR client for OCR page processing.
 
     Args:
         config: Configuration dictionary from config.yaml
@@ -258,7 +263,7 @@ def process_page(
 ) -> Dict:
     """
     Process a single page using VLLM OCR.
-    Interface function for ocr_chapters_jp.py.
+    Interface function for OCR page processing.
     
     Args:
         client: OCRClient instance

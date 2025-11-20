@@ -12,8 +12,8 @@ Output structure:
       ...
       epub_progress.json
     images/
-      chapter_1_img_0.jpg
-      chapter_2_img_0.jpg
+      page_1_img_0.jpg
+      page_2_img_0.jpg
       ...
 """
 
@@ -26,22 +26,16 @@ import hashlib
 from urllib.parse import unquote, urljoin
 from bs4 import BeautifulSoup
 import tiktoken
-import yaml
 
 from .epub_input.epub_parser import EPUBParser
 from .epub_input.custom_converters import convert_html_to_markdown
 from .epub_input.semantic_enrichment import SemanticEnricher, semantic_pipeline
 from .processors.utils.content_splitter import split_content
 from .utils.llm_client import LLMClient
+from .utils.common import load_config
 
 # Initialize tokenizer for accurate token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")
-
-
-def load_config(config_path="config.yaml"):
-    """Load configuration from config file."""
-    with open(config_path, "r", encoding="utf-8") as file:
-        return yaml.safe_load(file)
 
 
 def save_progress(progress_file: Path, progress: Dict):
@@ -139,7 +133,7 @@ def extract_and_save_images(
                 ext = Path(resolved_src).suffix.lstrip('.') or 'jpg'
 
             # Save image
-            img_filename = f"chapter_{chapter_idx}_img_{img_counter}.{ext}"
+            img_filename = f"page_{chapter_idx}_img_{img_counter}.{ext}"
             img_path = images_dir / img_filename
             img_path.write_bytes(img_bytes)
 

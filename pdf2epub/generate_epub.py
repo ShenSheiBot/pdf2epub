@@ -18,6 +18,7 @@ from .utils.logging_config import configure_logging
 from .utils.common import load_config, load_book_structure, ensure_directory
 from .utils.zip_utils import create_password_protected_zip
 from .utils.llm_client import LLMClient
+from .chapter_identity import ChapterIdentity
 
 # Configure logger
 logger = configure_logging()
@@ -34,7 +35,9 @@ def build_subchapter_locations(markdown_dir, parts_info):
         if parts > 1:
             # This chapter has multiple parts
             for part_num in range(1, parts + 1):
-                part_file = markdown_dir / f"chapter_{chapter_index}.part{part_num}.md"
+                # Use ChapterIdentity for consistent naming
+                part_name = ChapterIdentity.make_part_name(f"chapter_{chapter_index}", part_num)
+                part_file = markdown_dir / f"{part_name}.md"
                 if part_file.exists():
                     with open(part_file, "r", encoding="utf-8") as f:
                         lines = f.readlines()
@@ -106,22 +109,19 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
     # Find all chapter files (including part files)
     chapter_files = {}
 
-    # First collect all files by chapter number
+    # First collect all files by chapter number using ChapterIdentity
     for md_file in sorted(markdown_dir.glob("*.md")):
-        if md_file.name.startswith("chapter_"):
-            # Extract chapter number
-            match = re.match(r"chapter_(\d+)(?:\.part(\d+))?\.md", md_file.name)
-            if match:
-                chapter_num = int(match.group(1))
-                part_num = int(match.group(2)) if match.group(2) else None
+        identity = ChapterIdentity.parse(md_file.name)
+        if identity and identity.number is not None:
+            chapter_num = identity.number
 
-                if chapter_num not in chapter_files:
-                    chapter_files[chapter_num] = {}
+            if chapter_num not in chapter_files:
+                chapter_files[chapter_num] = {}
 
-                if part_num is not None:
-                    chapter_files[chapter_num][part_num] = md_file
-                else:
-                    chapter_files[chapter_num]["main"] = md_file
+            if identity.part is not None:
+                chapter_files[chapter_num][identity.part] = md_file
+            else:
+                chapter_files[chapter_num]["main"] = md_file
 
     # Now process each chapter
     for chapter_num in sorted(chapter_files.keys()):
@@ -962,7 +962,7 @@ Original title: {epub_config.book_title}"""
 
         # Look for common cover image patterns in the EPUB images directory
         import glob
-        for pattern in ["chapter_1_img_0.*", "cover.*", "Chapter_1_img_0.*"]:
+        for pattern in ["page_1_img_0.*", "cover.*", "Page_1_img_0.*"]:
             matches = glob.glob(str(images_dir / pattern))
             logger.debug(f"Searching {images_dir / pattern}: {len(matches)} matches")
             if matches:

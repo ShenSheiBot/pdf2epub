@@ -27,6 +27,16 @@ class ContentSplitter(ABC):
 class SimpleSplitter(ContentSplitter):
     """A simple content splitter with intelligent paragraph detection."""
 
+    def __init__(self, min_part_tokens: int = 200):
+        """
+        Initialize the splitter.
+
+        Args:
+            min_part_tokens: Minimum tokens per part (default: 200).
+                            Parts smaller than this will be merged with adjacent parts.
+        """
+        self.min_part_tokens = min_part_tokens
+
     def split(self, content: str, max_tokens: int) -> List[str]:
         """
         Simple content splitter that divides content into roughly equal parts.
@@ -79,7 +89,62 @@ class SimpleSplitter(ContentSplitter):
         if current_part:
             parts.append(separator.join(current_part))
 
+        # Merge undersized parts with adjacent parts (respecting max_tokens limit)
+        parts = self._merge_small_parts(parts, separator, max_tokens)
+
         return parts if parts else [content]
+
+    def _merge_small_parts(self, parts: List[str], separator: str, max_tokens: int) -> List[str]:
+        """
+        Merge parts that are smaller than min_part_tokens with adjacent parts.
+
+        Args:
+            parts: List of content parts
+            separator: Separator to use when merging
+            max_tokens: Maximum tokens per part (to prevent over-merging)
+
+        Returns:
+            List of parts with small ones merged
+        """
+        if len(parts) <= 1:
+            return parts
+
+        merged = []
+        i = 0
+
+        while i < len(parts):
+            part = parts[i]
+            part_tokens = len(tokenizer.encode(part))
+
+            if part_tokens < self.min_part_tokens:
+                # This part is too small, try to merge it
+                if merged:
+                    # Check if merging with previous would exceed max_tokens
+                    prev_tokens = len(tokenizer.encode(merged[-1]))
+                    if prev_tokens + part_tokens <= max_tokens:
+                        # Safe to merge with previous
+                        merged[-1] = merged[-1] + separator + part
+                    else:
+                        # Can't merge without exceeding limit, keep as-is
+                        merged.append(part)
+                elif i + 1 < len(parts):
+                    # No previous part, check if we can merge with next
+                    next_tokens = len(tokenizer.encode(parts[i + 1]))
+                    if part_tokens + next_tokens <= max_tokens:
+                        # Safe to merge with next
+                        parts[i + 1] = part + separator + parts[i + 1]
+                    else:
+                        # Can't merge without exceeding limit, keep as-is
+                        merged.append(part)
+                else:
+                    # Only part left, keep it
+                    merged.append(part)
+            else:
+                merged.append(part)
+
+            i += 1
+
+        return merged
 
     def _find_paragraphs(self, content: str, min_paragraphs_needed: int) -> List[str]:
         """
@@ -211,9 +276,19 @@ class SimpleSplitter(ContentSplitter):
 
 class MarkdownStructureSplitter(ContentSplitter):
     """
-    A content splitter that intelligently chooses between title-based 
+    A content splitter that intelligently chooses between title-based
     and paragraph-based splitting strategies.
     """
+
+    def __init__(self, min_part_tokens: int = 200):
+        """
+        Initialize the splitter.
+
+        Args:
+            min_part_tokens: Minimum tokens per part (default: 200).
+                            Parts smaller than this will be merged with adjacent parts.
+        """
+        self.min_part_tokens = min_part_tokens
 
     def _detect_markdown_titles(self, content: str) -> List[Tuple[int, str, str]]:
         """
@@ -277,7 +352,7 @@ class MarkdownStructureSplitter(ContentSplitter):
         
         # If no titles were found or no sections created, fallback
         if not sections:
-            return SimpleSplitter().split(content, max_tokens)
+            return SimpleSplitter(self.min_part_tokens).split(content, max_tokens)
         
         # Greedy grouping of sections
         parts = []
@@ -302,12 +377,66 @@ class MarkdownStructureSplitter(ContentSplitter):
         # Add remaining content
         if current_part:
             parts.append('\n\n'.join(current_part))
-        
+
+        # Merge undersized parts with adjacent parts (respecting max_tokens limit)
+        parts = self._merge_small_parts(parts, max_tokens)
+
         # If we ended up with just one part and it's too large, fallback
-        if len(parts) == 1 and current_tokens > max_tokens:
-            return SimpleSplitter().split(content, max_tokens)
-        
+        if len(parts) == 1 and len(tokenizer.encode(parts[0])) > max_tokens:
+            return SimpleSplitter(self.min_part_tokens).split(content, max_tokens)
+
         return parts if parts else [content]
+
+    def _merge_small_parts(self, parts: List[str], max_tokens: int) -> List[str]:
+        """
+        Merge parts that are smaller than min_part_tokens with adjacent parts.
+
+        Args:
+            parts: List of content parts
+            max_tokens: Maximum tokens per part (to prevent over-merging)
+
+        Returns:
+            List of parts with small ones merged
+        """
+        if len(parts) <= 1:
+            return parts
+
+        merged = []
+        i = 0
+
+        while i < len(parts):
+            part = parts[i]
+            part_tokens = len(tokenizer.encode(part))
+
+            if part_tokens < self.min_part_tokens:
+                # This part is too small, try to merge it
+                if merged:
+                    # Check if merging with previous would exceed max_tokens
+                    prev_tokens = len(tokenizer.encode(merged[-1]))
+                    if prev_tokens + part_tokens <= max_tokens:
+                        # Safe to merge with previous
+                        merged[-1] = merged[-1] + '\n\n' + part
+                    else:
+                        # Can't merge without exceeding limit, keep as-is
+                        merged.append(part)
+                elif i + 1 < len(parts):
+                    # No previous part, check if we can merge with next
+                    next_tokens = len(tokenizer.encode(parts[i + 1]))
+                    if part_tokens + next_tokens <= max_tokens:
+                        # Safe to merge with next
+                        parts[i + 1] = part + '\n\n' + parts[i + 1]
+                    else:
+                        # Can't merge without exceeding limit, keep as-is
+                        merged.append(part)
+                else:
+                    # Only part left, keep it
+                    merged.append(part)
+            else:
+                merged.append(part)
+
+            i += 1
+
+        return merged
     
     def split(self, content: str, max_tokens: int) -> List[str]:
         """
@@ -333,4 +462,4 @@ class MarkdownStructureSplitter(ContentSplitter):
             return self._split_by_titles(content, max_tokens, titles)
         
         # Otherwise, fallback to paragraph-based splitting
-        return SimpleSplitter().split(content, max_tokens)
+        return SimpleSplitter(self.min_part_tokens).split(content, max_tokens)

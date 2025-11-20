@@ -7,7 +7,6 @@ all named entities that need consistent translation across chapters.
 """
 
 import json
-import yaml
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -15,16 +14,10 @@ from google.genai.types import Part
 from loguru import logger
 from .utils.logging_config import configure_logging
 from .utils.network_utils import GeminiClient
+from .utils.common import load_config
 
 # Configure logger
 logger = configure_logging()
-
-
-def load_config(config_path="config.yaml"):
-    """Load configuration from config file."""
-    with open(config_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    return config
 
 
 def create_entity_extraction_prompt(book_title: str, language_pair: tuple = ("Japanese", "Chinese")) -> str:

@@ -45,7 +45,7 @@ def ocr_pdf_chunk_mistral(
     api_key: str,
     chunk_info: str,
     images_dir: Optional[Path] = None,
-    chapter_index: int = 0,
+    page_number: int = 0,
     image_counter: int = 0,
     max_retries: int = 5,
     initial_backoff: float = 4.0,
@@ -59,7 +59,7 @@ def ocr_pdf_chunk_mistral(
         api_key: Mistral API key
         chunk_info: Description of the chunk for logging
         images_dir: Directory to save extracted images
-        chapter_index: Index of current chapter
+        page_number: Page number for image naming
         image_counter: Current image counter
         max_retries: Maximum retry attempts for 429 errors
         initial_backoff: Initial backoff time in seconds
@@ -174,8 +174,8 @@ def ocr_pdf_chunk_mistral(
         images_dir.mkdir(parents=True, exist_ok=True)
 
         for img_info in all_images:
-            # Create filename using chapter and image counter
-            img_filename = f"chapter_{chapter_index}_img_{image_counter:03d}.{img_info['format']}"
+            # Create filename using page number and image counter
+            img_filename = f"page_{page_number}_img_{image_counter:03d}.{img_info['format']}"
             img_path = images_dir / img_filename
 
             # Decode and save image
@@ -243,7 +243,7 @@ def ocr_pdf_chunk_vertex(
     location: str,
     chunk_info: str,
     images_dir: Optional[Path] = None,
-    chapter_index: int = 0,
+    page_number: int = 0,
     image_counter: int = 0,
     max_retries: int = 5,
     initial_backoff: float = 4.0
@@ -260,7 +260,7 @@ def ocr_pdf_chunk_vertex(
         location: GCP location
         chunk_info: Description of the chunk for logging
         images_dir: Directory to save extracted images
-        chapter_index: Index of current chapter
+        page_number: Page number for image naming
         image_counter: Current image counter
         max_retries: Maximum retry attempts for 429 errors
         initial_backoff: Initial backoff time in seconds
@@ -382,8 +382,8 @@ def ocr_pdf_chunk_vertex(
         images_dir.mkdir(parents=True, exist_ok=True)
 
         for img_info in all_images:
-            # Create filename using chapter and image counter
-            img_filename = f"chapter_{chapter_index}_img_{image_counter:03d}.{img_info['format']}"
+            # Create filename using page number and image counter
+            img_filename = f"page_{page_number}_img_{image_counter:03d}.{img_info['format']}"
             img_path = images_dir / img_filename
 
             # Decode and save image
@@ -448,7 +448,7 @@ def ocr_pdf_chunk_vllm(
     config: Dict,
     chunk_info: str,
     images_dir: Optional[Path] = None,
-    chapter_index: int = 0,
+    page_number: int = 0,
     image_counter: int = 0,
     max_retries: int = 5,
     initial_backoff: float = 4.0
@@ -461,7 +461,7 @@ def ocr_pdf_chunk_vllm(
         config: Configuration dictionary
         chunk_info: Description of the chunk for logging
         images_dir: Directory to save extracted images
-        chapter_index: Index of current chapter
+        page_number: Page number for image naming
         image_counter: Current image counter
         max_retries: Maximum retry attempts for OCR calls
         initial_backoff: Initial backoff time in seconds
@@ -541,7 +541,7 @@ def ocr_pdf_chunk_vllm(
             base64_data = match.group(3)
 
             # Create filename
-            img_filename = f"chapter_{chapter_index}_img_{image_counter:03d}.{image_format}"
+            img_filename = f"page_{page_number}_img_{image_counter:03d}.{image_format}"
             img_path = images_dir / img_filename
 
             try:

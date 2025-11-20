@@ -1,13 +1,12 @@
 """
 Document parsing utilities for content analysis and splitting.
 
-This module provides functions to analyze document structure, identify sections,
-find split positions, and extract information useful for intelligent content splitting.
+This module provides functions to find split positions and extract paragraphs
+for content splitting operations.
 """
 
 import re
-import json
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Tuple, Dict
 from loguru import logger
 import tiktoken
 
@@ -155,456 +154,6 @@ def find_split_positions_by_indices(
 
     positions.append(len(content))
     return sorted(set(positions))
-
-
-def _is_markdown_header(line: str) -> bool:
-    """Check if a line is a markdown header."""
-    return bool(re.match(r"^#{1,6}\s+\S", line))
-
-
-def _extract_header_text(line: str) -> str:
-    """Extract the text content from a markdown header."""
-    match = re.match(r"^#{1,6}\s+(.+)$", line)
-    return match.group(1) if match else line
-
-
-def _is_potential_list_item(line: str) -> bool:
-    """Check if a line looks like a list item."""
-    # Check for numbered lists (1. or 1) format)
-    if re.match(r"^\s*\d+[\.)]\s+\S", line):
-        return True
-    # Check for bullet lists
-    if re.match(r"^\s*[-*+]\s+\S", line):
-        return True
-    # Check for lettered lists
-    if re.match(r"^\s*[a-z][\.)]\s+\S", line):
-        return True
-    return False
-
-
-def _detect_footnote_definitions(
-    lines: List[str], section_start: int, section_end: int
-) -> List[int]:
-    """
-    Detect footnote definitions in a section.
-
-    Footnotes are typically marked as [^1], [^2], etc. at the start of a line.
-
-    Args:
-        lines: All document lines
-        section_start: Starting line index of the section
-        section_end: Ending line index of the section
-
-    Returns:
-        List of footnote numbers found as definitions
-    """
-    footnote_pattern = re.compile(r"^\[\^(\d+)\]:\s*")
-    footnotes = []
-
-    for i in range(section_start, min(section_end, len(lines))):
-        match = footnote_pattern.match(lines[i])
-        if match:
-            footnotes.append(int(match.group(1)))
-
-    return footnotes
-
-
-def _detect_citations(text: str) -> List[int]:
-    """
-    Detect citation references in text.
-
-    Common patterns:
-    - [1] or [1,2,3] or [1-5]
-    - (Smith 2020) or (Smith, 2020)
-    - ^1 or ^1,2,3
-    - Various footnote styles
-
-    Args:
-        text: The text to search for citations
-
-    Returns:
-        List of citation/reference numbers found
-    """
-    citations = set()
-
-    # Pattern 1: Square brackets with numbers [1] [1,2,3] [1-5]
-    bracket_pattern = re.compile(r"\[(\d+(?:[-,]\d+)*)\]")
-    for match in bracket_pattern.finditer(text):
-        citation_str = match.group(1)
-        # Parse ranges and lists
-        for part in citation_str.split(","):
-            if "-" in part:
-                try:
-                    start, end = map(int, part.split("-"))
-                    citations.update(range(start, end + 1))
-                except ValueError:
-                    pass
-            else:
-                try:
-                    citations.add(int(part))
-                except ValueError:
-                    pass
-
-    # Pattern 2: Superscript style ^1 ^1,2,3
-    superscript_pattern = re.compile(r"\^(\d+(?:,\d+)*)")
-    for match in superscript_pattern.finditer(text):
-        for num in match.group(1).split(","):
-            try:
-                citations.add(int(num))
-            except ValueError:
-                pass
-
-    # Pattern 3: Footnote references [^1]
-    footnote_pattern = re.compile(
-        r"\[\^(\d+)\](?!:)"
-    )  # Negative lookahead to exclude definitions
-    for match in footnote_pattern.finditer(text):
-        try:
-            citations.add(int(match.group(1)))
-        except ValueError:
-            pass
-
-    return sorted(citations)
-
-
-def _format_citation_ranges(citations: List[int]) -> str:
-    """
-    Format a list of citation numbers into a compact range string.
-
-    Example: [1,2,3,5,6,8] -> "1-3, 5-6, 8"
-
-    Args:
-        citations: List of citation numbers
-
-    Returns:
-        Formatted string representation
-    """
-    if not citations:
-        return "none"
-
-    ranges = []
-    start = citations[0]
-    end = citations[0]
-
-    for i in range(1, len(citations)):
-        if citations[i] == end + 1:
-            end = citations[i]
-        else:
-            if start == end:
-                ranges.append(str(start))
-            else:
-                ranges.append(f"{start}-{end}")
-            start = citations[i]
-            end = citations[i]
-
-    # Add the last range
-    if start == end:
-        ranges.append(str(start))
-    else:
-        ranges.append(f"{start}-{end}")
-
-    return ", ".join(ranges)
-
-
-def analyze_document_structure(
-    content: str, content_type: str = "general"
-) -> List[Dict]:
-    """
-    Analyze the structure of a document and return section information.
-
-    This function identifies document sections based on markdown headers and
-    other structural elements, providing token counts and metadata for each section.
-
-    Args:
-        content: The document content to analyze
-        content_type: Type of content ("general", "academic", "japanese")
-
-    Returns:
-        List of dictionaries containing section information:
-        - header: The section header text
-        - level: Header level (1-6 for markdown headers)
-        - tokens: Token count for this section only
-        - cumulative_tokens: Total tokens up to and including this section
-        - position: Dict with 'start' and 'end' character positions
-        - preview: Truncated preview of section content
-        - citations_formatted: (academic only) Citation references found
-        - footnote_definitions: (academic only) Footnote definitions found
-    """
-    logger.info(f"Analyzing document structure for {content_type} content")
-
-    lines = content.split("\n")
-    sections = []
-    cumulative_tokens = 0
-
-    # Find all headers and their positions
-    for i, line in enumerate(lines):
-        if _is_markdown_header(line):
-            # Calculate character position
-            char_pos = sum(len(lines[j]) + 1 for j in range(i))  # +1 for newline
-
-            # Get header level
-            level = len(re.match(r"^(#{1,6})\s", line).group(1))
-            header_text = _extract_header_text(line)
-
-            sections.append(
-                {
-                    "line_index": i,
-                    "char_position": char_pos,
-                    "header": header_text,
-                    "level": level,
-                    "tokens": 0,
-                    "cumulative_tokens": 0,
-                    "position": {"start": char_pos, "end": char_pos + len(line)},
-                }
-            )
-
-    # If no headers found, treat entire content as one section
-    if not sections:
-        total_tokens = len(tokenizer.encode(content))
-        return [
-            {
-                "header": "Document",
-                "level": 1,
-                "tokens": total_tokens,
-                "cumulative_tokens": total_tokens,
-                "position": {"start": 0, "end": len(content)},
-                "preview": content[:200] + "..." if len(content) > 200 else content,
-            }
-        ]
-
-    # Calculate tokens and positions for each section
-    for i, section in enumerate(sections):
-        # Determine section boundaries
-        start_line = section["line_index"]
-        if i < len(sections) - 1:
-            end_line = sections[i + 1]["line_index"]
-            end_char = sections[i + 1]["char_position"]
-        else:
-            end_line = len(lines)
-            end_char = len(content)
-
-        # Extract section content
-        section_lines = lines[start_line:end_line]
-        section_text = "\n".join(section_lines)
-
-        # Calculate tokens
-        section_tokens = len(tokenizer.encode(section_text))
-        cumulative_tokens += section_tokens
-
-        # Update section info
-        section["tokens"] = section_tokens
-        section["cumulative_tokens"] = cumulative_tokens
-        section["position"]["end"] = end_char
-
-        # Add preview
-        preview_text = section_text.strip()
-        if len(preview_text) > 200:
-            section["preview"] = preview_text[:100] + "..." + preview_text[-97:]
-        else:
-            section["preview"] = preview_text
-
-        # Academic content analysis
-        if content_type == "academic":
-            # Detect citations
-            citations = _detect_citations(section_text)
-            section["citations_formatted"] = _format_citation_ranges(citations)
-
-            # Detect footnote definitions
-            footnotes = _detect_footnote_definitions(lines, start_line, end_line)
-            section["footnote_definitions"] = (
-                _format_citation_ranges(footnotes) if footnotes else "none"
-            )
-
-        # Log section details for debugging
-        if content_type == "academic":
-            logger.debug(
-                f"Section {i}: '{section['header']}': "
-                f"citations: {section.get('citations_formatted', 'none')}, "
-                f"footnotes: {section.get('footnote_definitions', 'none')}, "
-                f"cumulative tokens: {section['cumulative_tokens']:,}"
-            )
-        else:
-            logger.debug(
-                f"Section {i}: '{section['header']}': "
-                f"tokens: {section['tokens']:,}, "
-                f"cumulative: {section['cumulative_tokens']:,}"
-            )
-
-    logger.info(f"Document analysis complete: {len(sections)} sections identified")
-
-    if sections:
-        logger.info(f"Total document tokens: {sections[-1]['cumulative_tokens']:,}")
-
-    # Academic-specific summary
-    if content_type == "academic" and sections:
-        total_citations = 0
-        total_definitions = 0
-        for section in sections:
-            if section.get("citations_formatted") != "none":
-                # Count actual citations
-                for part in section["citations_formatted"].split(", "):
-                    if "-" in part:
-                        start, end = map(int, part.split("-"))
-                        total_citations += end - start + 1
-                    else:
-                        total_citations += 1
-            if section.get("footnote_definitions") != "none":
-                for part in section["footnote_definitions"].split(", "):
-                    if "-" in part:
-                        start, end = map(int, part.split("-"))
-                        total_definitions += end - start + 1
-                    else:
-                        total_definitions += 1
-        logger.info(
-            f"Academic analysis: {total_citations} citations, {total_definitions} definitions found"
-        )
-
-    return sections
-
-
-def analyze_paragraph_structure(
-    content: str, max_preview_length: int = 50, min_paragraph_tokens: int = 20
-) -> List[Dict]:
-    """
-    Analyze document at the paragraph level for intelligent splitting.
-
-    Combines very short paragraphs to reduce token usage in structural map.
-
-    Args:
-        content: The document content to analyze
-        max_preview_length: Maximum length for paragraph preview (default: 50)
-        min_paragraph_tokens: Minimum tokens to keep as separate paragraph (default: 20)
-
-    Returns:
-        List of dictionaries with paragraph information:
-        - paragraph_index: Sequential index starting from 0
-        - tokens: Token count of the paragraph(s)
-        - cumulative_tokens: Running total of tokens up to and including this paragraph
-        - preview: Truncated preview of content
-        - position: Dict with 'start' and 'end' character positions
-    """
-    # Find paragraphs using multi-level detection
-    paragraphs_with_positions = _extract_paragraphs_with_positions(content)
-
-    paragraph_map = []
-    cumulative_tokens = 0
-
-    # Buffer for combining short paragraphs
-    combined_text = ""
-    combined_start = None
-    combined_end = None
-    combined_tokens = 0
-
-    for i, (para_text, start_pos, end_pos) in enumerate(paragraphs_with_positions):
-        if not para_text.strip():
-            continue
-
-        # Calculate token count
-        token_count = len(tokenizer.encode(para_text))
-
-        # Combine very short paragraphs to reduce map size
-        if token_count < min_paragraph_tokens:
-            if combined_text:
-                combined_text += " " + para_text
-                combined_tokens += token_count
-                combined_end = end_pos
-            else:
-                combined_text = para_text
-                combined_start = start_pos
-                combined_end = end_pos
-                combined_tokens = token_count
-
-            # If combined paragraphs are now large enough, add them
-            if combined_tokens >= min_paragraph_tokens:
-                cumulative_tokens += combined_tokens
-
-                # Create preview
-                if len(combined_text) <= max_preview_length:
-                    preview = combined_text
-                else:
-                    preview = combined_text[: max_preview_length - 3] + "..."
-                preview = preview.replace("\n", " ").strip()
-
-                paragraph_info = {
-                    "paragraph_index": len(paragraph_map),
-                    "tokens": combined_tokens,
-                    "cumulative_tokens": cumulative_tokens,
-                    "preview": preview,
-                    "position": {"start": combined_start, "end": combined_end},
-                }
-                paragraph_map.append(paragraph_info)
-
-                # Reset buffer
-                combined_text = ""
-                combined_start = None
-                combined_end = None
-                combined_tokens = 0
-        else:
-            # First flush any buffered short paragraphs
-            if combined_text:
-                cumulative_tokens += combined_tokens
-
-                # Create preview
-                if len(combined_text) <= max_preview_length:
-                    preview = combined_text
-                else:
-                    preview = combined_text[: max_preview_length - 3] + "..."
-                preview = preview.replace("\n", " ").strip()
-
-                paragraph_info = {
-                    "paragraph_index": len(paragraph_map),
-                    "tokens": combined_tokens,
-                    "cumulative_tokens": cumulative_tokens,
-                    "preview": preview,
-                    "position": {"start": combined_start, "end": combined_end},
-                }
-                paragraph_map.append(paragraph_info)
-
-                combined_text = ""
-                combined_start = None
-                combined_end = None
-                combined_tokens = 0
-
-            # Add this normal-sized paragraph
-            cumulative_tokens += token_count
-
-            # Create preview
-            if len(para_text) <= max_preview_length:
-                preview = para_text
-            else:
-                preview = para_text[: max_preview_length - 3] + "..."
-            preview = preview.replace("\n", " ").strip()
-
-            paragraph_info = {
-                "paragraph_index": len(paragraph_map),
-                "tokens": token_count,
-                "cumulative_tokens": cumulative_tokens,
-                "preview": preview,
-                "position": {"start": start_pos, "end": end_pos},
-            }
-            paragraph_map.append(paragraph_info)
-
-    # Don't forget remaining combined paragraphs
-    if combined_text:
-        cumulative_tokens += combined_tokens
-
-        # Create preview
-        if len(combined_text) <= max_preview_length:
-            preview = combined_text
-        else:
-            preview = combined_text[: max_preview_length - 3] + "..."
-        preview = preview.replace("\n", " ").strip()
-
-        paragraph_info = {
-            "paragraph_index": len(paragraph_map),
-            "tokens": combined_tokens,
-            "cumulative_tokens": cumulative_tokens,
-            "preview": preview,
-            "position": {"start": combined_start, "end": combined_end},
-        }
-        paragraph_map.append(paragraph_info)
-
-    return paragraph_map
 
 
 def _preprocess_ocr_page_breaks(content: str) -> Tuple[str, List[int]]:
@@ -756,7 +305,7 @@ def _should_remove_page_break(current_result: List[str], lines: List[str], break
     return False
 
 
-def _extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int]]:
+def extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int]]:
     """
     Extract paragraphs with their character positions in the original content.
 
@@ -764,7 +313,7 @@ def _extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int
     respects both Western and CJK punctuation.
 
     Returns:
-        List of tuples: (paragraph_text, start_position_in_original, end_position_in_original)
+        List of tuples: (paragraph_text, start_position, end_position)
     """
     # Preprocess content to handle page breaks that interrupt sentences
     preprocessed, position_map = _preprocess_ocr_page_breaks(content)
@@ -785,7 +334,6 @@ def _extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int
                 end_preprocessed = start_preprocessed + len(part)
 
                 # Map positions back to original content
-                # Find first non-whitespace character positions
                 part_stripped = part.strip()
                 start_stripped = part.find(part_stripped)
                 end_stripped = start_stripped + len(part_stripped)
@@ -839,16 +387,13 @@ def _extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int
             median_tokens = sorted(token_sizes)[len(token_sizes)//2] if token_sizes else 0
 
             # Use token-based limits for consistency across languages
-            # 150% of 4000 tokens = 6000 tokens max for a single paragraph
             max_acceptable_tokens = 6000
 
             # If the largest paragraph is too big, continue to single newlines
-            # Or if median is too small (many tiny fragments - less than ~50 tokens)
             if max_tokens <= max_acceptable_tokens and median_tokens > 50:
                 return paragraphs_with_positions
 
     # Try single newlines with intelligent filtering
-    # This handles cases where double newlines created too many tiny fragments or too few good paragraphs
     if "\n" in preprocessed:
         lines = preprocessed.split("\n")
         current_para = []
@@ -877,7 +422,6 @@ def _extract_paragraphs_with_positions(content: str) -> List[Tuple[str, int, int
                 current_para = [line_text]
             else:
                 # Check if this line ends a paragraph
-                # Western and CJK sentence-ending punctuation
                 sentence_endings = ".!?。！？」』】）)」』"
 
                 if current_para[-1] and current_para[-1][-1] in sentence_endings:

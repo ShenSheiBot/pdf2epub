@@ -55,7 +55,7 @@ def ocr_pdf_chunk(
     location: str = None,
     chunk_info: str = "",
     images_dir: Path = None,
-    chapter_index: int = 1,
+    page_number: int = 1,
     image_counter: int = 0,
     max_retries: int = 5,
     initial_backoff: float = 4.0,
@@ -76,7 +76,7 @@ def ocr_pdf_chunk(
         location: GCP location (required for vertex backend)
         chunk_info: Description of the chunk being processed
         images_dir: Directory to save extracted images
-        chapter_index: Page number for image naming (use page_num)
+        page_number: Page number for image naming
         image_counter: Starting counter for image numbering
         max_retries: Maximum number of retry attempts for 429 errors
         initial_backoff: Initial backoff time in seconds
@@ -100,7 +100,7 @@ def ocr_pdf_chunk(
             "api_key": api_key,
             "chunk_info": chunk_info,
             "images_dir": images_dir,
-            "chapter_index": chapter_index,
+            "page_number": page_number,
             "image_counter": image_counter,
             "max_retries": max_retries,
             "initial_backoff": initial_backoff
@@ -122,7 +122,7 @@ def ocr_pdf_chunk(
             location=location,
             chunk_info=chunk_info,
             images_dir=images_dir,
-            chapter_index=chapter_index,
+            page_number=page_number,
             image_counter=image_counter,
             max_retries=max_retries,
             initial_backoff=initial_backoff
@@ -139,7 +139,7 @@ def ocr_pdf_chunk(
             config=config,
             chunk_info=chunk_info,
             images_dir=images_dir,
-            chapter_index=chapter_index,
+            page_number=page_number,
             image_counter=image_counter,
             max_retries=max_retries,
             initial_backoff=initial_backoff
@@ -172,7 +172,7 @@ def ocr_pdf_chunk(
         result = process_page_func(
             client=_backend_clients['azure'],
             img_bytes=img_bytes,
-            page_num=chapter_index,  # chapter_index is actually page_num
+            page_num=page_number,
             config=config,
             base_output_dir=base_output_dir
         )
@@ -218,7 +218,7 @@ def ocr_pdf_chunk(
         result = process_page_func(
             client=_backend_clients['vision'],
             img_bytes=img_bytes,
-            page_num=chapter_index,  # chapter_index is actually page_num
+            page_num=page_number,
             config=config,
             base_output_dir=base_output_dir
         )

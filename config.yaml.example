@@ -1,114 +1,169 @@
-title: Your Book Title Here
-author: Author Name
+# PDF2EPUB Configuration Example
+# ===============================
+# Copy this file to config.yaml and fill in your credentials
 
-# LLM credentials
-anthropic_api_key: your-anthropic-api-key-here
-anthropic_base_url: https://api.anthropic.com
-anthropic_model: claude-sonnet-4-20250514
-google_api_key: your-google-api-key-here
-openai_api_key: your-openai-api-key-here
-openai_base_url: https://api.openai.com/v1
-openai_model: gpt-4o
-mistral_api_key: your-mistral-api-key-here
-mistral_base_url: https://api.mistral.ai/v1
+title: "Your Book Title"
 
-# OCR Backend Selection
-ocr_backend: vertex  # Options: 'vertex', 'mistral', 'vllm', 'azure', 'vision'
+# Credentials - Provider configurations
+# =====================================
+# Define all your API providers here. You can have multiple instances of the same type.
+credentials:
+  providers:
+    # Google (Gemini) - Required for most operations
+    gemini:
+      type: google
+      api_key: "your-google-api-key"
 
-# GCP Configuration (for vertex OCR backend)
-gcp_location: us-central1
+    # Anthropic - Optional, for Claude models
+    anthropic:
+      type: anthropic
+      api_key: "your-anthropic-api-key"
+      base_url: "https://api.anthropic.com"  # or your proxy URL
 
-# Specialized model settings
-breakdown_model: gemini-2.5-pro  # Model for PDF structure analysis
-entity_extraction_model: gemini-2.5-flash  # Model for entity extraction
+    # OpenAI-compatible providers
+    # You can define multiple OpenAI-compatible endpoints
 
-# Translation config
-target_language: English  # Target language for translation
-source_language: Japanese  # Source language
+    openai:
+      type: openai
+      api_key: "your-openai-api-key"
+      base_url: "https://api.openai.com/v1"
 
-# Sync config
-s3_access_key_id: your-s3-access-key
-s3_secret_access_key: your-s3-secret-key
-s3_bucket_name: your-bucket-name
-s3_endpoint: https://s3.amazonaws.com  # Or your S3-compatible endpoint
+    deepseek:
+      type: openai
+      api_key: "your-deepseek-api-key"
+      base_url: "https://api.deepseek.com/v1"
 
-num_retries: 3
-max_backoff_seconds: 30
-max_concurrent_workers: 8  # Maximum number of concurrent API calls (adjust based on your API rate limits)
+    # poe:
+    #   type: openai
+    #   api_key: "your-poe-api-key"
+    #   base_url: "https://api.poe.com/v1"
 
-# Furigana handling mode (for azure/vision backends)
-furigana_mode: attach  # Options: 'attach' (add as (かな)) or 'delete' (remove furigana)
+    # Azure (for OCR) - Optional
+    # azure:
+    #   type: azure
+    #   api_key: "your-azure-key"
+    #   endpoint: "https://your-resource.cognitiveservices.azure.com/"
 
-azure_endpoint: https://your-azure-endpoint.cognitiveservices.azure.com/
-azure_key: your-azure-key-here
-azure_use_markdown: true  # Use markdown (prebuilt-layout) for rich formatting. Set to false for cheaper text-only mode
+# OCR Configuration
+# =================
+ocr:
+  backend: vision  # Options: 'vertex', 'mistral', 'vllm', 'azure', 'vision'
+  furigana_mode: attach  # Options: 'attach' or 'delete'
 
-# Vision API OCR Configuration
-service_account_key_path: sa-keys.json  # Path to Google Cloud service account key file
-vision_ocr_settings:
-  zoom_factor: 1.0  # Image extraction quality (1.0-3.0, higher = better quality but slower)
-  max_workers: 4  # Number of parallel processing threads
+  max_retries: 5
+  initial_backoff: 4.0
 
-  # Illustration detection settings
-  illustration_padding: 25  # Pixels to pad around text regions when whiting out
-  trim_step_percent: 0.005  # Step size for border trimming (0.005-0.1)
-  min_black_pixels: 200  # Minimum non-white pixels to consider as content
+  # Backend-specific overrides (optional)
+  backends:
+    vision:
+      max_retries: 3
+      initial_backoff: 2.0
 
-# Model retry configuration
-# ========================
-# NEW: You can now specify separate retry counts for API errors vs validation failures
-#
-# api_retries: Number of times to retry on transient API errors (network, rate limits)
-# validation_retries: Number of times to retry the same model when output fails validation
-# max_retries: (Legacy) Used for api_retries if new fields aren't specified
-#
-# Models are tried in order until one succeeds
+  # Vision API settings (for 'vision' backend)
+  vision:
+    service_account_key_path: sa-keys.json
+    zoom_factor: 1.0
+    max_workers: 4
+    illustration_padding: 25
+    trim_step_percent: 0.005
+    min_black_pixels: 200
 
-polish_models:
-  - provider: anthropic
-    model: claude-sonnet-4-20250514
-    api_retries: 2          # Retry API/network errors twice
-    validation_retries: 1   # Retry once if output fails validation
-    # Or use legacy format:
-    # max_retries: 2        # Backward compatible - sets api_retries=2, validation_retries=0
+  # VLLM models for OCR (for 'vllm' backend)
+  vllm_models:
+    - provider: gemini
+      model: gemini-2.5-pro
+    # - provider: anthropic
+    #   model: claude-sonnet-4-20250514
 
-translation_models:
-  - provider: openai
-    model: deepseek-chat
-    api_retries: 3          # More tolerant of API errors
-    validation_retries: 0   # Don't retry validation failures (faster)
-  # Example with fallback model:
-  # - provider: anthropic
-  #   model: claude-sonnet-4-20250514
-  #   api_retries: 2
-  #   validation_retries: 1
+# Translation Configuration
+# =========================
+translation:
+  source_language: Japanese
+  target_language: Chinese
+  entity_extraction_model: gemini-2.5-flash
 
-# Polish processing mode
+  # Models to use for translation (tried in order)
+  models:
+    - provider: gemini
+      model: gemini-2.5-pro
+      api_retries: 2
+      validation_retries: 3
+    - provider: deepseek
+      model: deepseek-chat
+      api_retries: 3
+      validation_retries: 1
+
+  truncation_check_lines: 3
+
+# Polish Configuration
+# ====================
+polish:
+  processing_mode: parallel  # 'parallel' or 'sequential'
+
+  models:
+    - provider: gemini
+      model: gemini-2.5-flash
+      api_retries: 2
+      validation_retries: 1
+    # - provider: anthropic
+    #   model: claude-sonnet-4-20250514
+    #   api_retries: 2
+    #   validation_retries: 1
+
+  truncation_check_lines: 5
+
+# Breakdown Configuration
 # =======================
-polish_processing_mode: parallel  # Options: 'parallel' or 'sequential'
-                                 # parallel: Process all parts concurrently (faster, default)
-                                 # sequential: Process parts one by one, injecting previous part as context (better continuity)
+breakdown:
+  model: gemini-2.5-pro
 
-# Validation strategy configuration
-# ==================================
-# Controls how validation failures are handled across all processors
+# Storage Configuration (for sync feature)
+# ========================================
+# storage:
+#   s3:
+#     access_key_id: "your-access-key"
+#     secret_access_key: "your-secret-key"
+#     bucket_name: "your-bucket"
+#     endpoint: "https://your-s3-endpoint"
+
+# General Configuration
+# =====================
+general:
+  max_concurrent_workers: 8
+
+# Validation Strategy
+# ===================
 validation_strategy:
-  max_attempts: 2                  # Global max validation attempts per file
-  use_longest_on_failure: false    # If true, use longest response when all attempts fail
-  fallback_between_models: true    # If true, try next model when current fails validation
-  validate_chinese_translation: false  # If true, validate Chinese translations contain Chinese characters
+  max_attempts: 2
+  use_longest_on_failure: false
+  fallback_between_models: true
+  validate_chinese_translation: false
 
-# VLLM OCR Models Configuration
-# ==============================
-# Used when ocr_backend is set to 'vllm'
-# For Anthropic/Gemini providers, uses top-level API credentials
-# For DeepSeek or other custom providers, specify api_key and base_url here
-ocr_vllm_models:
-  - provider: anthropic
-    model: claude-sonnet-4-20250514
-  # - provider: gemini
-  #   model: gemini-2.5-pro
-  # - provider: deepseek
-  #   model: deepseek-ai/DeepSeek-OCR
-  #   api_key: your-deepseek-api-key
-  #   base_url: https://your-deepseek-endpoint/v1
+# Model Output Limits
+# ===================
+# Practical reliable output tokens per model
+# Adjust based on your experience with each model
+model_output_limits:
+  "gemini-2.5-pro": 8000
+  "gemini-2.5-flash": 6000
+  "gemini-3-pro-preview": 8000
+  "claude-sonnet-4-20250514": 8000
+  "claude-3-haiku-20240307": 4000
+  "deepseek-chat": 8000
+  "gpt-4o": 8000
+  "gpt-4o-mini": 4000
+  "_default": 4000
+
+# Splitting Configuration
+# =======================
+splitting:
+  max_resplits: 3
+  consecutive_failures_threshold: 2
+  max_retries_before_resplit: 2
+
+# Retry Configuration
+# ===================
+retry:
+  num_retries: 3
+  max_backoff_seconds: 30
+  max_wait_seconds: 30

@@ -44,6 +44,8 @@ When use_longest_on_failure = False:
 - Process fails with exception rather than using invalid content
 """
 
+import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from loguru import logger
@@ -58,6 +60,7 @@ class AttemptResult:
     validation_reason: str
     attempt_number: int
     content_length: int
+    error_output_path: Optional[str] = None
 
 
 class ValidationStrategy:
@@ -70,7 +73,7 @@ class ValidationStrategy:
     - How to select the best response from multiple attempts
     """
 
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict] = None, error_output_dir: Optional[Path] = None):
         """
         Initialize the validation strategy.
 
@@ -79,6 +82,7 @@ class ValidationStrategy:
                 - max_attempts: Max validation attempts per file (default: 2)
                 - use_longest_on_failure: Use longest response on failure (default: False)
                 - fallback_between_models: Try next model on validation failure (default: True)
+            error_output_dir: Directory to save error outputs for debugging
         """
         config = config or {}
 
@@ -87,8 +91,63 @@ class ValidationStrategy:
         self.use_longest_on_failure = config.get('use_longest_on_failure', False)
         self.fallback_between_models = config.get('fallback_between_models', True)
 
+        # Error output directory
+        self.error_output_dir = error_output_dir
+
         # Track attempts for decision making
         self.current_attempts: List[AttemptResult] = []
+
+    def save_error_response(
+        self,
+        unit_key: str,
+        attempt_number: int,
+        response: str,
+        validation_reason: str
+    ) -> Optional[str]:
+        """
+        Save error response to file for debugging.
+
+        Args:
+            unit_key: Unit identifier (e.g., "chapter_5.part1")
+            attempt_number: Attempt number
+            response: The full LLM response
+            validation_reason: Why validation failed
+
+        Returns:
+            Relative path to saved file, or None if error_output_dir not set
+        """
+        if not self.error_output_dir:
+            return None
+
+        self.error_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create filename with timestamp
+        timestamp = int(time.time() * 1000)
+        # Sanitize unit_key for filename
+        safe_unit_key = unit_key.replace("/", "_").replace(" ", "_")
+        filename = f"{safe_unit_key}_attempt{attempt_number}_{timestamp}.txt"
+        filepath = self.error_output_dir / filename
+
+        # Write error details and full response
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(f"Unit: {unit_key}\n")
+            f.write(f"Attempt: {attempt_number}\n")
+            f.write(f"Timestamp: {time.time()}\n")
+            f.write(f"Validation Reason: {validation_reason}\n")
+            f.write(f"Response Length: {len(response)} chars\n")
+            f.write("=" * 60 + "\n")
+            f.write("FULL RESPONSE:\n")
+            f.write("=" * 60 + "\n")
+            f.write(response)
+
+        # Return relative path from parent of error_output_dir
+        try:
+            relative_path = str(filepath.relative_to(self.error_output_dir.parent))
+        except ValueError:
+            relative_path = str(filepath)
+
+        logger.debug(f"Saved error response to {relative_path}")
+        return relative_path
 
     def parse_model_config(self, model_config: Dict) -> Tuple[int, int]:
         """
@@ -189,7 +248,8 @@ class ValidationStrategy:
         model_config: Dict,
         is_valid: bool,
         validation_reason: str,
-        attempt_number: int
+        attempt_number: int,
+        error_output_path: Optional[str] = None
     ) -> None:
         """
         Record an attempt result for later selection.
@@ -200,6 +260,7 @@ class ValidationStrategy:
             is_valid: Whether validation passed
             validation_reason: Reason for validation result
             attempt_number: The attempt number
+            error_output_path: Path to saved error output file (if validation failed)
         """
         self.current_attempts.append(AttemptResult(
             response=response,
@@ -207,7 +268,8 @@ class ValidationStrategy:
             is_valid=is_valid,
             validation_reason=validation_reason,
             attempt_number=attempt_number,
-            content_length=len(response)
+            content_length=len(response),
+            error_output_path=error_output_path
         ))
 
     def select_best_response(self, attempts: Optional[List[AttemptResult]] = None) -> Optional[str]:
@@ -284,9 +346,12 @@ class ValidationStrategy:
         for attempt in self.current_attempts:
             status = "✓" if attempt.is_valid else "✗"
             model = attempt.model_config.get('model', 'unknown')
-            lines.append(
+            line = (
                 f"  {status} Attempt {attempt.attempt_number} with {model}: "
                 f"{attempt.validation_reason} ({attempt.content_length} chars)"
             )
+            if attempt.error_output_path:
+                line += f" [saved: {attempt.error_output_path}]"
+            lines.append(line)
 
         return "\n".join(lines)

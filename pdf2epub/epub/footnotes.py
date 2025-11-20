@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from enum import Enum
 from loguru import logger
 
+from ..chapter_identity import ChapterIdentity
+
 
 class FootnoteStyle(Enum):
     """Footnote organization style."""
@@ -283,10 +285,10 @@ class FootnoteManager:
         """
         for file_path in files:
             chapter_name = file_path.stem
-            # Extract base chapter name
-            base_match = re.match(r'(chapter_\d+)(?:[._]part\d+)?', chapter_name)
-            if base_match:
-                base_chapter = base_match.group(1)
+            # Use ChapterIdentity to extract base chapter name
+            identity = ChapterIdentity.parse(chapter_name)
+            if identity:
+                base_chapter = identity.base_name
                 if base_chapter not in self.local_chapter_groups:
                     self.local_chapter_groups[base_chapter] = []
                 self.local_chapter_groups[base_chapter].append(chapter_name)
@@ -384,14 +386,11 @@ class FootnoteManager:
         Generate a sort key for chapter names to maintain proper order.
         Handles chapter_N and chapter_N.partM or chapter_N_partM formats.
         """
-        import re
-        # Handle both .part and _part formats
-        match = re.match(r'chapter_(\d+)(?:[._]part(\d+))?', chapter_name)
-        if match:
-            chapter_num = int(match.group(1))
-            part_num = int(match.group(2)) if match.group(2) else 0
-            return (chapter_num, part_num)
-        return (999, 0)  # Put non-chapter files at the end
+        # Use ChapterIdentity for consistent sorting
+        identity = ChapterIdentity.parse(chapter_name)
+        if identity:
+            return identity.sort_key
+        return (999, 0, 0)  # Put unrecognized files at the end
     
     def _identify_primary_definition_chapters(self) -> None:
         """
@@ -526,9 +525,9 @@ class FootnoteManager:
         """
         if self.style == FootnoteStyle.LOCAL:
             # Check if this chapter is part of a multi-part chapter
-            base_match = re.match(r'(chapter_\d+)(?:[._]part\d+)?', source_chapter)
-            if base_match:
-                base_chapter = base_match.group(1)
+            source_identity = ChapterIdentity.parse(source_chapter)
+            if source_identity:
+                base_chapter = source_identity.base_name
 
                 # Check if this is a multi-part chapter with local mappings
                 if base_chapter in self.local_occurrence_mapping and len(self.local_chapter_groups.get(base_chapter, [])) > 1:
@@ -544,25 +543,27 @@ class FootnoteManager:
                             # Same file, use local anchor with unique ID
                             fnref_id = f"fnref-{source_chapter}-{key}"
                             # Use file name even for same-file references in LOCAL style, with occurrence number
-                            source_chapter_html = source_chapter.replace('.part', '_part')
-                            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_chapter_html}.html#fn:{key}:{occurrence_num}">[{key}]</a></sup>'
+                            source_html = source_identity.html_name
+                            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{key}:{occurrence_num}">[{key}]</a></sup>'
                         else:
                             # Cross-part reference within the same chapter
                             fn_id = f"fn:{key}:{occurrence_num}"
                             fnref_id = f"fnref-{source_chapter}-{key}"
-                            # Fix chapter name for split chapters (e.g., chapter_19.part1 -> chapter_19_part1)
-                            html_target = target_chapter.replace('.part', '_part')
+                            # Use ChapterIdentity for HTML name conversion
+                            target_identity = ChapterIdentity.parse(target_chapter)
+                            html_target = target_identity.html_name if target_identity else f"{target_chapter}.html"
                             return (
                                 f'<sup id="{fnref_id}">'
-                                f'<a class="footnote-ref" href="{html_target}.html#{fn_id}">[{key}]</a>'
+                                f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{key}]</a>'
                                 f'</sup>'
                             )
 
             # Single file chapter or no multi-part mapping - still use file name for consistency
             fnref_id = f"fnref-{source_chapter}-{key}"
-            source_chapter_html = source_chapter.replace('.part', '_part')
+            # Use ChapterIdentity for HTML name, fallback if not recognized
+            source_html = source_identity.html_name if source_identity else f"{source_chapter.replace('.part', '_part')}.html"
             # For single-file chapters, occurrence is always 1
-            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_chapter_html}.html#fn:{key}:1">[{key}]</a></sup>'
+            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{key}:1">[{key}]</a></sup>'
         
         # Global style: find where the footnote is defined using occurrence mapping
         if key in self.definitions:
@@ -591,16 +592,17 @@ class FootnoteManager:
             if target_chapter == source_chapter:
                 # Same file reference - still use file name for consistency
                 fnref_id = f"fnref-{source_chapter}-{key}"
-                # Use file name even for same-file references, with occurrence number
-                html_target = source_chapter.replace('.part', '_part')
+                # Use ChapterIdentity for HTML name
+                source_identity = ChapterIdentity.parse(source_chapter)
+                html_target = source_identity.html_name if source_identity else f"{source_chapter.replace('.part', '_part')}.html"
                 # Use occurrence number if available, otherwise default to 1
                 occ_num = occurrence_num if occurrence_num else 1
-                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}.html#fn:{key}:{occ_num}">[{key}]</a></sup>'
+                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}#fn:{key}:{occ_num}">[{key}]</a></sup>'
             else:
                 # Cross-file reference in LOCAL mode with multi-part chapters
                 # Use position-based mapping to find the correct occurrence number
-                base_source = re.match(r'(chapter_\d+)(?:[._]part\d+)?', source_chapter)
-                base_source_chapter = base_source.group(1) if base_source else source_chapter
+                source_identity = ChapterIdentity.parse(source_chapter)
+                base_source_chapter = source_identity.base_name if source_identity else source_chapter
 
                 if base_source_chapter in self.local_occurrence_mapping:
                     mapping = self.local_occurrence_mapping[base_source_chapter]
@@ -621,12 +623,13 @@ class FootnoteManager:
 
                 fnref_id = f"fnref-{source_chapter}-{key}"
 
-                # Fix chapter name for split chapters (e.g., chapter_19.part1 -> chapter_19_part1)
-                html_target = target_chapter.replace('.part', '_part')
+                # Use ChapterIdentity for HTML name conversion
+                target_identity = ChapterIdentity.parse(target_chapter)
+                html_target = target_identity.html_name if target_identity else f"{target_chapter.replace('.part', '_part')}.html"
 
                 return (
                     f'<sup id="{fnref_id}">'
-                    f'<a class="footnote-ref" href="{html_target}.html#{fn_id}">[{key}]</a>'
+                    f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{key}]</a>'
                     f'</sup>'
                 )
 

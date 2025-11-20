@@ -7,20 +7,35 @@ import yaml
 from pathlib import Path
 from typing import Dict, Optional
 
+from .config_manager import ConfigManager, load_config as _load_config_from_manager
 
+# Re-export for backward compatibility
 def load_config(config_path: str = "config.yaml") -> Dict:
     """
     Load configuration from config file.
-    
+
+    Uses ConfigManager internally for migration and backward compatibility.
+
     Args:
         config_path: Path to the YAML config file
-        
+
     Returns:
-        Configuration dictionary
+        Configuration dictionary (in legacy format for backward compatibility)
     """
-    with open(config_path, "r", encoding="utf-8") as file:
-        config = yaml.safe_load(file)
-    return config
+    return _load_config_from_manager(config_path)
+
+
+def get_config_manager(config_path: str = "config.yaml") -> ConfigManager:
+    """
+    Get a ConfigManager instance for advanced config access.
+
+    Args:
+        config_path: Path to the YAML config file
+
+    Returns:
+        ConfigManager instance
+    """
+    return ConfigManager(config_path)
 
 
 def load_book_structure(book_title: str) -> Optional[Dict]:

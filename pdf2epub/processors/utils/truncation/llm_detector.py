@@ -1,9 +1,9 @@
 """
-LLM-based truncation detection for translations.
+LLM-based truncation detection for various tasks.
 
 This module provides lightweight truncation detection using an LLM to verify
-if a translation has been completed by comparing the endings of original
-and translated text.
+if content has been properly processed by comparing the endings of original
+and processed text.
 """
 
 from typing import Tuple, Dict, Optional
@@ -12,18 +12,20 @@ from ....utils.model_utils import get_cheapest_model_configs
 
 
 class LLMTruncationDetector(BaseTruncationDetector):
-    """LLM-based truncation detector for translations."""
-    
-    def __init__(self, llm_client, num_lines: int = 3):
+    """LLM-based truncation detector with task-specific prompts."""
+
+    def __init__(self, llm_client, num_lines: int = 3, task_type: str = "translate"):
         """
         Initialize the detector.
-        
+
         Args:
             llm_client: LLM client for verification
             num_lines: Number of lines from the end to check (default: 3)
+            task_type: Type of task - "translate" or "polish" (default: "translate")
         """
         self.llm_client = llm_client
         self.num_lines = num_lines
+        self.task_type = task_type
     
     def detect(
         self,
@@ -69,33 +71,13 @@ class LLMTruncationDetector(BaseTruncationDetector):
         
         # Get last N non-empty lines for comparison
         last_original = '\n'.join(original_lines[-self.num_lines:]) if original_lines else ""
-        last_translated = '\n'.join(translated_lines[-self.num_lines:]) if translated_lines else ""
-        
-        # Prepare the verification prompt
-        lang_info = ""
-        if source_language and target_language:
-            lang_info = f" from {source_language} to {target_language}"
-        
-        prompt = f"""You are a translation completeness checker. Analyze if a translation{lang_info} has been completed or was cut off mid-way.
+        last_processed = '\n'.join(translated_lines[-self.num_lines:]) if translated_lines else ""
 
-Compare these endings:
-
-ORIGINAL (last {self.num_lines} non-empty lines):
-{last_original}
-
-TRANSLATION (last {self.num_lines} non-empty lines):
-{last_translated}
-
-Answer with ONLY "complete" or "truncated" based on:
-1. Does the translation include all the content from the original's ending?
-2. Are there significant content elements from the original's ending that are completely missing in the translation?
-
-Note: 
-- Minor formatting differences or slight variations in the final lines are acceptable
-- A translation can be truncated even if it ends at a complete sentence
-- Focus on whether ALL original content was translated, not how it ends
-
-Your answer (one word only):"""
+        # Generate task-specific prompt
+        prompt = self._generate_prompt(
+            last_original, last_processed,
+            source_language, target_language
+        )
         
         try:
             # Use cheapest models for this check
@@ -121,10 +103,10 @@ Your answer (one word only):"""
             
             details = {
                 'last_lines_original': last_original,
-                'last_lines_translated': last_translated,
+                'last_lines_processed': last_processed,
                 'llm_response': answer,
                 'original_line_count': len(original_lines),
-                'translated_line_count': len(translated_lines)
+                'processed_line_count': len(translated_lines)
             }
             
             if "truncated" in answer:
@@ -145,7 +127,7 @@ Your answer (one word only):"""
             # If LLM check fails, fall back to simple heuristics
             details = {
                 'last_lines_original': last_original,
-                'last_lines_translated': last_translated,
+                'last_lines_processed': last_processed,
                 'error': str(e)
             }
             
@@ -194,5 +176,95 @@ Your answer (one word only):"""
         # Add error info if LLM failed
         if 'error' in details:
             summary_parts.append(f"Note: LLM check failed, used fallback heuristics")
-        
+
         return "\n".join(summary_parts)
+
+    def _generate_prompt(
+        self,
+        last_original: str,
+        last_processed: str,
+        source_language: Optional[str] = None,
+        target_language: Optional[str] = None
+    ) -> str:
+        """
+        Generate task-specific prompt for truncation detection.
+
+        Args:
+            last_original: Last N lines of original content
+            last_processed: Last N lines of processed content
+            source_language: Source language (for translation)
+            target_language: Target language (for translation)
+
+        Returns:
+            Prompt string
+        """
+        if self.task_type == "polish":
+            return self._generate_polish_prompt(last_original, last_processed)
+        else:
+            return self._generate_translate_prompt(
+                last_original, last_processed,
+                source_language, target_language
+            )
+
+    def _generate_polish_prompt(self, last_original: str, last_processed: str) -> str:
+        """Generate prompt for polish truncation detection."""
+        return f"""You are a markdown polishing completeness checker. Analyze if the polished output covers all the meaningful content from the original OCR text.
+
+Compare these endings:
+
+ORIGINAL OCR (last {self.num_lines} non-empty lines):
+{last_original}
+
+POLISHED OUTPUT (last {self.num_lines} non-empty lines):
+{last_processed}
+
+Answer with ONLY "complete" or "truncated" based on:
+1. Does the polished output include the MEANINGFUL content from the original's ending?
+2. Was actual content cut off or stopped mid-way?
+
+IMPORTANT - These are NOT truncation (answer "complete"):
+- Removing duplicate text (OCR often duplicates headers/titles)
+- Removing PDF watermarks like "Powered by TCPDF" or similar
+- Removing page numbers or other metadata
+- Consolidating repeated content into a single clean version
+- Formatting changes (spacing, headers, etc.)
+
+These ARE truncation (answer "truncated"):
+- Missing sentences or paragraphs that contain unique information
+- Content that stops mid-sentence or mid-paragraph
+- Entire sections of unique content removed
+
+Your answer (one word only):"""
+
+    def _generate_translate_prompt(
+        self,
+        last_original: str,
+        last_processed: str,
+        source_language: Optional[str] = None,
+        target_language: Optional[str] = None
+    ) -> str:
+        """Generate prompt for translation truncation detection."""
+        lang_info = ""
+        if source_language and target_language:
+            lang_info = f" from {source_language} to {target_language}"
+
+        return f"""You are a translation completeness checker. Analyze if a translation{lang_info} has been completed or was cut off mid-way.
+
+Compare these endings:
+
+ORIGINAL (last {self.num_lines} non-empty lines):
+{last_original}
+
+TRANSLATION (last {self.num_lines} non-empty lines):
+{last_processed}
+
+Answer with ONLY "complete" or "truncated" based on:
+1. Does the translation include all the content from the original's ending?
+2. Are there significant content elements from the original's ending that are completely missing in the translation?
+
+Note:
+- Minor formatting differences or slight variations in the final lines are acceptable
+- A translation can be truncated even if it ends at a complete sentence
+- Focus on whether ALL original content was translated, not how it ends
+
+Your answer (one word only):"""

@@ -27,48 +27,168 @@ class LLMClient:
     """
     Unified LLM client that handles multiple providers transparently.
     """
-    
+
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize LLM client with configuration.
-        
+
         Args:
             config: Configuration dict containing API keys and settings
         """
         self.config = config
+        # Cache for created clients by provider name
+        self._clients: Dict[str, Any] = {}
+        # Track safety blocks per operation to allow retrying on different content
+        self._safety_blocked_operations = {}  # {provider: set(operation_names)}
+
+        # Default retry settings
+        self._num_retries = config.get("num_retries", 3)
+        self._max_backoff_seconds = config.get("max_backoff_seconds", 30)
+
+        # Legacy client references for backward compatibility
         self._gemini_client = None
         self._anthropic_client = None
         self._openai_client = None
-        # Track safety blocks per operation to allow retrying on different content
-        self._safety_blocked_operations = {}  # {provider: set(operation_names)}
-        
-        # Initialize clients based on available API keys
-        num_retries = config.get("num_retries", 3)
-        max_backoff_seconds = config.get("max_backoff_seconds", 30)
-        
-        if config.get("google_api_key"):
+
+        # Initialize legacy clients for backward compatibility
+        self._init_legacy_clients()
+
+    def _init_legacy_clients(self):
+        """Initialize clients using legacy config keys for backward compatibility."""
+        if self.config.get("google_api_key"):
             self._gemini_client = GeminiClient(
-                api_key=config["google_api_key"],
-                num_retries=num_retries,
-                max_backoff_seconds=max_backoff_seconds
+                api_key=self.config["google_api_key"],
+                num_retries=self._num_retries,
+                max_backoff_seconds=self._max_backoff_seconds
             )
-            
-        if config.get("anthropic_api_key"):
+            self._clients["gemini"] = self._gemini_client
+
+        if self.config.get("anthropic_api_key"):
             self._anthropic_client = AnthropicClient(
-                api_key=config["anthropic_api_key"],
-                base_url=config.get("anthropic_base_url"),
-                num_retries=num_retries,
-                max_backoff_seconds=max_backoff_seconds
+                api_key=self.config["anthropic_api_key"],
+                base_url=self.config.get("anthropic_base_url"),
+                num_retries=self._num_retries,
+                max_backoff_seconds=self._max_backoff_seconds
             )
-        
-        if config.get("openai_api_key"):
+            self._clients["anthropic"] = self._anthropic_client
+
+        if self.config.get("openai_api_key"):
             self._openai_client = OpenAIClient(
-                api_key=config["openai_api_key"],
-                base_url=config.get("openai_base_url"),
-                model=config.get("openai_model"),
-                num_retries=num_retries,
-                max_backoff_seconds=max_backoff_seconds
+                api_key=self.config["openai_api_key"],
+                base_url=self.config.get("openai_base_url"),
+                model=self.config.get("openai_model"),
+                num_retries=self._num_retries,
+                max_backoff_seconds=self._max_backoff_seconds
             )
+            self._clients["openai"] = self._openai_client
+            # Also register for common OpenAI-compatible providers
+            self._clients["deepseek"] = self._openai_client
+            self._clients["poe"] = self._openai_client
+
+    def _get_client(self, provider_name: str):
+        """
+        Get or create a client for the given provider.
+
+        Args:
+            provider_name: Name of the provider (e.g., "gemini", "deepseek", "anthropic-proxy")
+
+        Returns:
+            Client instance or None if provider not configured
+        """
+        # Check cache first
+        if provider_name in self._clients:
+            return self._clients[provider_name]
+
+        # Try to get provider config from ConfigManager structure
+        providers = self.config.get("credentials", {}).get("providers", {})
+
+        if provider_name in providers:
+            provider_config = providers[provider_name]
+            client = self._create_client_from_provider(provider_name, provider_config)
+            if client:
+                self._clients[provider_name] = client
+                return client
+
+        # Fallback: infer from provider name for legacy compatibility
+        return self._get_legacy_client(provider_name)
+
+    def _create_client_from_provider(self, provider_name: str, provider_config: Dict) -> Any:
+        """
+        Create a client from provider configuration.
+
+        Args:
+            provider_name: Name of the provider
+            provider_config: Provider configuration dict with type, api_key, etc.
+
+        Returns:
+            Client instance
+        """
+        provider_type = provider_config.get("type", self._infer_provider_type(provider_name))
+        api_key = provider_config.get("api_key")
+        base_url = provider_config.get("base_url")
+
+        if not api_key:
+            logger.warning(f"No API key found for provider '{provider_name}'")
+            return None
+
+        if provider_type == "google":
+            return GeminiClient(
+                api_key=api_key,
+                num_retries=self._num_retries,
+                max_backoff_seconds=self._max_backoff_seconds
+            )
+        elif provider_type == "anthropic":
+            return AnthropicClient(
+                api_key=api_key,
+                base_url=base_url,
+                num_retries=self._num_retries,
+                max_backoff_seconds=self._max_backoff_seconds
+            )
+        elif provider_type == "openai":
+            return OpenAIClient(
+                api_key=api_key,
+                base_url=base_url,
+                model=provider_config.get("default_model"),
+                num_retries=self._num_retries,
+                max_backoff_seconds=self._max_backoff_seconds
+            )
+        else:
+            logger.warning(f"Unknown provider type '{provider_type}' for '{provider_name}'")
+            return None
+
+    def _get_legacy_client(self, provider_name: str):
+        """Get client using legacy provider name mapping."""
+        name_lower = provider_name.lower()
+
+        if "gemini" in name_lower or provider_name == "google":
+            return self._gemini_client
+        elif "anthropic" in name_lower or "claude" in name_lower:
+            return self._anthropic_client
+        elif any(x in name_lower for x in ["openai", "deepseek", "poe"]):
+            return self._openai_client
+
+        return None
+
+    def _infer_provider_type(self, provider_name: str) -> str:
+        """Infer provider type from provider name."""
+        name_lower = provider_name.lower()
+
+        if "gemini" in name_lower or "vertex" in name_lower:
+            return "google"
+        elif "anthropic" in name_lower or "claude" in name_lower:
+            return "anthropic"
+        else:
+            return "openai"
+
+    def _get_provider_type(self, provider_name: str) -> str:
+        """Get the type of a provider."""
+        # Check ConfigManager structure first
+        providers = self.config.get("credentials", {}).get("providers", {})
+        if provider_name in providers:
+            return providers[provider_name].get("type", self._infer_provider_type(provider_name))
+
+        # Fallback to inference
+        return self._infer_provider_type(provider_name)
     
     def generate(
         self,
@@ -105,7 +225,7 @@ class LLMClient:
             provider = model_config["provider"]
             model = model_config["model"]
             max_retries = model_config.get("max_retries", 1)
-            
+
             # Skip if provider was blocked for this specific operation
             if provider in self._safety_blocked_operations:
                 if operation_name in self._safety_blocked_operations[provider]:
@@ -116,36 +236,49 @@ class LLMClient:
                 elif self._safety_blocked_operations[provider]:
                     blocked_count = len(self._safety_blocked_operations[provider])
                     logger.debug(f"{provider} had safety blocks on {blocked_count} other operation(s), trying anyway for {operation_name}")
-            
+
+            # Get client for this provider
+            client = self._get_client(provider)
+            if not client:
+                logger.warning(f"No client available for provider '{provider}'")
+                attempts_summary.append(f"{provider}: no client")
+                continue
+
             try:
                 logger.info(f"Trying {provider} model {model} for {operation_name}")
-                
-                if provider == "gemini" and self._gemini_client:
+
+                # Determine provider type and call appropriate method
+                provider_type = self._get_provider_type(provider)
+
+                if provider_type == "google":
                     response = self._generate_with_gemini(
                         prompt=prompt,
                         model=model,
                         max_retries=max_retries,
-                        operation_name=operation_name
+                        operation_name=operation_name,
+                        client=client
                     )
                     logger.success(f"Successfully generated with {provider} for {operation_name}")
                     return response
-                    
-                elif provider == "anthropic" and self._anthropic_client:
+
+                elif provider_type == "anthropic":
                     response = self._generate_with_anthropic(
                         prompt=prompt,
                         model=model,
                         max_retries=max_retries,
-                        operation_name=operation_name
+                        operation_name=operation_name,
+                        client=client
                     )
                     logger.success(f"Successfully generated with {provider} for {operation_name}")
                     return response
-                    
-                elif provider == "openai" and self._openai_client:
+
+                elif provider_type == "openai":
                     response = self._generate_with_openai(
                         prompt=prompt,
                         model=model,
                         max_retries=max_retries,
-                        operation_name=operation_name
+                        operation_name=operation_name,
+                        client=client
                     )
                     logger.success(f"Successfully generated with {provider} for {operation_name}")
                     return response
@@ -247,41 +380,64 @@ class LLMClient:
                         f"(validation attempt {val_attempt + 1}/{validation_retries + 1})"
                     )
 
+                    # Get client for this provider
+                    client = self._get_client(provider)
+                    if not client:
+                        logger.warning(f"No client available for provider '{provider}'")
+                        break  # Skip to next model
+
                     # Generate with API retries handled internally
-                    if provider == "gemini" and self._gemini_client:
+                    provider_type = self._get_provider_type(provider)
+
+                    if provider_type == "google":
                         response = self._generate_with_gemini(
                             prompt=prompt,
                             model=model,
                             max_retries=api_retries,
-                            operation_name=operation_name
+                            operation_name=operation_name,
+                            client=client
                         )
-                    elif provider == "anthropic" and self._anthropic_client:
+                    elif provider_type == "anthropic":
                         response = self._generate_with_anthropic(
                             prompt=prompt,
                             model=model,
                             max_retries=api_retries,
-                            operation_name=operation_name
+                            operation_name=operation_name,
+                            client=client
                         )
-                    elif provider == "openai" and self._openai_client:
+                    elif provider_type == "openai":
                         response = self._generate_with_openai(
                             prompt=prompt,
                             model=model,
                             max_retries=api_retries,
-                            operation_name=operation_name
+                            operation_name=operation_name,
+                            client=client
                         )
                     else:
-                        logger.warning(f"Provider {provider} not available or not configured")
+                        logger.warning(f"Unknown provider type '{provider_type}' for '{provider}'")
                         break  # Skip to next model
 
                     # Validate if validator provided
                     if validator:
                         is_valid, reason = validator(response)
+
+                        # Save error response if validation failed
+                        error_output_path = None
+                        if not is_valid:
+                            error_output_path = validation_strategy.save_error_response(
+                                unit_key=operation_name,
+                                attempt_number=val_attempt + 1,
+                                response=response,
+                                validation_reason=reason
+                            )
+
                         validation_strategy.record_attempt(
                             response=response,
                             model_config=model_config,
                             is_valid=is_valid,
                             validation_reason=reason,
-                            attempt_number=val_attempt + 1
+                            attempt_number=val_attempt + 1,
+                            error_output_path=error_output_path
                         )
 
                         if is_valid:
@@ -337,21 +493,38 @@ class LLMClient:
         if best_response:
             return best_response
 
-        # Complete failure
+        # Complete failure - include validation summary and error output paths for debugging
+        summary = validation_strategy.get_summary()
+
+        # Collect error output paths from all attempts
+        error_paths = [
+            a.error_output_path for a in validation_strategy.current_attempts
+            if a.error_output_path
+        ]
+        error_paths_str = ""
+        if error_paths:
+            error_paths_str = f"\n\nError outputs saved to:\n" + "\n".join(f"  - {p}" for p in error_paths)
+
         error_msg = f"All models failed validation for {operation_name}"
         if last_error:
-            raise Exception(f"{error_msg}. Last error: {last_error}")
+            raise Exception(f"{error_msg}. Last error: {last_error}\n\nValidation summary:\n{summary}{error_paths_str}")
         else:
-            raise Exception(error_msg)
+            raise Exception(f"{error_msg}\n\nValidation summary:\n{summary}{error_paths_str}")
 
     def _generate_with_gemini(
         self,
         prompt: Union[str, List[Dict]],
         model: str,
         max_retries: int,
-        operation_name: str
+        operation_name: str,
+        client: GeminiClient = None
     ) -> str:
         """Generate content with Gemini, handling retries internally."""
+
+        # Use provided client or fall back to legacy
+        gemini_client = client or self._gemini_client
+        if not gemini_client:
+            raise ValueError("No Gemini client available")
 
         # Convert prompt format for Gemini
         contents = None
@@ -386,22 +559,25 @@ class LLMClient:
                         contents.append(part)
         else:
             contents = prompt
-        
+
         # Configure generation with defaults
         temperature = 0.1  # Low temperature for consistent results
-        config = self._gemini_client.get_default_config(temperature)
+        config = gemini_client.get_default_config(temperature)
         # Max output tokens is already set to 65536 in get_default_config
-        
+
+        # Get max wait from config
+        max_wait = self.config.get('retry', {}).get('max_wait_seconds', self.config.get('max_backoff_seconds', 30))
+
         # Create retry decorator with specified attempts
         @retry(
             retry=retry_if_exception(self._is_retryable_gemini_error),
-            wait=wait_random_exponential(multiplier=1, max=30),
+            wait=wait_random_exponential(multiplier=1, max=max_wait),
             stop=stop_after_attempt(max_retries),
             reraise=True
         )
         def generate_with_retry():
             try:
-                return self._gemini_client.generate_content_stream(
+                return gemini_client.generate_content_stream(
                     model=model,
                     contents=contents,
                     config=config,
@@ -413,7 +589,7 @@ class LLMClient:
                 if any(term in error_str for term in ['prohibited', 'safety', 'blocked']):
                     raise SafetyBlockError(str(e), "gemini")
                 raise
-        
+
         return generate_with_retry()
     
     def _generate_with_anthropic(
@@ -421,24 +597,33 @@ class LLMClient:
         prompt: Union[str, List[Dict]],
         model: str,
         max_retries: int,
-        operation_name: str
+        operation_name: str,
+        client: AnthropicClient = None
     ) -> str:
         """Generate content with Anthropic, handling retries internally."""
-        
+
+        # Use provided client or fall back to legacy
+        anthropic_client = client or self._anthropic_client
+        if not anthropic_client:
+            raise ValueError("No Anthropic client available")
+
         # Use defaults for temperature and max_tokens
         temperature = 0.1  # Low temperature for consistent results
         max_tokens = 64000  # Claude Sonnet 4 max limit
-        
+
+        # Get max wait from config
+        max_wait = self.config.get('retry', {}).get('max_wait_seconds', self.config.get('max_backoff_seconds', 30))
+
         # Create retry decorator with specified attempts
         @retry(
             retry=retry_if_exception(self._is_retryable_anthropic_error),
-            wait=wait_random_exponential(multiplier=1, max=30),
+            wait=wait_random_exponential(multiplier=1, max=max_wait),
             stop=stop_after_attempt(max_retries),
             reraise=True
         )
         def generate_with_retry():
             try:
-                return self._anthropic_client.generate_content(
+                return anthropic_client.generate_content(
                     prompt=prompt,
                     model=model,
                     max_tokens=max_tokens,
@@ -451,7 +636,7 @@ class LLMClient:
                 if any(term in error_str for term in ['content_policy', 'unsafe', 'violation']):
                     raise SafetyBlockError(str(e), "anthropic")
                 raise
-        
+
         return generate_with_retry()
     
     def _is_retryable_gemini_error(self, exception: Exception) -> bool:
@@ -471,29 +656,38 @@ class LLMClient:
         prompt: Union[str, List[Dict]],
         model: str,
         max_retries: int,
-        operation_name: str
+        operation_name: str,
+        client: OpenAIClient = None
     ) -> str:
         """Generate content with OpenAI, handling retries internally."""
-        
+
+        # Use provided client or fall back to legacy
+        openai_client = client or self._openai_client
+        if not openai_client:
+            raise ValueError("No OpenAI client available")
+
         # Use model-specific max tokens if available
         max_tokens = 8192  # Default for most OpenAI models
         if "gpt-4" in model.lower():
             max_tokens = 8192
         elif "gpt-3.5" in model.lower():
             max_tokens = 4096
-        
+
         temperature = 0.1  # Low temperature for consistent results
-        
+
+        # Get max wait from config
+        max_wait = self.config.get('retry', {}).get('max_wait_seconds', self.config.get('max_backoff_seconds', 30))
+
         # Create retry decorator with specified attempts
         @retry(
             retry=retry_if_exception(self._is_retryable_openai_error),
-            wait=wait_random_exponential(multiplier=1, max=30),
+            wait=wait_random_exponential(multiplier=1, max=max_wait),
             stop=stop_after_attempt(max_retries),
             reraise=True
         )
         def generate_with_retry():
             try:
-                return self._openai_client.generate_content(
+                return openai_client.generate_content(
                     prompt=prompt,
                     model=model,
                     max_tokens=max_tokens,
@@ -506,7 +700,7 @@ class LLMClient:
                 if any(term in error_str for term in ['content_policy', 'refused', 'violation']):
                     raise SafetyBlockError(str(e), "openai")
                 raise
-        
+
         return generate_with_retry()
     
     def _is_retryable_openai_error(self, exception: Exception) -> bool:

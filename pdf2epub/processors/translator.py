@@ -5,14 +5,17 @@ This processor translates markdown content from one language to another
 while preserving formatting and structure.
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from pathlib import Path
 from loguru import logger
 import re
 import random
-
+import time
 from .base import BaseMarkdownProcessor
 from .utils.truncation import LLMTruncationDetector
+from .utils.split_manager import SplitManager
+from .tracker import ProcessingTracker
+from ..chapter_identity import ChapterIdentity
 
 
 class TranslateProcessor(BaseMarkdownProcessor):
@@ -71,7 +74,7 @@ class TranslateProcessor(BaseMarkdownProcessor):
         # Initialize truncation detector
         self.truncation_detector = LLMTruncationDetector(
             llm_client=self.llm_client,
-            num_lines=3
+            num_lines=config.get('translate', {}).get('truncation_check_lines', 3)
         )
         
         # Auto-detect entities if use_entities is None, otherwise use explicit value
@@ -89,188 +92,117 @@ class TranslateProcessor(BaseMarkdownProcessor):
         else:
             # Explicitly requested NOT to use entities
             self.entities = None
-        
-        # Store language info in progress
-        if self.progress.get("target_language") != target_language:
-            if self.progress.get("target_language") is not None:
-                logger.warning(
-                    f"Target language changed from {self.progress['target_language']} "
-                    f"to {target_language}"
-                )
-                if resume:
-                    logger.warning("Resuming with different target language may produce mixed results")
-            self.progress["target_language"] = target_language
-            self.progress["source_language"] = source_language
-            self.save_progress()
-    
-    def get_progress_filename(self) -> str:
-        """Get the name for the progress file."""
-        return "translation_progress"
-    
-    def get_progress_key(self) -> str:
-        """Get the key used in progress tracking."""
-        return "translations"
-    
+
+        # Initialize ProcessingTracker for audit trail
+        tracker_path = self.output_dir / "processing_tracker.json"
+        self.processing_tracker = ProcessingTracker(tracker_path, "TranslateProcessor")
+
+        # Initialize SplitManager for dynamic splitting
+        # Translation often needs larger parts since translated text expands
+        splitting_config = config.get('splitting', {})
+        self.split_manager = SplitManager(
+            tracker=self.processing_tracker,
+            output_dir=self.output_dir,
+            default_max_tokens=self.get_max_tokens_per_part(),
+            max_resplits=splitting_config.get('max_resplits', 3),
+            consecutive_failures_threshold=splitting_config.get('consecutive_failures_threshold', 2)
+        )
+
     def get_operation_name(self, file_name: str) -> str:
         """Get the operation name for logging."""
         return f"Translate {file_name}"
-    
-    def _detect_part_files(self, file_name: str) -> list:
-        """Detect if there are part files for this file."""
-        base_name = Path(file_name).stem
-        part_files = sorted(self.input_dir.glob(f"{base_name}.part*.md"))
-        return part_files
-    
-    def _translate_part(self, content: str, file_name: str, part_idx: int = None, total_parts: int = None) -> str:
-        """Translate a single part of content using the new centralized retry logic."""
+
+    def get_model_configs(self) -> List[Dict]:
+        """Get the model configurations for translation."""
+        return self.translation_models
+
+    def process_unit(self, content: str, unit_key: str, **context) -> str:
+        """
+        Translate a single content unit (part or whole file).
+
+        Args:
+            content: Content to translate
+            unit_key: Unit identifier for tracking
+            **context: Context including file_name, part_idx, total_parts, previous_context
+
+        Returns:
+            Translated content
+
+        Raises:
+            Exception: On translation failure
+        """
+        file_name = context.get('file_name', unit_key)
+        part_idx = context.get('part_idx')
+        total_parts = context.get('total_parts')
+        previous_context = context.get('previous_context')
+
         # Create the translation prompt
         prompt = self._create_translation_prompt()
 
         # Create multi-part content for the LLM
-        multi_part_content = [
-            {"type": "text", "text": prompt},
-            {"type": "text", "text": content}
-        ]
+        if previous_context and part_idx and part_idx > 1:
+            # Use conversation history for terminology/style consistency
+            prev_user_content = [
+                {"type": "text", "text": prompt + f"\n\nContent to translate (part {part_idx-1}/{total_parts}):"},
+                {"type": "text", "text": previous_context['original']}
+            ]
+            current_user_content = [
+                {"type": "text", "text": f"Now translate part {part_idx}/{total_parts} (continuation). Maintain consistent terminology and style with the previous translation.\n\nContent to translate:"},
+                {"type": "text", "text": content}
+            ]
+            multi_part_content = [
+                {"role": "user", "content": prev_user_content},
+                {"role": "assistant", "content": previous_context['processed']},
+                {"role": "user", "content": current_user_content}
+            ]
+        else:
+            # No previous context, use standard format
+            multi_part_content = [
+                {"type": "text", "text": prompt},
+                {"type": "text", "text": content}
+            ]
 
         # Generate operation name
-        if part_idx and total_parts:
-            operation_name = f"{self.get_operation_name(file_name)} part {part_idx}/{total_parts}"
+        nested_part_id = context.get('nested_part_id')
+        unit_key = context.get('unit_key', file_name.replace('.md', ''))
+
+        if nested_part_id and nested_part_id != unit_key:
+            # Nested split occurred, show the nested part ID
+            # e.g., "chapter_6.part1.part2" -> "Translate chapter_6.md (part1.part2)"
+            nested_suffix = nested_part_id.replace(f"{file_name.replace('.md', '')}.", '')
+            operation_name = f"{self.get_operation_name(file_name)} ({nested_suffix})"
         else:
             operation_name = self.get_operation_name(file_name)
+            if part_idx and total_parts:
+                operation_name = f"{operation_name} part {part_idx}/{total_parts}"
 
-        # Define validator function that includes all our translation validations
+        # Define validator function
         def validator(response: str) -> Tuple[bool, str]:
-            # Clean the response first
             cleaned = self.clean_markdown_response(response)
-
-            # Apply language-specific post-processing for validation
             if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
                 cleaned = self._clean_japanese_artifacts(cleaned)
-
-            # Correct footnote colons
             cleaned = self._correct_footnote_colons(cleaned)
-
-            # Validate using existing method (checks for truncation)
-            is_valid, reason = self.validate_output(
+            return self.validate_output(
                 original=content,
                 processed=cleaned,
                 file_name=f"{file_name} part {part_idx}/{total_parts}" if part_idx and total_parts else file_name
             )
 
-            return is_valid, reason
+        # Call LLM
+        translated_content = self.generate_with_retry(
+            multi_part_content=multi_part_content,
+            model_configs=self.translation_models,
+            validator=validator,
+            operation_name=operation_name
+        )
 
-        try:
-            # Use the new generate_with_validation method
-            # All retry logic is now handled within the LLMClient
-            # Create a new ValidationStrategy instance for thread safety
-            from ..processors.validation_strategy import ValidationStrategy
-            validation_config = self.config.get('validation_strategy', {})
-            validation_config['use_longest_on_failure'] = self.use_longest_on_failure
-            thread_local_strategy = ValidationStrategy(validation_config)
+        # Apply post-processing
+        if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
+            translated_content = self._clean_japanese_artifacts(translated_content)
+        translated_content = self._correct_footnote_colons(translated_content)
 
-            translated_content = self.llm_client.generate_with_validation(
-                prompt=multi_part_content,
-                model_configs=self.translation_models,
-                validator=validator,
-                validation_strategy=thread_local_strategy,
-                operation_name=operation_name
-            )
+        return translated_content
 
-            # Clean and post-process the final response
-            translated_content = self.clean_markdown_response(translated_content)
-
-            # Apply Japanese to Chinese specific post-processing
-            if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
-                translated_content = self._clean_japanese_artifacts(translated_content)
-
-            # Correct footnote colon syntax for all translations
-            translated_content = self._correct_footnote_colons(translated_content)
-
-            return translated_content
-
-        except Exception as e:
-            logger.error(f"Failed to translate {operation_name}: {e}")
-            raise
-    
-    def process_content(
-        self,
-        content: str,
-        file_name: str,
-        **kwargs
-    ) -> str:
-        """
-        Process markdown content by translating it.
-        
-        Args:
-            content: The markdown content to translate
-            file_name: Name of the file being processed
-            **kwargs: Additional arguments
-        
-        Returns:
-            Translated markdown content
-        """
-        # If this is already a part file, don't look for more parts
-        if '.part' in Path(file_name).stem:
-            # This is already a part file, translate it directly
-            return self._translate_part(content, file_name)
-        
-        # Check if there are part files (from polisher)
-        part_files = self._detect_part_files(file_name)
-        
-        if part_files:
-            logger.info(f"Found {len(part_files)} part files for {file_name}, translating separately")
-            translated_parts = []
-            output_dir = Path(self.output_dir)
-            base_name = Path(file_name).stem
-
-            for part_idx, part_file in enumerate(part_files, 1):
-                # Check if this part was already translated (for resume)
-                translated_part_file = output_dir / f"{base_name}.part{part_idx}.md"
-
-                if self.resume and translated_part_file.exists():
-                    # Part already translated, load it
-                    logger.info(f"Skipping {file_name} part {part_idx}/{len(part_files)} (already translated)")
-                    with open(translated_part_file, 'r', encoding='utf-8') as f:
-                        translated_part = f.read()
-                    translated_parts.append(translated_part)
-                    continue
-
-                # Read part content
-                with open(part_file, 'r', encoding='utf-8') as f:
-                    part_content = f.read()
-
-                # Translate the part
-                translated_part = self._translate_part(
-                    content=part_content,
-                    file_name=file_name,
-                    part_idx=part_idx,
-                    total_parts=len(part_files)
-                )
-
-                # Validate this part
-                is_valid, reason = self.validate_output(
-                    original=part_content,
-                    processed=translated_part,
-                    file_name=f"{file_name} part {part_idx}/{len(part_files)}"
-                )
-
-                if not is_valid:
-                    logger.warning(f"Part {part_idx}/{len(part_files)} validation failed: {reason}")
-
-                translated_parts.append(translated_part)
-
-                # Save translated part file
-                with open(translated_part_file, 'w', encoding='utf-8') as f:
-                    f.write(translated_part)
-                logger.debug(f"Saved translated part: {translated_part_file.name}")
-
-            # Combine all parts
-            combined = "\n\n".join(translated_parts)
-            return combined
-        else:
-            # No parts, translate as single file
-            return self._translate_part(content, file_name)
-    
     def validate_output(
         self,
         original: str,
@@ -323,33 +255,7 @@ class TranslateProcessor(BaseMarkdownProcessor):
                 logger.debug(f"Chinese translation validated for {file_name}: {chinese_validation_msg}")
 
         return True, "Validation passed"
-    
-    def process_file(
-        self,
-        input_path,
-        output_path,
-        **kwargs
-    ) -> bool:
-        """
-        Process a single markdown file for translation.
-        
-        Override to add language information to progress tracking.
-        """
-        success = super().process_file(input_path, output_path, **kwargs)
-        
-        if success:
-            # Update progress with language info
-            file_key = str(input_path.stem)
-            progress_key = self.get_progress_key()
-            if file_key in self.progress[progress_key]:
-                self.progress[progress_key][file_key].update({
-                    "source_language": self.source_language,
-                    "target_language": self.target_language
-                })
-                self.save_progress()
-        
-        return success
-    
+
     def _load_entities(self) -> Optional[Dict]:
         """Load translation entities from JSON file."""
         import json
@@ -502,7 +408,7 @@ class TranslateProcessor(BaseMarkdownProcessor):
 
 重要要求：
 1. **保留所有markdown格式**：保持标题(#, ##, ###)、强调(*斜体*, **粗体**)、列表、引用、代码块等格式不变
-2. **图片链接保持不变**：不要翻译或修改图片路径，如 ![...](../images/xxx.png)
+2. **图片链接保持不变**：不要翻译或修改图片路径，如 ![...](../images/xxx.png) 或 <img src="..." />
 3. **脚注处理**：
    - 保持脚注格式 [^1], [^2] 等不变
    - 不要添加原文中不存在的脚注
@@ -518,7 +424,7 @@ Translate the following markdown content from {self.source_language} to {self.ta
 
 IMPORTANT REQUIREMENTS:
 1. **Preserve ALL markdown formatting**: Keep headers (#, ##, ###), emphasis (*italic*, **bold**), lists, quotes, code blocks, etc.
-2. **Keep image links unchanged**: Do not translate or modify image paths like ![...](../images/xxx.png)
+2. **Keep image links unchanged**: Do not translate or modify image paths like ![...](../images/xxx.png) or <img src="..." />
 3. **Don't touch footnote**:
    - Keep the footnote format [^1], [^2], etc. unchanged
    - Don't add footnote that does not exist in the original text
@@ -659,5 +565,5 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
             reference += "**重要提示：** 请在整个文本中保持这些译名的一致性。\n"
         else:
             reference += "**IMPORTANT:** Maintain these translations consistently throughout the text.\n"
-        
+
         return reference

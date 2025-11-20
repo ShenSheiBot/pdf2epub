@@ -10,12 +10,31 @@ from typing import List, Tuple, Optional
 from loguru import logger
 
 # Compile regex once for performance
-IMG_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+# Markdown image pattern: ![alt](src)
+MD_IMG_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+# HTML image pattern: <img src="..." ... /> or <img src="..." ...>
+# Also match surrounding div if present
+HTML_IMG_PATTERN = re.compile(
+    r'(?:<div[^>]*>)?\s*<img\s+[^>]*src="([^"]+)"[^>]*/?\s*>\s*(?:</div>)?',
+    re.IGNORECASE
+)
 
 
 def extract_images_from_markdown(content: str) -> List[Tuple[str, int, int]]:
-    """Extract all image references from markdown content."""
-    return [(m.group(0), m.start(), m.end()) for m in IMG_PATTERN.finditer(content)]
+    """Extract all image references from markdown and HTML content."""
+    results = []
+
+    # Extract markdown images
+    for m in MD_IMG_PATTERN.finditer(content):
+        results.append((m.group(0), m.start(), m.end()))
+
+    # Extract HTML images
+    for m in HTML_IMG_PATTERN.finditer(content):
+        results.append((m.group(0), m.start(), m.end()))
+
+    # Sort by position
+    results.sort(key=lambda x: x[1])
+    return results
 
 
 def _prefix_removed_lengths(

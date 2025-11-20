@@ -260,9 +260,17 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     - Abbreviations, Bibliography, Index, or Summary Table are NOT considered as notes. Only literal `Notes` with [1], [2], [3]... are considered as notes.
     - Regular content chapters should not have a "type" field
 
+    Also analyze the content characteristics:
+    - **language**: The primary language of the book content (e.g., "english", "japanese", "chinese", "french", "german", etc.)
+    - **is_vertical_text**: true if the PDF contains vertical text layout (縦書き), false otherwise
+    - **has_footnotes**: true if the content has footnotes, endnotes, or citations with superscript numbers (like ¹²³, [1], $^{{1}}$), false otherwise
+
     Return the result in the following JSON structure:
     {{
         "author": string,  # Author name(s) as they appear in the book. If multiple authors, separate with commas. If no author found, use "Unknown Author"
+        "language": string,  # Primary language of the content (e.g., "english", "japanese", "chinese")
+        "is_vertical_text": boolean,  # true if vertical text layout, false otherwise
+        "has_footnotes": boolean,  # true if content has footnotes/citations, false otherwise
         "cover_page": {{
             "page_number": int
         }},
@@ -298,7 +306,7 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
             "page_number": int
         }}
     }}
-    
+
     Example of a notes chapter:
     {{
         "title": "Notes",

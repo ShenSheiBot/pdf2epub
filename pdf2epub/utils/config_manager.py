@@ -27,6 +27,7 @@ class ConfigManager:
     MIGRATION_MAP = {
         # Credentials - Google
         "google_api_key": "credentials.providers.gemini.api_key",
+        "google_base_url": "credentials.providers.gemini.base_url",
 
         # Credentials - Anthropic
         "anthropic_api_key": "credentials.providers.anthropic.api_key",

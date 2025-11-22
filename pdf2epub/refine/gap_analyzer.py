@@ -30,6 +30,15 @@ class Gap:
 
 
 @dataclass
+class Overlap:
+    """Represents an overlap between consecutive TOC entries."""
+    current_entry: Dict  # The earlier entry
+    next_entry: Dict  # The later entry
+    overlap_start: int  # First overlapping page
+    overlap_end: int  # Last overlapping page
+
+
+@dataclass
 class GapClassification:
     """LLM classification of gap content."""
     is_substantial: bool
@@ -256,6 +265,7 @@ Determine:
    - NO: completely blank pages, pages with only PDF metadata/watermarks
 
 2. **Content type:**
+   - "continuation": Content that continues from previous section (no new title/heading, starts mid-paragraph or continues the same topic)
    - "part_title": Part/section title page
    - "introduction": Preface, foreword, or introductory text
    - "appendix": Supplementary material
@@ -266,7 +276,7 @@ Determine:
 
 3. **Suggested title:**
    - Extract from content when possible
-   - For blank pages: empty string
+   - For blank pages or continuation: empty string
 
 Return JSON:
 {{
@@ -279,6 +289,8 @@ Return JSON:
 
 **Important:**
 - Preserve original language for titles
+- For "continuation" type: this content should be merged with the previous entry, not treated as a new section
+- Indicators of continuation: no heading/title at page start, text flows from previous context, same writing style
 """
 
         generation_config = self.client.get_default_config(temperature=0.1)
@@ -302,7 +314,11 @@ Return JSON:
             content_type = result.get('content_type', 'blank')
             is_substantial = result.get('is_substantial', False)
 
-            if not is_substantial or content_type == 'blank':
+            # Continuation content should not create a new entry
+            if content_type == 'continuation':
+                is_substantial = False
+                suggested_level = 0
+            elif not is_substantial or content_type == 'blank':
                 suggested_level = 0
             elif gap.gap_type in ['front', 'back', 'toc_to_content']:
                 suggested_level = 1
@@ -507,7 +523,22 @@ Return only the JSON array.
             if not classification:
                 continue
 
-            # Skip non-substantial content
+            # Handle continuation: extend previous entry's end_page
+            if classification.content_type == 'continuation' and gap.prev_entry:
+                prev_node = self._find_node_by_title(
+                    modified_data['chapters'],
+                    gap.prev_entry
+                )
+                if prev_node:
+                    old_end = prev_node['end_page']
+                    prev_node['end_page'] = gap.end_page
+                    logger.info(
+                        f"Extended '{gap.prev_entry}' end_page: "
+                        f"{old_end} -> {gap.end_page} (continuation)"
+                    )
+                continue
+
+            # Skip other non-substantial content
             if not classification.is_substantial or classification.suggested_level == 0:
                 logger.debug(
                     f"Skipping gap {gap.start_page}-{gap.end_page}: "
@@ -633,6 +664,201 @@ Return only the JSON array.
                     next_title,
                     new_entry,
                     None
+                ):
+                    return True
+
+        return False
+
+    def detect_overlaps(self, toc_data: Dict) -> List[Overlap]:
+        """
+        Detect all overlaps in the TOC structure.
+
+        An overlap occurs when one entry's end_page >= next entry's start_page.
+
+        Args:
+            toc_data: Full toc_tree.json data
+
+        Returns:
+            List of Overlap objects representing overlapping page ranges
+        """
+        overlaps = []
+        chapters = toc_data.get('chapters', [])
+
+        # Recursively detect overlaps
+        chapter_overlaps = self._detect_overlaps_recursive(chapters)
+        overlaps.extend(chapter_overlaps)
+
+        if overlaps:
+            logger.warning(f"Detected {len(overlaps)} overlaps in TOC structure")
+            for overlap in overlaps:
+                logger.warning(
+                    f"  Overlap: '{overlap.current_entry['title']}' "
+                    f"(ends {overlap.current_entry['end_page']}) vs "
+                    f"'{overlap.next_entry['title']}' "
+                    f"(starts {overlap.next_entry['start_page']})"
+                )
+        else:
+            logger.debug("No overlaps detected in TOC structure")
+
+        return overlaps
+
+    def _detect_overlaps_recursive(self, nodes: List[Dict]) -> List[Overlap]:
+        """
+        Recursively detect overlaps within a list of nodes.
+
+        Args:
+            nodes: List of chapter/section entries
+
+        Returns:
+            List of overlaps found
+        """
+        overlaps = []
+
+        for i, node in enumerate(nodes):
+            # Check for overlap with next sibling
+            if i + 1 < len(nodes):
+                next_node = nodes[i + 1]
+                if node['end_page'] >= next_node['start_page']:
+                    overlaps.append(Overlap(
+                        current_entry=node,
+                        next_entry=next_node,
+                        overlap_start=next_node['start_page'],
+                        overlap_end=node['end_page']
+                    ))
+
+            # Recurse into children
+            if node.get('children'):
+                child_overlaps = self._detect_overlaps_recursive(node['children'])
+                overlaps.extend(child_overlaps)
+
+        return overlaps
+
+    def resolve_overlaps(
+        self,
+        toc_data: Dict,
+        overlaps: List[Overlap],
+        pages_dir: Path,
+        boundary_verifier
+    ) -> Dict:
+        """
+        Resolve overlaps by finding actual title positions using LLM.
+
+        For each overlap, uses BoundaryVerifier to find where the next entry's
+        title actually appears, then adjusts both entries' page boundaries.
+
+        Args:
+            toc_data: Full toc_tree.json data
+            overlaps: List of detected overlaps
+            pages_dir: Directory containing page_*.md files
+            boundary_verifier: BoundaryVerifier instance for title search
+
+        Returns:
+            Modified toc_data with overlaps resolved
+        """
+        import copy
+        from .toc_tree import TOCNode
+
+        modified_data = copy.deepcopy(toc_data)
+
+        for overlap in overlaps:
+            # Create a TOCNode for the next entry to use with BoundaryVerifier
+            next_entry = overlap.next_entry
+            next_node = TOCNode(
+                title=next_entry['title'],
+                level=next_entry.get('level', 1),
+                start_page=next_entry['start_page'],
+                end_page=next_entry['end_page']
+            )
+
+            # First verify if title is on the expected page
+            logger.info(
+                f"Resolving overlap: checking '{next_entry['title']}' "
+                f"around page {next_entry['start_page']}"
+            )
+
+            result = boundary_verifier.verify_boundary(next_node, pages_dir)
+
+            actual_page = None
+            if result.get('found'):
+                actual_page = next_entry['start_page']
+                logger.debug(f"Title found on expected page {actual_page}")
+            else:
+                # Search nearby pages
+                prev_title = overlap.current_entry['title']
+                actual_page = boundary_verifier.search_nearby_pages(
+                    next_node,
+                    pages_dir,
+                    search_range=5,
+                    prev_title=prev_title
+                )
+
+            if actual_page:
+                # Update page boundaries in the modified data
+                self._update_overlap_boundaries(
+                    modified_data['chapters'],
+                    overlap.current_entry['title'],
+                    overlap.next_entry['title'],
+                    actual_page
+                )
+                logger.success(
+                    f"Resolved overlap: '{next_entry['title']}' "
+                    f"starts at page {actual_page} "
+                    f"(was {next_entry['start_page']})"
+                )
+            else:
+                logger.error(
+                    f"Could not resolve overlap for '{next_entry['title']}': "
+                    f"title not found in nearby pages"
+                )
+
+        return modified_data
+
+    def _update_overlap_boundaries(
+        self,
+        nodes: List[Dict],
+        current_title: str,
+        next_title: str,
+        actual_start: int
+    ) -> bool:
+        """
+        Update page boundaries to resolve an overlap.
+
+        Sets current entry's end_page to actual_start - 1,
+        and next entry's start_page to actual_start.
+
+        Args:
+            nodes: List of chapter/section entries
+            current_title: Title of the earlier entry
+            next_title: Title of the later entry
+            actual_start: Actual start page of next entry
+
+        Returns:
+            True if updated successfully
+        """
+        for i, node in enumerate(nodes):
+            if node['title'] == current_title and i + 1 < len(nodes):
+                next_node = nodes[i + 1]
+                if next_node['title'] == next_title:
+                    # Update boundaries
+                    old_end = node['end_page']
+                    old_start = next_node['start_page']
+
+                    node['end_page'] = actual_start - 1
+                    next_node['start_page'] = actual_start
+
+                    logger.debug(
+                        f"Updated '{current_title}' end: {old_end} -> {actual_start - 1}, "
+                        f"'{next_title}' start: {old_start} -> {actual_start}"
+                    )
+                    return True
+
+            # Recurse into children
+            if node.get('children'):
+                if self._update_overlap_boundaries(
+                    node['children'],
+                    current_title,
+                    next_title,
+                    actual_start
                 ):
                     return True
 

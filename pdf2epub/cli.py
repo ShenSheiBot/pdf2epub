@@ -125,7 +125,8 @@ def breakdown_command(args):
     # Load configuration
     config = load_breakdown_config(args.config)
     api_key = config.get("google_api_key")
-    
+    base_url = config.get("google_base_url")
+
     if not api_key:
         logger.error("Google API key not found in config.yaml")
         return 1
@@ -162,7 +163,7 @@ def breakdown_command(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup Gemini API
-    gemini_client = GeminiClient(api_key)
+    gemini_client = GeminiClient(api_key, base_url=base_url)
     
     # Use preprocess_pdf which handles page number patches and multi-round compression
     processed_pdf = preprocess_pdf(input_pdf, output_dir)
@@ -481,6 +482,7 @@ def extract_entities_command(args):
 
     # Get API key
     api_key = config.get("google_api_key")
+    base_url = config.get("google_base_url")
     if not api_key:
         logger.error("Google API key not found in config.yaml")
         return 1
@@ -489,7 +491,7 @@ def extract_entities_command(args):
     logger.info(f"Language pair: {args.source_lang} → {args.target_lang}")
 
     # Initialize Gemini client
-    gemini_client = GeminiClient(api_key)
+    gemini_client = GeminiClient(api_key, base_url=base_url)
 
     # Setup paths
     output_dir = Path("output") / book_title

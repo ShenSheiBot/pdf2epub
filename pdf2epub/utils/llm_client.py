@@ -58,6 +58,7 @@ class LLMClient:
         if self.config.get("google_api_key"):
             self._gemini_client = GeminiClient(
                 api_key=self.config["google_api_key"],
+                base_url=self.config.get("google_base_url"),
                 num_retries=self._num_retries,
                 max_backoff_seconds=self._max_backoff_seconds
             )
@@ -134,6 +135,7 @@ class LLMClient:
         if provider_type == "google":
             return GeminiClient(
                 api_key=api_key,
+                base_url=base_url,
                 num_retries=self._num_retries,
                 max_backoff_seconds=self._max_backoff_seconds
             )

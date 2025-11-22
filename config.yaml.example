@@ -13,6 +13,7 @@ credentials:
     gemini:
       type: google
       api_key: "your-google-api-key"
+      # base_url: "https://your-proxy.example.com"  # Optional: custom endpoint
 
     # Anthropic - Optional, for Claude models
     anthropic:

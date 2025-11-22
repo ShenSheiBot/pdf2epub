@@ -68,7 +68,10 @@ Transcribe the entire page content accurately."""
         
         # Initialize clients based on available API keys
         if config.get("google_api_key"):
-            self._gemini_client = GeminiClient(config["google_api_key"])
+            self._gemini_client = GeminiClient(
+                config["google_api_key"],
+                base_url=config.get("google_base_url")
+            )
             
         if config.get("anthropic_api_key"):
             self._anthropic_client = AnthropicClient(

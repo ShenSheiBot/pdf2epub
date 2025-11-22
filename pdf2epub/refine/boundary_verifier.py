@@ -79,8 +79,8 @@ Return JSON:
 **Important:**
 - Use LENIENT matching. Return found=true if:
   - The page contains a title with roughly the same meaning
-  - Minor differences are acceptable: OCR errors, punctuation, spacing, shortened forms
-  - Examples: "List of contributors" matches "Contributors", "73 Modern drama" matches "Modern drama"
+  - Minor differences are acceptable: OCR errors, punctuation, spacing, shortened forms, Roman numeral variations
+  - Examples: "List of contributors" matches "Contributors", "73 Modern drama" matches "Modern drama", "PART II" matches "PART III" (OCR error)
 - Only return found=false if:
   - No similar title exists on the page at all
   - The title meaning is completely different

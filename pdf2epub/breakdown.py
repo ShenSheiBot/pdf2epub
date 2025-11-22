@@ -230,6 +230,7 @@ def main():
     # Load configuration
     config = load_config(args.config)
     api_key = config.get("google_api_key")
+    base_url = config.get("google_base_url")
     
     # Get input PDF path
     input_pdf = Path(args.input)
@@ -250,7 +251,7 @@ def main():
         raise ValueError("Google API key not found in config.yaml")
 
     # Setup Gemini API
-    client = GeminiClient(api_key)
+    client = GeminiClient(api_key, base_url=base_url)
 
     # Preprocess and get the PDF path to use
     processed_pdf = preprocess_pdf(input_pdf, output_dir)

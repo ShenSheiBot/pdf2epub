@@ -434,12 +434,13 @@ def main():
     
     # Get API key
     api_key = config.get("google_api_key")
+    base_url = config.get("google_base_url")
     if not api_key:
         logger.error("Google API key not found in config.yaml")
         return 1
-    
+
     # Initialize Gemini client
-    gemini_client = GeminiClient(api_key)
+    gemini_client = GeminiClient(api_key, base_url=base_url)
     
     # Setup output directory
     output_dir = Path("output") / book_title

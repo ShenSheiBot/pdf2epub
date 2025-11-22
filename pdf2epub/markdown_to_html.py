@@ -11,6 +11,7 @@ from typing import Optional
 import yaml
 from loguru import logger
 from .utils.logging_config import configure_logging
+from .chapter_identity import ChapterIdentity
 
 # We'll use markdown library - need to add to pyproject.toml: 
 # poetry add markdown
@@ -427,9 +428,9 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
     lines = markdown_content.split('\n')
     processed_lines = []
 
-    # Extract base chapter name
-    base_match = re.match(r'(chapter_\d+)(?:[._]part\d+)?', source_chapter)
-    base_chapter = base_match.group(1) if base_match else source_chapter
+    # Extract base chapter name using ChapterIdentity
+    source_identity = ChapterIdentity.parse(source_chapter)
+    base_chapter = source_identity.base_name if source_identity else source_chapter
 
     # Check if this is a multi-part chapter
     is_multi_part = False
@@ -496,20 +497,18 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
                     backref_chapter = ref_chapters[0]
                     fnref_id = f"fnref-{backref_chapter}-{fn_key}"
                     # Always use file name, even for same-file backrefs
-                    backref_chapter_html = backref_chapter.replace('.part', '_part')
-                    backref_link = f"{backref_chapter_html}.html#{fnref_id}"
+                    backref_identity = ChapterIdentity.parse(backref_chapter)
+                    backref_link = f"{backref_identity.html_name}#{fnref_id}" if backref_identity else f"{backref_chapter}.html#{fnref_id}"
                 else:
                     # Fallback - still use file name
                     fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                    source_chapter_html = source_chapter.replace('.part', '_part')
-                    backref_link = f"{source_chapter_html}.html#{fnref_id}"
+                    backref_link = f"{source_identity.html_name}#{fnref_id}" if source_identity else f"{source_chapter}.html#{fnref_id}"
             else:
                 # Single-part chapter, use simple ID with unique prefix
                 fn_id = f"fn:{fn_key}"
                 fnref_id = f"fnref-{source_chapter}-{fn_key}"
                 # Use file name even for single-part chapters
-                source_chapter_html = source_chapter.replace('.part', '_part')
-                backref_link = f"{source_chapter_html}.html#{fnref_id}"
+                backref_link = f"{source_identity.html_name}#{fnref_id}" if source_identity else f"{source_chapter}.html#{fnref_id}"
 
             # Convert to HTML footnote definition (using same format as GLOBAL mode)
             processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
@@ -530,8 +529,8 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
 
                 # Default local reference - use file name for consistency
                 fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                source_chapter_html = source_chapter.replace('.part', '_part')
-                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_chapter_html}.html#fn:{fn_key}">[{fn_key}]</a></sup>'
+                source_html = source_identity.html_name if source_identity else f"{source_chapter}.html"
+                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{fn_key}">[{fn_key}]</a></sup>'
 
             # Replace footnote references
             line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)

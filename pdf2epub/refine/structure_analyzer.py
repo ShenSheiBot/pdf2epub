@@ -72,7 +72,11 @@ Include:
 
 Additionally identify special chapter types:
 - If a chapter consists ONLY of footnotes/endnotes for other chapters, add "type": "notes"
+- If any chapter's notes are at the end of itself, then there should be NO notes chapter
 - A book contains at most one notes chapter
+- Abbreviations, Bibliography, Index, or Summary Table are NOT considered as notes
+- Only literal "Notes" or "Endnotes" chapters with [1], [2], [3]... definitions are considered as notes
+- Regular content chapters should not have a "type" field
 
 Also analyze content characteristics:
 - **language**: Primary language (e.g., "english", "japanese", "chinese")
@@ -114,7 +118,17 @@ Return JSON:
 **IMPORTANT**:
 - The "children" field is recursive and can contain unlimited levels
 - If a section has no subsections, its "children" should be an empty array []
-- Preserve the original language for all titles
+- Preserve the original language for all titles and author names
+- Note that nearby chapters may overlap if there are no page breaks
+
+Example of a notes chapter:
+{{
+    "title": "Notes",
+    "start_page": 250,
+    "end_page": 275,
+    "level": 1,
+    "type": "notes"
+}}
 """
 
         # Read PDF
@@ -139,6 +153,9 @@ Return JSON:
 
         result = json.loads(response_text)
 
+        # Validate and fix notes type - remove from non-notes chapters
+        self._fix_invalid_notes_type(result.get('chapters', []))
+
         # Convert to TOCNode tree
         toc_tree = dict_list_to_toc_tree(result.get('chapters', []))
 
@@ -156,6 +173,35 @@ Return JSON:
 
         logger.info(f"Extracted {len(toc_tree)} top-level chapters")
         return toc_tree, book_metadata
+
+    def _fix_invalid_notes_type(self, chapters: List[Dict]):
+        """
+        Remove type='notes' from chapters that are clearly not notes.
+
+        Bibliography, Index, Abbreviations, Summary Table should not be marked as notes.
+        Only literal "Notes" or "Endnotes" chapters should have this type.
+        """
+        invalid_keywords = ['bibliography', 'index', 'abbreviation', 'summary', 'glossary', 'appendix']
+        valid_keywords = ['notes', 'endnotes']
+
+        for chapter in chapters:
+            if chapter.get('type') == 'notes':
+                title_lower = chapter.get('title', '').lower()
+                # Check if title contains invalid keywords
+                has_invalid = any(kw in title_lower for kw in invalid_keywords)
+                # Check if title contains valid keywords
+                has_valid = any(kw in title_lower for kw in valid_keywords)
+
+                if has_invalid and not has_valid:
+                    logger.warning(
+                        f"Removing invalid type='notes' from '{chapter['title']}' "
+                        f"(Bibliography/Index/etc are not notes chapters)"
+                    )
+                    del chapter['type']
+
+            # Recursively check children
+            if chapter.get('children'):
+                self._fix_invalid_notes_type(chapter['children'])
 
     def rebreakdown_chapter(
         self,

@@ -253,6 +253,60 @@ def flatten_toc_tree(
     return result
 
 
+def translate_book_title(
+    original_title: str,
+    llm_client: LLMClient,
+    source_language: str,
+    target_language: str,
+    output_dir: Path
+) -> str:
+    """
+    Translate the book title, with caching to file.
+
+    Args:
+        original_title: Original book title
+        llm_client: LLM client for translation
+        source_language: Source language
+        target_language: Target language
+        output_dir: Directory to cache translated title
+
+    Returns:
+        Translated book title
+    """
+    # Check for cached translation
+    cache_file = output_dir / "book_title_translated.txt"
+    if cache_file.exists():
+        translated = cache_file.read_text(encoding='utf-8').strip()
+        if translated:
+            logger.info(f"Loaded cached translated title: {translated}")
+            return translated
+
+    # Translate using LLM
+    prompt = f"""Translate the following book title from {source_language} to {target_language}.
+Return ONLY the translated title, no explanations or quotes.
+
+Original title: {original_title}
+
+Translated title:"""
+
+    try:
+        response = llm_client.generate(
+            prompt=prompt,
+            operation_name="Book title translation"
+        )
+
+        translated = response.strip().strip('"\'')
+
+        # Cache the translation
+        cache_file.write_text(translated, encoding='utf-8')
+        logger.info(f"Translated book title: {original_title} → {translated}")
+
+        return translated
+    except Exception as e:
+        logger.error(f"Failed to translate book title: {e}")
+        return original_title
+
+
 async def translate_toc_titles(
     toc_structure: List[Dict],
     llm_client: LLMClient,
@@ -302,11 +356,10 @@ Titles to translate:
 Translated titles:"""
 
     try:
-        # Use a fast model for translation
-        response = await llm_client.generate(
+        # Use configured LLM for translation
+        response = llm_client.generate(
             prompt=prompt,
-            model="gemini-2.5-flash",
-            provider="gemini"
+            operation_name="TOC title translation"
         )
 
         # Parse translated titles
@@ -680,16 +733,31 @@ async def build_epub(config: BuildEpubConfig) -> Path:
     # Flatten and process structure
     toc_structure = flatten_toc_tree(toc_tree['chapters'])
 
-    # Translate TOC titles if needed
+    # Translate TOC titles and book title if needed
     if config.translated and config.config:
         llm_client = LLMClient(config.config)
         source_language = toc_tree.get('language', 'English')
+
+        # Translate TOC titles
         toc_structure = await translate_toc_titles(
             toc_structure,
             llm_client,
             source_language,
             config.target_language
         )
+
+        # Translate book title
+        translated_title = translate_book_title(
+            config.book_title,
+            llm_client,
+            source_language,
+            config.target_language,
+            config.output_dir
+        )
+
+        # Update config with translated title
+        config.book_title = translated_title
+        logger.info(f"Using translated title for EPUB: {translated_title}")
 
     # Build structure with file paths
     epub_structure = build_epub_structure(toc_structure, config.markdown_dir)
@@ -799,13 +867,15 @@ async def build_epub(config: BuildEpubConfig) -> Path:
                         )
 
                         # Convert to HTML with full footnote and image support
+                        # Use actual part file name for correct footnote linking
+                        part_file_stem = Path(part_file).stem
                         html_content = markdown_to_html(
                             processed,
                             config.book_title,
                             language,
                             footnote_manager=footnote_manager,
                             image_mapping=image_mapping,
-                            source_chapter=unit_id
+                            source_chapter=part_file_stem
                         )
 
                         # Add subchapter anchors for TOC navigation
@@ -871,8 +941,10 @@ async def build_epub(config: BuildEpubConfig) -> Path:
         all_html_files
     )
 
-    # Create final EPUB
-    epub_path = config.output_dir / f"{config.book_title}.epub"
+    # Create final EPUB with sanitized filename
+    from .utils.common import sanitize_filename
+    safe_title = sanitize_filename(config.book_title)
+    epub_path = config.output_dir / f"{safe_title}.epub"
     builder.create_epub(epub_dir, epub_path)
 
     # Keep build directory for debugging (don't clean up)

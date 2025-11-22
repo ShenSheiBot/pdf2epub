@@ -297,7 +297,7 @@ class FootnoteManager:
         for base_chapter in self.local_chapter_groups:
             self.local_chapter_groups[base_chapter].sort(key=self._chapter_sort_key)
 
-        logger.debug(f"Built chapter groups: {self.local_chapter_groups}")
+        logger.debug(f"Built {len(self.local_chapter_groups)} chapter groups")
 
     def _build_local_occurrence_mappings(self) -> None:
         """

@@ -123,10 +123,24 @@ def is_transient_openai_error(exception: Exception) -> bool:
 class GeminiClient:
     """Wrapper for Gemini API with smart retry logic."""
     
-    def __init__(self, api_key: str, num_retries: int = 3, max_backoff_seconds: int = 30):
-        """Initialize Gemini client."""
+    def __init__(self, api_key: str, base_url: Optional[str] = None, num_retries: int = 3, max_backoff_seconds: int = 30):
+        """Initialize Gemini client.
+
+        Args:
+            api_key: Gemini API key
+            base_url: Custom API endpoint (e.g., 'google.shenshei.fans')
+            num_retries: Number of retries for transient errors
+            max_backoff_seconds: Maximum backoff time between retries
+        """
         from google import genai
-        self.client = genai.Client(api_key=api_key)
+        if base_url:
+            # Use custom endpoint
+            self.client = genai.Client(
+                api_key=api_key,
+                http_options={'base_url': base_url}
+            )
+        else:
+            self.client = genai.Client(api_key=api_key)
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
         # Initialize tokenizer for accurate token counting
@@ -205,7 +219,7 @@ class GeminiClient:
                             raise ValueError(f"Content blocked: {reason}")
 
                     # Extract text from content parts, filtering out thoughts
-                    if hasattr(candidate, 'content') and candidate.content:
+                    if hasattr(candidate, 'content') and candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
                             # Skip thought parts (Gemini 3 thinking mode)
                             if hasattr(part, 'thought') and part.thought:

@@ -65,11 +65,12 @@ class RefinedBreakdown:
         credentials = config.get('credentials', {}).get('providers', {})
         gemini_config = credentials.get('gemini', {})
         api_key = gemini_config.get('api_key')
+        base_url = gemini_config.get('base_url')
 
         if not api_key:
             raise ValueError("Gemini API key not found in config")
 
-        self.client = GeminiClient(api_key, num_retries=3, max_backoff_seconds=30)
+        self.client = GeminiClient(api_key, base_url=base_url, num_retries=3, max_backoff_seconds=30)
 
         # Get models from config
         refine_config = config.get('refine', {})
@@ -179,6 +180,13 @@ class RefinedBreakdown:
 
             toc_tree = dict_list_to_toc_tree(toc_data['chapters'])
             book_metadata = {k: v for k, v in toc_data.items() if k != 'chapters'}
+        elif toc_tree_original.exists() and resume:
+            # toc_tree.json was deleted but original exists - load original
+            logger.info("Loading original TOC tree (toc_tree.json was deleted)")
+            with open(toc_tree_original, 'r', encoding='utf-8') as f:
+                toc_data = json.load(f)
+            toc_tree = dict_list_to_toc_tree(toc_data['chapters'])
+            book_metadata = {k: v for k, v in toc_data.items() if k != 'chapters'}
         else:
             # Preprocess PDF
             processed_pdf = preprocess_pdf(pdf_path, output_dir)
@@ -198,7 +206,55 @@ class RefinedBreakdown:
                 json.dump(toc_data, f, indent=2, ensure_ascii=False)
             logger.success(f"TOC tree saved to {toc_tree_file}")
 
-        # Step 1.5: Detect and fill gaps in TOC
+        # Step 1.5: Verify boundaries FIRST (before gap/overlap detection)
+        # This ensures start_pages are correct before we detect gaps
+        logger.info(f"Verifying boundaries (max {self.max_workers} workers)...")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(self._verify_chapter, chapter, pages_dir): chapter
+                for chapter in toc_tree
+            }
+            for future in as_completed(futures):
+                chapter = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Verification failed for '{chapter.title}': {e}")
+
+        # Save state after verification
+        self.state.save(state_file)
+
+        # Step 1.6: Correct end_pages based on verified start_pages
+        logger.info("Correcting end_pages based on verified boundaries...")
+        self._correct_end_pages(toc_tree)
+
+        # Update toc_data with corrected end_pages
+        toc_data['chapters'] = [node.to_dict() for node in toc_tree]
+        with open(toc_tree_file, 'w', encoding='utf-8') as f:
+            json.dump(toc_data, f, indent=2, ensure_ascii=False)
+
+        # Step 1.7: Detect and resolve overlaps in TOC
+        logger.info("Detecting overlaps in TOC structure...")
+        overlaps = self.gap_analyzer.detect_overlaps(toc_data)
+
+        if overlaps:
+            logger.info(f"Found {len(overlaps)} overlaps, resolving with LLM...")
+            toc_data = self.gap_analyzer.resolve_overlaps(
+                toc_data, overlaps, pages_dir, self.boundary_verifier
+            )
+
+            # Rebuild TOC tree from updated data
+            toc_tree = dict_list_to_toc_tree(toc_data['chapters'])
+
+            # Save updated TOC tree
+            with open(toc_tree_file, 'w', encoding='utf-8') as f:
+                json.dump(toc_data, f, indent=2, ensure_ascii=False)
+
+            logger.success(f"Resolved {len(overlaps)} overlaps, updated {toc_tree_file}")
+        else:
+            logger.info("No overlaps found in TOC structure")
+
+        # Step 1.8: Detect and fill gaps in TOC (using verified data)
         if not self.state.gaps_filled:
             # Save original TOC tree before gap filling
             if not toc_tree_original.exists():
@@ -249,23 +305,6 @@ class RefinedBreakdown:
         logger.info("Estimating token counts...")
         self._estimate_all_tokens(toc_tree, pages_dir)
 
-        # Step 3: Verify boundaries and handle failures (parallel)
-        logger.info(f"Verifying boundaries (max {self.max_workers} workers)...")
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(self._verify_chapter, chapter, pages_dir): chapter
-                for chapter in toc_tree
-            }
-            for future in as_completed(futures):
-                chapter = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Verification failed for '{chapter.title}': {e}")
-
-        # Save state
-        self.state.save(state_file)
-
         # Step 4: Generate work units
         logger.info("Generating work units...")
         work_units = []
@@ -310,6 +349,40 @@ class RefinedBreakdown:
         # Recursively estimate children
         for child in node.children:
             self._estimate_node_tokens(child, pages_dir)
+
+    def _correct_end_pages(self, toc_tree: List[TOCNode]):
+        """
+        Correct end_pages based on verified start_pages of next siblings.
+
+        After boundary verification, we know the correct start_pages.
+        For each node, its end_page should be at most next_sibling.start_page - 1,
+        unless they share a page (same start_page).
+
+        This ensures gap detection uses consistent data.
+        """
+        def correct_recursive(nodes: List[TOCNode]):
+            for i, node in enumerate(nodes):
+                if i + 1 < len(nodes):
+                    next_node = nodes[i + 1]
+                    # Calculate expected end_page
+                    expected_end = next_node.start_page - 1
+
+                    # Only correct if current end_page is less than expected
+                    # (meaning there was a gap that shouldn't exist)
+                    if node.end_page < expected_end:
+                        logger.debug(
+                            f"Correcting '{node.title}' end_page: "
+                            f"{node.end_page} -> {expected_end}"
+                        )
+                        node.end_page = expected_end
+                    # If end_page > expected_end, there's an overlap
+                    # (handled by overlap detection)
+
+                # Recursively process children
+                if node.children:
+                    correct_recursive(node.children)
+
+        correct_recursive(toc_tree)
 
     def _verify_chapter(self, chapter: TOCNode, pages_dir: Path):
         """

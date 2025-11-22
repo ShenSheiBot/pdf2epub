@@ -92,6 +92,9 @@ Your tasks for ACADEMIC content:
      * Bottom of pages (separated from main text)
      * End of chapters in dedicated Notes/References sections
      * Clearly marked footnote sections
+   - Convert OCR footnote formats to markdown:
+     * "[footnote] $^N$ text" or "[footnote] $ ^{{N}} $ text" → "[^N]: text"
+     * "^N text" at page bottom → "[^N]: text"
    - Preserve exact footnote numbering from the source
    - If footnote is at the bottom of page, group and move them to the end of section
    - Never invent or add missing footnotes

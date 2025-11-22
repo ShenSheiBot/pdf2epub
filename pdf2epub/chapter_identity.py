@@ -20,26 +20,25 @@ class ChapterIdentity:
 
     Attributes:
         prefix: The type prefix (e.g., "chapter", "unit", "front_matter")
-        number: The chapter/unit number (None for front_matter/back_matter)
+        number: The chapter/unit hierarchical index as string (e.g., "7.1.1", None for front_matter/back_matter)
         part: The part number if split (None for single files)
 
     Examples:
-        "chapter_5" -> ChapterIdentity("chapter", 5, None)
-        "chapter_5.part2" -> ChapterIdentity("chapter", 5, 2)
-        "unit_001" -> ChapterIdentity("unit", 1, None)
-        "unit_001.part3" -> ChapterIdentity("unit", 1, 3)
+        "chapter_5" -> ChapterIdentity("chapter", "5", None)
+        "chapter_7.1.1" -> ChapterIdentity("chapter", "7.1.1", None)
+        "chapter_7.1.1.part2" -> ChapterIdentity("chapter", "7.1.1", 2)
         "front_matter" -> ChapterIdentity("front_matter", None, None)
         "back_matter.part1" -> ChapterIdentity("back_matter", None, 1)
     """
 
     prefix: str
-    number: Optional[int]
+    number: Optional[str]  # Changed from int to str to support "7.1.1"
     part: Optional[int]
 
     # Regex patterns for parsing
-    # Pattern 1: prefix_number[.partN] (e.g., chapter_5, chapter_5.part1)
+    # Pattern 1: prefix_number[.subindices][.partN] (e.g., chapter_7, chapter_7.1.1, chapter_7.1.1.part2)
     _NUMBERED_PATTERN = re.compile(
-        r'^([a-zA-Z_]+)_(\d+)(?:\.part(\d+))?$'
+        r'^([a-zA-Z_]+)_(\d+(?:\.\d+)*)(?:\.part(\d+))?$'
     )
 
     # Pattern 2: special_matter[.partN] (e.g., front_matter, back_matter.part1)
@@ -56,17 +55,17 @@ class ChapterIdentity:
         Parse a filename (with or without extension) into ChapterIdentity.
 
         Args:
-            filename: The filename to parse (e.g., "chapter_5.part1.md" or "chapter_5.part1")
+            filename: The filename to parse (e.g., "chapter_7.1.1.part1.md" or "chapter_7.1.1")
 
         Returns:
             ChapterIdentity if parsing succeeds, None otherwise
 
         Examples:
             >>> ChapterIdentity.parse("chapter_5.md")
-            ChapterIdentity(prefix='chapter', number=5, part=None)
+            ChapterIdentity(prefix='chapter', number='5', part=None)
 
-            >>> ChapterIdentity.parse("chapter_5.part2")
-            ChapterIdentity(prefix='chapter', number=5, part=2)
+            >>> ChapterIdentity.parse("chapter_7.1.1.part2")
+            ChapterIdentity(prefix='chapter', number='7.1.1', part=2)
 
             >>> ChapterIdentity.parse("front_matter")
             ChapterIdentity(prefix='front_matter', number=None, part=None)
@@ -88,11 +87,11 @@ class ChapterIdentity:
             part = int(match.group(2)) if match.group(2) else None
             return cls(prefix=prefix, number=None, part=part)
 
-        # Try numbered pattern (chapter_N, unit_N, etc.)
+        # Try numbered pattern (chapter_N, chapter_N.M.K, etc.)
         match = cls._NUMBERED_PATTERN.match(stem)
         if match:
             prefix = match.group(1)
-            number = int(match.group(2))
+            number = match.group(2)  # Keep as string to preserve "7.1.1"
             part = int(match.group(3)) if match.group(3) else None
             return cls(prefix=prefix, number=number, part=part)
 
@@ -161,15 +160,29 @@ class ChapterIdentity:
         return self.prefix == 'back_matter'
 
     @property
-    def sort_key(self) -> Tuple[int, int, int]:
+    def index_path(self) -> List[int]:
+        """
+        Get the hierarchical index as a list of integers.
+
+        Examples:
+            ChapterIdentity("chapter", "7", None).index_path -> [7]
+            ChapterIdentity("chapter", "7.1.1", None).index_path -> [7, 1, 1]
+            ChapterIdentity("front_matter", None, None).index_path -> []
+        """
+        if self.number is None:
+            return []
+        return [int(x) for x in self.number.split('.')]
+
+    @property
+    def sort_key(self) -> Tuple:
         """
         Get a sort key for ordering chapters.
 
-        Order: front_matter < numbered chapters (by number) < back_matter
+        Order: front_matter < numbered chapters (by hierarchical index) < back_matter
         Within each: parts ordered by part number
 
         Returns:
-            Tuple (category, number, part) for sorting
+            Tuple for sorting (category, index_path, part)
         """
         if self.is_front_matter:
             category = 0
@@ -178,10 +191,11 @@ class ChapterIdentity:
         else:
             category = 1
 
-        number = self.number if self.number is not None else 0
+        # Use index_path for hierarchical sorting
+        idx_path = self.index_path if self.number is not None else []
         part = self.part if self.part is not None else 0
 
-        return (category, number, part)
+        return (category, idx_path, part)
 
     @staticmethod
     def make_part_name(base: str, part_num: int) -> str:

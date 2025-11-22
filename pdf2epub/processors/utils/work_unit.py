@@ -9,7 +9,7 @@ This module provides:
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from loguru import logger
 import tiktoken
 
@@ -26,8 +26,11 @@ class WorkUnit:
 
     A work unit is the atomic unit of processing that can be submitted
     to the thread pool. It can be either a whole file or a part of a file.
+
+    Note: Despite the "chapter" in naming, a WorkUnit can represent any
+    level of the book structure: chapter, section, subsection, etc.
     """
-    id: str                           # e.g., "chapter_5" or "chapter_5.part2"
+    id: str                           # e.g., "chapter_5" or "chapter_5.section_1"
     file_key: str                     # e.g., "chapter_5"
     part_index: Optional[int]         # None for single-file, 1+ for parts
     total_parts: int                  # 1 for single-file
@@ -37,6 +40,12 @@ class WorkUnit:
     dependencies: List[str] = field(default_factory=list)  # IDs of prerequisite units
     priority: int = 0                 # Lower = higher priority (for scheduling)
     token_count: int = 0              # Token count for content
+
+    # Fields from refined breakdown
+    toc_path: Optional[List[str]] = None     # e.g., ["Part I", "Chapter 1", "Section 1.1"]
+    page_range: Optional[Tuple[int, int]] = None  # (start_page, end_page)
+    footnote_refs: Optional[List[int]] = None    # Referenced footnote numbers
+    footnotes: Optional[Dict[int, str]] = None   # Footnote definitions {num: text}
 
     def __post_init__(self):
         """Calculate token count after initialization."""
@@ -55,7 +64,7 @@ class WorkUnit:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             "id": self.id,
             "file_key": self.file_key,
             "part_index": self.part_index,
@@ -66,6 +75,16 @@ class WorkUnit:
             "priority": self.priority,
             "token_count": self.token_count
         }
+        # Add optional fields from refined breakdown
+        if self.toc_path is not None:
+            result["toc_path"] = self.toc_path
+        if self.page_range is not None:
+            result["page_range"] = list(self.page_range)
+        if self.footnote_refs is not None:
+            result["footnote_refs"] = self.footnote_refs
+        if self.footnotes is not None:
+            result["footnotes"] = self.footnotes
+        return result
 
 
 class WorkUnitDiscovery:

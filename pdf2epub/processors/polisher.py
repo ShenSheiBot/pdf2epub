@@ -129,42 +129,52 @@ class PolishProcessor(BaseMarkdownProcessor):
     def _get_chapter_info(self, file_name: str) -> Dict:
         """
         Get chapter information from book structure.
-        
+
         Args:
-            file_name: The markdown file name (e.g., "chapter_12.md")
-        
+            file_name: The markdown file name (e.g., "chapter_12.md", "chapter_7.1.1.md")
+
         Returns:
             Chapter info dict with 'type', 'title', etc., or empty dict if not found
         """
-        # Extract chapter number from file name
-        import re
-        
-        # Handle various formats: chapter_N.md, chapter_N.partM.md, chapter_N_partM.md
-        match = re.match(r'chapter_(\d+)', file_name)
-        if not match:
+        # Use ChapterIdentity to parse the filename
+        identity = ChapterIdentity.parse(file_name)
+        if not identity or not identity.number:
             return {}
-        
-        chapter_num = int(match.group(1))
-        
-        # Find corresponding chapter in structure
+
+        # Get the index path for hierarchical lookup
+        index_path = identity.index_path
+
+        # Navigate through the tree structure
         chapters = self.book_structure.get('chapters', [])
-        if 0 <= chapter_num - 1 < len(chapters):
-            return chapters[chapter_num - 1]
-        
-        return {}
+        current_level = chapters
+
+        for idx in index_path:
+            # Convert 1-based index to 0-based
+            array_idx = idx - 1
+
+            if 0 <= array_idx < len(current_level):
+                current = current_level[array_idx]
+                # Move to children for next iteration
+                current_level = current.get('children', [])
+            else:
+                return {}
+
+        return current
 
     def get_operation_name(self, file_name: str) -> str:
         """Get the operation name for logging."""
-        # Extract chapter info from filename
-        if file_name == "front_matter.md":
-            return "Front Matter"
-        elif file_name == "back_matter.md":
-            return "Back Matter"
-        else:
-            match = re.search(r'chapter_(\d+)', file_name)
-            if match:
-                return f"Chapter {match.group(1)}"
-            return file_name
+        # Use ChapterIdentity for consistent parsing
+        identity = ChapterIdentity.parse(file_name)
+
+        if identity:
+            if identity.is_front_matter:
+                return "Front Matter"
+            elif identity.is_back_matter:
+                return "Back Matter"
+            elif identity.number:
+                return f"Chapter {identity.number}"
+
+        return file_name
 
     def get_model_configs(self) -> List[Dict]:
         """Get the model configurations for polishing."""
@@ -371,6 +381,11 @@ class PolishProcessor(BaseMarkdownProcessor):
     def _post_process_markdown(self, markdown: str) -> str:
         """Post-process the polished markdown to clean up any issues."""
         # Remove any leading/trailing whitespace
+        markdown = markdown.strip()
+
+        # Remove trailing empty "Notes" header (academic content artifact)
+        # Pattern: "### Notes" or similar at end of file with no content
+        markdown = re.sub(r'\n#{1,6}\s+Notes\s*$', '', markdown, flags=re.IGNORECASE)
         markdown = markdown.strip()
 
         # Remove images that point to non-existent files

@@ -1,36 +1,54 @@
 import os
+import sys
 from pathlib import Path
 from loguru import logger
 
 
-def configure_logging(title=None, verbose=True):
+def configure_logging(title=None, command=None, verbose=True):
     """
-    Configure loguru logger to write logs to stderr (if verbose) and to a file in output/title/logs/ folder.
-    
+    Configure loguru logger with separate formats for file and stderr.
+
+    - File: Detailed format with timestamp, function name, line number (DEBUG level)
+    - Stderr: Concise format with just level and message (INFO level)
+
     Args:
-        title (str, optional): The book title to use for the log folder. If None, logs will only go to stderr if verbose is True.
+        title (str, optional): The book title to use for the log folder.
+        command (str, optional): Command name for separate log file (e.g., 'refine', 'polish').
         verbose (bool, optional): Whether to output logs to stderr. Defaults to True.
-    
+
     Returns:
         The configured logger instance
     """
-    # Remove default stderr handler if not verbose
-    if not verbose:
-        logger.remove()
-    # If title is provided, add file handler
+    # Remove all existing handlers
+    logger.remove()
+
+    # Add stderr handler with concise format (INFO level only)
+    if verbose:
+        logger.add(
+            sink=sys.stderr,
+            format="<level>{level: <8}</level> | {message}",
+            level="INFO",
+            colorize=True,
+        )
+
+    # Add file handler with detailed format (DEBUG level)
     if title:
         # Create logs directory
         log_dir = Path("output") / title / "logs"
         os.makedirs(log_dir, exist_ok=True)
-        
-        # Add file handler
-        log_file = log_dir / "process.log"
+
+        # Determine log file name
+        if command:
+            log_file = log_dir / f"{command}.log"
+        else:
+            log_file = log_dir / "process.log"
+
         logger.add(
             sink=str(log_file),
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
             level="DEBUG",
             rotation="10 MB",
             retention="1 week",
         )
-    
+
     return logger

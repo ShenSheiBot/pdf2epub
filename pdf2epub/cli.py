@@ -29,21 +29,30 @@ def polish_command(args):
     if not book_title:
         logger.error("No title found in config.yaml")
         return 1
-    
+
+    # Configure file logging
+    configure_logging(book_title, "polish")
+
     logger.info(f"Starting polish process for: {book_title}")
     if args.content_type != "auto":
         logger.info(f"Content type: {args.content_type}")
     
     # Load book structure if available
+    # Prefer toc_tree.json (from refine) over book_structure.json (from breakdown)
     output_dir = Path("output") / book_title
+    toc_tree_file = output_dir / "toc_tree.json"
     structure_file = output_dir / "book_structure.json"
     book_structure = None
-    
-    if structure_file.exists():
-        import json
+
+    import json
+    if toc_tree_file.exists():
+        with open(toc_tree_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from toc_tree.json for context-aware polishing")
+    elif structure_file.exists():
         with open(structure_file, 'r', encoding='utf-8') as f:
             book_structure = json.load(f)
-        logger.info("Loaded book structure for context-aware polishing")
+        logger.info("Loaded book structure from book_structure.json for context-aware polishing")
     
     # Initialize the polish processor
     # Get use_longest_on_failure from config if not explicitly set in CLI
@@ -79,7 +88,31 @@ def polish_command(args):
 
 
 def breakdown_command(args):
-    """Handle the breakdown subcommand."""
+    """Handle the breakdown subcommand.
+
+    DEPRECATED: This command is part of the legacy workflow.
+    Please use: ocr-pages → refine → polish → build-epub
+    """
+    # ============================================================
+    # ⚠️  DEPRECATED COMMAND - 已弃用命令
+    # ============================================================
+    # This command is part of the LEGACY workflow and may be removed.
+    # 此命令属于旧版工作流，可能会被移除。
+    #
+    # RECOMMENDED workflow / 推荐的新工作流：
+    #   pdf2epub ocr-pages → refine → polish → build-epub
+    # ============================================================
+    logger.warning("=" * 60)
+    logger.warning("⚠️  DEPRECATED: 'breakdown' is part of the legacy workflow")
+    logger.warning("   此命令已弃用，属于旧版工作流")
+    logger.warning("")
+    logger.warning("   Recommended workflow / 推荐工作流:")
+    logger.warning("   pdf2epub ocr-pages -i <pdf>")
+    logger.warning("   pdf2epub refine")
+    logger.warning("   pdf2epub polish")
+    logger.warning("   pdf2epub build-epub")
+    logger.warning("=" * 60)
+
     from pdf2epub.breakdown import (
         load_config as load_breakdown_config,
         preprocess_pdf,
@@ -88,7 +121,7 @@ def breakdown_command(args):
     )
     from pdf2epub.utils.network_utils import GeminiClient
     import json
-    
+
     # Load configuration
     config = load_breakdown_config(args.config)
     api_key = config.get("google_api_key")
@@ -108,7 +141,10 @@ def breakdown_command(args):
     if not book_title:
         book_title = input_pdf.stem
         logger.warning(f"No title found in config, using PDF filename: {book_title}")
-    
+
+    # Configure file logging
+    configure_logging(book_title, "breakdown")
+
     logger.info(f"Processing PDF breakdown for: {book_title}")
 
     # Define output directory
@@ -177,6 +213,10 @@ def epub_input_command(args):
         clean_title = re.sub(r'[-\s]+', '_', clean_title)
         output_dir = Path("output") / clean_title
 
+    # Configure file logging
+    book_title = output_dir.name
+    configure_logging(book_title, "epub-input")
+
     logger.info(f"Processing EPUB: {epub_path}")
     logger.info(f"Output directory: {output_dir}")
 
@@ -219,8 +259,182 @@ def epub_input_command(args):
     return 0
 
 
+def refine_command(args):
+    """Handle the refine subcommand (refined breakdown with boundary verification)."""
+    from pdf2epub.refine import RefinedBreakdown
+    from pathlib import Path
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "refine")
+
+    # Get refine config
+    refine_config = config.get('refine', {})
+    max_tokens = args.max_tokens or refine_config.get('max_tokens', 8000)
+
+    # Determine PDF path
+    output_dir = Path("output") / book_title
+    if args.input:
+        pdf_path = Path(args.input)
+    else:
+        # Try to find processed PDF in output directory
+        pdf_path = output_dir / "input.pdf"
+        if not pdf_path.exists():
+            pdf_path = output_dir / "input_original.pdf"
+
+    if not pdf_path.exists():
+        logger.error(f"PDF not found: {pdf_path}")
+        logger.info("Specify --input <pdf_path> to provide the PDF file")
+        return 1
+
+    # Check for pages
+    pages_dir = output_dir / "pages"
+    if not pages_dir.exists() or not list(pages_dir.glob("page_*.md")):
+        logger.error(f"OCR pages not found in {pages_dir}")
+        logger.info("Run 'pdf2epub ocr-pages' first to generate page-level OCR")
+        return 1
+
+    logger.info(f"Starting refined breakdown for: {book_title}")
+    logger.info(f"Max tokens per unit: {max_tokens}")
+
+    try:
+        refiner = RefinedBreakdown(
+            config=config,
+            max_tokens=max_tokens
+        )
+
+        unit_metadata = refiner.process(
+            pdf_path=pdf_path,
+            output_dir=output_dir,
+            book_title=book_title,
+            resume=args.resume
+        )
+
+        logger.success(f"Refined breakdown complete: {len(unit_metadata)} units generated")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Refined breakdown failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def ocr_pages_command(args):
+    """Handle the ocr-pages subcommand (page-level OCR)."""
+    from pdf2epub.ocr_pages import ocr_full_book_pagewise
+    from pathlib import Path
+    import yaml
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "ocr-pages")
+
+    # Setup paths
+    output_dir = Path("output") / book_title
+
+    # Find PDF
+    if args.input:
+        pdf_path = Path(args.input)
+    else:
+        pdf_path = output_dir / "input.pdf"
+        if not pdf_path.exists():
+            pdf_path = output_dir / "input_original.pdf"
+
+    if not pdf_path.exists():
+        logger.error(f"PDF not found: {pdf_path}")
+        logger.info("Specify --input with the path to your PDF file")
+        return 1
+
+    logger.info(f"Starting page-level OCR for: {book_title}")
+
+    # Get OCR settings from config
+    ocr_config = config.get('ocr', {})
+    backend = ocr_config.get('backend', 'mistral')
+    max_workers = args.max_workers or ocr_config.get('vision', {}).get('max_workers', 5)
+
+    # Get credentials
+    credentials = config.get('credentials', {}).get('providers', {})
+
+    # Setup backend-specific parameters
+    api_key = None
+    base_url = None
+
+    if backend == 'mistral':
+        mistral_config = credentials.get('mistral', {})
+        api_key = mistral_config.get('api_key')
+        base_url = mistral_config.get('base_url')
+    elif backend == 'azure':
+        azure_config = credentials.get('azure', {})
+        api_key = azure_config.get('api_key')
+        base_url = azure_config.get('endpoint')
+
+    try:
+        ocr_full_book_pagewise(
+            pdf_path=pdf_path,
+            output_dir=output_dir,
+            start_page=args.start_page or 1,
+            end_page=args.end_page,
+            backend=backend,
+            api_key=api_key,
+            base_url=base_url,
+            resume=args.resume,
+            config=config,
+            max_workers=max_workers
+        )
+
+        logger.success(f"Page-level OCR complete!")
+        logger.info(f"Output: {output_dir / 'pages'}")
+        logger.info("Next step: pdf2epub refine")
+        return 0
+
+    except Exception as e:
+        logger.error(f"OCR failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def ocr_command(args):
-    """Handle the OCR subcommand."""
+    """Handle the OCR subcommand (legacy chapter-based workflow).
+
+    DEPRECATED: This command is part of the legacy workflow.
+    Please use: ocr-pages → refine → polish → build-epub
+    """
+    # ============================================================
+    # ⚠️  DEPRECATED COMMAND - 已弃用命令
+    # ============================================================
+    # This command is part of the LEGACY workflow and may be removed.
+    # 此命令属于旧版工作流，可能会被移除。
+    #
+    # RECOMMENDED workflow / 推荐的新工作流：
+    #   pdf2epub ocr-pages → refine → polish → build-epub
+    # ============================================================
+    logger.warning("=" * 60)
+    logger.warning("⚠️  DEPRECATED: 'ocr' is part of the legacy workflow")
+    logger.warning("   此命令已弃用，属于旧版工作流")
+    logger.warning("")
+    logger.warning("   Use 'ocr-pages' instead / 请使用 'ocr-pages':")
+    logger.warning("   pdf2epub ocr-pages -i <pdf>")
+    logger.warning("   pdf2epub refine")
+    logger.warning("   pdf2epub polish")
+    logger.warning("   pdf2epub build-epub")
+    logger.warning("=" * 60)
+
     import sys
     original_argv = sys.argv
 
@@ -261,6 +475,9 @@ def extract_entities_command(args):
         else:
             logger.error("No title found in config.yaml and no input file specified")
             return 1
+
+    # Configure file logging
+    configure_logging(book_title, "extract-entities")
 
     # Get API key
     api_key = config.get("google_api_key")
@@ -326,11 +543,32 @@ def extract_entities_command(args):
 
 
 def epub_command(args):
-    """Handle the epub generation subcommand."""
+    """Handle the epub generation subcommand.
+
+    DEPRECATED: This command is part of the legacy workflow.
+    Please use: build-epub (which uses toc_tree.json)
+    """
+    # ============================================================
+    # ⚠️  DEPRECATED COMMAND - 已弃用命令
+    # ============================================================
+    # This command is part of the LEGACY workflow and may be removed.
+    # 此命令属于旧版工作流，可能会被移除。
+    #
+    # RECOMMENDED command / 推荐的新命令：
+    #   pdf2epub build-epub (uses toc_tree.json)
+    # ============================================================
+    logger.warning("=" * 60)
+    logger.warning("⚠️  DEPRECATED: 'epub' is part of the legacy workflow")
+    logger.warning("   此命令已弃用，属于旧版工作流")
+    logger.warning("")
+    logger.warning("   Use 'build-epub' instead / 请使用 'build-epub':")
+    logger.warning("   pdf2epub build-epub [--translated]")
+    logger.warning("=" * 60)
+
     # Import the main function from generate_epub
     from pdf2epub.generate_epub import main as generate_epub_main
     import sys
-    
+
     # Prepare arguments for generate_epub main function
     # Save original sys.argv and replace it
     original_argv = sys.argv
@@ -366,23 +604,142 @@ def epub_command(args):
         sys.argv = original_argv
 
 
+def build_epub_command(args):
+    """Handle the build-epub subcommand (toc_tree.json driven)."""
+    import asyncio
+    from pathlib import Path
+    from .build_epub import build_epub, BuildEpubConfig
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "build-epub")
+
+    # Set up paths
+    output_dir = Path("output") / book_title
+    toc_tree_path = output_dir / "toc_tree.json"
+
+    if not toc_tree_path.exists():
+        logger.error(f"toc_tree.json not found at {toc_tree_path}")
+        logger.info("Run 'refine' command first to generate toc_tree.json")
+        return 1
+
+    # Determine markdown directory
+    if args.translated:
+        markdown_dir = output_dir / "translated"
+        logger.info("Building EPUB from translated markdown...")
+    else:
+        markdown_dir = output_dir / "polished_markdown"
+        logger.info("Building EPUB from polished markdown...")
+
+    if not markdown_dir.exists():
+        logger.error(f"Markdown directory not found: {markdown_dir}")
+        return 1
+
+    # Set up images directory
+    images_dir = output_dir / "images"
+    if not images_dir.exists():
+        images_dir = None
+
+    # Set up cover image
+    cover_image = None
+    if args.cover:
+        cover_path = Path(args.cover)
+        if cover_path.exists():
+            cover_image = cover_path
+        else:
+            logger.warning(f"Cover image not found: {args.cover}")
+    else:
+        # Auto-detect cover in images directory
+        if images_dir:
+            for cover_name in ["cover.jpg", "cover.jpeg", "cover.png", "cover.gif"]:
+                cover_path = images_dir / cover_name
+                if cover_path.exists():
+                    cover_image = cover_path
+                    logger.info(f"Auto-detected cover image: {cover_path}")
+                    break
+
+    # Get target language from config
+    target_language = config.get("translation", {}).get("target_language", "Chinese")
+
+    # Create config
+    build_config = BuildEpubConfig(
+        book_title=book_title,
+        output_dir=output_dir,
+        markdown_dir=markdown_dir,
+        toc_tree_path=toc_tree_path,
+        images_dir=images_dir,
+        cover_image=cover_image,
+        translated=args.translated,
+        target_language=target_language,
+        config=config
+    )
+
+    try:
+        # Run async build
+        epub_path = asyncio.run(build_epub(build_config))
+        logger.success(f"EPUB created: {epub_path}")
+        return 0
+    except Exception as e:
+        logger.error(f"EPUB build failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def translate_command(args):
     """Handle the translate subcommand."""
     # Load configuration
     config = load_config(args.config)
     book_title = config.get("title")
-    
+
     if not book_title:
         logger.error("No title found in config.yaml")
         return 1
-    
+
+    # Configure file logging
+    configure_logging(book_title, "translate")
+
+    # Load book structure if available
+    # Prefer toc_tree.json (from refine) over book_structure.json (from breakdown)
+    output_dir = Path("output") / book_title
+    toc_tree_file = output_dir / "toc_tree.json"
+    structure_file = output_dir / "book_structure.json"
+    book_structure = None
+
+    import json
+    if toc_tree_file.exists():
+        with open(toc_tree_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from toc_tree.json")
+    elif structure_file.exists():
+        with open(structure_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from book_structure.json")
+
     # Get language settings
+    # Priority: args > config > book_structure > default
     target_language = args.target_language or config.get("target_language", "Chinese")
-    source_language = args.source_language or config.get("source_language", "Japanese")
-    
+
+    if args.source_language:
+        source_language = args.source_language
+    elif config.get("source_language"):
+        source_language = config.get("source_language")
+    elif book_structure and book_structure.get('language'):
+        source_language = book_structure.get('language')
+        logger.info(f"Auto-detected source language from book structure: {source_language}")
+    else:
+        source_language = "Japanese"
+
     logger.info(f"Starting translation for: {book_title}")
     logger.info(f"Translation: {source_language} → {target_language}")
-    
+
     # Determine use_entities value based on flags
     if args.no_entities:
         use_entities = False
@@ -390,7 +747,7 @@ def translate_command(args):
         use_entities = True
     else:
         use_entities = None  # Auto-detect
-    
+
     # Initialize the translation processor
     processor = TranslateProcessor(
         config=config,
@@ -401,7 +758,8 @@ def translate_command(args):
         resume=args.resume,
         translation_models=config.get("translation_models"),
         use_entities=use_entities,
-        use_longest_on_failure=args.use_longest_on_failure if args.use_longest_on_failure is not None else config.get('validation_strategy', {}).get('use_longest_on_failure', False)
+        use_longest_on_failure=args.use_longest_on_failure if args.use_longest_on_failure is not None else config.get('validation_strategy', {}).get('use_longest_on_failure', False),
+        book_structure=book_structure
     )
     
     # Process all files
@@ -429,6 +787,9 @@ def patch_paper_command(args):
         logger.error("No book title found in config.yaml")
         return 1
 
+    # Configure file logging
+    configure_logging(book_title, "patch-paper")
+
     logger.info(f"Patching structure for: {book_title}")
 
     success = patch_paper_structure(
@@ -450,35 +811,39 @@ def main():
         description="PDF to EPUB markdown processor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
+===============================================================================
+RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
+===============================================================================
+
   # Complete pipeline for a PDF book:
-  pdf2epub breakdown -i mybook.pdf
-  pdf2epub ocr
-  pdf2epub polish
-  pdf2epub epub
+  pdf2epub ocr-pages -i mybook.pdf   # Page-level OCR
+  pdf2epub refine                    # Generate toc_tree.json with boundary verification
+  pdf2epub polish                    # Clean up OCR output
+  pdf2epub build-epub                # Generate EPUB from toc_tree.json
+
+  # With translation:
+  pdf2epub ocr-pages -i mybook.pdf
+  pdf2epub refine
+  pdf2epub polish --content-type japanese
+  pdf2epub translate --target-language Chinese
+  pdf2epub build-epub --translated
 
   # EPUB as input (already clean text):
   pdf2epub epub-input -i mybook.epub
   pdf2epub translate --target-language Chinese  # Optional
-  pdf2epub epub
+  pdf2epub build-epub
 
-  # EPUB with custom filtering:
-  pdf2epub epub-input -i mybook.epub --skip-pattern "^Cover$" --skip-pattern "Copyright"
+===============================================================================
+⚠️  DEPRECATED WORKFLOW / 已弃用工作流 (still works, but not recommended):
+===============================================================================
 
-  # Japanese book with translation (set ocr_backend: vision in config.yaml):
-  pdf2epub breakdown -i manga.pdf
-  pdf2epub extract-entities -i manga.pdf  # Extract for consistency
-  pdf2epub ocr
-  pdf2epub polish --content-type japanese
-  pdf2epub translate --target-language Chinese  # Auto-uses entities
-  pdf2epub epub
+  # Legacy pipeline (uses book_structure.json):
+  pdf2epub breakdown -i mybook.pdf   # [DEPRECATED]
+  pdf2epub ocr                       # [DEPRECATED]
+  pdf2epub polish
+  pdf2epub epub                      # [DEPRECATED]
 
-  # Academic book with translation:
-  pdf2epub breakdown -i thesis.pdf
-  pdf2epub ocr
-  pdf2epub polish --content-type academic
-  pdf2epub translate --target-language Chinese
-  pdf2epub epub
+===============================================================================
         """
     )
     
@@ -490,11 +855,11 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
     subparsers.required = True
     
-    # Breakdown subcommand
+    # Breakdown subcommand (DEPRECATED)
     breakdown_parser = subparsers.add_parser(
         "breakdown",
-        help="Analyze PDF structure and prepare for OCR",
-        description="Extract book structure, compress PDF, and prepare for processing"
+        help="[DEPRECATED] Analyze PDF structure (use ocr-pages → refine instead)",
+        description="⚠️ DEPRECATED: This command is part of the legacy workflow. Use 'ocr-pages' + 'refine' instead."
     )
     breakdown_parser.add_argument(
         "-i", "--input",
@@ -554,11 +919,44 @@ Examples:
     )
     epub_input_parser.set_defaults(func=epub_input_command)
 
-    # OCR subcommand
+    # OCR Pages subcommand (new workflow)
+    ocr_pages_parser = subparsers.add_parser(
+        "ocr-pages",
+        help="Page-level OCR (for refined breakdown workflow)",
+        description="Extract text from each PDF page individually for refined breakdown"
+    )
+    ocr_pages_parser.add_argument(
+        "-i", "--input",
+        help="Path to PDF file (default: auto-detect from output directory)"
+    )
+    ocr_pages_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress"
+    )
+    ocr_pages_parser.add_argument(
+        "--start-page",
+        type=int,
+        help="First page to process (default: 1)"
+    )
+    ocr_pages_parser.add_argument(
+        "--end-page",
+        type=int,
+        help="Last page to process (default: all pages)"
+    )
+    ocr_pages_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Number of parallel OCR workers (default: from config or 5)"
+    )
+    ocr_pages_parser.set_defaults(func=ocr_pages_command)
+
+    # OCR subcommand (DEPRECATED - legacy chapter-based workflow)
     ocr_parser = subparsers.add_parser(
         "ocr",
-        help="Extract text from PDF pages using OCR",
-        description="Process PDF pages with OCR to extract text content"
+        help="[DEPRECATED] Chapter-based OCR (use ocr-pages → refine instead)",
+        description="⚠️ DEPRECATED: This command is part of the legacy workflow. Use 'ocr-pages' + 'refine' instead."
     )
     ocr_parser.add_argument(
         "--resume",
@@ -571,6 +969,29 @@ Examples:
         help="Only aggregate existing pages into chapters (skip OCR)"
     )
     ocr_parser.set_defaults(func=ocr_command)
+
+    # Refine subcommand (refined breakdown with boundary verification)
+    refine_parser = subparsers.add_parser(
+        "refine",
+        help="Refine structure with boundary verification",
+        description="Analyze TOC structure and verify section boundaries for precise splitting"
+    )
+    refine_parser.add_argument(
+        "-i", "--input",
+        help="Path to PDF file (default: auto-detect from output directory)"
+    )
+    refine_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress"
+    )
+    refine_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Maximum tokens per unit (default: from config or 8000)"
+    )
+    refine_parser.set_defaults(func=refine_command)
     
     # Polish subcommand
     polish_parser = subparsers.add_parser(
@@ -687,11 +1108,11 @@ Examples:
     )
     entity_parser.set_defaults(func=extract_entities_command)
     
-    # EPUB generation subcommand
+    # EPUB generation subcommand (DEPRECATED)
     epub_parser = subparsers.add_parser(
         "epub",
-        help="Generate EPUB from polished markdown",
-        description="Create EPUB file from processed markdown content"
+        help="[DEPRECATED] Generate EPUB (use build-epub instead)",
+        description="⚠️ DEPRECATED: This command is part of the legacy workflow. Use 'build-epub' instead."
     )
     epub_parser.add_argument(
         "-i", "--input",
@@ -718,6 +1139,23 @@ Examples:
         help="Force global footnotes (use last definition, ignore previous definitions)"
     )
     epub_parser.set_defaults(func=epub_command)
+
+    # Build EPUB subcommand (toc_tree.json driven - new approach)
+    build_epub_parser = subparsers.add_parser(
+        "build-epub",
+        help="Build EPUB from toc_tree.json structure (recommended)",
+        description="Create EPUB file using toc_tree.json as the structure authority"
+    )
+    build_epub_parser.add_argument(
+        "--translated",
+        action="store_true",
+        help="Build EPUB from translated markdown instead of polished"
+    )
+    build_epub_parser.add_argument(
+        "--cover",
+        help="Path to cover image file"
+    )
+    build_epub_parser.set_defaults(func=build_epub_command)
 
     # Patch paper structure subcommand
     patch_parser = subparsers.add_parser(

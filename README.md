@@ -17,13 +17,22 @@
 
 因为逐页进行转换，要求书的新章节*新起一页*，否则章节的最后部分可能会被顺延到下一章节。如果扫描件是每两页一扫描的pdf，建议拆分成单页pdf再操作。
 
-## 思路：
-1. **breakdown**：使用具有极大上下文的 gemini 解出全书基于pdf页数的目录结构
-2. **markdown ocr**：对于非纵排日语，使用多模态LLM将每页转换成带有插图的markdown。
-3. **markdown ocr (jp)**: 对于纵排日语，使用专门的OCR后端处理，支持振假名(furigana)识别和插图提取。
-4. **polish**: 使用LLM建立正确的链接跳转，消除OCR错误、多余的页眉页脚、页间分隔符、空白页，整理跨页的标题等级等。
-5. **translate**: （可选）使用LLM将markdown内容翻译成目标语言，保持原有格式和结构。
-6. **epub**: 将markdown和图片打包为epub格式。
+## 工作流程 (Workflow)
+
+### 推荐工作流 (Recommended - uses toc_tree.json)
+
+1. **ocr-pages**：逐页进行 OCR，使用多模态 LLM 将每页转换成带有插图的 markdown
+2. **refine**：智能分析 TOC 结构，验证章节边界，生成精确的 toc_tree.json（支持无限层级嵌套）
+3. **polish**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
+4. **translate**：（可选）使用 LLM 翻译成目标语言
+5. **build-epub**：基于 toc_tree.json 生成 EPUB
+
+### 旧版工作流 (Legacy - uses book_structure.json) ⚠️ DEPRECATED
+
+1. ~~**breakdown**：使用 Gemini 分析 PDF 结构~~
+2. ~~**ocr**：章节级 OCR~~
+3. **polish**：润色
+4. ~~**epub**：生成 EPUB~~
 
 
 ## 推荐LLM：
@@ -170,27 +179,31 @@ translation_models:
     max_retries: 2
 ```
 
-### 2. 基本工作流程（统一CLI）
+### 2. 推荐工作流程（统一CLI）
 
 所有功能通过统一的CLI入口访问：
 
-#### 步骤 1: 分析 PDF 结构
+#### 步骤 1: 页级 OCR
 ```bash
-uv run pdf2epub breakdown -i input.pdf
+uv run pdf2epub ocr-pages -i input.pdf
 ```
-生成 `output/{book_title}/book_structure.json`
-
-#### 步骤 2: OCR 转换
-
-```bash
-uv run pdf2epub ocr
-```
+生成 `output/{book_title}/pages/page_*.md`
 
 参数说明：
 - `--resume`: 从上次中断处继续
-- `--aggregate-only`: 仅聚合已OCR的页面（跳过OCR）
+- `--start-page`: 起始页码
+- `--end-page`: 结束页码
+- `--max-workers`: 并发数
 
-OCR后端在 `config.yaml` 中通过 `ocr_backend` 配置。
+#### 步骤 2: 精细化拆分
+```bash
+uv run pdf2epub refine
+```
+分析 TOC 结构并验证章节边界，生成 `output/{book_title}/toc_tree.json`（支持无限层级嵌套）
+
+参数说明：
+- `--resume`: 从上次中断处继续
+- `--max-tokens`: 每个单元的最大 token 数
 
 #### 步骤 3: 内容润色
 ```bash
@@ -211,9 +224,14 @@ uv run pdf2epub polish --content-type auto
 
 #### 步骤 4: 生成 EPUB
 ```bash
-uv run pdf2epub epub
+uv run pdf2epub build-epub
 ```
 最终 EPUB 文件保存在 `output/{book_title}/output.epub`
+
+如需从翻译后的内容生成：
+```bash
+uv run pdf2epub build-epub --translated
+```
 
 ### 3. 翻译功能
 
@@ -249,32 +267,32 @@ uv run pdf2epub translate --target-language Chinese --no-entities
 
 #### 日语轻小说翻译流程
 ```bash
-# 1. 分析结构
-uv run pdf2epub breakdown -i manga.pdf
+# 1. 页级OCR
+uv run pdf2epub ocr-pages -i manga.pdf
 
-# 2. 提取翻译实体
-uv run pdf2epub extract-entities -i manga.pdf
+# 2. 精细化拆分
+uv run pdf2epub refine
 
-# 3. 日语OCR
-uv run pdf2epub ocr --japanese --backend vision
+# 3. 提取翻译实体（可选，用于一致性）
+uv run pdf2epub extract-entities
 
 # 4. 日语内容润色
 uv run pdf2epub polish --content-type japanese
 
 # 5. 翻译成中文（自动使用已提取的实体）
-uv run pdf2epub translate
+uv run pdf2epub translate --target-language Chinese
 
 # 6. 生成EPUB
-uv run pdf2epub epub
+uv run pdf2epub build-epub --translated
 ```
 
 #### 学术书籍翻译流程
 ```bash
-# 1. 分析结构（添加页码标记）
-uv run pdf2epub breakdown -i thesis.pdf
+# 1. 页级OCR
+uv run pdf2epub ocr-pages -i thesis.pdf
 
-# 2. OCR提取
-uv run pdf2epub ocr
+# 2. 精细化拆分
+uv run pdf2epub refine
 
 # 3. 学术内容润色（保留脚注）
 uv run pdf2epub polish --content-type academic
@@ -283,7 +301,22 @@ uv run pdf2epub polish --content-type academic
 uv run pdf2epub translate --target-language Chinese
 
 # 5. 生成EPUB
-uv run pdf2epub epub
+uv run pdf2epub build-epub --translated
+```
+
+#### 英文书籍（无需翻译）
+```bash
+# 1. 页级OCR
+uv run pdf2epub ocr-pages -i book.pdf
+
+# 2. 精细化拆分
+uv run pdf2epub refine
+
+# 3. 内容润色
+uv run pdf2epub polish
+
+# 4. 生成EPUB
+uv run pdf2epub build-epub
 ```
 
 ### 5. 高级配置
@@ -330,10 +363,17 @@ ocr_settings:
 ```
 output/
 └── {book_title}/
-    ├── book_structure.json    # 书籍结构
+    ├── input.pdf              # 处理后的PDF
     ├── input_original.pdf     # 原始PDF副本
-    ├── ocr_markdown/          # OCR 原始结果
+    ├── toc_tree.json          # TOC结构（推荐工作流，支持无限层级）
+    ├── book_structure.json    # 书籍结构（旧版工作流）
+    ├── pages/                 # 页级OCR结果
+    │   ├── page_001.md
+    │   ├── page_002.md
+    │   └── ...
+    ├── ocr_markdown/          # 聚合后的章节内容
     │   ├── chapter_1.md
+    │   ├── chapter_1.1.md     # 支持层级嵌套
     │   └── ...
     ├── polished_markdown/     # 润色后内容
     │   ├── chapter_1.md
@@ -346,11 +386,37 @@ output/
     │   └── ...
     ├── translation_entities.json  # 翻译实体参考（如果提取了）
     ├── translation_reference.txt  # 人类可读的翻译参考
-    ├── progress.json          # OCR进度跟踪
-    ├── polish_progress.json  # 润色进度跟踪
-    ├── translation_progress.json  # 翻译进度跟踪
-    └── output.epub           # 最终 EPUB
+    ├── pages/ocr_progress.json           # 页级OCR进度
+    ├── ocr_markdown/tree_progress.json   # refine进度
+    ├── polished_markdown/processing_tracker.json   # 润色进度
+    ├── translated/processing_tracker.json          # 翻译进度
+    └── output.epub            # 最终 EPUB
 ```
+
+## ⚠️ 已弃用命令 (Deprecated Commands)
+
+以下命令属于旧版工作流，仍可运行但不推荐使用：
+
+| 旧命令 | 替代命令 | 说明 |
+|--------|----------|------|
+| `breakdown` | `ocr-pages` + `refine` | 旧版使用 Gemini 分析结构，新版使用边界验证 |
+| `ocr` | `ocr-pages` + `refine` | 旧版章节级 OCR，新版页级 OCR + 智能拆分 |
+| `epub` | `build-epub` | 旧版使用 book_structure.json，新版使用 toc_tree.json |
+
+### 旧版工作流（不推荐）
+```bash
+# ⚠️ DEPRECATED - 以下命令仍可使用但不推荐
+uv run pdf2epub breakdown -i input.pdf  # 会显示弃用警告
+uv run pdf2epub ocr                      # 会显示弃用警告
+uv run pdf2epub polish
+uv run pdf2epub epub                     # 会显示弃用警告
+```
+
+### 迁移到新工作流
+如果你之前使用旧工作流，建议迁移到新工作流以获得：
+- 更精确的章节边界检测
+- 支持无限层级的 TOC 嵌套
+- 更好的错误恢复和进度跟踪
 
 ## 贡献
 

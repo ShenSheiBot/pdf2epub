@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+================================================================================
+⚠️  DEPRECATED MODULE / 已弃用模块
+================================================================================
+This module is part of the LEGACY workflow and may be removed in future versions.
+此模块属于旧版工作流，可能会在未来版本中移除。
+
+RECOMMENDED command / 推荐的新命令:
+    pdf2epub build-epub [--translated]
+
+This module (generate_epub.py) generates EPUB from book_structure.json.
+The new 'build-epub' command uses toc_tree.json which supports hierarchical
+TOC structures with unlimited nesting levels.
+================================================================================
+
 Refactored EPUB generation orchestrator.
 
 This module serves as the high-level orchestrator for EPUB generation,
@@ -123,8 +137,13 @@ def build_structure_from_markdown(markdown_dir: Path, book_title: str) -> dict:
             else:
                 chapter_files[chapter_num]["main"] = md_file
 
-    # Now process each chapter
-    for chapter_num in sorted(chapter_files.keys()):
+    # Now process each chapter (sort using hierarchical index for proper ordering)
+    def chapter_sort_key(num):
+        """Sort key for hierarchical chapter numbers like '7', '7.1', '7.1.1'."""
+        # Filter out empty strings from split (handles trailing dots like "7.")
+        return [int(x) for x in num.split('.') if x]
+
+    for chapter_num in sorted(chapter_files.keys(), key=chapter_sort_key):
         files = chapter_files[chapter_num]
 
         # Determine which files to read

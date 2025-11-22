@@ -11,7 +11,8 @@ from google.genai.types import (
     GenerateContentConfig,
     HarmBlockThreshold,
     HarmCategory,
-    SafetySetting
+    SafetySetting,
+    ThinkingConfig
 )
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
 from tenacity.stop import stop_base
@@ -66,9 +67,10 @@ def is_transient_gemini_error(exception: Exception) -> bool:
         'rate_limit', '429', 'quota',
         'timeout', 'unavailable', '503',
         'internal', '500', '502', '504',
-        'resource_exhausted', 'overloaded'
+        'resource_exhausted', 'overloaded',
+        'disconnected', 'connection'
     ]
-    
+
     return any(keyword in error_str for keyword in transient_keywords)
 
 
@@ -189,27 +191,44 @@ class GeminiClient:
         aggregated_text = ""
         chunk_count = 0
         last_log_length = 0
-        
+
         for chunk in stream_response:
             chunk_count += 1
-            if hasattr(chunk, 'text') and chunk.text:
-                aggregated_text += chunk.text
-                
-                # Log progress periodically - every 500 tokens
-                current_tokens = len(self.tokenizer.encode(aggregated_text))
-                if current_tokens - last_log_length >= 500:
-                    logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
-                    last_log_length = current_tokens
-            
-            # Check for early termination
+
+            # Handle Gemini 3 response format with potential thought parts
             if hasattr(chunk, 'candidates') and chunk.candidates:
                 for candidate in chunk.candidates:
+                    # Check for early termination
                     if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
                         reason = str(candidate.finish_reason)
                         if any(term in reason for term in ['PROHIBITED', 'SAFETY', 'BLOCKED']):
                             raise ValueError(f"Content blocked: {reason}")
+
+                    # Extract text from content parts, filtering out thoughts
+                    if hasattr(candidate, 'content') and candidate.content:
+                        for part in candidate.content.parts:
+                            # Skip thought parts (Gemini 3 thinking mode)
+                            if hasattr(part, 'thought') and part.thought:
+                                continue
+                            if hasattr(part, 'text') and part.text:
+                                aggregated_text += part.text
+            elif hasattr(chunk, 'text') and chunk.text:
+                # Fallback for simpler response format
+                aggregated_text += chunk.text
+
+            # Log progress periodically - every 500 tokens
+            current_tokens = len(self.tokenizer.encode(aggregated_text))
+            if current_tokens - last_log_length >= 500:
+                logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                last_log_length = current_tokens
         
         if not aggregated_text:
+            logger.error(f"Empty stream: {chunk_count} chunks received for {operation_name}")
+            if chunk_count > 0:
+                logger.error(f"Last chunk had candidates: {hasattr(chunk, 'candidates')}")
+                if hasattr(chunk, 'candidates') and chunk.candidates:
+                    for candidate in chunk.candidates:
+                        logger.error(f"Candidate finish_reason: {getattr(candidate, 'finish_reason', 'N/A')}")
             raise ValueError(f"Empty stream response for {operation_name}")
         
         # Get final token count
@@ -226,6 +245,12 @@ class GeminiClient:
             top_k=20,
             candidate_count=1,
             max_output_tokens=65536,
+            # Configure thinking for Gemini 3 models (ignored by older models)
+            # Note: Gemini 3 requires thinking mode, cannot disable it
+            thinking_config=ThinkingConfig(
+                thinking_budget=1024,  # Minimal thinking budget
+                include_thoughts=False  # Don't include thought summaries in output
+            ),
             stop_sequences=None,
             safety_settings=[
                 SafetySetting(

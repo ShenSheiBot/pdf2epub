@@ -8,6 +8,7 @@ and error categorization for robust resume functionality.
 
 import json
 import time
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -157,6 +158,7 @@ class ProcessingTracker:
         """
         self.progress_path = Path(progress_path)
         self.processor_name = processor_name
+        self._lock = threading.RLock()  # Reentrant lock for thread safety
         self.progress = self._load_or_create()
 
     def _load_or_create(self) -> dict:
@@ -281,30 +283,31 @@ class ProcessingTracker:
             unit_key: Unit identifier (e.g., "chapter_5.part1")
             attempt: AttemptRecord with attempt details
         """
-        if unit_key not in self.progress["units"]:
-            self.progress["units"][unit_key] = {
-                "status": "pending",
-                "attempts": [],
-                "retry_count": 0
-            }
+        with self._lock:
+            if unit_key not in self.progress["units"]:
+                self.progress["units"][unit_key] = {
+                    "status": "pending",
+                    "attempts": [],
+                    "retry_count": 0
+                }
 
-        unit = self.progress["units"][unit_key]
-        unit["attempts"].append(attempt.to_dict())
+            unit = self.progress["units"][unit_key]
+            unit["attempts"].append(attempt.to_dict())
 
-        if attempt.status == "completed":
-            unit["status"] = "completed"
-            if attempt.output_tokens:
-                unit["final_output_tokens"] = attempt.output_tokens
-        else:
-            unit["status"] = "failed"
-            # Only increment retry_count if this is not the first attempt
-            if len(unit["attempts"]) > 1:
-                unit["retry_count"] = len(unit["attempts"]) - 1
+            if attempt.status == "completed":
+                unit["status"] = "completed"
+                if attempt.output_tokens:
+                    unit["final_output_tokens"] = attempt.output_tokens
+            else:
+                unit["status"] = "failed"
+                # Only increment retry_count if this is not the first attempt
+                if len(unit["attempts"]) > 1:
+                    unit["retry_count"] = len(unit["attempts"]) - 1
 
-        self._update_summary()
-        self.save()
+            self._update_summary()
+            self.save()
 
-        # Log the attempt
+        # Log the attempt (outside lock)
         if attempt.status == "completed":
             logger.info(f"[COMPLETED] {unit_key} - {attempt.model} "
                        f"({attempt.output_tokens} tokens, {attempt.duration_seconds:.1f}s)")
@@ -329,18 +332,20 @@ class ProcessingTracker:
 
     def get_failed_units(self) -> List[str]:
         """Get all failed unit keys."""
-        return [k for k, v in self.progress["units"].items()
-                if v.get("status") == "failed"]
+        with self._lock:
+            return [k for k, v in self.progress["units"].items()
+                    if v.get("status") == "failed"]
 
     def get_units_by_error_type(self, error_type: str) -> List[str]:
         """Get unit keys that have a specific error type."""
-        result = []
-        for unit_key, unit in self.progress["units"].items():
-            for attempt in unit.get("attempts", []):
-                if attempt.get("error_type") == error_type:
-                    result.append(unit_key)
-                    break
-        return result
+        with self._lock:
+            result = []
+            for unit_key, unit in self.progress["units"].items():
+                for attempt in unit.get("attempts", []):
+                    if attempt.get("error_type") == error_type:
+                        result.append(unit_key)
+                        break
+            return result
 
     def get_unit_attempts(self, unit_key: str) -> List[AttemptRecord]:
         """Get all attempts for a unit."""
@@ -367,23 +372,24 @@ class ProcessingTracker:
             base_key: Base file key (e.g., "chapter_5")
             split_record: SplitRecord with split details
         """
-        if base_key not in self.progress["split_history"]:
-            self.progress["split_history"][base_key] = {
-                "versions": [],
-                "current_version": -1
-            }
+        with self._lock:
+            if base_key not in self.progress["split_history"]:
+                self.progress["split_history"][base_key] = {
+                    "versions": [],
+                    "current_version": -1
+                }
 
-        history = self.progress["split_history"][base_key]
-        version = len(history["versions"])
-        split_record.version = version
+            history = self.progress["split_history"][base_key]
+            version = len(history["versions"])
+            split_record.version = version
 
-        history["versions"].append(split_record.to_dict())
-        history["current_version"] = version
+            history["versions"].append(split_record.to_dict())
+            history["current_version"] = version
+
+            self.save()
 
         logger.info(f"[SPLIT] {base_key} v{version}: {split_record.part_count} parts "
                    f"({split_record.method}, {split_record.reason})")
-
-        self.save()
 
     def get_current_split(self, base_key: str) -> Optional[dict]:
         """
@@ -463,18 +469,19 @@ class ProcessingTracker:
             base_key: Base file key
             part_indices: Indices of parts to reset
         """
-        for idx in part_indices:
-            part_key = ChapterIdentity.make_part_name(base_key, idx)
-            if part_key in self.progress["units"]:
-                self.progress["units"][part_key]["status"] = "pending"
-            else:
-                self.progress["units"][part_key] = {
-                    "status": "pending",
-                    "attempts": [],
-                    "retry_count": 0
-                }
+        with self._lock:
+            for idx in part_indices:
+                part_key = ChapterIdentity.make_part_name(base_key, idx)
+                if part_key in self.progress["units"]:
+                    self.progress["units"][part_key]["status"] = "pending"
+                else:
+                    self.progress["units"][part_key] = {
+                        "status": "pending",
+                        "attempts": [],
+                        "retry_count": 0
+                    }
 
-        self.save()
+            self.save()
 
     def migrate_unit_keys(self, old_to_new: Dict[str, str]):
         """
@@ -483,14 +490,15 @@ class ProcessingTracker:
         Args:
             old_to_new: Mapping from old unit keys to new unit keys
         """
-        units = self.progress["units"]
+        with self._lock:
+            units = self.progress["units"]
 
-        for old_key, new_key in old_to_new.items():
-            if old_key in units and old_key != new_key:
-                units[new_key] = units.pop(old_key)
-                logger.debug(f"Migrated unit {old_key} → {new_key}")
+            for old_key, new_key in old_to_new.items():
+                if old_key in units and old_key != new_key:
+                    units[new_key] = units.pop(old_key)
+                    logger.debug(f"Migrated unit {old_key} → {new_key}")
 
-        self.save()
+            self.save()
 
     # === Processing Plan ===
 

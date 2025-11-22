@@ -1,4 +1,21 @@
 """
+================================================================================
+⚠️  DEPRECATED MODULE / 已弃用模块
+================================================================================
+This module is part of the LEGACY workflow and may be removed in future versions.
+此模块属于旧版工作流，可能会在未来版本中移除。
+
+RECOMMENDED workflow / 推荐的新工作流:
+    pdf2epub ocr-pages -i <pdf>   # Page-level OCR
+    pdf2epub refine               # Generate toc_tree.json
+    pdf2epub polish
+    pdf2epub build-epub
+
+This module (ocr_chapters.py) aggregates page-level OCR results into chapters
+based on book_structure.json. The new workflow uses refine which generates
+toc_tree.json with precise boundary detection.
+================================================================================
+
 Chapter aggregation from OCR'd pages.
 
 This module aggregates page-level OCR results into chapter markdown files.

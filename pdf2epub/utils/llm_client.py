@@ -461,6 +461,8 @@ class LLMClient:
 
                 except SafetyBlockError as e:
                     # Track which operations have safety blocks
+                    if provider not in self._safety_blocked_operations:
+                        self._safety_blocked_operations[provider] = set()
                     self._safety_blocked_operations[provider].add(operation_name)
                     logger.warning(f"Safety block from {provider} for {operation_name}: {str(e)}")
                     break  # Move to next model, don't retry safety blocks

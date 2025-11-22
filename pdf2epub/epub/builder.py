@@ -17,13 +17,40 @@ from typing import Dict, List, Optional, Any
 from loguru import logger
 
 
+def _calculate_structure_depth(structure: Dict[str, Any]) -> int:
+    """
+    Calculate maximum depth of book structure.
+
+    Args:
+        structure: Book structure with chapters and optional subchapters
+
+    Returns:
+        Maximum depth (1 for flat, 2 for chapters+subchapters, etc.)
+    """
+    def get_depth(items: List[Dict], current: int) -> int:
+        if not items:
+            return current
+        max_depth = current
+        for item in items:
+            subchapters = item.get('subchapters', [])
+            if subchapters:
+                child_depth = get_depth(subchapters, current + 1)
+                max_depth = max(max_depth, child_depth)
+        return max_depth
+
+    chapters = structure.get('chapters', [])
+    if not chapters:
+        return 1
+    return get_depth(chapters, 1)
+
+
 class EpubBuilder:
     """Handles creation of all EPUB structural files and final packaging."""
-    
+
     def __init__(self, config, converter=None):
         """
         Initialize the EpubBuilder.
-        
+
         Args:
             config: EpubConfig instance with all settings
             converter: Optional ContentConverter instance for file naming helpers
@@ -136,14 +163,17 @@ a { text-decoration: none; }
         try:
             # Generate unique ID
             uid = str(uuid.uuid4())
-            
+
+            # Calculate actual depth from structure (+1 for TOC entry)
+            toc_depth = _calculate_structure_depth(structure) + 1
+
             # Start NCX document
             ncx = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
     <head>
         <meta name="dtb:uid" content="{uid}"/>
-        <meta name="dtb:depth" content="2"/>
+        <meta name="dtb:depth" content="{toc_depth}"/>
         <meta name="dtb:totalPageCount" content="0"/>
         <meta name="dtb:maxPageNumber" content="0"/>
     </head>

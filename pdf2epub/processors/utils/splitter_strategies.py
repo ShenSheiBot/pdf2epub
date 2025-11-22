@@ -73,12 +73,23 @@ class SimpleSplitter(ContentSplitter):
         elif "\n" not in content:
             separator = " "
 
-        for para in paragraphs:
+        for i, para in enumerate(paragraphs):
             para_tokens = len(tokenizer.encode(para))
-            if (
+
+            # Check if we should split here
+            should_split = (
                 current_tokens + para_tokens > target_tokens_per_part * 1.2
                 and current_part
-            ):
+            )
+
+            # Even if we want to split, check if it's a valid split point
+            if should_split and current_part:
+                prev_para = current_part[-1] if current_part else ""
+                if not self._is_valid_split_point(prev_para, para):
+                    # Not a valid split point, keep adding to current part
+                    should_split = False
+
+            if should_split:
                 parts.append(separator.join(current_part))
                 current_part = [para]
                 current_tokens = para_tokens
@@ -145,6 +156,51 @@ class SimpleSplitter(ContentSplitter):
             i += 1
 
         return merged
+
+    def _is_valid_split_point(self, prev_para: str, next_para: str) -> bool:
+        """
+        Check if the boundary between two paragraphs is a valid split point.
+
+        Invalid split points (OCR artifacts):
+        - Previous ends with comma
+        - Previous ends with lowercase and next starts with lowercase or (
+        - Next starts with ( followed by number
+        - Previous ends with opening quote/paren
+
+        Args:
+            prev_para: The paragraph before the potential split
+            next_para: The paragraph after the potential split
+
+        Returns:
+            True if this is a valid split point
+        """
+        if not prev_para or not next_para:
+            return True
+
+        prev_para = prev_para.strip()
+        next_para = next_para.strip()
+
+        if not prev_para or not next_para:
+            return True
+
+        last_char = prev_para[-1]
+        first_char = next_para[0]
+
+        # Invalid split indicators:
+        # 1. Previous ends with comma
+        if last_char == ',':
+            return False
+        # 2. Previous ends with lowercase and next starts with lowercase or (
+        if last_char.islower() and (first_char.islower() or first_char == '('):
+            return False
+        # 3. Next starts with ( followed by number (like "(1925)")
+        if first_char == '(' and len(next_para) > 1 and next_para[1].isdigit():
+            return False
+        # 4. Previous ends with opening quote/paren
+        if last_char in '("\'[{':
+            return False
+
+        return True
 
     def _find_paragraphs(self, content: str, min_paragraphs_needed: int) -> List[str]:
         """

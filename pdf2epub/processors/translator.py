@@ -31,11 +31,12 @@ class TranslateProcessor(BaseMarkdownProcessor):
         resume: bool = False,
         translation_models: Optional[list] = None,
         use_entities: Optional[bool] = None,
-        use_longest_on_failure: bool = False
+        use_longest_on_failure: bool = False,
+        book_structure: Optional[Dict] = None
     ):
         """
         Initialize the translation processor.
-        
+
         Args:
             config: Configuration dictionary
             book_title: Title of the book being processed
@@ -47,6 +48,7 @@ class TranslateProcessor(BaseMarkdownProcessor):
             use_entities: Whether to use extracted entities for consistency
                         (None = auto-detect, True = force use, False = force disable)
             use_longest_on_failure: If True, use longest response when all attempts fail validation
+            book_structure: Optional book structure from breakdown/refine phase
         """
         super().__init__(
             config=config,
@@ -57,7 +59,8 @@ class TranslateProcessor(BaseMarkdownProcessor):
             resume=resume,
             use_longest_on_failure=use_longest_on_failure
         )
-        
+
+        self.book_structure = book_structure or {}
         self.source_language = source_language
         self.target_language = target_language
 

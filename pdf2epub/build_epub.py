@@ -569,9 +569,17 @@ def build_epub(config: BuildEpubConfig) -> Path:
     from .epub.builder import EpubBuilder
     from .epub.converter import ContentConverter
     from .epub.footnotes import FootnoteManager
+    from .utils.config_manager import load_config
 
     logger.info(f"Building EPUB for: {config.book_title}")
     logger.info(f"Source: {'translated' if config.translated else 'polished_markdown'}")
+
+    # Load config for LLM-based footnote matching
+    try:
+        llm_config = load_config()
+    except Exception as e:
+        logger.debug(f"Could not load config for LLM: {e}")
+        llm_config = None
 
     # Load toc_tree.json
     toc_tree = load_toc_tree(config.toc_tree_path)
@@ -651,7 +659,7 @@ def build_epub(config: BuildEpubConfig) -> Path:
     auto_global = has_notes_chapter(toc_tree.get('chapters', []))
     if auto_global:
         logger.info("Detected notes chapter, enabling global footnote mode")
-    footnote_manager = FootnoteManager(config.markdown_dir, auto_global=auto_global)
+    footnote_manager = FootnoteManager(config.markdown_dir, auto_global=auto_global, config=llm_config)
     logger.debug(f"Initialized FootnoteManager in {footnote_manager.style.value} mode")
 
     # Copy and compress images, get mapping

@@ -115,12 +115,24 @@ class LLMSectionMatcher:
         Returns:
             True if matching succeeded, False otherwise
         """
-        if not self.config:
-            logger.warning("No config provided, cannot use LLM for section matching")
-            return False
-
         if not self.toc_chapters:
             logger.warning("No TOC chapters loaded")
+            return False
+
+        # Try to load cached results first
+        cache_path = self.markdown_dir.parent / "footnote_section_matches.json"
+        if cache_path.exists():
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    matches = json.load(f)
+                logger.info(f"Loaded {len(matches)} section matches from cache")
+                return self._parse_sections_from_result(matches, primary_definition_chapters)
+            except Exception as e:
+                logger.warning(f"Failed to load cached matches: {e}")
+
+        # No cache, need to call LLM
+        if not self.config:
+            logger.warning("No config provided, cannot use LLM for section matching")
             return False
 
         # Get Notes structure
@@ -201,6 +213,14 @@ TOC 章节列表：
 
             matches = json.loads(response)
             logger.info(f"LLM returned {len(matches)} section matches")
+
+            # Save matches to cache
+            try:
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(matches, f, ensure_ascii=False, indent=2)
+                logger.info(f"Saved section matches to cache: {cache_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save matches to cache: {e}")
 
             # Parse sections from LLM result
             return self._parse_sections_from_result(matches, primary_definition_chapters)

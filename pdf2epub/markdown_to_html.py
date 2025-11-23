@@ -577,43 +577,114 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
     # For definition chapters, convert footnote definitions to HTML without renumbering
     if is_definition_chapter:
         logger.debug(f"Definition chapter {source_chapter}: converting footnotes without renumbering")
-        
-        # Get global occurrence counter from FootnoteManager
-        global_def_occurrence = getattr(footnote_manager, '_global_def_occurrence', {})
-        
-        for line in lines:
-            # Check for footnote definition [^1]:
-            def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
-            if def_match:
-                fn_key = def_match.group(1)
-                fn_text = def_match.group(2)
-                
-                # Track occurrence number globally across all definition chapters
-                if fn_key not in global_def_occurrence:
-                    global_def_occurrence[fn_key] = 0
-                global_def_occurrence[fn_key] += 1
-                occurrence_num = global_def_occurrence[fn_key]
-                
-                # Store it back to FootnoteManager for persistence across files
-                footnote_manager._global_def_occurrence = global_def_occurrence
-                
-                # In global mode with occurrence mapping, keep the original numbering
-                # Add ID based on occurrence number for cross-chapter linking
-                fn_id = f"fn:{fn_key}:{occurrence_num}"
-                
-                # Output as HTML with occurrence-based ID
-                processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
-                processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}</p>')
-                processed_lines.append('</div>')
-            else:
-                # Process footnote references [^1] but NOT definitions
-                def replace_ref(match):
-                    fn_key = match.group(1)
-                    # Get the HTML from FootnoteManager which handles cross-chapter links
-                    return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
-                
-                line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
-                processed_lines.append(line)
+
+        # Check if we're using section-based mapping
+        use_section_mapping = (
+            hasattr(footnote_manager, 'section_definition_by_occurrence') and
+            footnote_manager.section_definition_by_occurrence and
+            hasattr(footnote_manager, 'notes_sections') and
+            footnote_manager.notes_sections
+        )
+
+        if use_section_mapping:
+            # Section-based occurrence counting
+            # First, identify sections in this file by scanning for headers
+            current_section_idx = None
+            section_def_counters = {}  # (section_idx, key) -> count
+
+            # Find which section each line belongs to
+            line_to_section = {}
+            for i, line in enumerate(lines):
+                # Check for section headers (matching what was found by LLM)
+                stripped = line.strip()
+                header_text = re.sub(r'^#+\s*', '', stripped)
+
+                # Find matching section
+                for idx, section in enumerate(footnote_manager.notes_sections):
+                    if section.source_file == source_chapter and section.header_text == header_text:
+                        current_section_idx = idx
+                        break
+
+                line_to_section[i] = current_section_idx
+
+            # Process lines with section-aware counting
+            for i, line in enumerate(lines):
+                # Check for footnote definition [^1]:
+                def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+                if def_match:
+                    fn_key = def_match.group(1)
+                    fn_text = def_match.group(2)
+
+                    section_idx = line_to_section.get(i)
+                    if section_idx is not None:
+                        # Track occurrence within this section
+                        counter_key = (section_idx, fn_key)
+                        if counter_key not in section_def_counters:
+                            section_def_counters[counter_key] = 0
+                        section_def_counters[counter_key] += 1
+                        occurrence_num = section_def_counters[counter_key]
+                    else:
+                        # Fallback to global counting if no section found
+                        global_def_occurrence = getattr(footnote_manager, '_global_def_occurrence', {})
+                        if fn_key not in global_def_occurrence:
+                            global_def_occurrence[fn_key] = 0
+                        global_def_occurrence[fn_key] += 1
+                        occurrence_num = global_def_occurrence[fn_key]
+                        footnote_manager._global_def_occurrence = global_def_occurrence
+
+                    # Generate ID with section-based occurrence
+                    fn_id = f"fn:{fn_key}:{occurrence_num}"
+
+                    # Output as HTML with occurrence-based ID
+                    processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
+                    processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}</p>')
+                    processed_lines.append('</div>')
+                else:
+                    # Process footnote references [^1] but NOT definitions
+                    def replace_ref(match):
+                        fn_key = match.group(1)
+                        # Get the HTML from FootnoteManager which handles cross-chapter links
+                        return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
+
+                    line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+                    processed_lines.append(line)
+        else:
+            # Global occurrence counting (original behavior)
+            global_def_occurrence = getattr(footnote_manager, '_global_def_occurrence', {})
+
+            for line in lines:
+                # Check for footnote definition [^1]:
+                def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+                if def_match:
+                    fn_key = def_match.group(1)
+                    fn_text = def_match.group(2)
+
+                    # Track occurrence number globally across all definition chapters
+                    if fn_key not in global_def_occurrence:
+                        global_def_occurrence[fn_key] = 0
+                    global_def_occurrence[fn_key] += 1
+                    occurrence_num = global_def_occurrence[fn_key]
+
+                    # Store it back to FootnoteManager for persistence across files
+                    footnote_manager._global_def_occurrence = global_def_occurrence
+
+                    # In global mode with occurrence mapping, keep the original numbering
+                    # Add ID based on occurrence number for cross-chapter linking
+                    fn_id = f"fn:{fn_key}:{occurrence_num}"
+
+                    # Output as HTML with occurrence-based ID
+                    processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
+                    processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}</p>')
+                    processed_lines.append('</div>')
+                else:
+                    # Process footnote references [^1] but NOT definitions
+                    def replace_ref(match):
+                        fn_key = match.group(1)
+                        # Get the HTML from FootnoteManager which handles cross-chapter links
+                        return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
+
+                    line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+                    processed_lines.append(line)
     else:
         # For reference chapters, only process references (no definitions to handle)
         for line in lines:

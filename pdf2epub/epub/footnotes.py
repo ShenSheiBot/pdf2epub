@@ -160,6 +160,12 @@ class FootnoteManager:
                 # Check for footnote references [^key] (not followed by colon)
                 ref_matches = re.findall(r'\[\^(\w+)\](?!:)', line)
                 for key in ref_matches:
+                    # Handle special page-note format like [^197n67]
+                    # Convert to just the note number (67) for matching with definitions
+                    page_note_match = re.match(r'^(\d+)n(\d+)$', key)
+                    if page_note_match:
+                        key = page_note_match.group(2)
+
                     referenced_keys.add(key)
                     if key not in self.references:
                         self.references[key] = []
@@ -517,12 +523,18 @@ class FootnoteManager:
         Get the HTML for a footnote reference.
 
         Args:
-            key: The footnote key (e.g., "1", "note")
+            key: The footnote key (e.g., "1", "note", or "197n67" for page-note format)
             source_chapter: The chapter containing the reference
 
         Returns:
             HTML string for the footnote reference, or None if not found
         """
+        # Handle special page-note format like [^197n67]
+        # Convert to just the note number (67) for matching with definitions
+        original_key = key
+        page_note_match = re.match(r'^(\d+)n(\d+)$', key)
+        if page_note_match:
+            key = page_note_match.group(2)
         if self.style == FootnoteStyle.LOCAL:
             # Check if this chapter is part of a multi-part chapter
             source_identity = ChapterIdentity.parse(source_chapter)
@@ -580,24 +592,27 @@ class FootnoteManager:
                         if def_obj.chapter in self.primary_definition_chapters:
                             definition = def_obj
                             break
-                    
+
                     # Fallback to last definition if none in primary chapters
                     if not definition:
                         definition = self.definitions[key][-1]
                 else:
                     definition = self.definitions[key][0]  # Use first definition
-            
+
             target_chapter = definition.chapter
-            
+
+            # Use original_key for display text, but key for linking
+            display_key = original_key
+
             if target_chapter == source_chapter:
                 # Same file reference - still use file name for consistency
-                fnref_id = f"fnref-{source_chapter}-{key}"
+                fnref_id = f"fnref-{source_chapter}-{original_key}"
                 # Use ChapterIdentity for HTML name
                 source_identity = ChapterIdentity.parse(source_chapter)
                 html_target = source_identity.html_name if source_identity else f"{source_chapter.replace('.part', '_part')}.html"
                 # Use occurrence number if available, otherwise default to 1
                 occ_num = occurrence_num if occurrence_num else 1
-                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}#fn:{key}:{occ_num}">[{key}]</a></sup>'
+                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}#fn:{key}:{occ_num}">[{display_key}]</a></sup>'
             else:
                 # Cross-file reference in LOCAL mode with multi-part chapters
                 # Use position-based mapping to find the correct occurrence number
@@ -621,7 +636,7 @@ class FootnoteManager:
                     fn_id = f"fn:{key}:1"
                     logger.debug(f"No mapping found for {base_source_chapter}, using default ID")
 
-                fnref_id = f"fnref-{source_chapter}-{key}"
+                fnref_id = f"fnref-{source_chapter}-{original_key}"
 
                 # Use ChapterIdentity for HTML name conversion
                 target_identity = ChapterIdentity.parse(target_chapter)
@@ -629,14 +644,14 @@ class FootnoteManager:
 
                 return (
                     f'<sup id="{fnref_id}">'
-                    f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{key}]</a>'
+                    f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{display_key}]</a>'
                     f'</sup>'
                 )
 
         # Footnote not found - return a plain reference with unique ID
-        logger.warning(f"Footnote '{key}' referenced in {source_chapter} but not defined")
-        fnref_id = f"fnref-{source_chapter}-{key}"
-        return f'<sup id="{fnref_id}">[{key}]</sup>'
+        logger.warning(f"Footnote '{original_key}' referenced in {source_chapter} but not defined")
+        fnref_id = f"fnref-{source_chapter}-{original_key}"
+        return f'<sup id="{fnref_id}">[{original_key}]</sup>'
     
     def get_definition_content(self, key: str) -> Optional[str]:
         """

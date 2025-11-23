@@ -211,6 +211,25 @@ def relevel_content(content: str, base_level: int, skip_first: bool = False) -> 
     return '\n'.join(lines)
 
 
+def has_notes_chapter(chapters: List[Dict]) -> bool:
+    """
+    Check if any chapter in the TOC tree has type 'notes'.
+
+    Args:
+        chapters: List of chapter dictionaries from toc_tree
+
+    Returns:
+        True if a notes chapter is found
+    """
+    for chapter in chapters:
+        if chapter.get('type') == 'notes':
+            return True
+        if 'children' in chapter and chapter['children']:
+            if has_notes_chapter(chapter['children']):
+                return True
+    return False
+
+
 def flatten_toc_tree(
     chapters: List[Dict],
     parent_index_path: List[int] = None
@@ -628,7 +647,11 @@ def build_epub(config: BuildEpubConfig) -> Path:
     (epub_dir / "images").mkdir()
 
     # Initialize FootnoteManager for cross-chapter footnote handling
-    footnote_manager = FootnoteManager(config.markdown_dir)
+    # Check if there's a notes chapter to enable global footnote mode
+    force_global = has_notes_chapter(toc_tree.get('chapters', []))
+    if force_global:
+        logger.info("Detected notes chapter, enabling global footnote mode")
+    footnote_manager = FootnoteManager(config.markdown_dir, force_global=force_global)
     logger.debug(f"Initialized FootnoteManager in {footnote_manager.style.value} mode")
 
     # Copy and compress images, get mapping

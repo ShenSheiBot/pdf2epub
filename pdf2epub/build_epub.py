@@ -18,7 +18,6 @@ from loguru import logger
 
 from .epub.builder import EpubBuilder
 from .epub.converter import ContentConverter
-from .utils.llm_client import LLMClient
 from .utils.unit_id import generate_unit_id
 from .utils.pdf_utils import extract_cover_image
 
@@ -252,153 +251,6 @@ def flatten_toc_tree(
 
     return result
 
-
-def translate_book_title(
-    original_title: str,
-    llm_client: LLMClient,
-    source_language: str,
-    target_language: str,
-    output_dir: Path
-) -> str:
-    """
-    Translate the book title, with caching to file.
-
-    Args:
-        original_title: Original book title
-        llm_client: LLM client for translation
-        source_language: Source language
-        target_language: Target language
-        output_dir: Directory to cache translated title
-
-    Returns:
-        Translated book title
-    """
-    # Check for cached translation
-    cache_file = output_dir / "book_title_translated.txt"
-    if cache_file.exists():
-        translated = cache_file.read_text(encoding='utf-8').strip()
-        if translated:
-            logger.info(f"Loaded cached translated title: {translated}")
-            return translated
-
-    # Translate using LLM
-    prompt = f"""Translate the following book title from {source_language} to {target_language}.
-Return ONLY the translated title, no explanations or quotes.
-
-Original title: {original_title}
-
-Translated title:"""
-
-    try:
-        response = llm_client.generate(
-            prompt=prompt,
-            operation_name="Book title translation"
-        )
-
-        translated = response.strip().strip('"\'')
-
-        # Cache the translation
-        cache_file.write_text(translated, encoding='utf-8')
-        logger.info(f"Translated book title: {original_title} → {translated}")
-
-        return translated
-    except Exception as e:
-        logger.error(f"Failed to translate book title: {e}")
-        return original_title
-
-
-async def translate_toc_titles(
-    toc_structure: List[Dict],
-    llm_client: LLMClient,
-    source_language: str,
-    target_language: str
-) -> List[Dict]:
-    """
-    Translate all titles in toc_structure using LLM.
-
-    Args:
-        toc_structure: Flattened toc structure
-        llm_client: LLM client for translation
-        source_language: Source language
-        target_language: Target language
-
-    Returns:
-        toc_structure with translated titles
-    """
-    # Collect all titles
-    titles = []
-
-    def collect_titles(entries: List[Dict]):
-        for entry in entries:
-            titles.append(entry['title'])
-            if 'children' in entry:
-                collect_titles(entry['children'])
-
-    collect_titles(toc_structure)
-
-    if not titles:
-        return toc_structure
-
-    # Create translation prompt
-    titles_text = '\n'.join([f"{i+1}. {t}" for i, t in enumerate(titles)])
-
-    prompt = f"""Translate the following table of contents titles from {source_language} to {target_language}.
-
-IMPORTANT:
-- Keep chapter numbers at the beginning (e.g., "38 Introduction" -> "38 介绍")
-- Keep "PART" markers but translate the rest (e.g., "PART IV THE EDO PERIOD" -> "第四部分 江户时代")
-- Maintain academic/formal tone
-- Return ONLY the translated titles, one per line, in the same order
-
-Titles to translate:
-{titles_text}
-
-Translated titles:"""
-
-    try:
-        # Use configured LLM for translation
-        response = llm_client.generate(
-            prompt=prompt,
-            operation_name="TOC title translation"
-        )
-
-        # Parse translated titles
-        translated_lines = [l.strip() for l in response.strip().split('\n') if l.strip()]
-
-        # Remove numbering if present
-        translated_titles = []
-        for line in translated_lines:
-            # Remove "1. ", "2. " etc. if present
-            cleaned = re.sub(r'^\d+\.\s*', '', line)
-            translated_titles.append(cleaned)
-
-        if len(translated_titles) != len(titles):
-            logger.warning(
-                f"Translation count mismatch: expected {len(titles)}, got {len(translated_titles)}"
-            )
-            # Fall back to original titles for missing ones
-            while len(translated_titles) < len(titles):
-                translated_titles.append(titles[len(translated_titles)])
-
-        # Apply translations back to structure
-        title_idx = [0]  # Use list to allow modification in nested function
-
-        def apply_translations(entries: List[Dict]):
-            for entry in entries:
-                if title_idx[0] < len(translated_titles):
-                    entry['title'] = translated_titles[title_idx[0]]
-                    title_idx[0] += 1
-                if 'children' in entry:
-                    apply_translations(entry['children'])
-
-        apply_translations(toc_structure)
-        logger.info(f"Translated {len(titles)} TOC titles to {target_language}")
-
-    except Exception as e:
-        logger.error(f"Failed to translate TOC titles: {e}")
-        logger.warning("Using original titles")
-
-    return toc_structure
 
 
 def build_epub_structure(
@@ -683,7 +535,7 @@ def generate_hierarchical_toc_html(
         return False
 
 
-async def build_epub(config: BuildEpubConfig) -> Path:
+def build_epub(config: BuildEpubConfig) -> Path:
     """
     Main entry point for building EPUB from toc_tree.json.
 
@@ -730,34 +582,23 @@ async def build_epub(config: BuildEpubConfig) -> Path:
             else:
                 logger.warning("Cannot extract cover: PDF not found in output directory")
 
+    # Load translated TOC if building translated EPUB
+    if config.translated:
+        translated_toc_path = config.output_dir / "toc_tree_translated.json"
+        if translated_toc_path.exists():
+            with open(translated_toc_path, 'r', encoding='utf-8') as f:
+                toc_tree = json.load(f)
+            logger.info("Loaded translated TOC from toc_tree_translated.json")
+
+            # Use translated book title
+            if 'book_title' in toc_tree:
+                config.book_title = toc_tree['book_title']
+                logger.info(f"Using translated title: {config.book_title}")
+        else:
+            logger.warning("toc_tree_translated.json not found, using original titles")
+
     # Flatten and process structure
     toc_structure = flatten_toc_tree(toc_tree['chapters'])
-
-    # Translate TOC titles and book title if needed
-    if config.translated and config.config:
-        llm_client = LLMClient(config.config)
-        source_language = toc_tree.get('language', 'English')
-
-        # Translate TOC titles
-        toc_structure = await translate_toc_titles(
-            toc_structure,
-            llm_client,
-            source_language,
-            config.target_language
-        )
-
-        # Translate book title
-        translated_title = translate_book_title(
-            config.book_title,
-            llm_client,
-            source_language,
-            config.target_language,
-            config.output_dir
-        )
-
-        # Update config with translated title
-        config.book_title = translated_title
-        logger.info(f"Using translated title for EPUB: {translated_title}")
 
     # Build structure with file paths
     epub_structure = build_epub_structure(toc_structure, config.markdown_dir)

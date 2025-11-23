@@ -684,8 +684,8 @@ def build_epub_command(args):
     )
 
     try:
-        # Run async build
-        epub_path = asyncio.run(build_epub(build_config))
+        # Build EPUB
+        epub_path = build_epub(build_config)
         logger.success(f"EPUB created: {epub_path}")
         return 0
     except Exception as e:

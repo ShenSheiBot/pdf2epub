@@ -246,7 +246,7 @@ def process_page(client: DocumentIntelligenceClient, img_bytes: bytes, page_num:
         images_dir = None
     
     # Check if we should use Azure's native figure extraction
-    use_azure_illustrations = config.get('use_azure_illustrations', False)
+    use_azure_illustrations = config.get('ocr', {}).get('use_azure_illustrations', False)
     
     # Call analyze_azure_ocr directly with figure extraction if enabled
     # Use 'prebuilt-layout' if we need figures, otherwise 'prebuilt-read' for cost savings

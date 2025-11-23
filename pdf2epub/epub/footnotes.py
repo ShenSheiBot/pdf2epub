@@ -46,17 +46,21 @@ class FootnoteManager:
     or globally (centralized in specific chapters) and handles them appropriately.
     """
     
-    def __init__(self, markdown_dir: Path, force_global: bool = False):
+    def __init__(self, markdown_dir: Path, force_global: bool = False, auto_global: bool = False):
         """
         Initialize the footnote manager.
-        
+
         Args:
             markdown_dir: Directory containing markdown files
-            force_global: If True, force global footnote style (use last definition)
+            force_global: If True, force global footnote style via CLI flag
+            auto_global: If True, auto-detected global mode (e.g., notes chapter found)
         """
         self.markdown_dir = Path(markdown_dir)
         self.force_global = force_global
-        self.style = FootnoteStyle.GLOBAL if force_global else FootnoteStyle.LOCAL  # Default or forced style
+        self.auto_global = auto_global
+        # Enable global mode if either forced or auto-detected
+        use_global = force_global or auto_global
+        self.style = FootnoteStyle.GLOBAL if use_global else FootnoteStyle.LOCAL  # Default or forced style
         self.definitions: Dict[str, List[FootnoteDefinition]] = {}  # key -> list of definitions
         self.references: Dict[str, List[FootnoteReference]] = {}    # key -> list of references
         self.chapter_definitions: Dict[str, Set[str]] = {}  # chapter -> set of defined keys
@@ -119,8 +123,8 @@ class FootnoteManager:
         if self.style == FootnoteStyle.LOCAL:
             self._build_local_occurrence_mappings()
         elif self.style == FootnoteStyle.GLOBAL:
-            # If force_global, identify primary definition chapters
-            if self.force_global:
+            # If force_global or auto_global, identify primary definition chapters
+            if self.force_global or self.auto_global:
                 self._identify_primary_definition_chapters()
             # Build occurrence mapping for all global styles
             self._build_occurrence_mapping()
@@ -199,10 +203,13 @@ class FootnoteManager:
           2. There are other chapters with references but no definitions
           3. The referenced keys match defined keys across chapters
         """
-        # If forced global, skip analysis
-        if self.force_global:
+        # If forced or auto global, skip analysis
+        if self.force_global or self.auto_global:
             self.style = FootnoteStyle.GLOBAL
-            logger.info("Using forced GLOBAL footnote style")
+            if self.force_global:
+                logger.info("Using forced GLOBAL footnote style")
+            else:
+                logger.info("Using auto-detected GLOBAL footnote style (notes chapter found)")
             return
         
         # Check if we have the pattern for global footnotes
@@ -271,7 +278,7 @@ class FootnoteManager:
         for key, def_list in self.definitions.items():
             for defn in def_list:
                 # Filter to primary chapters if force_global
-                if not self.force_global or not self.primary_definition_chapters or defn.chapter in self.primary_definition_chapters:
+                if not (self.force_global or self.auto_global) or not self.primary_definition_chapters or defn.chapter in self.primary_definition_chapters:
                     all_defs.append((key, defn))
         all_defs.sort(key=lambda x: (self._chapter_sort_key(x[1].chapter), x[1].line_num))
         
@@ -467,8 +474,9 @@ class FootnoteManager:
     
     def _log_analysis_results(self) -> None:
         """Log the results of the footnote analysis."""
-        if self.force_global:
-            logger.info(f"Footnote style: FORCED GLOBAL")
+        if self.force_global or self.auto_global:
+            mode_type = "FORCED" if self.force_global else "AUTO"
+            logger.info(f"Footnote style: {mode_type} GLOBAL")
             logger.info(f"Primary definition chapters: {sorted(self.primary_definition_chapters)}")
             total_defs = sum(len(self.chapter_definitions.get(ch, set())) for ch in self.primary_definition_chapters)
             logger.info(f"Total definitions in primary chapters: {total_defs}")
@@ -482,7 +490,7 @@ class FootnoteManager:
             # Log which chapters contain definitions
             for chapter in sorted(self.definition_chapters):
                 count = len(self.chapter_definitions.get(chapter, set()))
-                is_primary = " (PRIMARY)" if self.force_global and chapter in self.primary_definition_chapters else ""
+                is_primary = " (PRIMARY)" if (self.force_global or self.auto_global) and chapter in self.primary_definition_chapters else ""
                 logger.debug(f"  {chapter}: {count} definitions{is_primary}")
             
             # Log chapters with references only
@@ -491,7 +499,7 @@ class FootnoteManager:
                 logger.debug(f"  {chapter}: {count} references (no definitions)")
             
             # If force_global, log which definitions will be used
-            if self.force_global and self.definitions:
+            if (self.force_global or self.auto_global) and self.definitions:
                 logger.info("Footnote consolidation summary:")
                 definitions_used = {}
                 for key in sorted(self.definitions.keys()):
@@ -585,7 +593,7 @@ class FootnoteManager:
                 definition = self.definition_by_occurrence[(key, occurrence_num)]
             else:
                 # Fallback to old logic
-                if self.force_global:
+                if self.force_global or self.auto_global:
                     # Find the last definition in primary definition chapters
                     definition = None
                     for def_obj in reversed(self.definitions[key]):
@@ -664,13 +672,13 @@ class FootnoteManager:
             The footnote content, or None if not found
         """
         if key in self.definitions and self.definitions[key]:
-            # If force_global, use definition from primary definition chapters
-            if self.force_global:
+            # If force_global or auto_global, use definition from primary definition chapters
+            if self.force_global or self.auto_global:
                 # Find the last definition in primary definition chapters
                 for def_obj in reversed(self.definitions[key]):
                     if def_obj.chapter in self.primary_definition_chapters:
                         return def_obj.content
-                
+
                 # Fallback to last definition if none in primary chapters
                 return self.definitions[key][-1].content
             else:
@@ -694,18 +702,18 @@ class FootnoteManager:
         
         # Global style: only include if this is where it's defined
         if key in self.definitions:
-            if self.force_global:
+            if self.force_global or self.auto_global:
                 # Only include definitions in primary definition chapters
                 if chapter not in self.primary_definition_chapters:
                     return False
-                
+
                 # Include ALL definitions in primary definition chapters
                 # This is important for occurrence-based mapping where we have
                 # multiple definitions with the same key (e.g., multiple [^1]s)
                 for def_obj in self.definitions[key]:
                     if def_obj.chapter == chapter:
                         return True
-                
+
                 return False
             else:
                 # Normal global style: include any definition in this chapter

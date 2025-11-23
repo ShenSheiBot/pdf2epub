@@ -648,10 +648,10 @@ def build_epub(config: BuildEpubConfig) -> Path:
 
     # Initialize FootnoteManager for cross-chapter footnote handling
     # Check if there's a notes chapter to enable global footnote mode
-    force_global = has_notes_chapter(toc_tree.get('chapters', []))
-    if force_global:
+    auto_global = has_notes_chapter(toc_tree.get('chapters', []))
+    if auto_global:
         logger.info("Detected notes chapter, enabling global footnote mode")
-    footnote_manager = FootnoteManager(config.markdown_dir, force_global=force_global)
+    footnote_manager = FootnoteManager(config.markdown_dir, auto_global=auto_global)
     logger.debug(f"Initialized FootnoteManager in {footnote_manager.style.value} mode")
 
     # Copy and compress images, get mapping

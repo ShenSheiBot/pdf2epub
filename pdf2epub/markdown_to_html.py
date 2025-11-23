@@ -592,6 +592,12 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
             current_section_idx = None
             section_def_counters = {}  # (section_idx, key) -> count
 
+            # Build reverse mapping: section -> unit_id (for backref generation)
+            section_to_unit_id = {}
+            for unit_id, section in footnote_manager.chapter_to_section.items():
+                section_idx = footnote_manager.notes_sections.index(section)
+                section_to_unit_id[section_idx] = unit_id
+
             # Find which section each line belongs to
             line_to_section = {}
             for i, line in enumerate(lines):
@@ -635,9 +641,35 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
                     # Generate ID with section-based occurrence
                     fn_id = f"fn:{fn_key}:{occurrence_num}"
 
-                    # Output as HTML with occurrence-based ID
+                    # Generate backref link to the source chapter
+                    backref_html = ""
+                    if section_idx is not None and section_idx in section_to_unit_id:
+                        # Find the source chapter that references this footnote
+                        ref_unit_id = section_to_unit_id[section_idx]
+                        # The unit_id is like "chapter_9", we need to find actual file(s)
+                        fnref_id = f"fnref-{ref_unit_id}-{fn_key}-{occurrence_num}"
+
+                        # Check if this chapter has multiple parts
+                        if hasattr(footnote_manager, 'local_chapter_groups') and ref_unit_id in footnote_manager.local_chapter_groups:
+                            # Use the first part file
+                            first_part = footnote_manager.local_chapter_groups[ref_unit_id][0]
+                            ref_identity = ChapterIdentity.parse(first_part)
+                            if ref_identity:
+                                backref_link = f"{ref_identity.html_name}#{fnref_id}"
+                            else:
+                                backref_link = f"{first_part.replace('.part', '_part')}.html#{fnref_id}"
+                        else:
+                            # Single file chapter
+                            ref_identity = ChapterIdentity.parse(ref_unit_id)
+                            if ref_identity:
+                                backref_link = f"{ref_identity.html_name}#{fnref_id}"
+                            else:
+                                backref_link = f"{ref_unit_id.replace('.part', '_part')}.html#{fnref_id}"
+                        backref_html = f' <a class="footnote-backref" href="{backref_link}" title="Jump back to footnote {fn_key} in the text">↩</a>'
+
+                    # Output as HTML with occurrence-based ID and backref
                     processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
-                    processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}</p>')
+                    processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}{backref_html}</p>')
                     processed_lines.append('</div>')
                 else:
                     # Process footnote references [^1] but NOT definitions

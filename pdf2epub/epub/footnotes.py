@@ -642,7 +642,8 @@ class FootnoteManager:
                     target_chapter = definition.chapter
 
                     # Generate HTML link
-                    fnref_id = f"fnref-{source_chapter}-{original_key}-{occurrence}"
+                    # Use base_chapter (unit_id) for fnref_id to match the backref in definition
+                    fnref_id = f"fnref-{base_chapter}-{key}-{occurrence}"
                     target_identity = ChapterIdentity.parse(target_chapter)
                     html_target = target_identity.html_name if target_identity else f"{target_chapter.replace('.part', '_part')}.html"
 

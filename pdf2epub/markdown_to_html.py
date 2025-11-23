@@ -649,9 +649,32 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
                         # The unit_id is like "chapter_9", we need to find actual file(s)
                         fnref_id = f"fnref-{ref_unit_id}-{fn_key}-{occurrence_num}"
 
-                        # Check if this chapter has multiple parts
-                        if hasattr(footnote_manager, 'local_chapter_groups') and ref_unit_id in footnote_manager.local_chapter_groups:
-                            # Use the first part file
+                        # Find the actual file containing this reference occurrence
+                        ref_file = None
+                        if hasattr(footnote_manager, 'references') and fn_key in footnote_manager.references:
+                            # Get all references for this key
+                            all_refs = footnote_manager.references[fn_key]
+                            # Filter to refs in this chapter (matching unit_id)
+                            chapter_refs = []
+                            for ref in all_refs:
+                                ref_base = ref.chapter.split('.part')[0] if '.part' in ref.chapter else ref.chapter
+                                if ref_base == ref_unit_id:
+                                    chapter_refs.append(ref)
+                            # Sort by file and line number
+                            chapter_refs.sort(key=lambda r: (footnote_manager._chapter_sort_key(r.chapter), r.line_num))
+                            # Get the Nth occurrence (occurrence_num is 1-based)
+                            if occurrence_num <= len(chapter_refs):
+                                ref_file = chapter_refs[occurrence_num - 1].chapter
+
+                        if ref_file:
+                            # Use the actual file containing the reference
+                            ref_identity = ChapterIdentity.parse(ref_file)
+                            if ref_identity:
+                                backref_link = f"{ref_identity.html_name}#{fnref_id}"
+                            else:
+                                backref_link = f"{ref_file.replace('.part', '_part')}.html#{fnref_id}"
+                        elif hasattr(footnote_manager, 'local_chapter_groups') and ref_unit_id in footnote_manager.local_chapter_groups:
+                            # Fallback: use the first part file
                             first_part = footnote_manager.local_chapter_groups[ref_unit_id][0]
                             ref_identity = ChapterIdentity.parse(first_part)
                             if ref_identity:

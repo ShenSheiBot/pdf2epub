@@ -81,12 +81,16 @@ class GapAnalyzer:
         gaps = []
         chapters = toc_data.get('chapters', [])
 
-        # Get boundary pages
-        cover_page = toc_data.get('cover_page', {}).get('page_number', 1)
-        toc_info = toc_data.get('table_of_contents', {})
+        # Get boundary pages (handle None values from JSON null)
+        cover_page_data = toc_data.get('cover_page')
+        cover_page = cover_page_data.get('page_number', 1) if cover_page_data else 1
+
+        toc_info = toc_data.get('table_of_contents') or {}
         toc_start = toc_info.get('start_page', cover_page + 1)
         toc_end = toc_info.get('end_page', toc_start)
-        back_cover = toc_data.get('back_cover', {}).get('page_number')
+
+        back_cover_data = toc_data.get('back_cover')
+        back_cover = back_cover_data.get('page_number') if back_cover_data else None
 
         # 1. Front gap: cover to TOC
         if cover_page + 1 < toc_start:

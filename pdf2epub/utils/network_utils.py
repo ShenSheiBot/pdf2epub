@@ -311,7 +311,7 @@ class AnthropicClient:
     def generate_content(
         self,
         prompt: Union[str, List[Dict]],
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-5-20250929",
         max_tokens: int = 8192,
         temperature: float = 0.1,
         operation_name: str = "Anthropic API call"
@@ -556,7 +556,7 @@ def generate_with_fallback(
     gemini_client: Optional[GeminiClient] = None,
     anthropic_client: Optional[AnthropicClient] = None,
     gemini_model: str = "gemini-2.5-pro",
-    anthropic_model: str = "claude-sonnet-4-20250514",
+    anthropic_model: str = "claude-sonnet-4-5-20250929",
     operation_name: str = "API call",
     prefer_anthropic: bool = False
 ) -> str:

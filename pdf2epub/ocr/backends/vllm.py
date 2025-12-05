@@ -72,7 +72,7 @@ class OCRClient:
                 self.client = anthropic.Anthropic(api_key=key)
 
             # Store model name from config for later use
-            self.anthropic_model = config.get('anthropic_model', 'claude-3-5-sonnet-20241022')
+            self.anthropic_model = config.get('anthropic_model', 'claude-sonnet-4-5-20250929')
 
         elif self.model_type == "deepseek":
             # Try: provided key -> config.yaml -> env var
@@ -226,7 +226,7 @@ def init_client(config: Dict) -> OCRClient:
     if provider == 'anthropic':
         model_type = 'anthropic'
         # Use top-level credentials, override model name from ocr_vllm_models
-        client_config['anthropic_model'] = model_config.get('model', 'claude-sonnet-4-20250514')
+        client_config['anthropic_model'] = model_config.get('model', 'claude-sonnet-4-5-20250929')
     elif provider == 'google' or provider == 'gemini':
         model_type = 'gemini'
         # Use top-level credentials, will set model name after client creation

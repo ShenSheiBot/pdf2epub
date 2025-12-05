@@ -77,12 +77,16 @@ def get_splitter(strategy: str = "markdown") -> ContentSplitter:
         strategy: The splitting strategy to use:
             - "markdown": MarkdownStructureSplitter (markdown-aware, default)
             - "simple": SimpleSplitter (paragraph-based fallback)
+            - "compressed": CompressedSplitter (line-based, preserves structure)
 
     Returns:
         A content splitter instance.
     """
     if strategy == "simple":
         return SimpleSplitter()
+    elif strategy == "compressed":
+        from pdf2epub.html_translation.splitter import CompressedSplitter
+        return CompressedSplitter()
     else:
         # Default to markdown-aware splitting
         return MarkdownStructureSplitter()

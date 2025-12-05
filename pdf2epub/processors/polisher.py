@@ -180,25 +180,21 @@ class PolishProcessor(BaseMarkdownProcessor):
         """Get the model configurations for polishing."""
         return self.polish_models
 
-    def process_unit(self, content: str, unit_key: str, **context) -> str:
+    def build_prompt(self, content: str, unit_key: str, **context) -> List[Dict]:
         """
-        Process a single polish unit (part or whole file).
+        Build the polishing prompt with optional conversation history.
 
         Args:
             content: Content to polish
             unit_key: Unit identifier for tracking
-            **context: Context including file_name, part_idx, total_parts, original_content, previous_context
+            **context: Context including file_name, part_idx, total_parts, previous_context
 
         Returns:
-            Polished content
-
-        Raises:
-            Exception: On processing failure
+            Multi-part content for LLM (may include conversation history)
         """
         file_name = context.get('file_name', unit_key)
         part_idx = context.get('part_idx', 1)
         total_parts = context.get('total_parts', 1)
-        original_content = context.get('original_content', content)
         previous_context = context.get('previous_context')
 
         # Create the polishing prompt
@@ -240,60 +236,79 @@ class PolishProcessor(BaseMarkdownProcessor):
                 {"type": "text", "text": f"Now polish part {part_idx}/{total_parts} (continuation of the same chapter).\n\nIMPORTANT: Since this is a continuation, your MAXIMUM heading level is ## (H2). Convert any # (H1) headings to ## (H2).\n\nContent to polish:"},
                 {"type": "text", "text": content}
             ]
-            multi_part_content = [
+            return [
                 {"role": "user", "content": prev_user_content},
                 {"role": "assistant", "content": previous_context['processed']},
                 {"role": "user", "content": current_user_content}
             ]
         else:
             # No previous context, use standard format
-            multi_part_content = [
+            return [
                 {"type": "text", "text": prompt},
                 {"type": "text", "text": content}
             ]
 
-        # Create operation name for logging
-        nested_part_id = context.get('nested_part_id')
-        if nested_part_id and nested_part_id != unit_key:
-            # Nested split occurred, show the nested part ID
-            # e.g., "chapter_6.part1.part2" -> "Chapter 6 (part1.part2)"
-            nested_suffix = nested_part_id.replace(f"{file_name.replace('.md', '')}.", '')
-            operation_name = f"{chapter_name} ({nested_suffix})"
-        elif total_parts > 1:
-            operation_name = f"{chapter_name} part {part_idx}/{total_parts}"
-        else:
-            operation_name = chapter_name
+    def post_process(self, result: str, **context) -> str:
+        """
+        Post-process the polished result.
 
-        # Define validator function if not skipping truncation check
-        validator = None
-        if not self.skip_truncation_check:
-            def validator(response: str) -> Tuple[bool, str]:
-                cleaned_response = self.clean_markdown_response(response)
-                is_valid, reason = self.validate_output(
-                    original=content,
-                    processed=cleaned_response,
-                    file_name=f"{file_name} part {part_idx}/{total_parts}" if total_parts > 1 else file_name
-                )
-                if not is_valid and "truncat" in reason.lower():
-                    self._save_truncated_output(file_name, part_idx, total_parts, cleaned_response, reason)
-                return is_valid, reason
+        Applies markdown cleanup and restores lost images for single-part files.
 
-        # Call LLM
-        polished_part = self.generate_with_retry(
-            multi_part_content=multi_part_content,
-            model_configs=self.polish_models,
-            validator=validator,
-            operation_name=operation_name
-        )
+        Args:
+            result: Cleaned LLM response
+            **context: Context including original_content, total_parts
 
-        # Post-process
-        polished_part = self._post_process_markdown(polished_part)
+        Returns:
+            Post-processed result
+        """
+        # Apply markdown post-processing
+        result = self._post_process_markdown(result)
 
         # Restore lost images if single part
+        total_parts = context.get('total_parts', 1)
         if total_parts == 1:
-            polished_part = restore_lost_images(original_content, polished_part)
+            original_content = context.get('original_content', '')
+            result = restore_lost_images(original_content, result)
 
-        return polished_part
+        return result
+
+    def get_context_for_next_part(self, content: str, result: str, **context) -> Optional[Dict]:
+        """
+        Get context to inject into the next part's build_prompt.
+
+        Only provides context in sequential processing mode.
+
+        Args:
+            content: Original content of this part
+            result: Processed result of this part
+            **context: Processing context
+
+        Returns:
+            Context dict for next part, or None if parallel mode
+        """
+        if self.processing_mode == "sequential":
+            return {"original": content, "processed": result}
+        return None
+
+    def on_validation_failure(self, file_name: str, reason: str, response: str) -> None:
+        """
+        Save truncated output for debugging.
+
+        Args:
+            file_name: Name of the file being processed
+            reason: Validation failure reason
+            response: The failed response
+        """
+        if "truncat" in reason.lower():
+            # Extract part info from file_name if present
+            # file_name format: "chapter_5.md part 2/3" or "chapter_5.md"
+            if " part " in file_name:
+                base_file, part_info = file_name.rsplit(" part ", 1)
+                part_idx, total_parts = map(int, part_info.split("/"))
+            else:
+                base_file = file_name
+                part_idx, total_parts = 1, 1
+            self._save_truncated_output(base_file, part_idx, total_parts, response, reason)
 
     def _cleanup_part_files(self, file_name: str) -> None:
         """Clean up any existing part files and progress entries for this file."""

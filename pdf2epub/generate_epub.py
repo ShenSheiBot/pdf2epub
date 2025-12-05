@@ -302,7 +302,7 @@ Book structure to translate:"""
             {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 2},
             {
                 "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5-20250929",
                 "max_retries": 2,
             },
         ],
@@ -440,7 +440,7 @@ ORIGINAL OCR STRUCTURE (reference):
         {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 2},
         {
             "provider": "anthropic",
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-5-20250929",
             "max_retries": 2,
         },
     ]

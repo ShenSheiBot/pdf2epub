@@ -74,7 +74,7 @@ ocr:
     - provider: gemini
       model: gemini-2.5-pro
     # - provider: anthropic
-    #   model: claude-sonnet-4-20250514
+    #   model: claude-sonnet-4-5-20250929
 
 # Translation Configuration
 # =========================
@@ -107,7 +107,7 @@ polish:
       api_retries: 2
       validation_retries: 1
     # - provider: anthropic
-    #   model: claude-sonnet-4-20250514
+    #   model: claude-sonnet-4-5-20250929
     #   api_retries: 2
     #   validation_retries: 1
 
@@ -148,7 +148,7 @@ model_output_limits:
   "gemini-2.5-pro": 8000
   "gemini-2.5-flash": 6000
   "gemini-3-pro-preview": 8000
-  "claude-sonnet-4-20250514": 8000
+  "claude-sonnet-4-5-20250929": 8000
   "claude-3-haiku-20240307": 4000
   "deepseek-chat": 8000
   "gpt-4o": 8000

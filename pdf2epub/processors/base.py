@@ -30,7 +30,22 @@ tokenizer = tiktoken.get_encoding("cl100k_base")
 
 class BaseMarkdownProcessor(ABC):
     """Abstract base class for markdown processors."""
-    
+
+    def __init_subclass__(cls, **kwargs):
+        """
+        Prevent subclasses from overriding process_unit.
+
+        This enforces the Template Method pattern - subclasses must implement
+        build_prompt() instead of process_unit() to ensure validation and
+        error handling are never bypassed.
+        """
+        super().__init_subclass__(**kwargs)
+        if 'process_unit' in cls.__dict__:
+            raise TypeError(
+                f"{cls.__name__} should not override process_unit. "
+                f"Implement build_prompt() instead."
+            )
+
     def __init__(
         self,
         config: Dict,
@@ -81,6 +96,33 @@ class BaseMarkdownProcessor(ABC):
         # Initialize LLM client
         self.llm_client = LLMClient(config)
 
+    # ==================== 子类必须实现的方法 ====================
+
+    @abstractmethod
+    def build_prompt(self, content: str, unit_key: str, **context) -> Any:
+        """
+        Build the prompt for LLM processing.
+
+        Subclasses MUST implement this method instead of process_unit().
+        This ensures validation and error handling are never bypassed.
+
+        Args:
+            content: Content to process
+            unit_key: Unit identifier for tracking (e.g., "chapter_5.part2")
+            **context: Processor-specific context including:
+                - file_name: Original file name
+                - part_idx: Part index (1-based)
+                - total_parts: Total number of parts
+                - previous_context: Context from previous part (if any)
+                - Any other processor-specific data
+
+        Returns:
+            Either:
+            - str: Simple prompt string
+            - List[Dict]: Multi-part content with conversation history
+        """
+        pass
+
     @abstractmethod
     def validate_output(
         self,
@@ -90,21 +132,86 @@ class BaseMarkdownProcessor(ABC):
     ) -> Tuple[bool, str]:
         """
         Validate the processed output.
-        
+
+        Subclasses MUST implement this method.
+        Even if no validation is needed, return (True, "No validation needed").
+
         Args:
             original: Original content
             processed: Processed content
             file_name: Name of the file
-        
+
         Returns:
             Tuple of (is_valid, reason)
         """
         pass
-    
+
+    @abstractmethod
+    def post_process(self, result: str, **context) -> str:
+        """
+        Post-process the LLM result.
+
+        Subclasses MUST implement this method.
+        Even if no post-processing is needed, return result unchanged.
+
+        Args:
+            result: Cleaned LLM response
+            **context: Same context as build_prompt
+
+        Returns:
+            Post-processed result
+        """
+        pass
+
+    @abstractmethod
+    def get_context_for_next_part(self, content: str, result: str, **context) -> Optional[Dict]:
+        """
+        Get context to inject into the next part's build_prompt.
+
+        Subclasses MUST implement this method.
+        Return None if no context injection is needed.
+
+        Args:
+            content: Original content of this part
+            result: Processed result of this part
+            **context: Same context as build_prompt
+
+        Returns:
+            None: No context injection needed
+            Dict: Context dict to pass to next part's build_prompt as 'previous_context'
+        """
+        pass
+
+    @abstractmethod
+    def get_split_strategy(self) -> str:
+        """
+        Get splitting strategy for this processor.
+
+        Subclasses MUST implement this method.
+
+        Returns:
+            Strategy name: 'markdown', 'compressed', 'academic', 'japanese', 'general'
+        """
+        pass
+
+    @abstractmethod
+    def get_model_configs(self) -> List[Dict]:
+        """
+        Get the model configurations for this processor.
+
+        Subclasses MUST implement this method.
+
+        Returns:
+            List of model configuration dictionaries
+        """
+        pass
+
     @abstractmethod
     def get_operation_name(self, file_name: str) -> str:
         """
         Get the operation name for logging.
+
+        Subclasses MUST implement this method.
 
         Args:
             file_name: Name of the file being processed
@@ -114,40 +221,103 @@ class BaseMarkdownProcessor(ABC):
         """
         pass
 
-    @abstractmethod
+    # ==================== 子类可选覆盖的方法 ====================
+
+    def clean_response(self, response: str) -> str:
+        """
+        Clean the LLM response before validation and post-processing.
+
+        Override this method to customize response cleaning (e.g., remove markdown code blocks).
+        Default implementation calls clean_markdown_response().
+
+        Args:
+            response: Raw LLM response
+
+        Returns:
+            Cleaned response
+        """
+        return self.clean_markdown_response(response)
+
+    def on_validation_failure(self, file_name: str, reason: str, response: str) -> None:
+        """
+        Called when validation fails.
+
+        Override this method to perform additional actions on validation failure
+        (e.g., save truncated output for debugging).
+
+        Args:
+            file_name: Name of the file being processed
+            reason: Validation failure reason
+            response: The failed response (already cleaned)
+        """
+        pass
+
+    # ==================== 基类实现的核心方法 ====================
+
     def process_unit(self, content: str, unit_key: str, **context) -> str:
         """
-        Process a single content unit (part or whole file).
+        Process a single content unit with validation and error handling.
 
-        This is the core processing logic that each processor must implement.
-        It will be called by process_content_with_resplit() for each part.
+        DO NOT override this method in subclasses. The __init_subclass__ check
+        will raise TypeError if you try to override it.
+
+        Instead, implement build_prompt(), validate_output(), and post_process().
 
         Args:
             content: Content to process
-            unit_key: Unit identifier for tracking (e.g., "chapter_5.part2")
-            **context: Processor-specific context including:
-                - file_name: Original file name
-                - part_idx: Part index (1-based)
-                - total_parts: Total number of parts
-                - Any other processor-specific data
+            unit_key: Unit identifier for tracking
+            **context: Processor-specific context
 
         Returns:
             Processed content
-
-        Raises:
-            Exception: Any processing failure (handled by base retry/resplit logic)
         """
-        pass
+        if not content.strip():
+            return content
 
-    @abstractmethod
-    def get_model_configs(self) -> List[Dict]:
-        """
-        Get the model configurations for this processor.
+        file_name = context.get('file_name', unit_key)
+        part_idx = context.get('part_idx')
+        total_parts = context.get('total_parts')
+        nested_part_id = context.get('nested_part_id')
 
-        Returns:
-            List of model configuration dictionaries
-        """
-        pass
+        # Build file_name_with_part for logging and error reporting
+        if part_idx and total_parts and total_parts > 1:
+            file_name_with_part = f"{file_name} part {part_idx}/{total_parts}"
+        else:
+            file_name_with_part = file_name
+
+        # Build operation_name with part info
+        base_operation_name = self.get_operation_name(file_name)
+        if nested_part_id and nested_part_id != unit_key:
+            # Nested split occurred
+            nested_suffix = nested_part_id.replace(f"{file_name.replace('.md', '')}.", '')
+            operation_name = f"{base_operation_name} ({nested_suffix})"
+        elif part_idx and total_parts and total_parts > 1:
+            operation_name = f"{base_operation_name} part {part_idx}/{total_parts}"
+        else:
+            operation_name = base_operation_name
+
+        # 1. Subclass builds the prompt
+        prompt = self.build_prompt(content, unit_key, **context)
+
+        # 2. Build validator that calls subclass's validate_output
+        def validator(response: str) -> Tuple[bool, str]:
+            cleaned = self.clean_response(response)
+            is_valid, reason = self.validate_output(content, cleaned, file_name_with_part)
+            if not is_valid:
+                self.on_validation_failure(file_name_with_part, reason, cleaned)
+            return is_valid, reason
+
+        # 3. Call LLM with validation (auto-saves error outputs)
+        result = self.generate_with_retry(
+            multi_part_content=prompt,
+            model_configs=self.get_model_configs(),
+            validator=validator,
+            operation_name=operation_name
+        )
+
+        # 4. Clean response and call subclass's post_process
+        cleaned = self.clean_response(result)
+        return self.post_process(cleaned, **context)
 
     # === Split-Aware Processing ===
 
@@ -191,14 +361,6 @@ class BaseMarkdownProcessor(ABC):
             first_model = model_configs[0].get('model', '')
             return self.get_model_output_limit(first_model)
         return self.config.get('model_output_limits', {}).get('_default', 4000)
-
-    def get_split_strategy(self) -> str:
-        """
-        Get splitting strategy for this processor.
-
-        Override to use different strategies (auto, general, academic, japanese).
-        """
-        return self.config.get('split_strategy', 'auto')
 
     def create_split_manager(self, tracker: ProcessingTracker) -> SplitManager:
         """
@@ -307,7 +469,24 @@ class BaseMarkdownProcessor(ABC):
         inject_context = self.get_inject_context()
         return self.process_all_units(inject_context=inject_context)
 
-    def process_all_units(self, inject_context: bool = False) -> Dict[str, Any]:
+    def process_specific_files(self, file_stems: List[str]) -> Dict[str, Any]:
+        """
+        Process only specific files by their stem names.
+
+        Args:
+            file_stems: List of file stems to process (e.g., ["chapter_1", "chapter_2"])
+
+        Returns:
+            Summary statistics
+        """
+        inject_context = self.get_inject_context()
+        return self.process_all_units(inject_context=inject_context, file_filter=set(file_stems))
+
+    def process_all_units(
+        self,
+        inject_context: bool = False,
+        file_filter: Optional[set] = None
+    ) -> Dict[str, Any]:
         """
         Process all work units with a flat thread pool.
 
@@ -316,6 +495,7 @@ class BaseMarkdownProcessor(ABC):
 
         Args:
             inject_context: If True, parts depend on previous parts for context
+            file_filter: If provided, only process units whose file_key is in this set
 
         Returns:
             Summary statistics
@@ -328,6 +508,11 @@ class BaseMarkdownProcessor(ABC):
             splits_dir=self.splits_dir
         )
         all_units = discovery.discover_all_units()
+
+        # Apply file filter if provided
+        if file_filter:
+            all_units = [u for u in all_units if u.file_key in file_filter]
+            logger.info(f"Filtered to {len(all_units)} units matching file filter")
 
         if not all_units:
             logger.error(f"No work units found in {self.input_dir}")
@@ -554,8 +739,9 @@ class BaseMarkdownProcessor(ABC):
                         f"{unit.token_count:,} tokens > {max_tokens:,} limit"
                     )
 
-                    # Split using the configured splitter
-                    splitter = get_splitter("markdown")
+                    # Split using the processor's configured strategy
+                    strategy = self.get_split_strategy()
+                    splitter = get_splitter(strategy)
                     parts = splitter.split(unit.content, max_tokens)
 
                     if len(parts) > 1:

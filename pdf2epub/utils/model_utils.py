@@ -111,7 +111,7 @@ def get_quality_model_configs(
     if config.get('anthropic_api_key'):
         model_configs.append({
             "provider": "anthropic",
-            "model": config.get('anthropic_model', 'claude-sonnet-4-20250514'),
+            "model": config.get('anthropic_model', 'claude-sonnet-4-5-20250929'),
             "max_retries": 2
         })
     

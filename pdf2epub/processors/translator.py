@@ -70,9 +70,10 @@ class TranslateProcessor(BaseMarkdownProcessor):
         self.validate_chinese = validation_config.get('validate_chinese_translation', True)
         
         # Set default translation models if not provided
-        self.translation_models = translation_models or [
-            {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 2},
-            {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+        # Use translation.models from config, same as regular translate
+        self.translation_models = translation_models or config.get('translation', {}).get('models') or [
+            {"provider": "gemini", "model": "gemini-2.5-pro", "api_retries": 2, "validation_retries": 2},
+            {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929", "api_retries": 2, "validation_retries": 1}
         ]
         
         # Initialize truncation detector
@@ -120,9 +121,9 @@ class TranslateProcessor(BaseMarkdownProcessor):
         """Get the model configurations for translation."""
         return self.translation_models
 
-    def process_unit(self, content: str, unit_key: str, **context) -> str:
+    def build_prompt(self, content: str, unit_key: str, **context) -> List[Dict]:
         """
-        Translate a single content unit (part or whole file).
+        Build the translation prompt with optional conversation history.
 
         Args:
             content: Content to translate
@@ -130,12 +131,8 @@ class TranslateProcessor(BaseMarkdownProcessor):
             **context: Context including file_name, part_idx, total_parts, previous_context
 
         Returns:
-            Translated content
-
-        Raises:
-            Exception: On translation failure
+            Multi-part content for LLM (may include conversation history)
         """
-        file_name = context.get('file_name', unit_key)
         part_idx = context.get('part_idx')
         total_parts = context.get('total_parts')
         previous_context = context.get('previous_context')
@@ -154,58 +151,83 @@ class TranslateProcessor(BaseMarkdownProcessor):
                 {"type": "text", "text": f"Now translate part {part_idx}/{total_parts} (continuation). Maintain consistent terminology and style with the previous translation.\n\nContent to translate:"},
                 {"type": "text", "text": content}
             ]
-            multi_part_content = [
+            return [
                 {"role": "user", "content": prev_user_content},
                 {"role": "assistant", "content": previous_context['processed']},
                 {"role": "user", "content": current_user_content}
             ]
         else:
             # No previous context, use standard format
-            multi_part_content = [
+            return [
                 {"type": "text", "text": prompt},
                 {"type": "text", "text": content}
             ]
 
-        # Generate operation name
-        nested_part_id = context.get('nested_part_id')
-        unit_key = context.get('unit_key', file_name.replace('.md', ''))
+    def clean_response(self, response: str) -> str:
+        """
+        Clean LLM response before validation.
 
-        if nested_part_id and nested_part_id != unit_key:
-            # Nested split occurred, show the nested part ID
-            # e.g., "chapter_6.part1.part2" -> "Translate chapter_6.md (part1.part2)"
-            nested_suffix = nested_part_id.replace(f"{file_name.replace('.md', '')}.", '')
-            operation_name = f"{self.get_operation_name(file_name)} ({nested_suffix})"
-        else:
-            operation_name = self.get_operation_name(file_name)
-            if part_idx and total_parts:
-                operation_name = f"{operation_name} part {part_idx}/{total_parts}"
+        Performs all cleaning that was previously done before validation:
+        1. Markdown cleanup (remove code blocks)
+        2. Japanese artifact cleanup (if Japanese to Chinese)
+        3. Footnote colon correction
 
-        # Define validator function
-        def validator(response: str) -> Tuple[bool, str]:
-            cleaned = self.clean_markdown_response(response)
-            if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
-                cleaned = self._clean_japanese_artifacts(cleaned)
-            cleaned = self._correct_footnote_colons(cleaned)
-            return self.validate_output(
-                original=content,
-                processed=cleaned,
-                file_name=f"{file_name} part {part_idx}/{total_parts}" if part_idx and total_parts else file_name
-            )
+        Args:
+            response: Raw LLM response
 
-        # Call LLM
-        translated_content = self.generate_with_retry(
-            multi_part_content=multi_part_content,
-            model_configs=self.translation_models,
-            validator=validator,
-            operation_name=operation_name
-        )
+        Returns:
+            Fully cleaned response (ready for validation)
+        """
+        # First do standard markdown cleanup
+        cleaned = self.clean_markdown_response(response)
 
-        # Apply post-processing
+        # Clean Japanese artifacts if translating Japanese to Chinese
         if self.source_language.lower() in ["japanese", "日本語"] and self.target_language.lower() in ["chinese", "中文", "chinese simplified", "简体中文"]:
-            translated_content = self._clean_japanese_artifacts(translated_content)
-        translated_content = self._correct_footnote_colons(translated_content)
+            cleaned = self._clean_japanese_artifacts(cleaned)
 
-        return translated_content
+        # Correct footnote colons
+        return self._correct_footnote_colons(cleaned)
+
+    def post_process(self, result: str, **context) -> str:
+        """
+        Post-process the translated result.
+
+        All cleaning is done in clean_response() before validation,
+        so post_process just returns the result unchanged.
+
+        Args:
+            result: Already cleaned LLM response
+            **context: Processing context
+
+        Returns:
+            Result unchanged
+        """
+        return result
+
+    def get_context_for_next_part(self, content: str, result: str, **context) -> Optional[Dict]:
+        """
+        Get context to inject into the next part's build_prompt.
+
+        Always provides context for terminology/style consistency.
+
+        Args:
+            content: Original content of this part
+            result: Processed result of this part
+            **context: Processing context
+
+        Returns:
+            Context dict for next part
+        """
+        return {"original": content, "processed": result}
+
+    def get_split_strategy(self) -> str:
+        """
+        Get splitting strategy for this processor.
+
+        Returns:
+            Strategy name: 'markdown'
+        """
+        return 'markdown'
 
     def validate_output(
         self,

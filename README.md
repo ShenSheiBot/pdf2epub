@@ -121,7 +121,7 @@ ocr_backend: vllm  # 使用VLLM后端
 # VLLM模型配置
 ocr_vllm_models:
   - provider: anthropic
-    model: claude-sonnet-4-20250514
+    model: claude-sonnet-4-5-20250929
     max_retries: 2
   # 或使用Gemini
   - provider: gemini
@@ -170,7 +170,7 @@ target_language: Chinese
 # 处理模型配置
 polish_models:
   - provider: anthropic
-    model: claude-sonnet-4-20250514
+    model: claude-sonnet-4-5-20250929
     max_retries: 2
 
 translation_models:
@@ -330,7 +330,7 @@ polish_models:
     model: gemini-2.5-pro
     max_retries: 1  # 瞬时错误重试次数
   - provider: anthropic
-    model: claude-sonnet-4-20250514
+    model: claude-sonnet-4-5-20250929
     max_retries: 2
 ```
 

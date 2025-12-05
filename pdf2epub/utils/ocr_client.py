@@ -105,7 +105,7 @@ Transcribe the entire page content accurately."""
         if model_configs is None:
             model_configs = self.config.get("ocr_models", [
                 {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 1},
-                {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+                {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929", "max_retries": 2}
             ])
         
         prompt = custom_prompt if custom_prompt else self.OCR_PROMPT

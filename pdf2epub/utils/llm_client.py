@@ -217,7 +217,7 @@ class LLMClient:
         if model_configs is None:
             model_configs = self.config.get("polish_models", [
                 {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 1},
-                {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+                {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929", "max_retries": 2}
             ])
         
         last_error = None
@@ -355,7 +355,7 @@ class LLMClient:
         if model_configs is None:
             model_configs = self.config.get("polish_models", [
                 {"provider": "gemini", "model": "gemini-2.5-pro", "max_retries": 1},
-                {"provider": "anthropic", "model": "claude-sonnet-4-20250514", "max_retries": 2}
+                {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929", "max_retries": 2}
             ])
 
         validation_strategy.clear_attempts()

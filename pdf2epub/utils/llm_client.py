@@ -5,9 +5,10 @@ Handles provider-specific logic and retry strategies internally.
 
 from typing import Union, List, Dict, Optional, Any, Callable, Tuple
 from loguru import logger
-from tenacity import retry, stop_after_attempt, stop_after_delay, wait_random_exponential, retry_if_exception
+from tenacity import stop_after_delay, wait_random_exponential
+from .retry_utils import retry_with_logging
 from .network_utils import (
-    GeminiClient, 
+    GeminiClient,
     AnthropicClient,
     OpenAIClient,
     is_transient_gemini_error,
@@ -575,15 +576,11 @@ class LLMClient:
         max_retry_duration = self.config.get('retry', {}).get('max_retry_duration_seconds', 300)
 
         # Create retry decorator with time-based limit for network/rate-limit errors
-        @retry(
-            retry=retry_if_exception(self._is_retryable_gemini_error),
-            wait=wait_random_exponential(multiplier=2, max=max_wait_between),
-            stop=stop_after_delay(max_retry_duration),
-            reraise=True,
-            before_sleep=lambda rs: logger.info(
-                f"Retrying {operation_name} in {rs.next_action.sleep:.1f}s "
-                f"(attempt {rs.attempt_number}, elapsed {rs.seconds_since_start:.0f}s)"
-            )
+        @retry_with_logging(
+            operation_name=operation_name,
+            retry_condition=self._is_retryable_gemini_error,
+            wait_strategy=wait_random_exponential(multiplier=2, max=max_wait_between),
+            stop_strategy=stop_after_delay(max_retry_duration),
         )
         def generate_with_retry():
             try:
@@ -626,15 +623,11 @@ class LLMClient:
         max_retry_duration = self.config.get('retry', {}).get('max_retry_duration_seconds', 300)
 
         # Create retry decorator with time-based limit for network/rate-limit errors
-        @retry(
-            retry=retry_if_exception(self._is_retryable_anthropic_error),
-            wait=wait_random_exponential(multiplier=2, max=max_wait_between),
-            stop=stop_after_delay(max_retry_duration),
-            reraise=True,
-            before_sleep=lambda rs: logger.info(
-                f"Retrying {operation_name} in {rs.next_action.sleep:.1f}s "
-                f"(attempt {rs.attempt_number}, elapsed {rs.seconds_since_start:.0f}s)"
-            )
+        @retry_with_logging(
+            operation_name=operation_name,
+            retry_condition=self._is_retryable_anthropic_error,
+            wait_strategy=wait_random_exponential(multiplier=2, max=max_wait_between),
+            stop_strategy=stop_after_delay(max_retry_duration),
         )
         def generate_with_retry():
             try:
@@ -695,15 +688,11 @@ class LLMClient:
         max_retry_duration = self.config.get('retry', {}).get('max_retry_duration_seconds', 300)
 
         # Create retry decorator with time-based limit for network/rate-limit errors
-        @retry(
-            retry=retry_if_exception(self._is_retryable_openai_error),
-            wait=wait_random_exponential(multiplier=2, max=max_wait_between),
-            stop=stop_after_delay(max_retry_duration),
-            reraise=True,
-            before_sleep=lambda rs: logger.info(
-                f"Retrying {operation_name} in {rs.next_action.sleep:.1f}s "
-                f"(attempt {rs.attempt_number}, elapsed {rs.seconds_since_start:.0f}s)"
-            )
+        @retry_with_logging(
+            operation_name=operation_name,
+            retry_condition=self._is_retryable_openai_error,
+            wait_strategy=wait_random_exponential(multiplier=2, max=max_wait_between),
+            stop_strategy=stop_after_delay(max_retry_duration),
         )
         def generate_with_retry():
             try:

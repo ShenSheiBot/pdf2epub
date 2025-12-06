@@ -4,9 +4,10 @@ OCR-specific LLM client for handling Japanese text OCR with multiple model fallb
 
 from typing import Union, List, Dict, Optional, Any
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
+from tenacity import stop_after_attempt, wait_random_exponential
+from .retry_utils import retry_with_logging
 from .network_utils import (
-    GeminiClient, 
+    GeminiClient,
     AnthropicClient,
     is_transient_gemini_error,
     is_transient_anthropic_error
@@ -212,11 +213,11 @@ Transcribe the entire page content accurately."""
         generation_config = self._gemini_client.get_default_config(temperature)
         
         # Create retry decorator with specified attempts
-        @retry(
-            retry=retry_if_exception(self._is_retryable_gemini_error),
-            wait=wait_random_exponential(multiplier=1, max=30),
-            stop=stop_after_attempt(max_retries),
-            reraise=True
+        @retry_with_logging(
+            operation_name=operation_name,
+            retry_condition=self._is_retryable_gemini_error,
+            wait_strategy=wait_random_exponential(multiplier=1, max=30),
+            stop_strategy=stop_after_attempt(max_retries),
         )
         def ocr_with_retry():
             try:
@@ -232,7 +233,7 @@ Transcribe the entire page content accurately."""
                 if any(term in error_str for term in ['prohibited', 'safety', 'blocked']):
                     raise SafetyBlockError(str(e), "gemini")
                 raise
-        
+
         return ocr_with_retry()
     
     def _ocr_with_anthropic(
@@ -266,11 +267,11 @@ Transcribe the entire page content accurately."""
         max_tokens = 8192  # Sufficient for most OCR tasks
         
         # Create retry decorator with specified attempts
-        @retry(
-            retry=retry_if_exception(self._is_retryable_anthropic_error),
-            wait=wait_random_exponential(multiplier=1, max=30),
-            stop=stop_after_attempt(max_retries),
-            reraise=True
+        @retry_with_logging(
+            operation_name=operation_name,
+            retry_condition=self._is_retryable_anthropic_error,
+            wait_strategy=wait_random_exponential(multiplier=1, max=30),
+            stop_strategy=stop_after_attempt(max_retries),
         )
         def ocr_with_retry():
             try:
@@ -287,7 +288,7 @@ Transcribe the entire page content accurately."""
                 if any(term in error_str for term in ['content_policy', 'unsafe', 'violation']):
                     raise SafetyBlockError(str(e), "anthropic")
                 raise
-        
+
         return ocr_with_retry()
     
     def _is_retryable_gemini_error(self, exception: Exception) -> bool:

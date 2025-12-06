@@ -14,10 +14,33 @@ from google.genai.types import (
     SafetySetting,
     ThinkingConfig
 )
-from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception, RetryCallState
 from tenacity.stop import stop_base
 from tenacity.wait import wait_base
 import tiktoken
+
+
+def _create_method_before_sleep(operation_name_param: str = "operation_name") -> callable:
+    """
+    Create a before_sleep callback for class methods that logs exception details.
+
+    This extracts operation_name from method kwargs and includes exception info.
+    """
+    def before_sleep(retry_state: RetryCallState) -> None:
+        # Get operation_name from kwargs
+        operation_name = retry_state.kwargs.get(operation_name_param, "API call")
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+
+        if exc:
+            exc_msg = str(exc).replace('\n', ' ')[:500]
+        else:
+            exc_msg = "unknown error"
+
+        logger.warning(
+            f"Retry {retry_state.attempt_number} for {operation_name}: "
+            f"waiting {retry_state.next_action.sleep:.1f}s | {exc_msg}"
+        )
+    return before_sleep
 
 
 class stop_after_self_retries(stop_base):
@@ -150,7 +173,8 @@ class GeminiClient:
         retry=retry_if_exception(is_transient_gemini_error),
         wait=wait_exponential_with_self_max(multiplier=1),
         stop=stop_after_self_retries(),
-        reraise=True
+        reraise=True,
+        before_sleep=_create_method_before_sleep("operation_name")
     )
     def generate_content(
         self,
@@ -180,7 +204,8 @@ class GeminiClient:
         retry=retry_if_exception(is_transient_gemini_error),
         wait=wait_exponential_with_self_max(multiplier=1),
         stop=stop_after_self_retries(),
-        reraise=True
+        reraise=True,
+        before_sleep=_create_method_before_sleep("operation_name")
     )
     def generate_content_stream(
         self,
@@ -306,7 +331,8 @@ class AnthropicClient:
         retry=retry_if_exception(is_transient_anthropic_error),
         wait=wait_exponential_with_self_max(multiplier=1),
         stop=stop_after_self_retries(),
-        reraise=True
+        reraise=True,
+        before_sleep=_create_method_before_sleep("operation_name")
     )
     def generate_content(
         self,

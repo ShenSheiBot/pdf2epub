@@ -315,13 +315,16 @@ class HTMLEpubBuilder:
         return result
 
     def _update_content_opf(self, extract_dir: Path, metadata: Dict):
-        """Update content.opf with translated title."""
+        """Update content.opf with translated title and language."""
         opf_path = self._find_opf_path(extract_dir)
         if not opf_path:
             logger.warning("No OPF file found")
             return
+
         translated_title = metadata.get('translated_title')
-        if not translated_title:
+        target_lang_code = metadata.get('target_language_code')
+
+        if not translated_title and not target_lang_code:
             return
 
         try:
@@ -336,21 +339,40 @@ class HTMLEpubBuilder:
             }
 
             # Find and update dc:title
-            # Try with namespace first
-            title_elem = root.find('.//dc:title', namespaces)
-            if title_elem is None:
-                # Try without namespace (some EPUBs don't use namespaces properly)
-                for elem in root.iter():
-                    if elem.tag.endswith('}title') or elem.tag == 'title':
-                        title_elem = elem
-                        break
+            if translated_title:
+                # Try with namespace first
+                title_elem = root.find('.//dc:title', namespaces)
+                if title_elem is None:
+                    # Try without namespace (some EPUBs don't use namespaces properly)
+                    for elem in root.iter():
+                        if elem.tag.endswith('}title') or elem.tag == 'title':
+                            title_elem = elem
+                            break
 
-            if title_elem is not None:
-                title_elem.text = translated_title
-                tree.write(opf_path, encoding='utf-8', xml_declaration=True)
-                logger.debug(f"Updated content.opf title: {translated_title}")
-            else:
-                logger.warning("dc:title element not found in content.opf")
+                if title_elem is not None:
+                    title_elem.text = translated_title
+                    logger.debug(f"Updated content.opf title: {translated_title}")
+                else:
+                    logger.warning("dc:title element not found in content.opf")
+
+            # Find and update dc:language
+            if target_lang_code:
+                lang_elem = root.find('.//dc:language', namespaces)
+                if lang_elem is None:
+                    # Try without namespace
+                    for elem in root.iter():
+                        if elem.tag.endswith('}language') or elem.tag == 'language':
+                            lang_elem = elem
+                            break
+
+                if lang_elem is not None:
+                    old_lang = lang_elem.text
+                    lang_elem.text = target_lang_code
+                    logger.debug(f"Updated content.opf language: {old_lang} -> {target_lang_code}")
+                else:
+                    logger.warning("dc:language element not found in content.opf")
+
+            tree.write(opf_path, encoding='utf-8', xml_declaration=True)
 
         except Exception as e:
             logger.warning(f"Failed to update content.opf: {e}")
@@ -694,6 +716,26 @@ class HTMLEpubPipeline:
         base_code = lang_code.split('-')[0].lower()
         return lang_map.get(base_code, 'English')
 
+    def _get_language_code(self, language: str) -> str:
+        """Convert language name to ISO 639-1 code for EPUB metadata."""
+        # Map full names to language codes (reverse of _detect_language)
+        name_to_code = {
+            'english': 'en',
+            'japanese': 'ja',
+            'chinese': 'zh',
+            'german': 'de',
+            'french': 'fr',
+            'spanish': 'es',
+            'korean': 'ko',
+            'russian': 'ru',
+            '中文': 'zh',
+            '日本語': 'ja',
+            '한국어': 'ko',
+        }
+
+        lang_lower = language.lower()
+        return name_to_code.get(lang_lower, 'zh')  # Default to 'zh' for Chinese
+
     def extract_and_preprocess(self) -> int:
         """
         Extract XHTML from EPUB and compress for translation.
@@ -775,6 +817,47 @@ class HTMLEpubPipeline:
         logger.info(f"Compressed {extracted} XHTML files to {self.compressed_units_dir}")
         return extracted
 
+    def _merge_part_files(self) -> Dict[str, str]:
+        """
+        Merge split part files (*.part1.md, *.part2.md, etc.) into combined content.
+
+        When files are split for translation due to size limits, they produce
+        files like split_023.part1.md, split_023.part2.md. This method merges
+        them back together.
+
+        Returns:
+            Dict mapping base_name -> merged_content
+        """
+        import re
+        from collections import defaultdict
+
+        # Group files by base name
+        part_files = defaultdict(list)
+        part_pattern = re.compile(r'^(.+)\.part(\d+)\.md$')
+
+        for f in self.translated_dir.glob("*.part*.md"):
+            match = part_pattern.match(f.name)
+            if match:
+                base_name = match.group(1)
+                part_num = int(match.group(2))
+                part_files[base_name].append((part_num, f))
+
+        # Merge each group in order
+        merged = {}
+        for base_name, parts in part_files.items():
+            # Sort by part number
+            parts.sort(key=lambda x: x[0])
+
+            # Concatenate content
+            content_parts = []
+            for part_num, part_file in parts:
+                content_parts.append(part_file.read_text(encoding='utf-8'))
+
+            merged[base_name] = '\n'.join(content_parts)
+            logger.debug(f"Merged {len(parts)} parts for {base_name}")
+
+        return merged
+
     def postprocess_and_build(self, output_epub: Optional[Path] = None) -> Path:
         """
         Decompress translated content and build final EPUB.
@@ -789,33 +872,79 @@ class HTMLEpubPipeline:
             Path to built EPUB
         """
         import json
+        import re
         from .compressor import HTMLCompressor
 
         compressor = HTMLCompressor()
 
+        # First, merge any split part files
+        merged_parts = self._merge_part_files()
+        if merged_parts:
+            logger.info(f"Merged {len(merged_parts)} split files")
+
+        # Track which base names have been processed (to avoid duplicates)
+        processed_bases = set()
+
         # Decompress each translated file
         for translated_file in self.translated_dir.glob("*.md"):
-            mapping_path = self.compressed_units_dir / f"{translated_file.stem}.mapping.json"
+            # Skip part files (they've been merged)
+            if re.match(r'.*\.part\d+\.md$', translated_file.name):
+                continue
+
+            base_stem = translated_file.stem
+            mapping_path = self.compressed_units_dir / f"{base_stem}.mapping.json"
 
             if mapping_path.exists():
                 # Load mapping
                 with open(mapping_path, 'r', encoding='utf-8') as f:
                     mapping = json.load(f)
 
-                # Read translated compressed content
-                content = translated_file.read_text(encoding='utf-8')
+                # Check if we have merged content for this file
+                if base_stem in merged_parts:
+                    # Use merged content from parts
+                    content = merged_parts[base_stem]
+                    logger.debug(f"Using merged content for {base_stem}")
+                else:
+                    # Read translated compressed content directly
+                    content = translated_file.read_text(encoding='utf-8')
 
                 # Decompress to full HTML
                 restored = compressor.decompress(content, mapping)
 
                 # Save to final directory with original extension (.html or .xhtml)
                 original_ext = mapping.get('original_extension', '.xhtml')
-                final_path = self.final_dir / f"{translated_file.stem}{original_ext}"
+                final_path = self.final_dir / f"{base_stem}{original_ext}"
                 final_path.write_text(restored, encoding='utf-8')
 
-                logger.debug(f"Decompressed: {translated_file.stem}")
+                processed_bases.add(base_stem)
+                logger.debug(f"Decompressed: {base_stem}")
             else:
-                logger.warning(f"No mapping found for {translated_file.name}")
+                # Check if this is a base name that only has part files
+                if base_stem in merged_parts:
+                    # We have merged parts but no direct file - need to find mapping
+                    # This shouldn't happen normally, but handle it
+                    logger.warning(f"Found merged parts for {base_stem} but no base file")
+                else:
+                    logger.warning(f"No mapping found for {translated_file.name}")
+
+        # Handle cases where we have merged parts but no base .md file
+        for base_stem, content in merged_parts.items():
+            if base_stem in processed_bases:
+                continue
+
+            mapping_path = self.compressed_units_dir / f"{base_stem}.mapping.json"
+            if mapping_path.exists():
+                with open(mapping_path, 'r', encoding='utf-8') as f:
+                    mapping = json.load(f)
+
+                restored = compressor.decompress(content, mapping)
+                original_ext = mapping.get('original_extension', '.xhtml')
+                final_path = self.final_dir / f"{base_stem}{original_ext}"
+                final_path.write_text(restored, encoding='utf-8')
+
+                logger.debug(f"Decompressed from merged parts: {base_stem}")
+            else:
+                logger.warning(f"No mapping found for merged parts: {base_stem}")
 
         # Load translated metadata if available
         metadata_path = self.output_dir / "translated_metadata.json"
@@ -889,10 +1018,15 @@ class HTMLEpubPipeline:
             flat_toc, self.source_language, target_language, llm_client, batch_size
         )
 
+        # Map target language to ISO 639-1 code for EPUB metadata
+        target_lang_code = self._get_language_code(target_language)
+
         # Build result
         result = {
             'original_title': self.book_title,
             'translated_title': translated_title,
+            'target_language': target_language,
+            'target_language_code': target_lang_code,
             'toc': translated_toc
         }
 

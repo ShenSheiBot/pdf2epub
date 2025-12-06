@@ -5,7 +5,7 @@ Handles provider-specific logic and retry strategies internally.
 
 from typing import Union, List, Dict, Optional, Any, Callable, Tuple
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
+from tenacity import retry, stop_after_attempt, stop_after_delay, wait_random_exponential, retry_if_exception
 from .network_utils import (
     GeminiClient, 
     AnthropicClient,
@@ -471,13 +471,12 @@ class LLMClient:
 
                 except Exception as e:
                     last_error = e
+                    # If we get here, it means the retry logic exhausted (30 min timeout)
+                    # or a non-retryable error occurred
                     logger.warning(
-                        f"Error with {provider} model {model} (attempt {val_attempt + 1}): {e}"
+                        f"API error with {provider} model {model} after retries exhausted: {e}"
                     )
-                    if val_attempt < validation_retries:
-                        continue  # Retry if we have attempts left
-                    else:
-                        break  # Move to next model
+                    break  # Move to next model - validation_retries are for validation failures, not API errors
 
             # Check if should try next model
             all_attempts_failed = not any(
@@ -569,15 +568,22 @@ class LLMClient:
         config = gemini_client.get_default_config(temperature)
         # Max output tokens is already set to 65536 in get_default_config
 
-        # Get max wait from config
-        max_wait = self.config.get('retry', {}).get('max_wait_seconds', self.config.get('max_backoff_seconds', 30))
+        # Get retry config: use time-based limit for network errors (5 min default)
+        # max_wait_between_retries is the max backoff between retries
+        max_wait_between = self.config.get('retry', {}).get('max_wait_seconds', 120)
+        # max_retry_duration is the total time to keep retrying (5 min = 300s)
+        max_retry_duration = self.config.get('retry', {}).get('max_retry_duration_seconds', 300)
 
-        # Create retry decorator with specified attempts
+        # Create retry decorator with time-based limit for network/rate-limit errors
         @retry(
             retry=retry_if_exception(self._is_retryable_gemini_error),
-            wait=wait_random_exponential(multiplier=1, max=max_wait),
-            stop=stop_after_attempt(max_retries),
-            reraise=True
+            wait=wait_random_exponential(multiplier=2, max=max_wait_between),
+            stop=stop_after_delay(max_retry_duration),
+            reraise=True,
+            before_sleep=lambda rs: logger.info(
+                f"Retrying {operation_name} in {rs.next_action.sleep:.1f}s "
+                f"(attempt {rs.attempt_number}, elapsed {rs.seconds_since_start:.0f}s)"
+            )
         )
         def generate_with_retry():
             try:
@@ -615,15 +621,20 @@ class LLMClient:
         temperature = 0.1  # Low temperature for consistent results
         max_tokens = 64000  # Claude Sonnet 4 max limit
 
-        # Get max wait from config
-        max_wait = self.config.get('retry', {}).get('max_wait_seconds', self.config.get('max_backoff_seconds', 30))
+        # Get retry config: use time-based limit for network errors (5 min default)
+        max_wait_between = self.config.get('retry', {}).get('max_wait_seconds', 120)
+        max_retry_duration = self.config.get('retry', {}).get('max_retry_duration_seconds', 300)
 
-        # Create retry decorator with specified attempts
+        # Create retry decorator with time-based limit for network/rate-limit errors
         @retry(
             retry=retry_if_exception(self._is_retryable_anthropic_error),
-            wait=wait_random_exponential(multiplier=1, max=max_wait),
-            stop=stop_after_attempt(max_retries),
-            reraise=True
+            wait=wait_random_exponential(multiplier=2, max=max_wait_between),
+            stop=stop_after_delay(max_retry_duration),
+            reraise=True,
+            before_sleep=lambda rs: logger.info(
+                f"Retrying {operation_name} in {rs.next_action.sleep:.1f}s "
+                f"(attempt {rs.attempt_number}, elapsed {rs.seconds_since_start:.0f}s)"
+            )
         )
         def generate_with_retry():
             try:
@@ -679,15 +690,20 @@ class LLMClient:
 
         temperature = 0.1  # Low temperature for consistent results
 
-        # Get max wait from config
-        max_wait = self.config.get('retry', {}).get('max_wait_seconds', self.config.get('max_backoff_seconds', 30))
+        # Get retry config: use time-based limit for network errors (5 min default)
+        max_wait_between = self.config.get('retry', {}).get('max_wait_seconds', 120)
+        max_retry_duration = self.config.get('retry', {}).get('max_retry_duration_seconds', 300)
 
-        # Create retry decorator with specified attempts
+        # Create retry decorator with time-based limit for network/rate-limit errors
         @retry(
             retry=retry_if_exception(self._is_retryable_openai_error),
-            wait=wait_random_exponential(multiplier=1, max=max_wait),
-            stop=stop_after_attempt(max_retries),
-            reraise=True
+            wait=wait_random_exponential(multiplier=2, max=max_wait_between),
+            stop=stop_after_delay(max_retry_duration),
+            reraise=True,
+            before_sleep=lambda rs: logger.info(
+                f"Retrying {operation_name} in {rs.next_action.sleep:.1f}s "
+                f"(attempt {rs.attempt_number}, elapsed {rs.seconds_since_start:.0f}s)"
+            )
         )
         def generate_with_retry():
             try:

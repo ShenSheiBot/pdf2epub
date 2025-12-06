@@ -237,7 +237,7 @@ class ValidationStrategy:
 
         # Only try next model if fallback is enabled and current model failed
         if self.fallback_between_models and all_attempts_failed:
-            logger.info(f"Model {model_idx + 1} failed validation, trying next model...")
+            logger.info(f"Model {model_idx + 1} exhausted all attempts, trying next model...")
             return True
 
         return False

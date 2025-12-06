@@ -19,13 +19,33 @@
 
 ## 工作流程 (Workflow)
 
-### 推荐工作流 (Recommended - uses toc_tree.json)
+### PDF 工作流 (Recommended - uses toc_tree.json)
+
+适用于 PDF 扫描件转换：
 
 1. **ocr-pages**：逐页进行 OCR，使用多模态 LLM 将每页转换成带有插图的 markdown
 2. **refine**：智能分析 TOC 结构，验证章节边界，生成精确的 toc_tree.json（支持无限层级嵌套）
 3. **polish**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
 4. **translate**：（可选）使用 LLM 翻译成目标语言
 5. **build-epub**：基于 toc_tree.json 生成 EPUB
+
+### EPUB 翻译工作流 (NEW - 保留原始格式)
+
+适用于已有 EPUB 文件的翻译，完整保留原书的 CSS 样式、字体、排版：
+
+1. **translate-html**：直接翻译 EPUB 内的 XHTML 内容，保留所有 HTML 结构和样式
+2. **build-html-epub**：将翻译后的 HTML 重新打包成 EPUB
+
+```bash
+# EPUB 翻译示例
+uv run pdf2epub translate-html -i book.epub --target-language Chinese
+uv run pdf2epub build-html-epub
+```
+
+优势：
+- 完整保留原书的 CSS 样式、字体、封面、目录结构
+- 翻译后的书籍排版与原书一致
+- 支持增量翻译（`--resume`）和部分测试（`--limit N`）
 
 ### 旧版工作流 (Legacy - uses book_structure.json) ⚠️ DEPRECATED
 
@@ -302,6 +322,23 @@ uv run pdf2epub translate --target-language Chinese
 
 # 5. 生成EPUB
 uv run pdf2epub build-epub --translated
+```
+
+#### 已有 EPUB 翻译（保留原格式）
+```bash
+# 适用于已有 EPUB 文件，完整保留原书排版
+
+# 1. 翻译 EPUB 内容（保留 HTML 结构和 CSS）
+uv run pdf2epub translate-html -i book.epub --target-language Chinese
+
+# 2. 重新打包成 EPUB
+uv run pdf2epub build-html-epub
+
+# 可选：增量翻译（中断后继续）
+uv run pdf2epub translate-html -i book.epub --resume
+
+# 可选：测试翻译前几个文件
+uv run pdf2epub translate-html -i book.epub --limit 5
 ```
 
 #### 英文书籍（无需翻译）

@@ -188,78 +188,6 @@ def breakdown_command(args):
     return 0
 
 
-def epub_input_command(args):
-    """Handle the EPUB input subcommand (breakdown + conversion)."""
-    from pdf2epub.epub_breakdown import breakdown_epub
-    from pdf2epub.epub_to_markdown import convert_epub_to_markdown
-    from pathlib import Path
-
-    epub_path = Path(args.input)
-
-    if not epub_path.exists():
-        logger.error(f"EPUB file not found: {epub_path}")
-        return 1
-
-    # Determine output directory
-    if args.output:
-        output_dir = Path(args.output)
-    else:
-        # Auto-detect from EPUB metadata
-        from pdf2epub.epub_input.epub_parser import EPUBParser
-        temp_parser = EPUBParser(str(epub_path))
-        book_title = temp_parser.metadata['title']
-        # Clean title for directory name
-        import re
-        clean_title = re.sub(r'[^\w\s-]', '', book_title)
-        clean_title = re.sub(r'[-\s]+', '_', clean_title)
-        output_dir = Path("output") / clean_title
-
-    # Configure file logging
-    book_title = output_dir.name
-    configure_logging(book_title, "epub-input")
-
-    logger.info(f"Processing EPUB: {epub_path}")
-    logger.info(f"Output directory: {output_dir}")
-
-    # Step 1: Breakdown (analyze structure)
-    logger.info("Step 1/2: Analyzing EPUB structure...")
-    try:
-        structure = breakdown_epub(
-            str(epub_path),
-            str(output_dir),
-            skip_patterns=args.skip_patterns,
-            front_matter_position_threshold=args.front_matter_threshold,
-            back_matter_position_threshold=args.back_matter_threshold
-        )
-    except Exception as e:
-        logger.error(f"Failed to analyze EPUB structure: {e}")
-        return 1
-
-    # Step 2: Convert to Markdown
-    logger.info("Step 2/2: Converting to Markdown...")
-    try:
-        convert_epub_to_markdown(
-            str(epub_path),
-            structure_file=str(output_dir / "book_structure.json"),
-            output_dir=str(output_dir),
-            resume=args.resume,
-            config_path=args.config,
-            max_tokens_per_part=8000  # Use default for now
-        )
-    except Exception as e:
-        logger.error(f"Failed to convert EPUB to Markdown: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-    logger.success(f"EPUB processing complete! Output: {output_dir / 'polished_markdown'}")
-    logger.info("Next steps:")
-    logger.info("  - For translation: pdf2epub translate --target-language <language>")
-    logger.info("  - For EPUB generation: pdf2epub epub")
-
-    return 0
-
-
 def refine_command(args):
     """Handle the refine subcommand (refined breakdown with boundary verification)."""
     from pdf2epub.refine import RefinedBreakdown
@@ -695,6 +623,183 @@ def build_epub_command(args):
         return 1
 
 
+def translate_html_command(args):
+    """Handle the translate-html subcommand (direct HTML translation)."""
+    from pathlib import Path
+    from pdf2epub.html_translation import HTMLEpubPipeline, HTMLTranslateProcessor
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "translate-html")
+
+    # Setup paths
+    output_dir = Path("output") / book_title
+    epub_path = Path(args.input) if args.input else None
+
+    # If no epub specified, look for original epub in output dir
+    if epub_path is None:
+        for candidate in ["input.epub", "original.epub"]:
+            candidate_path = output_dir / candidate
+            if candidate_path.exists():
+                epub_path = candidate_path
+                break
+
+    if epub_path is None or not epub_path.exists():
+        logger.error("EPUB file not found. Use -i to specify the input EPUB.")
+        return 1
+
+    try:
+        # Create pipeline
+        pipeline = HTMLEpubPipeline(
+            epub_path=epub_path,
+            output_dir=output_dir,
+            config=config
+        )
+
+        # Auto-detect source language from EPUB metadata
+        source_language = args.source_language or pipeline.source_language
+        target_language = args.target_language or config.get("translation", {}).get("target_language", "Chinese")
+
+        logger.info(f"Starting HTML translation for: {pipeline.book_title}")
+        logger.info(f"Source EPUB: {epub_path}")
+        logger.info(f"Translation: {source_language} → {target_language}")
+
+        # Step 1: Extract and preprocess
+        if not args.skip_extract:
+            extracted = pipeline.extract_and_preprocess()
+            logger.info(f"Extracted {extracted} XHTML files")
+
+        # Step 2: Translate metadata (title + TOC)
+        if not args.skip_translate:
+            logger.info("Translating book title and TOC...")
+            metadata = pipeline.translate_metadata(target_language=target_language)
+            logger.info(f"Translated title: {metadata['translated_title']}")
+
+        # Step 3: Translate content
+        if not args.skip_translate:
+            # Initialize translator
+            use_entities = None
+            if args.use_entities:
+                use_entities = True
+            elif args.no_entities:
+                use_entities = False
+
+            processor = HTMLTranslateProcessor(
+                config=config,
+                book_title=book_title,
+                source_language=source_language,
+                target_language=target_language,
+                max_workers=args.max_workers or config.get('max_concurrent_workers', 4),
+                resume=args.resume,
+                translation_models=config.get('translation', {}).get('models'),
+                use_entities=use_entities,
+                use_longest_on_failure=config.get('validation_strategy', {}).get('use_longest_on_failure', False)
+            )
+
+            # Handle --limit: only translate first N files, copy rest
+            if args.limit:
+                import shutil
+                all_files = sorted(pipeline.compressed_units_dir.glob("*.md"))
+                files_to_translate = all_files[:args.limit]
+                files_to_copy = all_files[args.limit:]
+
+                logger.info(f"Limit mode: translating {len(files_to_translate)} files, copying {len(files_to_copy)} untranslated")
+
+                # Copy untranslated files directly
+                for f in files_to_copy:
+                    dest = pipeline.translated_dir / f.name
+                    shutil.copy(f, dest)
+                    logger.debug(f"Copied untranslated: {f.name}")
+
+                # Process only limited files (pass specific files to processor)
+                summary = processor.process_specific_files([f.stem for f in files_to_translate])
+            else:
+                # Process all files
+                summary = processor.process_all_files()
+
+            if summary.get("error"):
+                logger.error(f"Translation failed: {summary['error']}")
+                return 1
+
+            logger.info(f"Translation complete: {summary.get('successful', 0)} files")
+
+        logger.success("HTML translation complete!")
+        logger.info(f"Output: {output_dir / 'translated_compressed'}")
+        logger.info("Next step: pdf2epub build-html-epub")
+        return 0
+
+    except Exception as e:
+        logger.error(f"HTML translation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def build_html_epub_command(args):
+    """Handle the build-html-epub subcommand (rebuild EPUB with translated HTML)."""
+    from pathlib import Path
+    from pdf2epub.html_translation import HTMLEpubPipeline, build_html_epub
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "build-html-epub")
+
+    # Setup paths
+    output_dir = Path("output") / book_title
+    epub_path = Path(args.input) if args.input else None
+
+    # If no epub specified, look for original epub in output dir
+    if epub_path is None:
+        for candidate in ["input.epub", "original.epub"]:
+            candidate_path = output_dir / candidate
+            if candidate_path.exists():
+                epub_path = candidate_path
+                break
+
+    if epub_path is None or not epub_path.exists():
+        logger.error("Original EPUB file not found. Use -i to specify the input EPUB.")
+        return 1
+
+    logger.info(f"Building translated EPUB for: {book_title}")
+
+    try:
+        # Create pipeline
+        pipeline = HTMLEpubPipeline(
+            epub_path=epub_path,
+            output_dir=output_dir,
+            config=config
+        )
+
+        # Determine output path (None = let postprocess_and_build use translated title)
+        output_epub = Path(args.output) if args.output else None
+
+        # Build EPUB (restore attrs + repackage)
+        result_path = pipeline.postprocess_and_build(output_epub)
+
+        logger.success(f"EPUB created: {result_path}")
+        return 0
+
+    except Exception as e:
+        logger.error(f"EPUB build failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def translate_command(args):
     """Handle the translate subcommand."""
     # Load configuration
@@ -758,7 +863,7 @@ def translate_command(args):
         target_language=target_language,
         max_workers=args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4),
         resume=args.resume,
-        translation_models=config.get("translation_models"),
+        translation_models=config.get('translation', {}).get('models'),
         use_entities=use_entities,
         use_longest_on_failure=args.use_longest_on_failure if args.use_longest_on_failure is not None else config.get('validation_strategy', {}).get('use_longest_on_failure', False),
         book_structure=book_structure
@@ -830,10 +935,13 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
   pdf2epub translate --target-language Chinese
   pdf2epub build-epub --translated
 
-  # EPUB as input (already clean text):
-  pdf2epub epub-input -i mybook.epub
-  pdf2epub translate --target-language Chinese  # Optional
-  pdf2epub build-epub
+  # EPUB Translation (preserves original formatting):
+  pdf2epub translate-html -i mybook.epub     # Extract + translate HTML
+  pdf2epub build-html-epub                    # Build translated EPUB
+
+  # Test with limited files first:
+  pdf2epub translate-html -i mybook.epub --limit 5
+  pdf2epub build-html-epub
 
 ===============================================================================
 ⚠️  DEPRECATED WORKFLOW / 已弃用工作流 (still works, but not recommended):
@@ -880,46 +988,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Force reprocessing even if files exist"
     )
     breakdown_parser.set_defaults(func=breakdown_command)
-
-    # EPUB Input subcommand
-    epub_input_parser = subparsers.add_parser(
-        "epub-input",
-        help="Process EPUB file as input (extract to polished markdown)",
-        description="Analyze EPUB structure and convert to polished markdown, ready for translation or EPUB generation"
-    )
-    epub_input_parser.add_argument(
-        "-i", "--input",
-        required=True,
-        help="Path to input EPUB file"
-    )
-    epub_input_parser.add_argument(
-        "-o", "--output",
-        help="Output directory (default: auto-detect from EPUB title)"
-    )
-    epub_input_parser.add_argument(
-        "--skip-pattern",
-        action="append",
-        dest="skip_patterns",
-        help="Regex pattern to skip chapters (can be used multiple times)"
-    )
-    epub_input_parser.add_argument(
-        "--front-matter-threshold",
-        type=int,
-        default=5,
-        help="First N spine items to mark as front matter (default: 5)"
-    )
-    epub_input_parser.add_argument(
-        "--back-matter-threshold",
-        type=int,
-        default=3,
-        help="Last N spine items to mark as back matter (default: 3)"
-    )
-    epub_input_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from previous progress"
-    )
-    epub_input_parser.set_defaults(func=epub_input_command)
 
     # OCR Pages subcommand (new workflow)
     ocr_pages_parser = subparsers.add_parser(
@@ -1158,6 +1226,80 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Path to cover image file"
     )
     build_epub_parser.set_defaults(func=build_epub_command)
+
+    # HTML Translation subcommand (direct HTML translation for EPUB)
+    translate_html_parser = subparsers.add_parser(
+        "translate-html",
+        help="Translate EPUB content directly (preserves HTML structure)",
+        description="Translate EPUB XHTML content directly without markdown conversion"
+    )
+    translate_html_parser.add_argument(
+        "-i", "--input",
+        help="Path to input EPUB file (default: output/<book_title>/input.epub)"
+    )
+    translate_html_parser.add_argument(
+        "--source-language",
+        help="Source language (default: from config or Japanese)"
+    )
+    translate_html_parser.add_argument(
+        "--target-language",
+        help="Target language (default: from config or Chinese)"
+    )
+    translate_html_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress"
+    )
+    translate_html_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum number of concurrent workers (default: from config or 4)"
+    )
+    translate_html_parser.add_argument(
+        "--skip-extract",
+        action="store_true",
+        help="Skip extraction step (use existing html_units/)"
+    )
+    translate_html_parser.add_argument(
+        "--skip-translate",
+        action="store_true",
+        help="Skip translation step (only extract)"
+    )
+    translate_html_parser.add_argument(
+        "--use-entities",
+        action="store_true",
+        default=None,
+        help="Force use of extracted entities"
+    )
+    translate_html_parser.add_argument(
+        "--no-entities",
+        action="store_true",
+        help="Force disable entity usage"
+    )
+    translate_html_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only translate first N files (rest are copied untranslated for testing)"
+    )
+    translate_html_parser.set_defaults(func=translate_html_command)
+
+    # Build HTML EPUB subcommand (rebuild EPUB with translated HTML)
+    build_html_epub_parser = subparsers.add_parser(
+        "build-html-epub",
+        help="Build EPUB from translated HTML (preserves original formatting)",
+        description="Rebuild EPUB by replacing XHTML content with translations"
+    )
+    build_html_epub_parser.add_argument(
+        "-i", "--input",
+        help="Path to original EPUB file (default: output/<book_title>/input.epub)"
+    )
+    build_html_epub_parser.add_argument(
+        "-o", "--output",
+        help="Path to output EPUB file (default: <book_title>_translated.epub)"
+    )
+    build_html_epub_parser.set_defaults(func=build_html_epub_command)
 
     # Patch paper structure subcommand
     patch_parser = subparsers.add_parser(

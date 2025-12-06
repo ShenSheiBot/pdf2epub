@@ -96,8 +96,8 @@ def convert_to_epub(input_path: Path, output_dir: Path) -> tuple[Path, bool]:
 
     try:
         if extracted_path.suffix.lower() == ".epub":
-            # 直接是 epub，复制到输出目录
-            epub_path = output_dir / (input_path.stem + ".epub")
+            # 保存为 input.epub，方便后续 build-html-epub 自动找到
+            epub_path = output_dir / "input.epub"
             shutil.copy2(extracted_path, epub_path)
 
             # 修复 mobi 包生成的 EPUB 中可能存在的 XML 问题

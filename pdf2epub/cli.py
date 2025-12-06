@@ -655,8 +655,12 @@ def translate_html_command(args):
         logger.error("Input file not found. Use -i to specify EPUB/AZW3/MOBI file.")
         return 1
 
-    # 格式转换（如需要）
+    # 格式转换或复制到 output 目录
     from pdf2epub.utils.ebook_converter import needs_conversion, convert_to_epub
+    import shutil
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_epub = output_dir / "input.epub"
 
     if needs_conversion(epub_path):
         try:
@@ -664,6 +668,11 @@ def translate_html_command(args):
         except Exception as e:
             logger.error(f"Format conversion failed: {e}")
             return 1
+    elif epub_path.resolve() != input_epub.resolve():
+        # EPUB 输入也复制到 output 目录，方便 build-html-epub 找到
+        shutil.copy2(epub_path, input_epub)
+        logger.info(f"Copied input EPUB to: {input_epub}")
+        epub_path = input_epub
 
     try:
         # Create pipeline
@@ -781,8 +790,26 @@ def build_html_epub_command(args):
                 break
 
     if epub_path is None or not epub_path.exists():
-        logger.error("Original EPUB file not found. Use -i to specify the input EPUB.")
+        logger.error("Input file not found. Use -i to specify EPUB/AZW3/MOBI file.")
         return 1
+
+    # 格式转换或复制到 output 目录
+    from pdf2epub.utils.ebook_converter import needs_conversion, convert_to_epub
+    import shutil
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_epub = output_dir / "input.epub"
+
+    if needs_conversion(epub_path):
+        try:
+            epub_path, _ = convert_to_epub(epub_path, output_dir)
+        except Exception as e:
+            logger.error(f"Format conversion failed: {e}")
+            return 1
+    elif epub_path.resolve() != input_epub.resolve():
+        shutil.copy2(epub_path, input_epub)
+        logger.info(f"Copied input EPUB to: {input_epub}")
+        epub_path = input_epub
 
     logger.info(f"Building translated EPUB for: {book_title}")
 
@@ -1299,11 +1326,11 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
     build_html_epub_parser = subparsers.add_parser(
         "build-html-epub",
         help="Build EPUB from translated HTML (preserves original formatting)",
-        description="Rebuild EPUB by replacing XHTML content with translations"
+        description="Rebuild EPUB by replacing XHTML content with translations. AZW3/MOBI auto-converted."
     )
     build_html_epub_parser.add_argument(
         "-i", "--input",
-        help="Path to original EPUB file (default: output/<book_title>/input.epub)"
+        help="Input file: EPUB, AZW3, or MOBI (default: output/<book_title>/input.epub)"
     )
     build_html_epub_parser.add_argument(
         "-o", "--output",

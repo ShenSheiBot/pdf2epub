@@ -31,6 +31,7 @@ dependencies = [
     "lxml>=6.0.2",
     "tinycss2>=1.2.1",
     "cssselect2>=0.7.0",
+    "mobi>=0.4.1",
 ]
 
 [project.scripts]

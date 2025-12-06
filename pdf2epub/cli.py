@@ -652,8 +652,18 @@ def translate_html_command(args):
                 break
 
     if epub_path is None or not epub_path.exists():
-        logger.error("EPUB file not found. Use -i to specify the input EPUB.")
+        logger.error("Input file not found. Use -i to specify EPUB/AZW3/MOBI file.")
         return 1
+
+    # 格式转换（如需要）
+    from pdf2epub.utils.ebook_converter import needs_conversion, convert_to_epub
+
+    if needs_conversion(epub_path):
+        try:
+            epub_path, _ = convert_to_epub(epub_path, output_dir)
+        except Exception as e:
+            logger.error(f"Format conversion failed: {e}")
+            return 1
 
     try:
         # Create pipeline
@@ -1227,15 +1237,15 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
     )
     build_epub_parser.set_defaults(func=build_epub_command)
 
-    # HTML Translation subcommand (direct HTML translation for EPUB)
+    # HTML Translation subcommand (direct HTML translation for EPUB/AZW3/MOBI)
     translate_html_parser = subparsers.add_parser(
         "translate-html",
-        help="Translate EPUB content directly (preserves HTML structure)",
-        description="Translate EPUB XHTML content directly without markdown conversion"
+        help="Translate EPUB/AZW3/MOBI content directly (preserves HTML structure)",
+        description="Translate ebook XHTML content directly. AZW3/MOBI files are auto-converted to EPUB."
     )
     translate_html_parser.add_argument(
         "-i", "--input",
-        help="Path to input EPUB file (default: output/<book_title>/input.epub)"
+        help="Input file: EPUB, AZW3, or MOBI (default: output/<book_title>/input.epub)"
     )
     translate_html_parser.add_argument(
         "--source-language",

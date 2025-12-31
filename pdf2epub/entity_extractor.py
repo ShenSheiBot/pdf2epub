@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 from google.genai.types import Part
 from loguru import logger
 from .utils.logging_config import configure_logging
-from .utils.network_utils import GeminiClient
+from .utils.network_utils import GeminiClient, create_gemini_client_from_config
 from .utils.common import load_config
 
 # Configure logger
@@ -432,15 +432,14 @@ def main():
         book_title = Path(args.input).stem
         logger.warning(f"No title in config, using: {book_title}")
     
-    # Get API key
-    api_key = config.get("google_api_key")
-    base_url = config.get("google_base_url")
-    if not api_key:
-        logger.error("Google API key not found in config.yaml")
-        return 1
-
     # Initialize Gemini client
-    gemini_client = GeminiClient(api_key, base_url=base_url)
+    translation_config = config.get("translation", {})
+    provider_name = translation_config.get("provider", "gemini")
+    try:
+        gemini_client = create_gemini_client_from_config(config, provider_name)
+    except ValueError as e:
+        logger.error(str(e))
+        return 1
     
     # Setup output directory
     output_dir = Path("output") / book_title

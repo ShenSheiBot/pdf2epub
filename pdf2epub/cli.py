@@ -119,17 +119,11 @@ def breakdown_command(args):
         analyze_pdf_structure,
         detect_front_and_back_matter
     )
-    from pdf2epub.utils.network_utils import GeminiClient
+    from pdf2epub.utils.network_utils import create_gemini_client_from_config
     import json
 
     # Load configuration
     config = load_breakdown_config(args.config)
-    api_key = config.get("google_api_key")
-    base_url = config.get("google_base_url")
-
-    if not api_key:
-        logger.error("Google API key not found in config.yaml")
-        return 1
     
     # Get input PDF path
     input_pdf = Path(args.input)
@@ -163,7 +157,13 @@ def breakdown_command(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup Gemini API
-    gemini_client = GeminiClient(api_key, base_url=base_url)
+    breakdown_config = config.get("breakdown", {})
+    provider_name = breakdown_config.get("provider", "gemini")
+    try:
+        gemini_client = create_gemini_client_from_config(config, provider_name)
+    except ValueError as e:
+        logger.error(str(e))
+        return 1
     
     # Use preprocess_pdf which handles page number patches and multi-round compression
     processed_pdf = preprocess_pdf(input_pdf, output_dir)
@@ -388,9 +388,9 @@ def extract_entities_command(args):
     from pdf2epub.entity_extractor import (
         load_config as load_entity_config,
         extract_entities_from_pdf,
-        save_entities,
-        GeminiClient
+        save_entities
     )
+    from pdf2epub.utils.network_utils import create_gemini_client_from_config
     
     # Load configuration
     config = load_entity_config(args.config)
@@ -408,18 +408,17 @@ def extract_entities_command(args):
     # Configure file logging
     configure_logging(book_title, "extract-entities")
 
-    # Get API key
-    api_key = config.get("google_api_key")
-    base_url = config.get("google_base_url")
-    if not api_key:
-        logger.error("Google API key not found in config.yaml")
-        return 1
-
     logger.info(f"Extracting entities from: {book_title}")
     logger.info(f"Language pair: {args.source_lang} → {args.target_lang}")
 
     # Initialize Gemini client
-    gemini_client = GeminiClient(api_key, base_url=base_url)
+    translation_config = config.get("translation", {})
+    provider_name = translation_config.get("provider", "gemini")
+    try:
+        gemini_client = create_gemini_client_from_config(config, provider_name)
+    except ValueError as e:
+        logger.error(str(e))
+        return 1
 
     # Setup paths
     output_dir = Path("output") / book_title

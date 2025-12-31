@@ -56,7 +56,10 @@ class LLMClient:
 
     def _init_legacy_clients(self):
         """Initialize clients using legacy config keys for backward compatibility."""
-        if self.config.get("google_api_key"):
+        # Skip legacy init if new provider config exists
+        providers = self.config.get("credentials", {}).get("providers", {})
+
+        if self.config.get("google_api_key") and "gemini" not in providers:
             self._gemini_client = GeminiClient(
                 api_key=self.config["google_api_key"],
                 base_url=self.config.get("google_base_url"),

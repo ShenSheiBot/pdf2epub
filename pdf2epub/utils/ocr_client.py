@@ -10,7 +10,8 @@ from .network_utils import (
     GeminiClient,
     AnthropicClient,
     is_transient_gemini_error,
-    is_transient_anthropic_error
+    is_transient_anthropic_error,
+    create_gemini_client_from_config
 )
 from google.genai.types import Part
 import base64
@@ -67,12 +68,14 @@ Transcribe the entire page content accurately."""
         # Track safety blocks per page to allow retrying on different pages
         self._safety_blocked_pages = {}  # {provider: set(page_nums)}
         
-        # Initialize clients based on available API keys
-        if config.get("google_api_key"):
-            self._gemini_client = GeminiClient(
-                config["google_api_key"],
-                base_url=config.get("google_base_url")
-            )
+        # Initialize clients based on available providers
+        ocr_config = config.get("ocr", {})
+        provider_name = ocr_config.get("provider", "gemini")
+        try:
+            self._gemini_client = create_gemini_client_from_config(config, provider_name)
+        except ValueError:
+            # Fallback: no Gemini client available
+            pass
             
         if config.get("anthropic_api_key"):
             self._anthropic_client = AnthropicClient(

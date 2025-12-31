@@ -17,7 +17,7 @@ from loguru import logger
 import tiktoken
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ..utils.network_utils import GeminiClient
+from ..utils.network_utils import GeminiClient, create_gemini_client_from_config
 from ..utils.pdf_utils import preprocess_pdf
 from ..utils.unit_id import generate_unit_id
 from .toc_tree import TOCNode, dict_list_to_toc_tree
@@ -62,15 +62,11 @@ class RefinedBreakdown:
         self.max_workers = max_workers or config.get('general', {}).get('max_concurrent_workers', 8)
 
         # Initialize Gemini client
-        credentials = config.get('credentials', {}).get('providers', {})
-        gemini_config = credentials.get('gemini', {})
-        api_key = gemini_config.get('api_key')
-        base_url = gemini_config.get('base_url')
-
-        if not api_key:
-            raise ValueError("Gemini API key not found in config")
-
-        self.client = GeminiClient(api_key, base_url=base_url, num_retries=3, max_backoff_seconds=30)
+        refine_config = config.get('refine', {})
+        provider_name = refine_config.get('provider', 'gemini')
+        self.client = create_gemini_client_from_config(
+            config, provider_name, num_retries=3, max_backoff_seconds=30
+        )
 
         # Get models from config
         refine_config = config.get('refine', {})

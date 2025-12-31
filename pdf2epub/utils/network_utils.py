@@ -674,3 +674,46 @@ def generate_with_fallback(
         )
     
     raise ValueError("No API clients available")
+
+
+def create_gemini_client_from_config(
+    config: Dict[str, Any],
+    provider_name: str = "gemini",
+    num_retries: int = 3,
+    max_backoff_seconds: int = 30
+) -> GeminiClient:
+    """
+    Create a GeminiClient from config with full provider support.
+
+    Args:
+        config: Full config dict
+        provider_name: Provider name (e.g., 'gemini', 'vertex', 'gemini-vertex')
+        num_retries: Number of retries for transient errors
+        max_backoff_seconds: Maximum backoff time between retries
+
+    Returns:
+        Configured GeminiClient instance
+
+    Raises:
+        ValueError: If API key not found
+    """
+    providers = config.get("credentials", {}).get("providers", {})
+    provider_config = providers.get(provider_name, {})
+
+    # Get provider settings with legacy fallback
+    api_key = provider_config.get("api_key") or config.get("google_api_key")
+    base_url = provider_config.get("base_url") or config.get("google_base_url")
+    vertexai = provider_config.get("vertexai", False)
+    extra_headers = provider_config.get("extra_headers")
+
+    if not api_key:
+        raise ValueError(f"API key not found for provider '{provider_name}'")
+
+    return GeminiClient(
+        api_key=api_key,
+        base_url=base_url,
+        vertexai=vertexai,
+        extra_headers=extra_headers,
+        num_retries=num_retries,
+        max_backoff_seconds=max_backoff_seconds
+    )

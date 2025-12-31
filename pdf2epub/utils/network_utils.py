@@ -145,25 +145,44 @@ def is_transient_openai_error(exception: Exception) -> bool:
 
 class GeminiClient:
     """Wrapper for Gemini API with smart retry logic."""
-    
-    def __init__(self, api_key: str, base_url: Optional[str] = None, num_retries: int = 3, max_backoff_seconds: int = 30):
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: Optional[str] = None,
+        vertexai: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
+        num_retries: int = 3,
+        max_backoff_seconds: int = 30
+    ):
         """Initialize Gemini client.
 
         Args:
             api_key: Gemini API key
             base_url: Custom API endpoint (e.g., 'google.shenshei.fans')
+            vertexai: Use Vertex AI express mode (official, not via proxy)
+            extra_headers: Extra HTTP headers (e.g., {'X-Use-Vertex': 'true'} for proxy)
             num_retries: Number of retries for transient errors
             max_backoff_seconds: Maximum backoff time between retries
         """
         from google import genai
-        if base_url:
-            # Use custom endpoint
-            self.client = genai.Client(
-                api_key=api_key,
-                http_options={'base_url': base_url}
-            )
+
+        if vertexai and not base_url:
+            # Official Vertex AI express mode
+            self.client = genai.Client(vertexai=True, api_key=api_key)
         else:
-            self.client = genai.Client(api_key=api_key)
+            # Build http_options for proxy or default
+            http_options = {}
+            if base_url:
+                http_options['base_url'] = base_url
+            if extra_headers:
+                http_options['headers'] = extra_headers
+
+            if http_options:
+                self.client = genai.Client(api_key=api_key, http_options=http_options)
+            else:
+                self.client = genai.Client(api_key=api_key)
+
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
         # Initialize tokenizer for accurate token counting

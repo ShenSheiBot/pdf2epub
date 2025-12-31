@@ -137,6 +137,8 @@ class LLMClient:
             return GeminiClient(
                 api_key=api_key,
                 base_url=base_url,
+                vertexai=provider_config.get("vertexai", False),
+                extra_headers=provider_config.get("extra_headers"),
                 num_retries=self._num_retries,
                 max_backoff_seconds=self._max_backoff_seconds
             )

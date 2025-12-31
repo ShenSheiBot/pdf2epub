@@ -353,7 +353,8 @@ class ConfigManager:
 
         # Include other nested configs that code might access
         for key in ["validation_strategy", "model_output_limits", "splitting",
-                    "retry", "polish", "translate", "ocr"]:
+                    "retry", "polish", "translate", "ocr", "credentials",
+                    "refine", "breakdown", "translation"]:
             if key in self._config and key not in legacy:
                 legacy[key] = self._config[key]
 

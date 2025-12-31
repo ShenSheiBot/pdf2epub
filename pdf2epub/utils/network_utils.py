@@ -700,11 +700,18 @@ def create_gemini_client_from_config(
     providers = config.get("credentials", {}).get("providers", {})
     provider_config = providers.get(provider_name, {})
 
-    # Get provider settings with legacy fallback
-    api_key = provider_config.get("api_key") or config.get("google_api_key")
-    base_url = provider_config.get("base_url") or config.get("google_base_url")
-    vertexai = provider_config.get("vertexai", False)
-    extra_headers = provider_config.get("extra_headers")
+    # Get provider settings - only fallback to legacy if provider not found
+    if provider_config:
+        api_key = provider_config.get("api_key")
+        base_url = provider_config.get("base_url")
+        vertexai = provider_config.get("vertexai", False)
+        extra_headers = provider_config.get("extra_headers")
+    else:
+        # Legacy fallback for backward compatibility
+        api_key = config.get("google_api_key")
+        base_url = config.get("google_base_url")
+        vertexai = False
+        extra_headers = None
 
     if not api_key:
         raise ValueError(f"API key not found for provider '{provider_name}'")

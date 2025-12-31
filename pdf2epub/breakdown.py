@@ -229,8 +229,17 @@ def main():
     
     # Load configuration
     config = load_config(args.config)
-    api_key = config.get("google_api_key")
-    base_url = config.get("google_base_url")
+
+    # Get provider config for breakdown
+    breakdown_config = config.get("breakdown", {})
+    provider_name = breakdown_config.get("provider", "gemini")
+    providers = config.get("credentials", {}).get("providers", {})
+    provider_config = providers.get(provider_name, {})
+
+    api_key = provider_config.get("api_key") or config.get("google_api_key")
+    base_url = provider_config.get("base_url") or config.get("google_base_url")
+    vertexai = provider_config.get("vertexai", False)
+    extra_headers = provider_config.get("extra_headers")
     
     # Get input PDF path
     input_pdf = Path(args.input)
@@ -251,7 +260,12 @@ def main():
         raise ValueError("Google API key not found in config.yaml")
 
     # Setup Gemini API
-    client = GeminiClient(api_key, base_url=base_url)
+    client = GeminiClient(
+        api_key=api_key,
+        base_url=base_url,
+        vertexai=vertexai,
+        extra_headers=extra_headers
+    )
 
     # Preprocess and get the PDF path to use
     processed_pdf = preprocess_pdf(input_pdf, output_dir)

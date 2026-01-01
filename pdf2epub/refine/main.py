@@ -215,21 +215,25 @@ class RefinedBreakdown:
 
         # Step 1.5: Verify boundaries FIRST (before gap/overlap detection)
         # This ensures start_pages are correct before we detect gaps
-        logger.info(f"Verifying boundaries (max {self.max_workers} workers)...")
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(self._verify_chapter, chapter, pages_dir): chapter
-                for chapter in toc_tree
-            }
-            for future in as_completed(futures):
-                chapter = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Verification failed for '{chapter.title}': {e}")
+        if self.state.verification_complete:
+            logger.info(f"Verification already complete, skipping ({len(self.state.verified_nodes)} nodes)")
+        else:
+            logger.info(f"Verifying boundaries (max {self.max_workers} workers)...")
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {
+                    executor.submit(self._verify_chapter, chapter, pages_dir): chapter
+                    for chapter in toc_tree
+                }
+                for future in as_completed(futures):
+                    chapter = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Verification failed for '{chapter.title}': {e}")
 
-        # Save state after verification
-        self.state.save(state_file)
+            # Mark verification as complete and save state
+            self.state.verification_complete = True
+            self.state.save(state_file)
 
         # Step 1.6: Correct end_pages based on verified start_pages
         logger.info("Correcting end_pages based on verified boundaries...")
@@ -307,6 +311,7 @@ class RefinedBreakdown:
                 logger.info("No gaps found in TOC structure")
 
             self.state.gaps_filled = True
+            self.state.save(state_file)
 
         # Step 2: Estimate tokens for all nodes
         logger.info("Estimating token counts...")

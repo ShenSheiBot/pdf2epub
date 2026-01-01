@@ -252,6 +252,37 @@ class BaseMarkdownProcessor(ABC):
         """
         pass
 
+    def _is_image_only_content(self, content: str, min_text_chars: int = 100) -> bool:
+        """
+        Check if content is primarily images with minimal text.
+
+        Used to skip LLM processing for pages that are just images (e.g., genealogy charts,
+        full-page illustrations) where there's no meaningful text to polish.
+
+        Args:
+            content: Content to check
+            min_text_chars: Minimum text characters to consider as having meaningful content
+
+        Returns:
+            True if content is image-only (should skip processing)
+        """
+        import re
+
+        # Remove markdown images: ![alt](src)
+        text = re.sub(r'!\[[^\]]*\]\([^)]+\)', '', content)
+
+        # Remove HTML images with optional wrapping divs
+        text = re.sub(r'(?:<div[^>]*>)?\s*<img\s+[^>]*/?\s*>\s*(?:</div>)?', '', text, flags=re.IGNORECASE)
+
+        # Remove markdown headings (they're just titles, not content)
+        text = re.sub(r'^#{1,6}\s+.*$', '', text, flags=re.MULTILINE)
+
+        # Remove whitespace
+        text = text.strip()
+
+        # If remaining text is very short, it's image-only
+        return len(text) < min_text_chars
+
     # ==================== 基类实现的核心方法 ====================
 
     def process_unit(self, content: str, unit_key: str, **context) -> str:
@@ -272,6 +303,11 @@ class BaseMarkdownProcessor(ABC):
             Processed content
         """
         if not content.strip():
+            return content
+
+        # Skip LLM processing for image-only content (minimal text with just images)
+        if self._is_image_only_content(content):
+            logger.info(f"Skipping {unit_key}: image-only content")
             return content
 
         file_name = context.get('file_name', unit_key)

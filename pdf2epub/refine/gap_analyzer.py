@@ -6,6 +6,7 @@ and generate appropriate titles for the missing content.
 """
 
 import copy
+import json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple

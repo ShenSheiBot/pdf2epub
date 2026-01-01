@@ -21,6 +21,9 @@ class RefinerState:
     toc_structure: Dict = field(default_factory=dict)  # {author, chapters: [...]} (no page numbers)
     structure_analysis_complete: bool = False
 
+    # Verification phase complete
+    verification_complete: bool = False
+
     # node_id -> boundary_info
     verified_nodes: Dict[str, Dict] = field(default_factory=dict)
 
@@ -43,6 +46,7 @@ class RefinerState:
                 'toc_location': self.toc_location,
                 'toc_structure': self.toc_structure,
                 'structure_analysis_complete': self.structure_analysis_complete,
+                'verification_complete': self.verification_complete,
                 'verified': self.verified_nodes,
                 'failed': self.failed_nodes,
                 'retries': self.retry_counts,
@@ -58,6 +62,7 @@ class RefinerState:
                 self.toc_location = data.get('toc_location', {})
                 self.toc_structure = data.get('toc_structure', {})
                 self.structure_analysis_complete = data.get('structure_analysis_complete', False)
+                self.verification_complete = data.get('verification_complete', False)
                 self.verified_nodes = data.get('verified', {})
                 self.failed_nodes = data.get('failed', [])
                 self.retry_counts = data.get('retries', {})

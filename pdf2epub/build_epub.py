@@ -169,9 +169,40 @@ def process_chapter_content(
         # Add heading at start
         lines.insert(0, chapter_heading)
         lines.insert(1, '')  # Blank line after heading
+        title_line_idx = 0
+
+    # Remove duplicate heading if present (OCR artifact)
+    _remove_duplicate_heading(lines, title_line_idx, toc_title)
 
     # Relevel remaining headings
     return relevel_content('\n'.join(lines), toc_level, skip_first=True)
+
+
+def _remove_duplicate_heading(lines: list, title_line_idx: int, toc_title: str):
+    """Remove duplicate heading that follows the chapter title.
+
+    OCR often produces a heading like "## Title" which duplicates the TOC title.
+    If we find a similar heading within the next few lines, remove it.
+    """
+    import difflib
+
+    # Look in lines after the title (skip blank lines)
+    for i in range(title_line_idx + 1, min(title_line_idx + 5, len(lines))):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if line.startswith('#'):
+            # Extract heading text (remove # prefix)
+            heading_text = re.sub(r'^#+\s*', '', line)
+            # Check similarity
+            similarity = difflib.SequenceMatcher(
+                None, toc_title.lower(), heading_text.lower()
+            ).ratio()
+            if similarity > 0.8:
+                # Remove this duplicate heading
+                lines[i] = ''
+                logger.debug(f"Removed duplicate heading: '{heading_text}' (similarity: {similarity:.2f})")
+            break  # Only check the first heading after title
 
 
 def relevel_content(content: str, base_level: int, skip_first: bool = False) -> str:

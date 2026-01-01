@@ -13,7 +13,7 @@ from google.genai.types import Part
 from loguru import logger
 
 from ..utils.common import parse_llm_json
-from ..utils.network_utils import GeminiClient
+from ..utils.llm_client import BoundLLMClient
 from .toc_tree import TOCNode, dict_list_to_toc_tree
 
 
@@ -24,7 +24,7 @@ class StructureAnalyzer:
 
     def __init__(
         self,
-        client: GeminiClient,
+        client: BoundLLMClient,
         structure_model: str = "gemini-2.5-pro",
         analysis_model: str = "gemini-2.5-flash"
     ):
@@ -32,7 +32,7 @@ class StructureAnalyzer:
         Initialize the structure analyzer.
 
         Args:
-            client: GeminiClient for API calls
+            client: BoundLLMClient for API calls
             structure_model: Model for full PDF analysis (needs large context)
             analysis_model: Model for re-breakdown and subsection discovery
         """

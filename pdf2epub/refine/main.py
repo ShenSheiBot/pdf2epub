@@ -17,7 +17,7 @@ from loguru import logger
 import tiktoken
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ..utils.network_utils import GeminiClient, create_gemini_client_from_config
+from ..utils.llm_client import LLMClient, BoundLLMClient
 from ..utils.pdf_utils import preprocess_pdf
 from ..utils.unit_id import generate_unit_id
 from .toc_tree import TOCNode, dict_list_to_toc_tree
@@ -76,13 +76,10 @@ class RefinedBreakdown:
         verification_provider = verification_config.get('provider', default_provider)
         verification_model = verification_config.get('model', refine_config.get('verification_model', 'gemini-2.5-flash'))
 
-        # Create separate clients for structure and verification
-        structure_client = create_gemini_client_from_config(
-            config, structure_provider, num_retries=3, max_backoff_seconds=30
-        )
-        verification_client = create_gemini_client_from_config(
-            config, verification_provider, num_retries=3, max_backoff_seconds=30
-        )
+        # Create unified LLM client and bind to specific providers
+        llm_client = LLMClient(config)
+        structure_client = BoundLLMClient(llm_client, structure_provider)
+        verification_client = BoundLLMClient(llm_client, verification_provider)
 
         # Initialize components with their respective clients
         self.structure_analyzer = StructureAnalyzer(

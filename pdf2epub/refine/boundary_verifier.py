@@ -10,7 +10,7 @@ from typing import Dict, Optional
 from loguru import logger
 
 from ..utils.common import parse_llm_json
-from ..utils.network_utils import GeminiClient
+from ..utils.llm_client import BoundLLMClient
 from .toc_tree import TOCNode
 
 
@@ -22,12 +22,12 @@ class BoundaryVerifier:
     extracting content before and after the title.
     """
 
-    def __init__(self, client: GeminiClient, model: str = "gemini-2.5-flash"):
+    def __init__(self, client: BoundLLMClient, model: str = "gemini-2.5-flash"):
         """
         Initialize the boundary verifier.
 
         Args:
-            client: GeminiClient for API calls
+            client: BoundLLMClient for API calls
             model: Model to use for verification (should be fast/cheap)
         """
         self.client = client

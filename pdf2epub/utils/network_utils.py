@@ -359,7 +359,8 @@ class AnthropicClient:
         model: str = "claude-sonnet-4-5-20250929",
         max_tokens: int = 8192,
         temperature: float = 0.1,
-        operation_name: str = "Anthropic API call"
+        operation_name: str = "Anthropic API call",
+        json_mode: bool = False
     ) -> str:
         """Generate content with automatic retry for transient errors.
 
@@ -382,14 +383,21 @@ class AnthropicClient:
             content = self._process_content(prompt)
             messages = [{"role": "user", "content": content}]
 
+        # Build request kwargs
+        request_kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+
+        # Anthropic doesn't have native JSON mode, use system prompt instead
+        if json_mode:
+            request_kwargs["system"] = "You must respond with valid JSON only. No explanations, no markdown code blocks, just raw JSON."
+
         # Create message with streaming
-        stream = self.client.messages.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True
-        )
+        stream = self.client.messages.create(**request_kwargs)
         
         # Aggregate streamed response
         response_text = ""
@@ -460,25 +468,25 @@ class AnthropicClient:
 
 class OpenAIClient:
     """Wrapper for OpenAI API with smart retry logic."""
-    
+
     def __init__(self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None, num_retries: int = 3, max_backoff_seconds: int = 30):
         """Initialize OpenAI client."""
         from openai import OpenAI
-        
+
         # Set up client with optional base URL
         if base_url:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
         else:
             self.client = OpenAI(api_key=api_key)
-        
+
         # Store default model
         self.default_model = model or "gpt-4o"
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
-        
+
         # Initialize tokenizer for accurate token counting
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
-    
+
     @retry(
         retry=retry_if_exception(is_transient_openai_error),
         wait=wait_exponential_with_self_max(multiplier=1),
@@ -496,26 +504,32 @@ class OpenAIClient:
         model: Optional[str] = None,
         max_tokens: int = 8192,
         temperature: float = 0.1,
-        operation_name: str = "OpenAI API call"
+        operation_name: str = "OpenAI API call",
+        json_mode: bool = False
     ) -> str:
         """Generate content with automatic retry for transient errors."""
         logger.info(f"Calling OpenAI API for {operation_name}")
-        
+
         # Use provided model or default
         model_to_use = model or self.default_model
-        
+
         # Process content for messages format
         messages = self._format_messages(prompt)
-        
+
+        # Build request kwargs
+        request_kwargs = {
+            "model": model_to_use,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+        if json_mode:
+            request_kwargs["response_format"] = {"type": "json_object"}
+
         # Create chat completion with streaming
         try:
-            stream = self.client.chat.completions.create(
-                model=model_to_use,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True
-            )
+            stream = self.client.chat.completions.create(**request_kwargs)
         except Exception as e:
             logger.error(f"Failed to create OpenAI stream for {operation_name}: {e}")
             raise
@@ -542,7 +556,7 @@ class OpenAIClient:
         final_tokens = len(self.tokenizer.encode(response_text))
         logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from OpenAI for {operation_name}")
         return response_text
-    
+
     def _format_messages(self, prompt: Union[str, List[Dict]]) -> List[Dict]:
         """Format prompt into OpenAI messages format."""
         if isinstance(prompt, str):

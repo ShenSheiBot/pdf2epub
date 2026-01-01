@@ -24,6 +24,15 @@ class SafetyBlockError(Exception):
         super().__init__(message)
 
 
+class LLMGenerateConfig:
+    """Universal generation config that works across all providers."""
+
+    def __init__(self, temperature: float = 0.1, max_tokens: int = 8192):
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.response_mime_type: Optional[str] = None  # "application/json" for JSON mode
+
+
 class LLMClient:
     """
     Unified LLM client that handles multiple providers transparently.
@@ -53,6 +62,11 @@ class LLMClient:
 
         # Initialize legacy clients for backward compatibility
         self._init_legacy_clients()
+
+    @staticmethod
+    def get_default_config(temperature: float = 0.1) -> LLMGenerateConfig:
+        """Get default generation config."""
+        return LLMGenerateConfig(temperature=temperature)
 
     def _init_legacy_clients(self):
         """Initialize clients using legacy config keys for backward compatibility."""
@@ -197,7 +211,73 @@ class LLMClient:
 
         # Fallback to inference
         return self._infer_provider_type(provider_name)
-    
+
+    def generate_content_stream(
+        self,
+        provider: str,
+        model: str,
+        contents: Any,
+        config: Optional[LLMGenerateConfig] = None,
+        operation_name: str = "LLM generation"
+    ) -> str:
+        """
+        Generate content with streaming (unified interface for all providers).
+
+        Args:
+            provider: Provider name (e.g., "gemini", "vertex", "poe", "anthropic")
+            model: Model name
+            contents: Prompt content (string or structured)
+            config: Generation config (use get_default_config() to create)
+            operation_name: Name for logging
+
+        Returns:
+            Generated text
+        """
+        if config is None:
+            config = self.get_default_config()
+
+        client = self._get_client(provider)
+        if client is None:
+            raise ValueError(f"Provider '{provider}' not configured")
+
+        provider_type = self._get_provider_type(provider)
+        json_mode = getattr(config, 'response_mime_type', None) == "application/json"
+
+        if provider_type == "google":
+            # Use Gemini's native config
+            from google.genai.types import GenerateContentConfig
+            gemini_config = GenerateContentConfig(
+                temperature=config.temperature,
+                max_output_tokens=config.max_tokens,
+            )
+            if json_mode:
+                gemini_config.response_mime_type = "application/json"
+            return client.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=gemini_config,
+                operation_name=operation_name
+            )
+        elif provider_type == "anthropic":
+            return client.generate_content(
+                prompt=contents,
+                model=model,
+                max_tokens=config.max_tokens,
+                temperature=config.temperature,
+                operation_name=operation_name,
+                json_mode=json_mode
+            )
+        else:
+            # OpenAI-compatible
+            return client.generate_content(
+                prompt=contents,
+                model=model,
+                max_tokens=config.max_tokens,
+                temperature=config.temperature,
+                operation_name=operation_name,
+                json_mode=json_mode
+            )
+
     def generate(
         self,
         prompt: Union[str, List[Dict]],
@@ -743,3 +823,46 @@ class LLMClient:
         else:
             self._safety_blocked_operations.clear()
             logger.info("Cleared all safety blocks")
+
+
+class BoundLLMClient:
+    """
+    LLMClient bound to a specific provider.
+
+    Provides the same interface as GeminiClient for drop-in replacement,
+    but delegates to LLMClient with a fixed provider.
+    """
+
+    def __init__(self, llm_client: LLMClient, provider: str, model: str = None):
+        """
+        Initialize bound client.
+
+        Args:
+            llm_client: The underlying LLMClient
+            provider: Provider name to use for all calls
+            model: Default model (optional, can be overridden per call)
+        """
+        self.llm_client = llm_client
+        self.provider = provider
+        self.default_model = model
+
+    @staticmethod
+    def get_default_config(temperature: float = 0.1) -> LLMGenerateConfig:
+        """Get default generation config."""
+        return LLMGenerateConfig(temperature=temperature)
+
+    def generate_content_stream(
+        self,
+        model: str,
+        contents: Any,
+        config: Optional[LLMGenerateConfig] = None,
+        operation_name: str = "LLM generation"
+    ) -> str:
+        """Generate content with streaming."""
+        return self.llm_client.generate_content_stream(
+            provider=self.provider,
+            model=model or self.default_model,
+            contents=contents,
+            config=config,
+            operation_name=operation_name
+        )

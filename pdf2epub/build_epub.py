@@ -366,7 +366,7 @@ def generate_hierarchical_toc_ncx(
 
     play_order = [2]  # Use list for mutable counter
 
-    def render_entry(entry: Dict, indent: int = 2) -> str:
+    def render_entry(entry: Dict, indent: int = 2, parent_href: str = "text/toc.html") -> str:
         """Recursively render a nav entry and its children."""
         nonlocal play_order
         result = ""
@@ -387,10 +387,10 @@ def generate_hierarchical_toc_ncx(
                 else:
                     href = f"text/{unit_id}.html"
             else:
-                href = f"text/toc.html"  # Fallback
+                href = parent_href  # Use parent's file
         else:
-            # No file, link to first child with file
-            href = find_first_child_href(entry)
+            # No file, link to first child with file, or parent's file
+            href = find_first_child_href(entry, parent_href)
 
         result += f"""{spaces}<navPoint id="{nav_id}" playOrder="{play_order[0]}">
 {spaces}    <navLabel>
@@ -400,16 +400,16 @@ def generate_hierarchical_toc_ncx(
 """
         play_order[0] += 1
 
-        # Render children
+        # Render children, passing current href as parent
         if 'children' in entry:
             for child in entry['children']:
-                result += render_entry(child, indent + 1)
+                result += render_entry(child, indent + 1, href)
 
         result += f"{spaces}</navPoint>\n"
         return result
 
-    def find_first_child_href(entry: Dict) -> str:
-        """Find href of first descendant with a file."""
+    def find_first_child_href(entry: Dict, parent_href: str = "text/toc.html") -> str:
+        """Find href of first descendant with a file, or fall back to parent."""
         if 'file_path' in entry:
             unit_id = entry.get('unit_id')
             if unit_id:
@@ -419,13 +419,14 @@ def generate_hierarchical_toc_ncx(
                     return f"text/{unit_id}_part1.html"
                 else:
                     return f"text/{unit_id}.html"
-            return "text/toc.html"
+            return parent_href
         if 'children' in entry:
             for child in entry['children']:
-                href = find_first_child_href(child)
-                if href != "text/toc.html":
+                href = find_first_child_href(child, parent_href)
+                if href != "text/toc.html" and href != parent_href:
                     return href
-        return "text/toc.html"
+        # No file found in this subtree, use parent's file
+        return parent_href
 
     # Render all top-level entries
     for entry in structure:
@@ -479,7 +480,7 @@ def generate_hierarchical_toc_html(
         <h1>Table of Contents</h1>
 """
 
-    def render_entry(entry: Dict, level: int = 0) -> str:
+    def render_entry(entry: Dict, level: int = 0, parent_href: str = "toc.html") -> str:
         """Recursively render a TOC entry and its children."""
         result = ""
         indent = "            " + "    " * level
@@ -497,27 +498,26 @@ def generate_hierarchical_toc_html(
                 else:
                     href = f"{unit_id}.html"
             else:
-                href = "toc.html"
+                href = parent_href  # Use parent's file
         else:
-            # No file - could be a PART header
-            # Link to first child with file
-            href = find_first_child_href_html(entry)
+            # No file - link to first child with file, or parent's file
+            href = find_first_child_href_html(entry, parent_href)
 
         result += f"{indent}<li>\n"
         result += f"{indent}    <a href=\"{href}\">{title}</a>\n"
 
-        # Render children
+        # Render children, passing current href as parent
         if 'children' in entry and entry['children']:
             result += f"{indent}    <ul>\n"
             for child in entry['children']:
-                result += render_entry(child, level + 1)
+                result += render_entry(child, level + 1, href)
             result += f"{indent}    </ul>\n"
 
         result += f"{indent}</li>\n"
         return result
 
-    def find_first_child_href_html(entry: Dict) -> str:
-        """Find href of first descendant with a file (for HTML)."""
+    def find_first_child_href_html(entry: Dict, parent_href: str = "toc.html") -> str:
+        """Find href of first descendant with a file, or fall back to parent."""
         if 'file_path' in entry:
             unit_id = entry.get('unit_id')
             if unit_id:
@@ -527,13 +527,14 @@ def generate_hierarchical_toc_html(
                     return f"{unit_id}_part1.html"
                 else:
                     return f"{unit_id}.html"
-            return "toc.html"
+            return parent_href
         if 'children' in entry:
             for child in entry['children']:
-                href = find_first_child_href_html(child)
-                if href != "toc.html":
+                href = find_first_child_href_html(child, parent_href)
+                if href != "toc.html" and href != parent_href:
                     return href
-        return "toc.html"
+        # No file found in this subtree, use parent's file
+        return parent_href
 
     toc_html += "        <ul>\n"
     for entry in structure:

@@ -20,13 +20,13 @@ This module serves as the high-level orchestrator for EPUB generation,
 coordinating the ContentConverter and EpubBuilder components.
 """
 
-import json
 import re
 import argparse
 from pathlib import Path
 from loguru import logger
 
 from .epub import EpubConfig, ContentConverter, EpubBuilder
+from .utils.common import parse_llm_json
 from .epub.footnotes import FootnoteManager
 from .utils.logging_config import configure_logging
 from .utils.common import load_config, load_book_structure, ensure_directory
@@ -323,7 +323,7 @@ Book structure to translate:"""
             translated_json = translated_json.split("```")[1].split("```")[0]
 
         # Parse the translated JSON
-        translated_structure = json.loads(translated_json.strip())
+        translated_structure = parse_llm_json(translated_json.strip(), operation_name="Structure translation")
 
         # Save the translated structure
         translated_structure_path.parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +458,7 @@ ORIGINAL OCR STRUCTURE (reference):
         elif "```" in response:
             response = response.split("```")[1].split("```")[0]
 
-        releveled_structure = json.loads(response)
+        releveled_structure = parse_llm_json(response, operation_name="Heading relevel")
 
         # Build changes mapping
         changes = {}

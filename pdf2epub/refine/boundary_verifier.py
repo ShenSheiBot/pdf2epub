@@ -5,11 +5,11 @@ Verifies that section titles appear on expected pages and extracts
 the content before/after the title for precise page cutting.
 """
 
-import json
 from pathlib import Path
 from typing import Dict, Optional
 from loguru import logger
 
+from ..utils.common import parse_llm_json
 from ..utils.network_utils import GeminiClient
 from .toc_tree import TOCNode
 
@@ -106,7 +106,7 @@ Return JSON:
             )
 
             logger.debug(f"Response for '{node.title}': {response_text[:200]}...")
-            result = json.loads(response_text)
+            result = parse_llm_json(response_text, operation_name=f"Verify: {node.title}")
 
             if result.get('found', False):
                 logger.debug(f"Verified '{node.title}' on page {node.start_page}")
@@ -219,8 +219,7 @@ Return JSON:
                 f"Search: {node.title}"
             )
 
-            import json
-            result = json.loads(response_text)
+            result = parse_llm_json(response_text, operation_name=f"Search: {node.title}")
 
             if result.get('found') and result.get('page_number'):
                 page_num = result['page_number']

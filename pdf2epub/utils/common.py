@@ -3,11 +3,51 @@ Common utility functions used across multiple modules.
 """
 
 import json
+import time
 import yaml
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
+
+from loguru import logger
 
 from .config_manager import ConfigManager, load_config as _load_config_from_manager
+
+
+def parse_llm_json(
+    text: str,
+    save_dir: Optional[Path] = None,
+    operation_name: str = "LLM response"
+) -> Any:
+    """
+    Parse JSON from LLM response with lenient settings.
+
+    Uses strict=False to allow control characters that LLMs sometimes include.
+    Saves raw response to file on parse failure for debugging.
+
+    Args:
+        text: JSON text to parse
+        save_dir: Optional directory to save raw response on failure
+        operation_name: Name for error logging
+
+    Returns:
+        Parsed JSON object
+
+    Raises:
+        json.JSONDecodeError: If parsing fails even with lenient settings
+    """
+    try:
+        return json.loads(text, strict=False)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from {operation_name}: {e}")
+
+        if save_dir:
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            error_file = save_dir / f"json_error_{int(time.time())}.txt"
+            error_file.write_text(text, encoding='utf-8')
+            logger.error(f"Raw response saved to: {error_file}")
+
+        raise
 
 # Re-export for backward compatibility
 def load_config(config_path: str = "config.yaml") -> Dict:

@@ -17,10 +17,10 @@ toc_tree.json with more accurate boundary detection.
 ================================================================================
 """
 
-import json
 import yaml
 from pathlib import Path
 from google.genai.types import Part
+from .utils.common import parse_llm_json
 from .utils.network_utils import GeminiClient
 from .utils.pdf_utils import add_page_number_patches, preprocess_pdf
 import argparse
@@ -145,7 +145,7 @@ def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
     logger.debug(f"API response length: {len(response_text)} chars")
 
     # Parse the response as JSON
-    return json.loads(response_text)
+    return parse_llm_json(response_text, operation_name="PDF breakdown")
 
 
 def detect_front_and_back_matter(structure, pdf_path):

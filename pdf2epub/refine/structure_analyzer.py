@@ -7,12 +7,12 @@ Provides:
 - Discovery of hidden subsections
 """
 
-import json
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from google.genai.types import Part
 from loguru import logger
 
+from ..utils.common import parse_llm_json
 from ..utils.network_utils import GeminiClient
 from .toc_tree import TOCNode, dict_list_to_toc_tree
 
@@ -151,7 +151,7 @@ Example of a notes chapter:
             operation_name="PDF structure analysis"
         )
 
-        result = json.loads(response_text)
+        result = parse_llm_json(response_text, operation_name="PDF structure analysis")
 
         # Validate and fix notes type - remove from non-notes chapters
         self._fix_invalid_notes_type(result.get('chapters', []))
@@ -277,7 +277,7 @@ Example of a notes chapter:
                 operation_name=f"Re-breakdown: {chapter_title}"
             )
 
-            result = json.loads(response_text)
+            result = parse_llm_json(response_text, operation_name=f"Re-breakdown: {chapter_title}")
             sections = result.get('sections', [])
 
             if sections:

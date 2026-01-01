@@ -15,6 +15,7 @@ from loguru import logger
 from xml.etree import ElementTree as ET
 
 from .epub_parser import EPUBParser
+from ..utils.common import parse_llm_json
 
 
 def sanitize_filename(name: str) -> str:
@@ -1205,7 +1206,7 @@ Output JSON:"""
 
         # Try to parse as JSON
         try:
-            parsed = json.loads(response)
+            parsed = parse_llm_json(response, operation_name="Heading translation")
 
             if isinstance(parsed, list):
                 # Build original -> translated mapping

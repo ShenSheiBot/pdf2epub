@@ -5,13 +5,13 @@ Detects pages not covered by any TOC entry and uses LLM to classify
 and generate appropriate titles for the missing content.
 """
 
-import json
 import copy
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from loguru import logger
 
+from ..utils.common import parse_llm_json
 from ..utils.network_utils import GeminiClient
 
 
@@ -308,7 +308,7 @@ Return JSON:
                 operation_name=f"Classify gap: pages {gap.start_page}-{gap.end_page}"
             )
 
-            result = json.loads(response_text)
+            result = parse_llm_json(response_text, operation_name=f"Classify gap: pages {gap.start_page}-{gap.end_page}")
 
             # Handle case where LLM returns array instead of object
             if isinstance(result, list):
@@ -466,7 +466,7 @@ Return only the JSON array.
                 operation_name="Unify gap corrections"
             )
 
-            corrections = json.loads(response_text)
+            corrections = parse_llm_json(response_text, operation_name="Unify gap corrections")
 
             # Apply corrections (only title, keep computed level)
             corrected_classifications = classifications.copy()

@@ -11,8 +11,8 @@ from loguru import logger
 import re
 import random
 import time
-import json
 from .base import BaseMarkdownProcessor
+from ..utils.common import parse_llm_json
 from .utils.truncation import LLMTruncationDetector
 from .utils.split_manager import SplitManager
 from .tracker import ProcessingTracker
@@ -765,7 +765,7 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
                         json_lines.append(line)
                 response = '\n'.join(json_lines)
 
-            translations = json.loads(response)
+            translations = parse_llm_json(response, operation_name="TOC translation")
 
             # Validate
             if len(translations) != len(reference_json):

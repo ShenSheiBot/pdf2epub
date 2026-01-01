@@ -2,13 +2,13 @@
 LLM-based section matching for Notes chapters.
 """
 
-import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from loguru import logger
 
 from .models import FootnoteDefinition, NotesSection
+from ...utils.common import parse_llm_json
 
 
 class LLMSectionMatcher:
@@ -211,7 +211,7 @@ TOC 章节列表：
                         json_lines.append(line)
                 response = '\n'.join(json_lines)
 
-            matches = json.loads(response)
+            matches = parse_llm_json(response, operation_name="Notes section matching")
             logger.info(f"LLM returned {len(matches)} section matches")
 
             # Save matches to cache

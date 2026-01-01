@@ -14,7 +14,7 @@ from google.genai.types import Part
 from loguru import logger
 from .utils.logging_config import configure_logging
 from .utils.network_utils import GeminiClient, create_gemini_client_from_config
-from .utils.common import load_config
+from .utils.common import load_config, parse_llm_json
 
 # Configure logger
 logger = configure_logging()
@@ -232,7 +232,7 @@ def extract_entities_from_pdf(
         )
         
         # Parse JSON response
-        entities = json.loads(response_text)
+        entities = parse_llm_json(response_text, operation_name="Entity extraction")
         
         # Log summary
         logger.success("Entity extraction completed!")

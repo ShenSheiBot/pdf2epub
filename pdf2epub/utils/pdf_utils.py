@@ -102,6 +102,19 @@ def add_page_number_patches(pdf_path, output_path=None):
             # Scale font size based on patch height
             font_size = max(16, int(patch_height * 0.32))  # ~32% of patch height, min 16pt
 
+            # First: Add full-width white strips at top and bottom to cover printed page numbers
+            # These are drawn first (behind the corner patches)
+            # Use 150% of patch height to ensure printed page numbers are fully covered
+            strip_height = int(patch_height * 1.5)
+
+            # Top strip (covers header/printed page numbers at top)
+            top_strip = fitz.Rect(0, 0, width, strip_height)
+            page.draw_rect(top_strip, color=(1, 1, 1), fill=(1, 1, 1))
+
+            # Bottom strip (covers footer/printed page numbers at bottom)
+            bottom_strip = fitz.Rect(0, height - strip_height, width, height)
+            page.draw_rect(bottom_strip, color=(1, 1, 1), fill=(1, 1, 1))
+
             # Corner positions: top-left, top-right, bottom-left, bottom-right
             # Adjusted margins to ensure better coverage
             corner_positions = [

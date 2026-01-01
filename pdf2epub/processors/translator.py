@@ -5,12 +5,14 @@ This processor translates markdown content from one language to another
 while preserving formatting and structure.
 """
 
-from typing import Dict, Optional, Tuple, List, Any
-from pathlib import Path
-from loguru import logger
-import re
+import json
 import random
+import re
 import time
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List, Any
+
+from loguru import logger
 from .base import BaseMarkdownProcessor
 from ..utils.common import parse_llm_json
 from .utils.truncation import LLMTruncationDetector

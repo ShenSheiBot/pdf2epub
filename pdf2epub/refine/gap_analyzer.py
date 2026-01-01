@@ -86,52 +86,52 @@ class GapAnalyzer:
         cover_page = cover_page_data.get('page_number', 1) if cover_page_data else 1
 
         toc_info = toc_data.get('table_of_contents') or {}
-        toc_start = toc_info.get('start_page', cover_page + 1)
-        toc_end = toc_info.get('end_page', toc_start)
+        toc_start = toc_info.get('start_page')
+        toc_end = toc_info.get('end_page')
 
         back_cover_data = toc_data.get('back_cover')
         back_cover = back_cover_data.get('page_number') if back_cover_data else None
 
-        # 1. Front gap: cover to TOC
-        if cover_page + 1 < toc_start:
+        # Treat TOC as a virtual chapter for gap detection
+        # Combine chapters with TOC entry (if exists) and sort by start_page
+        all_entries = list(chapters)
+        if toc_start and toc_end:
+            all_entries.append({
+                'title': 'Table of Contents',
+                'start_page': toc_start,
+                'end_page': toc_end,
+                'level': 1
+            })
+        all_entries.sort(key=lambda x: x['start_page'])
+
+        # 1. Front gap: cover to first entry
+        if all_entries and cover_page + 1 < all_entries[0]['start_page']:
             gaps.append(Gap(
                 gap_type="front",
                 start_page=cover_page + 1,
-                end_page=toc_start - 1,
+                end_page=all_entries[0]['start_page'] - 1,
                 prev_entry="Cover",
-                next_entry="Table of Contents",
+                next_entry=all_entries[0]['title'],
                 parent_entry=None,
-                insert_path=[0]  # Insert at beginning
+                insert_path=[0]
             ))
 
-        # 2. TOC to first chapter
-        if chapters and toc_end + 1 < chapters[0]['start_page']:
-            gaps.append(Gap(
-                gap_type="toc_to_content",
-                start_page=toc_end + 1,
-                end_page=chapters[0]['start_page'] - 1,
-                prev_entry="Table of Contents",
-                next_entry=chapters[0]['title'],
-                parent_entry=None,
-                insert_path=[0]  # Insert at beginning
-            ))
-
-        # 3. Inter-chapter gaps and nested gaps (recursive)
+        # 2. Inter-chapter gaps (only for actual chapters, not TOC)
         chapter_gaps = self._detect_gaps_recursive(chapters, [])
         gaps.extend(chapter_gaps)
 
-        # 4. Back gap
-        if chapters and back_cover:
-            last_chapter = self._get_last_chapter(chapters)
-            if last_chapter and last_chapter['end_page'] < back_cover - 1:
+        # 3. Back gap: last entry to back cover
+        if all_entries and back_cover:
+            last_entry = max(all_entries, key=lambda x: x['end_page'])
+            if last_entry['end_page'] + 1 < back_cover:
                 gaps.append(Gap(
                     gap_type="back",
-                    start_page=last_chapter['end_page'] + 1,
+                    start_page=last_entry['end_page'] + 1,
                     end_page=back_cover - 1,
-                    prev_entry=last_chapter['title'],
+                    prev_entry=last_entry['title'],
                     next_entry="Back Cover",
                     parent_entry=None,
-                    insert_path=[len(chapters)]  # Append at end
+                    insert_path=[len(chapters)]
                 ))
 
         logger.info(f"Detected {len(gaps)} gaps in TOC structure")

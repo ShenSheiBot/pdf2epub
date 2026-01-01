@@ -182,10 +182,9 @@ def _remove_duplicate_heading(lines: list, title_line_idx: int, toc_title: str):
     """Remove duplicate heading that follows the chapter title.
 
     OCR often produces a heading like "## Title" which duplicates the TOC title.
-    If we find a similar heading within the next few lines, remove it.
+    If we find a semantically similar heading within the next few lines, remove it.
+    Uses embedding-based similarity for better multilingual support.
     """
-    import difflib
-
     # Look in lines after the title (skip blank lines)
     for i in range(title_line_idx + 1, min(title_line_idx + 5, len(lines))):
         line = lines[i].strip()
@@ -194,15 +193,56 @@ def _remove_duplicate_heading(lines: list, title_line_idx: int, toc_title: str):
         if line.startswith('#'):
             # Extract heading text (remove # prefix)
             heading_text = re.sub(r'^#+\s*', '', line)
-            # Check similarity
-            similarity = difflib.SequenceMatcher(
-                None, toc_title.lower(), heading_text.lower()
-            ).ratio()
-            if similarity > 0.8:
+            # Check semantic similarity using embeddings
+            similarity = _compute_semantic_similarity(toc_title, heading_text)
+            if similarity > 0.6:
                 # Remove this duplicate heading
                 lines[i] = ''
                 logger.debug(f"Removed duplicate heading: '{heading_text}' (similarity: {similarity:.2f})")
             break  # Only check the first heading after title
+
+
+# Lazy-loaded embedding model
+_embedding_model = None
+
+
+def _get_embedding_model():
+    """Lazy load the sentence transformer model."""
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            # Small multilingual model (~120MB)
+            _embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+            logger.debug("Loaded embedding model for heading deduplication")
+        except ImportError:
+            logger.warning("sentence-transformers not installed, falling back to text similarity")
+            _embedding_model = False  # Mark as unavailable
+    return _embedding_model
+
+
+def _compute_semantic_similarity(text1: str, text2: str) -> float:
+    """Compute semantic similarity between two texts using embeddings.
+
+    Falls back to text-based similarity if embeddings unavailable.
+    """
+    import difflib
+
+    model = _get_embedding_model()
+    if model is False:
+        # Fallback to text similarity
+        return difflib.SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+
+    try:
+        # Compute embeddings
+        embeddings = model.encode([text1, text2], convert_to_tensor=True)
+        # Cosine similarity
+        from sentence_transformers import util
+        similarity = util.cos_sim(embeddings[0], embeddings[1]).item()
+        return similarity
+    except Exception as e:
+        logger.warning(f"Embedding computation failed: {e}, falling back to text similarity")
+        return difflib.SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
 
 
 def relevel_content(content: str, base_level: int, skip_first: bool = False) -> str:

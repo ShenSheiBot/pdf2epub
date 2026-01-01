@@ -3,7 +3,19 @@ Boundary verification for TOC nodes.
 
 Verifies that section titles appear on expected pages and extracts
 the content before/after the title for precise page cutting.
+
+DEPRECATED: This module has been replaced by boundary_agent.py which uses
+a Pydantic AI agent for more flexible boundary verification, gap filling,
+and overlap detection. This file is kept for reference and will be removed
+in a future version.
 """
+
+import warnings
+warnings.warn(
+    "boundary_verifier is deprecated, use boundary_agent instead",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 from pathlib import Path
 from typing import Dict, Optional

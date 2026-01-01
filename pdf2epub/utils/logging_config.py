@@ -22,12 +22,13 @@ def configure_logging(title=None, command=None, verbose=True):
     # Remove all existing handlers
     logger.remove()
 
-    # Add stderr handler with concise format (INFO level only)
+    # Add stderr handler with concise format (level from env or INFO)
     if verbose:
+        stderr_level = os.environ.get("LOGURU_LEVEL", "INFO")
         logger.add(
             sink=sys.stderr,
             format="<level>{level: <8}</level> | {message}",
-            level="INFO",
+            level=stderr_level,
             colorize=True,
         )
 

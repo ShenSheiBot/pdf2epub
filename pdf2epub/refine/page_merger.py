@@ -1,11 +1,10 @@
 """
 Page merging with precise boundary cutting.
 
-Merges page content for TOC nodes, using boundary_info to
-precisely cut content at section boundaries.
+Merges page content for TOC nodes, using boundary_info (start_line/end_line)
+to precisely cut content at section boundaries.
 """
 
-import re
 from pathlib import Path
 from typing import List
 from loguru import logger
@@ -15,7 +14,9 @@ from .toc_tree import TOCNode
 
 class PageMerger:
     """
-    Merges pages for TOC nodes with precise boundary cutting.
+    Merges pages for TOC nodes with precise line-based boundary cutting.
+
+    Uses start_line/end_line from boundary_info to handle mid-page splits.
     """
 
     def merge_node_content(
@@ -27,12 +28,13 @@ class PageMerger:
         """
         Merge page content for a node.
 
-        Uses boundary_info to exclude content that doesn't belong to this node.
+        Uses boundary_info.start_line/end_line for precise cutting when
+        sections share a page.
 
         Args:
             node: TOCNode to merge content for
             pages_dir: Directory containing page files
-            next_node: Next sibling node (to get its content_before_title for end boundary)
+            next_node: Next sibling node (to get its start_line for end boundary)
 
         Returns:
             Merged content string
@@ -47,22 +49,32 @@ class PageMerger:
                 continue
 
             page_content = page_file.read_text(encoding='utf-8')
+            lines = page_content.split('\n')
 
-            # Handle first page - remove content before title
+            # Handle first page - start from start_line if set
             if page_num == node.start_page:
-                content_before = boundary.get('content_before_title', '')
-                if content_before:
-                    page_content = self._remove_prefix(page_content, content_before)
+                start_line = boundary.get('start_line')
+                if start_line is not None and start_line > 1:
+                    # start_line is 1-indexed, so we slice from start_line-1
+                    lines = lines[start_line - 1:]
+                    logger.debug(f"Node '{node.title}' starts at line {start_line}")
 
-            # Handle last page - remove content that belongs to next section
-            if page_num == node.end_page and next_node:
-                next_boundary = next_node.boundary_info or {}
-                # If next section starts on the same page, use its content_before_title as suffix
-                if next_node.start_page == node.end_page:
-                    content_before_next = next_boundary.get('content_before_title', '')
-                    if content_before_next:
-                        page_content = self._remove_suffix(page_content, content_before_next)
+            # Handle last page - end at end_line if set, or at next_node's start_line
+            if page_num == node.end_page:
+                end_line = boundary.get('end_line')
+                if end_line is not None:
+                    # end_line is 1-indexed, we want lines before this line
+                    lines = lines[:end_line - 1]
+                    logger.debug(f"Node '{node.title}' ends at line {end_line}")
+                elif next_node and next_node.start_page == node.end_page:
+                    # Next section starts on same page - cut before it
+                    next_boundary = next_node.boundary_info or {}
+                    next_start_line = next_boundary.get('start_line')
+                    if next_start_line is not None:
+                        lines = lines[:next_start_line - 1]
+                        logger.debug(f"Cutting before next section at line {next_start_line}")
 
+            page_content = '\n'.join(lines)
             if page_content.strip():
                 content_parts.append(page_content)
 
@@ -82,7 +94,7 @@ class PageMerger:
         Args:
             nodes: List of TOCNodes to merge
             pages_dir: Directory containing page files
-            next_node: Next sibling node (to get its content_before_title for end boundary)
+            next_node: Next sibling node (to get its start_line for end boundary)
 
         Returns:
             Merged content string
@@ -93,6 +105,7 @@ class PageMerger:
         # Get the full page range
         start_page = nodes[0].start_page
         end_page = nodes[-1].end_page
+        first_boundary = nodes[0].boundary_info or {}
 
         content_parts = []
 
@@ -102,96 +115,23 @@ class PageMerger:
                 continue
 
             page_content = page_file.read_text(encoding='utf-8')
+            lines = page_content.split('\n')
 
             # Handle first page of first node
-            if page_num == start_page and nodes[0].boundary_info:
-                content_before = nodes[0].boundary_info.get('content_before_title', '')
-                if content_before:
-                    page_content = self._remove_prefix(page_content, content_before)
+            if page_num == start_page:
+                start_line = first_boundary.get('start_line')
+                if start_line is not None and start_line > 1:
+                    lines = lines[start_line - 1:]
 
-            # Handle last page - remove content that belongs to next section
-            if page_num == end_page and next_node:
+            # Handle last page - end at next_node's start_line if on same page
+            if page_num == end_page and next_node and next_node.start_page == end_page:
                 next_boundary = next_node.boundary_info or {}
-                if next_node.start_page == end_page:
-                    content_before_next = next_boundary.get('content_before_title', '')
-                    if content_before_next:
-                        page_content = self._remove_suffix(page_content, content_before_next)
+                next_start_line = next_boundary.get('start_line')
+                if next_start_line is not None:
+                    lines = lines[:next_start_line - 1]
 
+            page_content = '\n'.join(lines)
             if page_content.strip():
                 content_parts.append(page_content)
 
         return '\n\n'.join(content_parts)
-
-    def _remove_prefix(self, text: str, prefix: str) -> str:
-        """
-        Remove prefix content from text.
-
-        Tries exact match first, then fuzzy match.
-
-        Args:
-            text: Full text
-            prefix: Prefix to remove
-
-        Returns:
-            Text with prefix removed
-        """
-        if not prefix or not prefix.strip():
-            return text
-
-        # Try exact match first
-        idx = text.find(prefix)
-        if idx != -1:
-            result = text[idx + len(prefix):].lstrip()
-            logger.debug(f"Removed {len(prefix)} chars from start (exact match)")
-            return result
-
-        # Try fuzzy match - match first few words
-        prefix_words = prefix.split()[:10]
-        if prefix_words:
-            # Build a pattern that matches the words with flexible whitespace
-            pattern = r'\s*'.join(re.escape(w) for w in prefix_words)
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                # Find the end of the prefix in the original text
-                # Look for where the prefix content ends
-                result = text[match.end():].lstrip()
-                logger.debug(f"Removed prefix using fuzzy match")
-                return result
-
-        # If no match found, log warning and return original
-        logger.warning(f"Could not find prefix to remove (first 50 chars): {prefix[:50]}...")
-        return text
-
-    def _remove_suffix(self, text: str, suffix: str) -> str:
-        """
-        Remove suffix content from text.
-
-        Args:
-            text: Full text
-            suffix: Suffix to remove
-
-        Returns:
-            Text with suffix removed
-        """
-        if not suffix or not suffix.strip():
-            return text
-
-        # Try exact match
-        idx = text.rfind(suffix)
-        if idx != -1:
-            result = text[:idx].rstrip()
-            logger.debug(f"Removed {len(suffix)} chars from end")
-            return result
-
-        # Try fuzzy match
-        suffix_words = suffix.split()[:10]
-        if suffix_words:
-            pattern = r'\s*'.join(re.escape(w) for w in suffix_words)
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                result = text[:match.start()].rstrip()
-                logger.debug(f"Removed suffix using fuzzy match")
-                return result
-
-        logger.warning(f"Could not find suffix to remove (first 50 chars): {suffix[:50]}...")
-        return text

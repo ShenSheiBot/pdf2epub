@@ -1,0 +1,800 @@
+"""
+Boundary verification agent using Pydantic AI.
+
+Uses an LLM agent with tools to verify and adjust chapter boundaries.
+Supports recursive verification of nested TOC structures.
+"""
+
+import json
+import asyncio
+from pathlib import Path
+from typing import Optional
+from pydantic import BaseModel
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+from loguru import logger
+import yaml
+import tiktoken
+
+from .toc_tree import TOCNode
+
+# Initialize tokenizer
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+
+def load_config() -> dict:
+    """Load config from config.yaml"""
+    config_path = Path(__file__).parent.parent.parent / "config.yaml"
+    if config_path.exists():
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+    return {}
+
+
+def get_model_and_limits():
+    """Get the model for boundary verification and its token limits.
+
+    Priority: Anthropic (Haiku) > POE (Gemini)
+
+    Returns:
+        Tuple of (model, model_name, max_tokens)
+    """
+    config = load_config()
+    providers = config.get('credentials', {}).get('providers', {})
+    model_limits = config.get('model_output_limits', {})
+    default_limit = model_limits.get('_default', 4000)
+
+    # Try Anthropic first (Haiku for speed/cost)
+    if 'anthropic' in providers:
+        p = providers['anthropic']
+        provider = AnthropicProvider(
+            api_key=p.get('api_key'),
+            base_url=p.get('base_url'),
+        )
+        model_name = 'claude-haiku-4-5-20251001'
+        model = AnthropicModel(model_name, provider=provider)
+        max_tokens = model_limits.get(model_name, default_limit)
+        return model, model_name, max_tokens
+
+    # Fallback to POE (OpenAI-compatible, can use Gemini-2.5-Flash)
+    if 'poe' in providers:
+        p = providers['poe']
+        provider = OpenAIProvider(
+            api_key=p.get('api_key'),
+            base_url=p.get('base_url'),
+        )
+        model_name = 'Gemini-2.5-Flash'
+        model = OpenAIChatModel(model_name, provider=provider)
+        max_tokens = model_limits.get(model_name, default_limit)
+        return model, model_name, max_tokens
+
+    raise ValueError("No suitable provider found in config.yaml (need anthropic or poe)")
+
+
+class Section(BaseModel):
+    """A section in the TOC with boundary information."""
+    title: str
+    start_page: int
+    end_page: int
+    start_line: Optional[int] = None  # None = start of page
+    end_line: Optional[int] = None    # None = end of page
+    verified: bool = False
+    children_count: int = 0
+    estimated_tokens: int = 0
+    original_index: Optional[int] = None  # Index in original children, None if inserted
+
+
+class ChapterState(BaseModel):
+    """State for boundary verification of a chapter's sections."""
+    sections: list[Section]
+    pages_dir: str
+    total_pages: int
+
+
+# Create the agent (lazy initialization)
+_agent = None
+_model_max_tokens = None  # Token limit from config
+
+
+def get_model_max_tokens() -> int:
+    """Get the model's max token limit from config.
+
+    This is used as the threshold for deciding whether to process children.
+    """
+    global _model_max_tokens
+    if _model_max_tokens is None:
+        _, _, _model_max_tokens = get_model_and_limits()
+    return _model_max_tokens
+
+
+def get_agent():
+    global _agent, _model_max_tokens
+    if _agent is None:
+        model, model_name, max_tokens = get_model_and_limits()
+        _model_max_tokens = max_tokens
+        logger.info(f"Using model {model_name} with max_tokens={max_tokens}")
+        _agent = Agent(
+            model,
+            deps_type=ChapterState,
+            system_prompt="""You are a boundary verification expert for book chapter segmentation.
+
+Your task is to verify and fix section boundaries, ensuring complete coverage with no gaps or overlaps.
+
+IMPORTANT: Be flexible with title matching!
+- OCR is imperfect: titles may have wrong spaces ("L' ATTENTAT" vs "L'ATTENTAT"),
+  accent errors ("é" vs "e"), or minor typos
+- Container sections like "Première partie", "Huitième partie" often DON'T appear literally
+  on the page - they're just TOC labels. The page may only show the first subsection's title.
+- What matters is: does the PAGE CONTENT make sense as the START of this section?
+
+Available tools:
+- read_page: Read a page's content (with line numbers)
+- adjust_start: Adjust a section's start page (automatically adjusts previous section's end)
+- set_split: Set a split point within a page (for when a section starts mid-page)
+- mark_verified: Mark a section as verified once you confirm the boundary is correct
+- remove_section: Remove a section that doesn't exist or should be merged
+- insert_section: Insert a new section when you find a gap with distinct content
+- check_issues: Check for gaps/overlaps/missing splits/possible mid-sentence cuts - call before saying "Done"
+
+Process:
+1. For each unverified section, read its start_page
+2. Check if the section title/heading appears on that page
+3. If the title is at line 1, just mark_verified
+4. If the title is NOT at line 1 (there's content before it), you MUST use set_split to set the exact line number where the section starts - this is critical for correct page merging!
+5. If title is on wrong page, use adjust_start to fix it
+6. If you find gaps between sections, read those pages and either:
+   - Extend an adjacent section to cover the gap, OR
+   - Insert a new section if there's a distinct chapter/heading
+7. If a section doesn't exist (OCR error), use remove_section
+
+IMPORTANT: When a section title appears mid-page (not line 1), you MUST call set_split before mark_verified. Otherwise the content before the title will be lost!
+
+Before saying "Done", call check_issues to verify:
+- No gaps between sections (missing pages)
+- No overlaps (end_page > next start_page)
+- No shared pages without split points defined
+- No POSSIBLE SPLIT warnings (page starts with lowercase/non-heading text)
+If issues remain, fix them or confirm they are intentional before finishing.
+""",
+        )
+
+        # Register tools
+        @_agent.tool
+        def read_page(ctx: RunContext[ChapterState], page_num: int) -> str:
+            """Read a page's content with line numbers.
+
+            Args:
+                page_num: The page number to read (1-indexed)
+
+            Returns:
+                The page content with line numbers, or error message if page doesn't exist.
+            """
+            logger.debug(f"Tool: read_page(page_num={page_num})")
+            pages_dir = Path(ctx.deps.pages_dir)
+            page_file = pages_dir / f"page_{page_num:03d}.md"
+
+            if not page_file.exists():
+                return f"Error: Page {page_num} does not exist (valid range: 1-{ctx.deps.total_pages})"
+
+            content = page_file.read_text(encoding='utf-8')
+            lines = content.split('\n')
+            numbered_lines = [f"{i+1:3d}| {line}" for i, line in enumerate(lines)]
+            return '\n'.join(numbered_lines)
+
+        @_agent.tool
+        def adjust_start(ctx: RunContext[ChapterState], section_index: int, new_start_page: int) -> str:
+            """Adjust a section's start page. Automatically adjusts the previous section's end page.
+
+            Args:
+                section_index: Index of the section to adjust (0-indexed)
+                new_start_page: The new start page for this section
+
+            Returns:
+                Updated sections state as JSON.
+            """
+            logger.debug(f"Tool: adjust_start(section_index={section_index}, new_start_page={new_start_page})")
+            sections = ctx.deps.sections
+
+            if section_index < 0 or section_index >= len(sections):
+                return f"Error: Invalid section index {section_index}"
+
+            section = sections[section_index]
+            old_start = section.start_page
+            section.start_page = new_start_page
+            section.start_line = None  # Clear any split
+            section.verified = False   # Need to re-verify
+
+            # Adjust previous section's end
+            if section_index > 0:
+                prev_section = sections[section_index - 1]
+                prev_section.end_page = new_start_page - 1
+                prev_section.end_line = None  # Clear any split
+
+            logger.info(f"Adjusted '{section.title}' start: {old_start} -> {new_start_page}")
+            return _format_sections(sections)
+
+        @_agent.tool
+        def set_split(ctx: RunContext[ChapterState], section_index: int, page_num: int, line_num: int) -> str:
+            """Set a split point: this section starts at the given line on the given page.
+            The previous section ends just before this line on the same page.
+
+            Args:
+                section_index: Index of the section that starts at this split point
+                page_num: The page number where the split occurs
+                line_num: The line number where this section starts (1-indexed)
+
+            Returns:
+                Updated sections state as JSON.
+            """
+            logger.debug(f"Tool: set_split(section_index={section_index}, page_num={page_num}, line_num={line_num})")
+            sections = ctx.deps.sections
+
+            if section_index < 0 or section_index >= len(sections):
+                return f"Error: Invalid section index {section_index}"
+
+            if section_index == 0:
+                return "Error: Cannot split before the first section"
+
+            section = sections[section_index]
+            prev_section = sections[section_index - 1]
+
+            # Set this section's start
+            section.start_page = page_num
+            section.start_line = line_num
+            section.verified = False
+
+            # Set previous section's end
+            prev_section.end_page = page_num
+            prev_section.end_line = line_num
+
+            logger.info(f"Set split at page {page_num} line {line_num}: '{prev_section.title}' ends, '{section.title}' starts")
+            return _format_sections(sections)
+
+        @_agent.tool
+        def mark_verified(ctx: RunContext[ChapterState], section_index: int) -> str:
+            """Mark a section as verified after confirming its boundary is correct.
+
+            Args:
+                section_index: Index of the section to mark as verified
+
+            Returns:
+                Updated sections state as JSON.
+            """
+            logger.debug(f"Tool: mark_verified(section_index={section_index})")
+            sections = ctx.deps.sections
+
+            if section_index < 0 or section_index >= len(sections):
+                return f"Error: Invalid section index {section_index}"
+
+            section = sections[section_index]
+            section.verified = True
+            logger.info(f"Verified: '{section.title}' at page {section.start_page}")
+            return _format_sections(sections)
+
+        @_agent.tool
+        def remove_section(ctx: RunContext[ChapterState], section_index: int) -> str:
+            """Remove a section from the list.
+
+            Use when:
+            - A section doesn't actually exist (OCR/TOC error)
+            - A section should be merged with adjacent ones
+
+            The previous section's end_page is extended to cover the removed section's range.
+
+            Args:
+                section_index: Index of the section to remove
+
+            Returns:
+                Updated sections state as JSON.
+            """
+            logger.debug(f"Tool: remove_section(section_index={section_index})")
+            sections = ctx.deps.sections
+
+            if section_index < 0 or section_index >= len(sections):
+                return f"Error: Invalid section index {section_index}"
+
+            if len(sections) <= 1:
+                return "Error: Cannot remove the only section"
+
+            removed = sections[section_index]
+
+            # Extend previous section to cover this range, or extend next section backward
+            if section_index > 0:
+                sections[section_index - 1].end_page = removed.end_page
+                sections[section_index - 1].end_line = removed.end_line
+            elif section_index < len(sections) - 1:
+                sections[section_index + 1].start_page = removed.start_page
+                sections[section_index + 1].start_line = removed.start_line
+
+            sections.pop(section_index)
+            logger.info(f"Removed section '{removed.title}'")
+            return _format_sections(sections)
+
+        @_agent.tool
+        def insert_section(ctx: RunContext[ChapterState], after_index: int, title: str, start_page: int, end_page: int) -> str:
+            """Insert a new section after the specified index.
+
+            Use when:
+            - You discover a gap between sections that contains a distinct chapter/section
+            - The TOC missed a section that clearly exists on the page
+
+            Args:
+                after_index: Insert after this section index (-1 to insert at beginning)
+                title: Title of the new section (as it appears on the page)
+                start_page: Start page of the new section
+                end_page: End page of the new section
+
+            Returns:
+                Updated sections state as JSON.
+            """
+            logger.debug(f"Tool: insert_section(after_index={after_index}, title={title}, start_page={start_page}, end_page={end_page})")
+            sections = ctx.deps.sections
+
+            if after_index < -1 or after_index >= len(sections):
+                return f"Error: Invalid after_index {after_index}"
+
+            # Create new section
+            new_section = Section(
+                title=title,
+                start_page=start_page,
+                end_page=end_page,
+                verified=False,
+            )
+
+            # Adjust adjacent sections
+            if after_index >= 0:
+                # Shrink the previous section's end
+                sections[after_index].end_page = start_page - 1
+                sections[after_index].end_line = None
+
+            insert_pos = after_index + 1
+            if insert_pos < len(sections):
+                # Shrink the next section's start if needed
+                if sections[insert_pos].start_page <= end_page:
+                    sections[insert_pos].start_page = end_page + 1
+                    sections[insert_pos].start_line = None
+
+            sections.insert(insert_pos, new_section)
+            logger.info(f"Inserted section '{title}' at index {insert_pos} (p{start_page}-p{end_page})")
+            return _format_sections(sections)
+
+        @_agent.tool
+        def check_issues(ctx: RunContext[ChapterState]) -> str:
+            """Check for boundary issues (gaps, overlaps, missing splits).
+
+            Call this before saying "Done" to verify everything is correct.
+
+            Returns:
+                List of issues found, or "No issues found" if clean.
+            """
+            logger.debug("Tool: check_issues()")
+            sections = ctx.deps.sections
+            pages_dir = Path(ctx.deps.pages_dir)
+            issues = detect_boundary_issues(sections, pages_dir)
+
+            if not issues:
+                return "No issues found. All sections have valid boundaries."
+
+            return f"Found {len(issues)} issues:\n" + "\n".join(f"- {issue}" for issue in issues)
+
+    return _agent
+
+
+def _sort_sections_by_page(sections: list[Section]) -> None:
+    """Sort sections by start_page in place."""
+    sections.sort(key=lambda s: (s.start_page, s.start_line or 0))
+
+
+def _format_sections(sections: list[Section]) -> str:
+    """Format sections as a readable JSON summary."""
+    result = []
+    for i, s in enumerate(sections):
+        status = "✓" if s.verified else "?"
+        start = f"p{s.start_page}"
+        if s.start_line:
+            start += f":L{s.start_line}"
+        end = f"p{s.end_page}"
+        if s.end_line:
+            end += f":L{s.end_line}"
+        result.append(f"  [{i}] {status} {s.title[:40]:<40} {start}-{end}")
+    return "Current sections:\n" + "\n".join(result)
+
+
+def detect_boundary_issues(sections: list[Section], pages_dir: Path = None) -> list[str]:
+    """Detect gaps, overlaps, missing splits, and possible mid-sentence splits.
+
+    Args:
+        sections: List of sections to check
+        pages_dir: Directory containing page files (optional, for content-based checks)
+
+    Returns:
+        List of issue descriptions, empty if no issues found.
+    """
+    issues = []
+
+    for i in range(len(sections) - 1):
+        curr = sections[i]
+        next_sec = sections[i + 1]
+
+        # Check for gap: curr.end_page + 1 < next.start_page
+        if curr.end_page + 1 < next_sec.start_page:
+            gap_start = curr.end_page + 1
+            gap_end = next_sec.start_page - 1
+            issues.append(
+                f"GAP: Pages {gap_start}-{gap_end} between "
+                f"[{i}] '{curr.title[:30]}' (ends p{curr.end_page}) and "
+                f"[{i+1}] '{next_sec.title[:30]}' (starts p{next_sec.start_page}). "
+                f"Read these pages and either extend an adjacent section or insert_section if there's a distinct heading."
+            )
+
+        # Check for overlap: curr.end_page > next.start_page
+        elif curr.end_page > next_sec.start_page:
+            issues.append(
+                f"OVERLAP: [{i}] '{curr.title[:30]}' ends p{curr.end_page} > "
+                f"[{i+1}] '{next_sec.title[:30]}' starts p{next_sec.start_page}. "
+                f"Use adjust_start or set_split to fix."
+            )
+
+        # Check for shared page without split
+        elif curr.end_page == next_sec.start_page:
+            if not curr.end_line and not next_sec.start_line:
+                issues.append(
+                    f"MISSING SPLIT: [{i}] '{curr.title[:30]}' and [{i+1}] '{next_sec.title[:30]}' "
+                    f"share page {curr.end_page} but no split is defined. "
+                    f"Read page {curr.end_page} and use set_split to define the boundary line."
+                )
+
+    # Check for possible mid-sentence splits (content-based)
+    if pages_dir:
+        for i, section in enumerate(sections):
+            # Skip if start_line is already set
+            if section.start_line:
+                continue
+
+            page_file = pages_dir / f"page_{section.start_page:03d}.md"
+            if not page_file.exists():
+                continue
+
+            content = page_file.read_text(encoding='utf-8')
+            first_line = content.split('\n')[0].strip() if content else ""
+
+            # Check if first line looks like a heading
+            if first_line.startswith('#'):
+                continue  # Has markdown heading, OK
+
+            # Check if first character is uppercase (A-Z)
+            if first_line and first_line[0].isupper():
+                continue  # Starts with uppercase, likely a title
+
+            # First line doesn't start with # or uppercase - possible split problem
+            if first_line:
+                issues.append(
+                    f"POSSIBLE SPLIT: [{i}] '{section.title[:30]}' starts at p{section.start_page} "
+                    f"but first line doesn't look like a heading: \"{first_line[:50]}...\". "
+                    f"Read the page and use set_split if the title appears later on the page."
+                )
+
+    return issues
+
+
+def estimate_tokens(pages_dir: Path, start_page: int, end_page: int) -> int:
+    """Estimate token count for a page range."""
+    total = 0
+    for page_num in range(start_page, end_page + 1):
+        page_file = pages_dir / f"page_{page_num:03d}.md"
+        if page_file.exists():
+            content = page_file.read_text(encoding='utf-8')
+            total += len(tokenizer.encode(content))
+    return total
+
+
+def toc_node_to_sections(node: TOCNode) -> list[Section]:
+    """Convert TOCNode children to Section list for verification."""
+    sections = []
+    for i, child in enumerate(node.children):
+        start_page = child.start_page
+        end_page = child.end_page
+
+        # Auto-fix invalid ranges
+        if end_page < start_page:
+            logger.warning(f"Fixed invalid range for '{child.title}': p{start_page}-p{end_page} -> p{start_page}-p{start_page}")
+            end_page = start_page
+
+        sections.append(Section(
+            title=child.title,
+            start_page=start_page,
+            end_page=end_page,
+            children_count=len(child.children),
+            estimated_tokens=child.estimated_tokens,
+            original_index=i,
+        ))
+    return sections
+
+
+def sections_to_toc_children(sections: list[Section], original_children: list[TOCNode]) -> list[TOCNode]:
+    """Update TOCNode children from verified sections.
+
+    Handles:
+    - Updated sections: sync start_page, end_page, boundary_info
+    - Removed sections: skip (not in sections list)
+    - Inserted sections: create new TOCNode
+    """
+    new_children = []
+
+    for section in sections:
+        if section.original_index is not None:
+            # Existing section - update it
+            child = original_children[section.original_index]
+            child.start_page = section.start_page
+            child.end_page = section.end_page
+            # Always reset boundary_info to new format (clears old content_before_title etc.)
+            if section.start_line or section.end_line:
+                child.boundary_info = {
+                    'start_line': section.start_line,
+                    'end_line': section.end_line,
+                }
+            else:
+                child.boundary_info = None  # Clear old format
+            new_children.append(child)
+        else:
+            # Inserted section - create new TOCNode
+            new_node = TOCNode(
+                title=section.title,
+                level=original_children[0].level if original_children else 1,
+                start_page=section.start_page,
+                end_page=section.end_page,
+                children=[],
+                gap_filled=True,  # Mark as inserted by agent
+            )
+            if section.start_line or section.end_line:
+                new_node.boundary_info = {
+                    'start_line': section.start_line,
+                    'end_line': section.end_line,
+                }
+            new_children.append(new_node)
+
+    return new_children
+
+
+async def verify_node_boundaries(
+    node: TOCNode,
+    pages_dir: Path,
+    total_pages: int,
+    max_retries: int = 3,
+) -> None:
+    """Verify boundaries for a single node's children.
+
+    Args:
+        node: TOCNode whose children need verification
+        pages_dir: Directory containing page_XXX.md files
+        total_pages: Total number of pages in the book
+        max_retries: Maximum retries for API errors
+    """
+    if not node.children:
+        return
+
+    sections = toc_node_to_sections(node)
+
+    state = ChapterState(
+        sections=sections,
+        pages_dir=str(pages_dir),
+        total_pages=total_pages,
+    )
+
+    logger.info(f"Verifying {len(sections)} children of '{node.title}'")
+    logger.debug(_format_sections(sections))
+
+    agent = get_agent()
+
+    # First round: normal verification
+    await _run_agent_with_retries(
+        agent, state,
+        f"Verify the boundaries for these {len(sections)} sections. "
+        f"Check each section's start_page to ensure the title appears there.\n\n"
+        f"{_format_sections(state.sections)}",
+        max_retries
+    )
+
+    # Check for issues after first round
+    issues = detect_boundary_issues(state.sections, pages_dir)
+    if issues:
+        logger.warning(f"Found {len(issues)} boundary issues, running second round...")
+        for issue in issues:
+            logger.warning(f"  {issue}")
+
+        # Second round: fix detected issues
+        issues_text = "\n".join(f"- {issue}" for issue in issues)
+        await _run_agent_with_retries(
+            agent, state,
+            f"The following boundary issues were detected:\n\n{issues_text}\n\n"
+            f"Please fix these issues. For each issue:\n"
+            f"- GAP: Read the gap pages and either extend an adjacent section's end_page (adjust_start), or use insert_section if there's a distinct chapter/heading.\n"
+            f"- OVERLAP: Use adjust_start or set_split to fix the overlap.\n"
+            f"- MISSING SPLIT: Read the shared page and use set_split to define where one section ends and the next begins.\n"
+            f"- POSSIBLE SPLIT: Read the page and check if the section title appears later on the page. If so, use set_split.\n\n"
+            f"If an issue is intentional (e.g., blank pages, appendix), you can ignore it.\n\n"
+            f"Current state:\n{_format_sections(state.sections)}",
+            max_retries
+        )
+        # Log final state after second round
+        final_issues = detect_boundary_issues(state.sections, pages_dir)
+        if final_issues:
+            logger.info(f"After second round, {len(final_issues)} issues remain (may be intentional)")
+
+    # Sort by page and update the node's children
+    _sort_sections_by_page(state.sections)
+    node.children = sections_to_toc_children(state.sections, node.children)
+
+
+async def _run_agent_with_retries(agent, state: ChapterState, prompt: str, max_retries: int):
+    """Run agent with retry logic for transient errors."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            await agent.run(prompt, deps=state)
+            return
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).lower()
+
+            # Check if it's a retryable error
+            if any(term in error_msg for term in ['empty', 'timeout', 'connection', '429', '500', '502', '503', '504']):
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+
+            # Non-retryable error
+            raise
+
+    # All retries exhausted
+    raise last_error
+
+
+async def verify_toc_recursive(
+    toc_tree: list[TOCNode],
+    pages_dir: Path,
+    total_pages: int,
+    max_tokens: int = None,
+    max_retries: int = 3,
+) -> list[TOCNode]:
+    """Recursively verify all boundaries in TOC tree.
+
+    Process:
+    1. Verify top-level chapters (sequential for stability)
+    2. For each chapter, if tokens < max_tokens, remove children
+    3. Otherwise, verify children (parallel within each level)
+    4. Recurse into children
+
+    Args:
+        toc_tree: List of top-level TOCNodes
+        pages_dir: Directory containing page_XXX.md files
+        total_pages: Total number of pages
+        max_tokens: Token threshold - nodes below this have children removed.
+                    If None, uses the model's limit from config.yaml.
+        max_retries: Maximum retries for API errors
+
+    Returns:
+        Updated TOC tree with verified boundaries
+    """
+    # Get max_tokens from config if not specified
+    if max_tokens is None:
+        max_tokens = get_model_max_tokens()
+        logger.info(f"Using max_tokens={max_tokens} from config")
+
+    # First estimate tokens for all nodes
+    def estimate_all(nodes: list[TOCNode]):
+        for node in nodes:
+            node.estimated_tokens = estimate_tokens(pages_dir, node.start_page, node.end_page)
+            estimate_all(node.children)
+
+    estimate_all(toc_tree)
+
+    # Create a virtual root to verify top-level chapters
+    class VirtualRoot:
+        def __init__(self, children):
+            self.title = "ROOT"
+            self.children = children
+
+    root = VirtualRoot(toc_tree)
+
+    # Step 1: Verify top-level chapters
+    logger.info("=== Verifying top-level chapters ===")
+    await verify_node_boundaries(root, pages_dir, total_pages, max_retries)
+
+    # Step 2: Process each chapter recursively
+    async def process_node(node: TOCNode, depth: int = 1):
+        indent = "  " * depth
+
+        # Check if below token threshold
+        if node.estimated_tokens < max_tokens:
+            if node.children:
+                logger.info(f"{indent}'{node.title}' has {node.estimated_tokens} tokens < {max_tokens}, removing {len(node.children)} children")
+                node.children = []
+            return
+
+        # Has children and above threshold - verify them
+        if node.children:
+            logger.info(f"{indent}=== Verifying children of '{node.title}' ({node.estimated_tokens} tokens) ===")
+            await verify_node_boundaries(node, pages_dir, total_pages, max_retries)
+
+            # Recurse into children (parallel)
+            tasks = [process_node(child, depth + 1) for child in node.children]
+            await asyncio.gather(*tasks)
+
+    # Process all top-level chapters in parallel
+    tasks = [process_node(chapter) for chapter in toc_tree]
+    await asyncio.gather(*tasks)
+
+    return toc_tree
+
+
+def load_toc_tree(toc_path: Path) -> tuple[list[TOCNode], dict]:
+    """Load TOC tree from JSON file.
+
+    Returns:
+        Tuple of (toc_tree, metadata)
+    """
+    with open(toc_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    chapters = data.get('chapters', [])
+    metadata = {k: v for k, v in data.items() if k != 'chapters'}
+
+    toc_tree = [TOCNode.from_dict(ch) for ch in chapters]
+    return toc_tree, metadata
+
+
+def save_toc_tree(toc_tree: list[TOCNode], metadata: dict, toc_path: Path):
+    """Save TOC tree to JSON file."""
+    data = {
+        **metadata,
+        'chapters': [node.to_dict() for node in toc_tree]
+    }
+    with open(toc_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# CLI entry point for testing
+if __name__ == "__main__":
+    import sys
+    from pdf2epub.utils.logging_config import configure_logging
+
+    configure_logging()
+
+    async def main():
+        output_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("output/Boniface VIII - Un pape hérétique")
+        toc_path = output_dir / "toc_tree_original.json"
+        pages_dir = output_dir / "pages"
+
+        # Count pages
+        total_pages = len(list(pages_dir.glob("page_*.md")))
+
+        # Load TOC
+        toc_tree, metadata = load_toc_tree(toc_path)
+
+        # Verify recursively (uses max_tokens from config)
+        toc_tree = await verify_toc_recursive(
+            toc_tree, pages_dir, total_pages,
+        )
+
+        # Save result
+        output_path = output_dir / "toc_tree_verified.json"
+        save_toc_tree(toc_tree, metadata, output_path)
+
+        print(f"\n=== Verification Complete ===")
+        print(f"Saved to: {output_path}")
+
+        # Print summary
+        def count_nodes(nodes):
+            total = len(nodes)
+            for n in nodes:
+                total += count_nodes(n.children)
+            return total
+
+        print(f"Total nodes: {count_nodes(toc_tree)}")
+
+    asyncio.run(main())

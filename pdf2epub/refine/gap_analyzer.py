@@ -3,7 +3,19 @@ Gap detection and filling for TOC structures.
 
 Detects pages not covered by any TOC entry and uses LLM to classify
 and generate appropriate titles for the missing content.
+
+DEPRECATED: This module has been replaced by boundary_agent.py which uses
+a Pydantic AI agent with insert_section/remove_section tools for gap filling
+and overlap detection. This file is kept for reference and will be removed
+in a future version.
 """
+
+import warnings
+warnings.warn(
+    "gap_analyzer is deprecated, use boundary_agent instead",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import copy
 import json

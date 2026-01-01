@@ -23,6 +23,7 @@ class TOCNode:
     children: List['TOCNode'] = field(default_factory=list)
 
     # Populated after boundary verification
+    # Contains: start_line (int), end_line (int) - for mid-page splits
     boundary_info: Optional[Dict] = None
 
     # For notes chapters

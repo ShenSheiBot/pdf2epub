@@ -280,17 +280,28 @@ class GeminiClient:
                 logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
                 last_log_length = current_tokens
         
+        # Log finish reason from last chunk
+        finish_reason = None
+        if chunk_count > 0 and hasattr(chunk, 'candidates') and chunk.candidates:
+            for candidate in chunk.candidates:
+                if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                    finish_reason = str(candidate.finish_reason)
+                    logger.debug(f"Stream finished with reason: {finish_reason}")
+
         if not aggregated_text:
             logger.error(f"Empty stream: {chunk_count} chunks received for {operation_name}")
-            if chunk_count > 0:
-                logger.error(f"Last chunk had candidates: {hasattr(chunk, 'candidates')}")
-                if hasattr(chunk, 'candidates') and chunk.candidates:
-                    for candidate in chunk.candidates:
-                        logger.error(f"Candidate finish_reason: {getattr(candidate, 'finish_reason', 'N/A')}")
+            if finish_reason:
+                logger.error(f"Finish reason: {finish_reason}")
             raise ValueError(f"Empty stream response for {operation_name}")
-        
+
         # Get final token count
         final_tokens = len(self.tokenizer.encode(aggregated_text))
+
+        # Warn if response seems abnormally short (< 500 tokens for structure analysis)
+        if final_tokens < 500 and "structure" in operation_name.lower():
+            logger.warning(f"Abnormally short response ({final_tokens} tokens) for {operation_name}")
+            if finish_reason:
+                logger.warning(f"Finish reason: {finish_reason}")
         logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) for {operation_name}")
         return aggregated_text
     

@@ -72,6 +72,7 @@ class RefinedBreakdown:
 
         structure_provider = structure_config.get('provider', default_provider)
         structure_model = structure_config.get('model', refine_config.get('structure_model', 'gemini-2.5-pro'))
+        toc_model = structure_config.get('toc_model', refine_config.get('toc_model', 'gemini-2.5-flash'))
 
         verification_provider = verification_config.get('provider', default_provider)
         verification_model = verification_config.get('model', refine_config.get('verification_model', 'gemini-2.5-flash'))
@@ -83,7 +84,8 @@ class RefinedBreakdown:
 
         # Initialize components with their respective clients
         self.structure_analyzer = StructureAnalyzer(
-            structure_client, structure_model, verification_model
+            structure_client, structure_model, toc_model,
+            verification_client, verification_model
         )
         self.boundary_verifier = BoundaryVerifier(verification_client, verification_model)
         self.gap_analyzer = GapAnalyzer(verification_client, verification_model)
@@ -195,10 +197,11 @@ class RefinedBreakdown:
             # Preprocess PDF
             processed_pdf = preprocess_pdf(pdf_path, output_dir)
 
-            # Analyze structure
+            # Analyze structure (with resume support)
             logger.info("Analyzing PDF structure...")
             toc_tree, book_metadata = self.structure_analyzer.analyze_pdf_structure(
-                processed_pdf, book_title
+                processed_pdf, book_title,
+                state=self.state, state_path=state_file
             )
 
             # Save TOC tree

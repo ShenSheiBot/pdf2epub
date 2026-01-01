@@ -27,7 +27,7 @@ class SafetyBlockError(Exception):
 class LLMGenerateConfig:
     """Universal generation config that works across all providers."""
 
-    def __init__(self, temperature: float = 0.1, max_tokens: int = 8192):
+    def __init__(self, temperature: float = 0.1, max_tokens: int = 65536):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.response_mime_type: Optional[str] = None  # "application/json" for JSON mode
@@ -244,12 +244,9 @@ class LLMClient:
         json_mode = getattr(config, 'response_mime_type', None) == "application/json"
 
         if provider_type == "google":
-            # Use Gemini's native config
-            from google.genai.types import GenerateContentConfig
-            gemini_config = GenerateContentConfig(
-                temperature=config.temperature,
-                max_output_tokens=config.max_tokens,
-            )
+            # Use Gemini's native config with full settings (thinking, safety, etc.)
+            gemini_config = client.get_default_config(temperature=config.temperature)
+            gemini_config.max_output_tokens = config.max_tokens
             if json_mode:
                 gemini_config.response_mime_type = "application/json"
             return client.generate_content_stream(

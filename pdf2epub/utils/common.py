@@ -35,10 +35,23 @@ def parse_llm_json(
     Raises:
         json.JSONDecodeError: If parsing fails even with lenient settings
     """
+    # Strip markdown code block markers if present
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]  # Remove ```json
+    elif text.startswith("```"):
+        text = text[3:]  # Remove ```
+    if text.endswith("```"):
+        text = text[:-3]  # Remove trailing ```
+    text = text.strip()
+
     try:
         return json.loads(text, strict=False)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON from {operation_name}: {e}")
+        # Log the actual response for debugging
+        logger.error(f"Response length: {len(text)} chars")
+        logger.error(f"Response preview: {text[:500]}...")
 
         if save_dir:
             save_dir = Path(save_dir)

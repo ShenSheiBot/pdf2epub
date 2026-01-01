@@ -61,24 +61,35 @@ class RefinedBreakdown:
         self.max_tokens = max_tokens
         self.max_workers = max_workers or config.get('general', {}).get('max_concurrent_workers', 8)
 
-        # Initialize Gemini client
+        # Get refine config with backward compatibility
         refine_config = config.get('refine', {})
-        provider_name = refine_config.get('provider', 'gemini')
-        self.client = create_gemini_client_from_config(
-            config, provider_name, num_retries=3, max_backoff_seconds=30
+        default_provider = refine_config.get('provider', 'gemini')
+
+        # New nested format: refine.structure.{provider, model}
+        # Old flat format: refine.{provider, structure_model, verification_model}
+        structure_config = refine_config.get('structure', {})
+        verification_config = refine_config.get('verification', {})
+
+        structure_provider = structure_config.get('provider', default_provider)
+        structure_model = structure_config.get('model', refine_config.get('structure_model', 'gemini-2.5-pro'))
+
+        verification_provider = verification_config.get('provider', default_provider)
+        verification_model = verification_config.get('model', refine_config.get('verification_model', 'gemini-2.5-flash'))
+
+        # Create separate clients for structure and verification
+        structure_client = create_gemini_client_from_config(
+            config, structure_provider, num_retries=3, max_backoff_seconds=30
+        )
+        verification_client = create_gemini_client_from_config(
+            config, verification_provider, num_retries=3, max_backoff_seconds=30
         )
 
-        # Get models from config
-        refine_config = config.get('refine', {})
-        structure_model = refine_config.get('structure_model', 'gemini-2.5-pro')
-        verification_model = refine_config.get('verification_model', 'gemini-2.5-flash')
-
-        # Initialize components
+        # Initialize components with their respective clients
         self.structure_analyzer = StructureAnalyzer(
-            self.client, structure_model, verification_model
+            structure_client, structure_model, verification_model
         )
-        self.boundary_verifier = BoundaryVerifier(self.client, verification_model)
-        self.gap_analyzer = GapAnalyzer(self.client, verification_model)
+        self.boundary_verifier = BoundaryVerifier(verification_client, verification_model)
+        self.gap_analyzer = GapAnalyzer(verification_client, verification_model)
         self.page_merger = PageMerger()
         self.state = RefinerState()
 

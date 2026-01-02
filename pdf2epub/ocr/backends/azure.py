@@ -173,19 +173,26 @@ def _extract_azure_figures(client: DocumentIntelligenceClient, azure_result, pag
                         with open(figure_path, "wb") as f:
                             for chunk in stream:
                                 f.write(chunk)
-                        
-                        logger.success(f"Saved Azure figure to {figure_path}")
-                        
-                        # Add to illustrations list
-                        # Use relative path for markdown (../images/ from ocr_markdown folder)
-                        relative_path = f"../images/{figure_filename}"
-                        illustrations.append({
-                            'path': relative_path,
-                            'caption': figure.caption.content if hasattr(figure, 'caption') and figure.caption else None,
-                            'page': page_num,
-                            'figure_id': figure.id,
-                            'placement': 'end'  # Default placement for Azure figures
-                        })
+
+                        # Verify file was saved and has content
+                        if figure_path.exists() and figure_path.stat().st_size > 0:
+                            logger.success(f"Saved Azure figure to {figure_path}")
+
+                            # Add to illustrations list
+                            # Use relative path for markdown (../images/ from ocr_markdown folder)
+                            relative_path = f"../images/{figure_filename}"
+                            illustrations.append({
+                                'path': relative_path,
+                                'caption': figure.caption.content if hasattr(figure, 'caption') and figure.caption else None,
+                                'page': page_num,
+                                'figure_id': figure.id,
+                                'placement': 'end'  # Default placement for Azure figures
+                            })
+                        else:
+                            # Remove empty file and skip this figure
+                            if figure_path.exists():
+                                figure_path.unlink()
+                            logger.warning(f"Azure returned empty figure for {figure.id}, skipping")
                     except Exception as e:
                         logger.error(f"Failed to download figure {figure.id}: {e}")
                         # Add without path for tracking

@@ -13,16 +13,21 @@ def inject_illustrations_into_text(text: str, illustrations: List[Dict]) -> str:
     if not illustrations:
         return text
 
+    # Filter out illustrations without a valid path
+    valid_illustrations = [ill for ill in illustrations if ill.get("path")]
+    if not valid_illustrations:
+        return text
+
     lines = text.split("\n")
     result_lines = []
 
     # Group illustrations by placement
-    above_illustrations = [ill for ill in illustrations if ill["placement"] == "above"]
-    below_illustrations = [ill for ill in illustrations if ill["placement"] == "below"]
+    above_illustrations = [ill for ill in valid_illustrations if ill["placement"] == "above"]
+    below_illustrations = [ill for ill in valid_illustrations if ill["placement"] == "below"]
     between_illustrations = [
-        ill for ill in illustrations if ill["placement"] == "between"
+        ill for ill in valid_illustrations if ill["placement"] == "between"
     ]
-    end_illustrations = [ill for ill in illustrations if ill["placement"] == "end"]
+    end_illustrations = [ill for ill in valid_illustrations if ill["placement"] == "end"]
 
     # Add above illustrations at the beginning
     for ill in above_illustrations:

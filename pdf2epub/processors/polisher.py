@@ -197,12 +197,12 @@ class PolishProcessor(BaseMarkdownProcessor):
         total_parts = context.get('total_parts', 1)
         previous_context = context.get('previous_context')
 
-        # Create the polishing prompt
-        chapter_name = self.get_operation_name(file_name)
-
-        # Get chapter info to check if this is a notes chapter
+        # Get chapter info for title and type
         chapter_info = self._get_chapter_info(file_name)
         is_notes_chapter = chapter_info.get('type') == 'notes'
+
+        # Use actual chapter title if available, otherwise use operation name for logging
+        chapter_name = chapter_info.get('title') or self.get_operation_name(file_name)
 
         # Also detect Notes chapter by content (fallback for mapping issues)
         if not is_notes_chapter:

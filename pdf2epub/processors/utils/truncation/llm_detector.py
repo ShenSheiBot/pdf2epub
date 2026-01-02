@@ -228,6 +228,8 @@ IMPORTANT - These are NOT truncation (answer "complete"):
 - Removing page numbers or other metadata
 - Consolidating repeated content into a single clean version
 - Formatting changes (spacing, headers, etc.)
+- Converting HTML tables (<table>, <tr>, <td>) to Markdown tables (| column |)
+- Converting HTML formatting to Markdown (removing HTML tags while preserving data)
 
 These ARE truncation (answer "truncated"):
 - Missing sentences or paragraphs that contain unique information

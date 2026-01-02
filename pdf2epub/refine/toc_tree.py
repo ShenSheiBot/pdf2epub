@@ -78,6 +78,12 @@ class TOCNode:
     @classmethod
     def from_dict(cls, data: Dict) -> 'TOCNode':
         """Create TOCNode from dictionary."""
+        # Validate required fields
+        if 'start_page' not in data or 'end_page' not in data:
+            from loguru import logger
+            logger.warning(f"Skipping invalid TOC entry (missing page info): {data.get('title', 'unknown')}")
+            return None
+
         node = cls(
             title=data['title'],
             level=data.get('level', 1),
@@ -89,7 +95,8 @@ class TOCNode:
         # Handle both 'children' and legacy 'subchapters'
         children_data = data.get('children', data.get('subchapters', []))
         if children_data:
-            node.children = [cls.from_dict(child) for child in children_data]
+            children = [cls.from_dict(child) for child in children_data]
+            node.children = [c for c in children if c is not None]  # Filter invalid
 
         if 'boundary_info' in data:
             node.boundary_info = data['boundary_info']
@@ -103,4 +110,5 @@ class TOCNode:
 
 def dict_list_to_toc_tree(chapters_data: List[Dict]) -> List[TOCNode]:
     """Convert a list of chapter dictionaries to TOCNode tree."""
-    return [TOCNode.from_dict(chapter) for chapter in chapters_data]
+    nodes = [TOCNode.from_dict(chapter) for chapter in chapters_data]
+    return [n for n in nodes if n is not None]  # Filter invalid entries

@@ -113,15 +113,29 @@ If no TOC exists, return: {"has_toc": false, "toc_start": null, "toc_end": null}
         Extract TOC structure (titles and hierarchy only, NO page numbers).
 
         Args:
-            pdf_path: Path to PDF file
+            pdf_path: Path to PDF file (will try to use original uncompressed version)
             toc_start: First page of TOC
             toc_end: Last page of TOC
 
         Returns:
             Dict with chapters list (no page numbers) or None if extraction fails
         """
+        # Step 2a: Use original PDF for better quality, extract only TOC pages
+        original_pdf = pdf_path.parent / "input_original.pdf"
+        pdf_to_use = original_pdf if original_pdf.exists() else pdf_path
+
+        toc_pages = list(range(toc_start, toc_end + 1))
+        pdf_data = self._prepare_pdf(pdf_to_use, include_pages=toc_pages)
+
+        if pdf_data is None:
+            logger.warning("Failed to extract TOC pages, using full compressed PDF")
+            with open(pdf_path, "rb") as f:
+                pdf_data = f.read()
+        else:
+            logger.info(f"Using {'original' if pdf_to_use == original_pdf else 'compressed'} PDF, TOC pages only")
+
         prompt = f"""
-Extract the structure from these Table of Contents pages (PDF pages {toc_start}-{toc_end}).
+Extract the structure from these Table of Contents pages.
 
 **CRITICAL**: Extract ONLY the hierarchical structure - titles and their nesting levels.
 **DO NOT include any page numbers** - we will determine those separately.
@@ -144,9 +158,6 @@ Return JSON:
 - Do NOT include page numbers in the output
 - Keep original language for all titles
 """
-
-        with open(pdf_path, "rb") as f:
-            pdf_data = f.read()
 
         parts = [
             prompt,
@@ -225,11 +236,11 @@ Return JSON:
     "chapters": [
         {{
             "title": string,
-            "start_page": int,  // PDF page number where this section starts
-            "end_page": int,    // PDF page number where this section ends
+            "start_page": int,  // REQUIRED: PDF page number where this section starts
+            "end_page": int,    // REQUIRED: PDF page number where this section ends
             "level": int,
             "type": string,     // Optional: "notes" for endnotes chapters
-            "children": [...]   // Same structure, recursive
+            "children": [...]   // Same structure - EVERY child MUST also have start_page and end_page
         }}
     ],
     "back_cover": {{"page_number": int}}
@@ -239,11 +250,18 @@ Return JSON:
 - Use PDF page numbers from "PDF Page: X" labels, NOT printed page numbers
 - The printed page numbers in the original TOC are WRONG - ignore them
 - Find each chapter title in the actual content and note its PDF page
-- Ignore pages {toc_start}-{toc_end} when searching (that's the TOC itself)
 """
 
-        with open(pdf_path, "rb") as f:
-            pdf_data = f.read()
+        # Step 2b: Use compressed PDF, exclude TOC pages to avoid confusion
+        toc_pages = list(range(toc_start, toc_end + 1))
+        pdf_data = self._prepare_pdf(pdf_path, exclude_pages=toc_pages)
+
+        if pdf_data is None:
+            logger.warning("Failed to exclude TOC pages, using full PDF")
+            with open(pdf_path, "rb") as f:
+                pdf_data = f.read()
+        else:
+            logger.info(f"Using compressed PDF, excluded TOC pages {toc_start}-{toc_end}")
 
         parts = [
             prompt,
@@ -261,7 +279,137 @@ Return JSON:
         )
 
         result = parse_llm_json(response_text, operation_name="TOC page matching")
+
+        # Step 2c: Validate and retry if issues found
+        issues = self._validate_toc_structure(result.get('chapters', []))
+        if issues:
+            logger.warning(f"Found {len(issues)} issues in TOC structure, requesting fix...")
+            for issue in issues[:5]:  # Log first 5 issues
+                logger.warning(f"  {issue}")
+
+            # Build error message for LLM
+            error_msg = "The following issues were found in your response:\n\n"
+            error_msg += "\n".join(f"- {issue}" for issue in issues)
+            error_msg += "\n\nPlease fix these issues and return the corrected JSON."
+
+            # Append to conversation and retry
+            parts.append(response_text)  # Add previous response
+            parts.append(error_msg)  # Add error feedback
+
+            response_text = self.structure_client.generate_content_stream(
+                model=self.structure_model,
+                contents=parts,
+                config=generation_config,
+                operation_name="TOC page matching (retry)"
+            )
+
+            result = parse_llm_json(response_text, operation_name="TOC page matching (retry)")
+
+            # Check if issues are fixed
+            remaining_issues = self._validate_toc_structure(result.get('chapters', []))
+            if remaining_issues:
+                logger.warning(f"After retry, {len(remaining_issues)} issues remain")
+
         return result
+
+    def _prepare_pdf(
+        self,
+        pdf_path: Path,
+        include_pages: Optional[List[int]] = None,
+        exclude_pages: Optional[List[int]] = None
+    ) -> Optional[bytes]:
+        """
+        Prepare PDF for LLM by selecting/excluding specific pages.
+
+        Args:
+            pdf_path: Path to the source PDF
+            include_pages: List of pages to include (1-indexed). If None, include all.
+            exclude_pages: List of pages to exclude (1-indexed). Applied after include.
+
+        Returns:
+            PDF bytes, or None if preparation fails
+        """
+        try:
+            import fitz  # pymupdf
+
+            src_doc = fitz.open(pdf_path)
+            total_pages = len(src_doc)
+
+            # Determine which pages to include
+            if include_pages is not None:
+                pages_to_use = set(include_pages)
+            else:
+                pages_to_use = set(range(1, total_pages + 1))
+
+            # Apply exclusions
+            if exclude_pages:
+                pages_to_use -= set(exclude_pages)
+
+            # Sort pages
+            pages_sorted = sorted(pages_to_use)
+
+            if not pages_sorted:
+                logger.error("No pages left after filtering")
+                src_doc.close()
+                return None
+
+            # Create new PDF with selected pages
+            new_doc = fitz.open()
+            for page_num in pages_sorted:
+                if 1 <= page_num <= total_pages:
+                    new_doc.insert_pdf(src_doc, from_page=page_num - 1, to_page=page_num - 1)
+
+            pdf_bytes = new_doc.tobytes()
+
+            src_doc.close()
+            new_doc.close()
+
+            logger.debug(
+                f"Prepared PDF from {pdf_path.name}: {len(pages_sorted)} pages "
+                f"({len(pdf_bytes) / 1024 / 1024:.1f} MB)"
+            )
+            return pdf_bytes
+
+        except Exception as e:
+            logger.error(f"Failed to prepare PDF: {e}")
+            return None
+
+    def _validate_toc_structure(self, chapters: List[Dict], path: str = "") -> List[str]:
+        """Validate TOC structure for common issues.
+
+        Returns list of issue descriptions.
+        """
+        issues = []
+
+        for i, chapter in enumerate(chapters):
+            chapter_path = f"{path}/{chapter.get('title', 'unknown')[:30]}" if path else chapter.get('title', 'unknown')[:30]
+
+            # Check required fields
+            if 'start_page' not in chapter:
+                issues.append(f"Missing start_page: {chapter_path}")
+            if 'end_page' not in chapter:
+                issues.append(f"Missing end_page: {chapter_path}")
+
+            # Check page range validity
+            start = chapter.get('start_page')
+            end = chapter.get('end_page')
+            if start is not None and end is not None:
+                if end < start:
+                    issues.append(f"Invalid range (end < start): {chapter_path} (p{start}-p{end})")
+
+                # Check for overlap with next sibling
+                if i + 1 < len(chapters):
+                    next_chapter = chapters[i + 1]
+                    next_start = next_chapter.get('start_page')
+                    if next_start is not None and end >= next_start:
+                        issues.append(f"Overlap: {chapter_path} ends at p{end} but next chapter starts at p{next_start}")
+
+            # Recursively check children
+            children = chapter.get('children', [])
+            if children:
+                issues.extend(self._validate_toc_structure(children, chapter_path))
+
+        return issues
 
     def analyze_pdf_structure(
         self,

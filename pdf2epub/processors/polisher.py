@@ -25,6 +25,78 @@ from ..chapter_identity import ChapterIdentity
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
+def convert_html_images_to_markdown(content: str) -> str:
+    """
+    Convert HTML img tags to markdown image syntax before sending to LLM.
+
+    This prevents LLMs from incorrectly attempting to convert HTML to markdown
+    and producing corrupted output like split `![` and `Image](...)`.
+
+    Handles various wrapper elements: div, figure, p, span, center, etc.
+
+    Args:
+        content: Markdown content that may contain HTML img tags
+
+    Returns:
+        Content with HTML img tags converted to markdown syntax
+    """
+
+    def extract_img_info(img_tag: str) -> tuple:
+        """Extract src and alt from an img tag."""
+        # Extract src attribute
+        src_match = re.search(r'src=["\']([^"\']+)["\']', img_tag, re.IGNORECASE)
+        if not src_match:
+            return None, None
+        src = src_match.group(1)
+
+        # Extract alt attribute (optional)
+        alt_match = re.search(r'alt=["\']([^"\']*)["\']', img_tag, re.IGNORECASE)
+        alt = alt_match.group(1) if alt_match else "Image"
+
+        return src, alt
+
+    def replace_img_tag(match: re.Match) -> str:
+        """Replace an img tag with markdown syntax."""
+        img_tag = match.group(0)
+        src, alt = extract_img_info(img_tag)
+        if src:
+            return f"![{alt}]({src})"
+        return img_tag  # Keep original if can't parse
+
+    # Pattern to match wrapper elements containing img tags
+    # Matches: <div ...>...<img ...>...</div>, <figure>...<img ...>...</figure>, etc.
+    wrapper_tags = r'div|figure|p|span|center|aside|section'
+    wrapper_pattern = re.compile(
+        rf'<({wrapper_tags})[^>]*>\s*'  # Opening tag
+        rf'(<img\s[^>]+/?\s*>)\s*'  # The img tag (captured)
+        rf'</\1>',  # Matching closing tag
+        re.IGNORECASE
+    )
+
+    def replace_wrapper(match: re.Match) -> str:
+        """Replace wrapped img with markdown."""
+        img_tag = match.group(2)
+        src, alt = extract_img_info(img_tag)
+        if src:
+            return f"![{alt}]({src})"
+        return match.group(0)  # Keep original if can't parse
+
+    # Replace wrapped images (may need multiple passes for nested structures)
+    prev_content = None
+    while prev_content != content:
+        prev_content = content
+        content = wrapper_pattern.sub(replace_wrapper, content)
+
+    # Then, replace any remaining standalone img tags
+    standalone_img_pattern = re.compile(
+        r'<img\s[^>]+/?\s*>',
+        re.IGNORECASE
+    )
+    content = standalone_img_pattern.sub(replace_img_tag, content)
+
+    return content
+
+
 class PolishProcessor(BaseMarkdownProcessor):
     """Processor for polishing OCR-extracted markdown content."""
     
@@ -196,6 +268,9 @@ class PolishProcessor(BaseMarkdownProcessor):
         part_idx = context.get('part_idx', 1)
         total_parts = context.get('total_parts', 1)
         previous_context = context.get('previous_context')
+
+        # Preprocess: convert HTML img tags to markdown to avoid LLM corruption
+        content = convert_html_images_to_markdown(content)
 
         # Get chapter info for title and type
         chapter_info = self._get_chapter_info(file_name)

@@ -371,6 +371,19 @@ Your tasks for JAPANESE content:
      * Sound effects or emotional expressions with ♡, ♪, etc.
    - KEEP ## only for actual section/scene headings (e.g., chapter titles, scene breaks)
    - When in doubt, remove the heading marker - normal paragraphs are safer than false headings
+
+6. **Remove page headers/footers captured by OCR**:
+   - OCR often captures page headers (running headers) that repeat on every page
+   - DELETE any standalone line that matches or closely resembles:
+     * The book title: "{book_title}"
+     * The chapter name: "{chapter_name}"
+     * Variations or partial matches of either
+   - These headers typically appear:
+     * As standalone lines between paragraphs (not part of sentences)
+     * With or without ## prefix
+     * Sometimes with slight variations, partial text, or OCR errors
+   - Do NOT delete if the title/chapter name appears as part of actual narrative content
+   - When in doubt, if a line contains ONLY a title/chapter name (not within a sentence), delete it
 """
 
     # Add context for multi-part chapters

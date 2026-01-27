@@ -361,6 +361,16 @@ Your tasks for JAPANESE content:
    - DO NOT replace image links with [illustration] or any other placeholder
    - DO NOT modify image paths or filenames
    - Verify furigana is attached to correct kanji
+
+5. **Fix incorrect headings from vertical text OCR**:
+   - Vertical text OCR often incorrectly marks normal text as headings (## or #)
+   - REMOVE the ## or # prefix if the line is clearly NOT a heading, such as:
+     * Dialogue: 「...」 or lines starting with quotes
+     * Exclamations or onomatopoeia: やめろっ!, あんっ♡, etc.
+     * Sentence fragments: lines that are clearly mid-sentence or incomplete
+     * Sound effects or emotional expressions with ♡, ♪, etc.
+   - KEEP ## only for actual section/scene headings (e.g., chapter titles, scene breaks)
+   - When in doubt, remove the heading marker - normal paragraphs are safer than false headings
 """
 
     # Add context for multi-part chapters

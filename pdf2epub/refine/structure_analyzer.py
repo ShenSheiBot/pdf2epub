@@ -359,16 +359,31 @@ Return JSON:
                 if 1 <= page_num <= total_pages:
                     new_doc.insert_pdf(src_doc, from_page=page_num - 1, to_page=page_num - 1)
 
-            pdf_bytes = new_doc.tobytes()
-
             src_doc.close()
-            new_doc.close()
 
-            logger.debug(
-                f"Prepared PDF from {pdf_path.name}: {len(pages_sorted)} pages "
-                f"({len(pdf_bytes) / 1024 / 1024:.1f} MB)"
-            )
-            return pdf_bytes
+            # Save to temp file with compression, then read back
+            # This is much better than tobytes() which produces uncompressed output
+            import tempfile
+            import os
+
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                new_doc.save(tmp_path, garbage=4, deflate=True, clean=True)
+                new_doc.close()
+
+                with open(tmp_path, 'rb') as f:
+                    pdf_bytes = f.read()
+
+                logger.debug(
+                    f"Prepared PDF from {pdf_path.name}: {len(pages_sorted)} pages "
+                    f"({len(pdf_bytes) / 1024 / 1024:.2f} MB)"
+                )
+                return pdf_bytes
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
         except Exception as e:
             logger.error(f"Failed to prepare PDF: {e}")

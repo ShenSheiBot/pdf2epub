@@ -331,53 +331,47 @@ Return JSON:
         """
         try:
             import fitz  # pymupdf
-
-            src_doc = fitz.open(pdf_path)
-            total_pages = len(src_doc)
-
-            # Determine which pages to include
-            if include_pages is not None:
-                pages_to_use = set(include_pages)
-            else:
-                pages_to_use = set(range(1, total_pages + 1))
-
-            # Apply exclusions
-            if exclude_pages:
-                pages_to_use -= set(exclude_pages)
-
-            # Sort pages
-            pages_sorted = sorted(pages_to_use)
-
-            if not pages_sorted:
-                logger.error("No pages left after filtering")
-                src_doc.close()
-                return None
-
-            # Create new PDF with selected pages
-            new_doc = fitz.open()
-            for page_num in pages_sorted:
-                if 1 <= page_num <= total_pages:
-                    new_doc.insert_pdf(src_doc, from_page=page_num - 1, to_page=page_num - 1)
-
-            src_doc.close()
-
-            # Save to temp file with compression, then read back
-            # This is much better than tobytes() which produces uncompressed output
             import tempfile
             import os
 
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+
+            # Determine which pages to keep
+            if include_pages is not None:
+                pages_to_keep = set(include_pages)
+            else:
+                pages_to_keep = set(range(1, total_pages + 1))
+
+            # Apply exclusions
+            if exclude_pages:
+                pages_to_keep -= set(exclude_pages)
+
+            if not pages_to_keep:
+                logger.error("No pages left after filtering")
+                doc.close()
+                return None
+
+            # Determine which pages to delete (1-indexed)
+            pages_to_delete = set(range(1, total_pages + 1)) - pages_to_keep
+
+            # Delete pages in reverse order to avoid index shifting
+            for page_num in sorted(pages_to_delete, reverse=True):
+                doc.delete_page(page_num - 1)  # delete_page uses 0-indexed
+
+            # Save to temp file (preserves original compression)
             with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
                 tmp_path = tmp.name
 
             try:
-                new_doc.save(tmp_path, garbage=4, deflate=True, clean=True)
-                new_doc.close()
+                doc.save(tmp_path, garbage=3, deflate=True)
+                doc.close()
 
                 with open(tmp_path, 'rb') as f:
                     pdf_bytes = f.read()
 
                 logger.debug(
-                    f"Prepared PDF from {pdf_path.name}: {len(pages_sorted)} pages "
+                    f"Prepared PDF from {pdf_path.name}: {len(pages_to_keep)} pages "
                     f"({len(pdf_bytes) / 1024 / 1024:.2f} MB)"
                 )
                 return pdf_bytes

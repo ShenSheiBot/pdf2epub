@@ -79,9 +79,11 @@ class TranslateProcessor(BaseMarkdownProcessor):
         ]
         
         # Initialize truncation detector
+        translate_config = config.get('translation', {})
         self.truncation_detector = LLMTruncationDetector(
             llm_client=self.llm_client,
-            num_lines=config.get('translate', {}).get('truncation_check_lines', 3)
+            num_lines=translate_config.get('truncation_check_lines', 3),
+            truncation_models=translate_config.get('truncation_models')
         )
         
         # Auto-detect entities if use_entities is None, otherwise use explicit value

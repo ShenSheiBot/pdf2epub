@@ -165,11 +165,13 @@ class PolishProcessor(BaseMarkdownProcessor):
         self.use_global_footnotes = self._has_notes_chapter()
 
         # Initialize composite truncation detector with polish-specific prompt
+        polish_config = config.get('polish', {})
         self.truncation_detector = CompositeTruncationDetector(
             llm_client=self.llm_client,
             min_unique_preserved_ratio=0.60,
             allow_deduplication=True,
-            truncation_check_lines=config.get('polish', {}).get('truncation_check_lines', 5),
+            truncation_check_lines=polish_config.get('truncation_check_lines', 5),
+            truncation_models=polish_config.get('truncation_models'),
             task_type="polish"
         )
 

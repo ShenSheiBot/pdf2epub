@@ -6,7 +6,7 @@ if content has been properly processed by comparing the endings of original
 and processed text.
 """
 
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 from .base import BaseTruncationDetector
 from ....utils.model_utils import get_cheapest_model_configs
 
@@ -14,7 +14,13 @@ from ....utils.model_utils import get_cheapest_model_configs
 class LLMTruncationDetector(BaseTruncationDetector):
     """LLM-based truncation detector with task-specific prompts."""
 
-    def __init__(self, llm_client, num_lines: int = 3, task_type: str = "translate"):
+    def __init__(
+        self,
+        llm_client,
+        num_lines: int = 3,
+        task_type: str = "translate",
+        truncation_models: Optional[List[Dict]] = None
+    ):
         """
         Initialize the detector.
 
@@ -22,10 +28,13 @@ class LLMTruncationDetector(BaseTruncationDetector):
             llm_client: LLM client for verification
             num_lines: Number of lines from the end to check (default: 3)
             task_type: Type of task - "translate" or "polish" (default: "translate")
+            truncation_models: Optional list of model configs for truncation check
+                             (e.g., [{"provider": "poe", "model": "Gemini-2.5-Flash"}])
         """
         self.llm_client = llm_client
         self.num_lines = num_lines
         self.task_type = task_type
+        self.truncation_models = truncation_models
     
     def detect(
         self,
@@ -80,22 +89,25 @@ class LLMTruncationDetector(BaseTruncationDetector):
         )
         
         try:
-            # Use cheapest models for this check
-            cheapest_models = get_cheapest_model_configs(
-                self.llm_client.config,
-                max_models=3
-            )
-            
-            # If no cheap models configured, fall back to default
-            if not cheapest_models:
-                cheapest_models = [
-                    {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 1}
-                ]
-            
+            # Use configured truncation models if provided, otherwise use cheapest models
+            if self.truncation_models:
+                model_configs = self.truncation_models
+            else:
+                model_configs = get_cheapest_model_configs(
+                    self.llm_client.config,
+                    max_models=3
+                )
+
+                # If no cheap models configured, fall back to default
+                if not model_configs:
+                    model_configs = [
+                        {"provider": "gemini", "model": "gemini-2.5-flash", "max_retries": 1}
+                    ]
+
             response = self.llm_client.generate(
                 prompt=prompt,
-                model_configs=cheapest_models,
-                operation_name="Translation truncation check"
+                model_configs=model_configs,
+                operation_name="Truncation check"
             )
             
             # Parse response

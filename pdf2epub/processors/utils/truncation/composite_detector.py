@@ -26,7 +26,7 @@ class CompositeTruncationDetector(BaseTruncationDetector):
         min_unique_preserved_ratio: float = 0.60,
         allow_deduplication: bool = True,
         truncation_check_lines: int = 5,
-        cheapest_model_configs: Optional[List[Dict]] = None,
+        truncation_models: Optional[List[Dict]] = None,
         task_type: str = "translate"
     ):
         """
@@ -37,11 +37,12 @@ class CompositeTruncationDetector(BaseTruncationDetector):
             min_unique_preserved_ratio: Minimum ratio for n-gram detector
             allow_deduplication: Whether deduplication is acceptable
             truncation_check_lines: Number of lines to check with LLM
-            cheapest_model_configs: Optional model configs for LLM fallback
+            truncation_models: Optional model configs for truncation check
+                             (e.g., [{"provider": "poe", "model": "Gemini-2.5-Flash"}])
             task_type: Type of task - "translate" or "polish" (default: "translate")
         """
         self.llm_client = llm_client
-        self.cheapest_model_configs = cheapest_model_configs
+        self.truncation_models = truncation_models
         self.task_type = task_type
 
         # Initialize sub-detectors
@@ -52,7 +53,8 @@ class CompositeTruncationDetector(BaseTruncationDetector):
         self.llm_detector = LLMTruncationDetector(
             llm_client=llm_client,
             num_lines=truncation_check_lines,
-            task_type=task_type
+            task_type=task_type,
+            truncation_models=truncation_models
         )
 
     def detect(

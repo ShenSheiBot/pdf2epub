@@ -180,7 +180,8 @@ class GeminiClient:
 
             # Set longer timeout for large PDF uploads (especially for slow networks)
             # Default Google SDK timeout is too short for 30MB+ PDFs on slow connections
-            http_options['timeout'] = 300  # 5 minutes for large file uploads
+            # NOTE: Google SDK expects timeout in MILLISECONDS, not seconds
+            http_options['timeout'] = 300000  # 300000ms = 300 seconds = 5 minutes for large file uploads
 
             if http_options:
                 self.client = genai.Client(api_key=api_key, http_options=http_options)

@@ -7,6 +7,8 @@ Provides:
 - Discovery of hidden subsections
 """
 
+import os
+import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from google.genai.types import Part
@@ -29,7 +31,8 @@ class StructureAnalyzer:
         structure_model: str,
         toc_model: str,
         analysis_client: BoundLLMClient,
-        analysis_model: str
+        analysis_model: str,
+        config: Dict = None
     ):
         """
         Initialize the structure analyzer.
@@ -40,12 +43,83 @@ class StructureAnalyzer:
             toc_model: Model for TOC detection/extraction (cheaper, still needs PDF)
             analysis_client: BoundLLMClient for re-breakdown (text only, no PDF needed)
             analysis_model: Model for re-breakdown and subsection discovery
+            config: Configuration dict for compression settings
         """
         self.structure_client = structure_client
         self.structure_model = structure_model
         self.toc_model = toc_model
         self.analysis_client = analysis_client
         self.analysis_model = analysis_model
+        self.config = config or {}
+
+    def _compress_pdf_to_limit(self, input_path: Path, output_path: Path, target_mb: float) -> bool:
+        """
+        Iteratively compress PDF until it's below target size.
+
+        Tries progressively more aggressive compression settings until the PDF
+        is below the target size in MB.
+
+        Args:
+            input_path: Path to input PDF
+            output_path: Path to save compressed PDF
+            target_mb: Target size in MB
+
+        Returns:
+            True if compression succeeded, False otherwise
+        """
+        from ..pdf_compressor import compress_pdf
+
+        # Progressive compression strategies (from moderate to extreme)
+        strategies = [
+            {"dpi": 150, "quality": 60, "grayscale": False, "desc": "moderate (150dpi, q60)"},
+            {"dpi": 120, "quality": 50, "grayscale": False, "desc": "aggressive (120dpi, q50)"},
+            {"dpi": 100, "quality": 40, "grayscale": False, "desc": "very aggressive (100dpi, q40)"},
+            {"dpi": 80, "quality": 30, "grayscale": False, "desc": "extreme (80dpi, q30)"},
+            {"dpi": 72, "quality": 20, "grayscale": True, "desc": "maximum (72dpi, q20, grayscale)"},
+        ]
+
+        input_size_mb = os.path.getsize(input_path) / 1024 / 1024
+        logger.info(f"Input PDF size: {input_size_mb:.2f} MB, target: {target_mb:.2f} MB")
+
+        for i, strategy in enumerate(strategies, 1):
+            logger.info(f"Compression attempt {i}/{len(strategies)}: {strategy['desc']}")
+
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+
+            try:
+                success, stats = compress_pdf(
+                    str(input_path),
+                    str(tmp_path),
+                    dpi=strategy['dpi'],
+                    quality=strategy['quality'],
+                    grayscale=strategy['grayscale']
+                )
+
+                if not success:
+                    logger.warning(f"Compression failed with {strategy['desc']}")
+                    tmp_path.unlink(missing_ok=True)
+                    continue
+
+                output_size_mb = stats['output_size_mb']
+                logger.info(f"Compressed to {output_size_mb:.2f} MB")
+
+                if output_size_mb <= target_mb:
+                    # Success! Move to final output path
+                    tmp_path.rename(output_path)
+                    logger.success(f"Successfully compressed to {output_size_mb:.2f} MB (under {target_mb:.2f} MB limit)")
+                    return True
+                else:
+                    logger.warning(f"Still too large ({output_size_mb:.2f} MB > {target_mb:.2f} MB), trying more aggressive compression...")
+                    tmp_path.unlink(missing_ok=True)
+
+            except Exception as e:
+                logger.error(f"Error during compression: {e}")
+                tmp_path.unlink(missing_ok=True)
+                continue
+
+        logger.error(f"Failed to compress PDF below {target_mb:.2f} MB after {len(strategies)} attempts")
+        return False
 
     def detect_toc_location(self, pdf_path: Path) -> Optional[Dict]:
         """
@@ -97,6 +171,11 @@ If no TOC exists, return: {"has_toc": false, "toc_start": null, "toc_end": null}
                 operation_name="TOC location detection"
             )
             result = parse_llm_json(response_text, operation_name="TOC location detection")
+
+            # Validate result is a dict
+            if not isinstance(result, dict):
+                logger.warning(f"TOC detection returned unexpected type: {type(result)}, expected dict")
+                return None
 
             if result.get('has_toc'):
                 logger.info(f"TOC detected: pages {result['toc_start']}-{result['toc_end']}")
@@ -367,12 +446,61 @@ Return JSON:
                 doc.save(tmp_path, garbage=3, deflate=True)
                 doc.close()
 
+                file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+
+                # Check if compression is needed
+                compression_config = self.config.get('refine', {}).get('pdf_compression', {})
+                payload_limit_mb = compression_config.get('payload_limit_mb', 30)
+                should_compress = compression_config.get('compress_if_exceeds', True)
+
+                if should_compress and file_size_mb > payload_limit_mb:
+                    logger.warning(
+                        f"PDF size ({file_size_mb:.2f} MB) exceeds payload limit ({payload_limit_mb} MB). "
+                        f"Applying JPEG compression..."
+                    )
+
+                    # Import compress_pdf
+                    from ..pdf_compressor import compress_pdf
+
+                    # Create compressed output path
+                    with tempfile.NamedTemporaryFile(suffix='_compressed.pdf', delete=False) as compressed_tmp:
+                        compressed_path = compressed_tmp.name
+
+                    # Compress with config settings
+                    dpi = compression_config.get('dpi', 150)
+                    quality = compression_config.get('quality', 60)
+                    grayscale = compression_config.get('grayscale', False)
+
+                    success, stats = compress_pdf(
+                        tmp_path,
+                        compressed_path,
+                        dpi=dpi,
+                        quality=quality,
+                        grayscale=grayscale
+                    )
+
+                    if success:
+                        compressed_size_mb = os.path.getsize(compressed_path) / 1024 / 1024
+                        logger.info(
+                            f"Compressed PDF: {file_size_mb:.2f} MB → {compressed_size_mb:.2f} MB "
+                            f"({stats['compression_ratio']:.1f}x compression)"
+                        )
+
+                        # Replace with compressed version
+                        os.unlink(tmp_path)
+                        tmp_path = compressed_path
+                        file_size_mb = compressed_size_mb
+                    else:
+                        logger.warning("Compression failed, using uncompressed version")
+                        if os.path.exists(compressed_path):
+                            os.unlink(compressed_path)
+
                 with open(tmp_path, 'rb') as f:
                     pdf_bytes = f.read()
 
                 logger.debug(
                     f"Prepared PDF from {pdf_path.name}: {len(pages_to_keep)} pages "
-                    f"({len(pdf_bytes) / 1024 / 1024:.2f} MB)"
+                    f"({file_size_mb:.2f} MB)"
                 )
                 return pdf_bytes
             finally:
@@ -449,13 +577,37 @@ Return JSON:
             if state and state_path:
                 state.save(state_path)
 
+        # Step 0: Compress PDF if needed to fit within payload limit
+        compression_config = self.config.get('refine', {}).get('pdf_compression', {})
+        payload_limit_mb = compression_config.get('payload_limit_mb', 30)
+        should_compress = compression_config.get('compress_if_exceeds', True)
+
+        pdf_size_mb = os.path.getsize(pdf_path) / 1024 / 1024
+        working_pdf_path = pdf_path  # By default, use original PDF
+
+        if should_compress and pdf_size_mb > payload_limit_mb:
+            logger.warning(f"PDF size ({pdf_size_mb:.2f} MB) exceeds payload limit ({payload_limit_mb} MB)")
+            logger.info("Compressing PDF to fit within API payload limit...")
+
+            # Create compressed PDF in same directory as input
+            compressed_pdf_path = pdf_path.parent / f"{pdf_path.stem}_compressed.pdf"
+
+            if self._compress_pdf_to_limit(pdf_path, compressed_pdf_path, payload_limit_mb):
+                logger.success(f"Using compressed PDF: {compressed_pdf_path}")
+                working_pdf_path = compressed_pdf_path
+            else:
+                logger.error("PDF compression failed, attempting to use original PDF (may fail with 413 error)")
+                working_pdf_path = pdf_path
+        else:
+            logger.info(f"PDF size ({pdf_size_mb:.2f} MB) is within payload limit ({payload_limit_mb} MB), no compression needed")
+
         # Step 1: Detect TOC location
         if state and state.toc_location:
             logger.info("Step 1: Using cached TOC location...")
             toc_location = state.toc_location
         else:
             logger.info("Step 1: Detecting TOC location...")
-            toc_location = self.detect_toc_location(pdf_path)
+            toc_location = self.detect_toc_location(working_pdf_path)
             if state and toc_location:
                 state.toc_location = toc_location
                 save_state()
@@ -470,7 +622,7 @@ Return JSON:
                 toc_structure = state.toc_structure
             else:
                 logger.info("Step 2a: Extracting TOC structure (without page numbers)...")
-                toc_structure = self.extract_toc_structure(pdf_path, toc_start, toc_end)
+                toc_structure = self.extract_toc_structure(working_pdf_path, toc_start, toc_end)
                 if state and toc_structure:
                     state.toc_structure = toc_structure
                     save_state()
@@ -479,16 +631,16 @@ Return JSON:
                 # Step 2b: Match TOC with content to get page numbers
                 logger.info("Step 2b: Matching TOC with content for page numbers...")
                 result = self.match_toc_with_content(
-                    pdf_path, toc_structure, book_title, toc_start, toc_end
+                    working_pdf_path, toc_structure, book_title, toc_start, toc_end
                 )
             else:
                 # TOC extraction failed, fall back to direct analysis
                 logger.warning("TOC structure extraction failed, using direct analysis")
-                result = self._analyze_pdf_directly(pdf_path, book_title)
+                result = self._analyze_pdf_directly(working_pdf_path, book_title)
         else:
             # No TOC detected, use direct analysis
             logger.info("No TOC detected, using direct analysis...")
-            result = self._analyze_pdf_directly(pdf_path, book_title)
+            result = self._analyze_pdf_directly(working_pdf_path, book_title)
 
         # Mark structure analysis complete
         if state:

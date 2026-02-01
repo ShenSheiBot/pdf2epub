@@ -88,7 +88,8 @@ class RefinedBreakdown:
         # Initialize components with their respective clients
         self.structure_analyzer = StructureAnalyzer(
             structure_client, structure_model, toc_model,
-            verification_client, verification_model
+            verification_client, verification_model,
+            config
         )
         # Note: BoundaryVerifier and GapAnalyzer replaced by boundary_agent
         self.page_merger = PageMerger()

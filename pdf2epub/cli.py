@@ -948,6 +948,88 @@ def patch_paper_command(args):
     return 0 if success else 1
 
 
+def polish_batch_command(args):
+    """Handle the polish-batch subcommand (using Gemini Batch API)."""
+    from pdf2epub.processors.batch_polisher import BatchPolishProcessor
+    import json
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "polish-batch")
+
+    logger.info(f"Starting batch polish for: {book_title}")
+    if args.content_type != "auto":
+        logger.info(f"Content type: {args.content_type}")
+
+    # Load book structure if available
+    output_dir = Path("output") / book_title
+    toc_tree_file = output_dir / "toc_tree.json"
+    structure_file = output_dir / "book_structure.json"
+    book_structure = None
+
+    if toc_tree_file.exists():
+        with open(toc_tree_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from toc_tree.json")
+    elif structure_file.exists():
+        with open(structure_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from book_structure.json")
+
+    # Get batch config
+    batch_config = config.get('batch', {})
+    max_retries = args.max_retries or batch_config.get('max_retries', 1)
+    poll_interval = args.poll_interval or batch_config.get('poll_interval', 60)
+
+    try:
+        # Initialize processor
+        processor = BatchPolishProcessor(
+            config=config,
+            book_title=book_title,
+            book_structure=book_structure,
+            content_type=args.content_type,
+            max_retries=max_retries,
+            poll_interval=poll_interval,
+            resume=args.resume
+        )
+
+        # Process all files
+        summary = processor.process_all()
+
+        # Check results
+        if summary.get("status") == "interrupted":
+            logger.warning(f"Processing interrupted. Job: {summary.get('job_name')}")
+            logger.info("Run with --resume to continue")
+            return 1
+
+        if summary.get("status") == "failed":
+            logger.error(f"Batch processing failed: {summary.get('error')}")
+            return 1
+
+        # Log summary
+        if summary.get("success_rate", 0) == 1.0:
+            logger.success("Batch polish completed successfully!")
+        else:
+            logger.warning(
+                f"Batch polish completed with {summary.get('failed', 0)} failures"
+            )
+
+        return 0 if summary.get("success_rate", 0) == 1.0 else 1
+
+    except Exception as e:
+        logger.error(f"Batch polish failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
@@ -1140,7 +1222,38 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Don't use longest response on failure (overrides config.yaml)"
     )
     polish_parser.set_defaults(func=polish_command)
-    
+
+    # Polish Batch subcommand (using Gemini Batch API)
+    polish_batch_parser = subparsers.add_parser(
+        "polish-batch",
+        help="Polish OCR-extracted markdown using Gemini Batch API (50%% cost reduction)",
+        description="Clean up and format OCR-extracted markdown using asynchronous batch processing"
+    )
+    polish_batch_parser.add_argument(
+        "--content-type",
+        choices=["academic", "japanese", "general", "auto"],
+        default="auto",
+        help="Type of content to polish (default: auto-detect)"
+    )
+    polish_batch_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress (including active batch jobs)"
+    )
+    polish_batch_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Maximum retries for validation failures (default: from config or 3)"
+    )
+    polish_batch_parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=None,
+        help="Seconds between job status polls (default: from config or 60)"
+    )
+    polish_batch_parser.set_defaults(func=polish_batch_command)
+
     # Translate subcommand
     translate_parser = subparsers.add_parser(
         "translate",

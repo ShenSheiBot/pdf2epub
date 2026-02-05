@@ -58,7 +58,7 @@ class BaseMarkdownProcessor(ABC):
     ):
         """
         Initialize the base processor.
-        
+
         Args:
             config: Configuration dictionary
             book_title: Title of the book being processed
@@ -74,6 +74,10 @@ class BaseMarkdownProcessor(ABC):
         self.max_workers = max_workers if max_workers != 4 else config.get('max_concurrent_workers', 4)
         self.resume = resume
         self.use_longest_on_failure = use_longest_on_failure
+
+        # Validation and saving behavior (can be overridden by subclasses)
+        self.auto_save = True  # If False, subclass must handle saving
+        self.validation_mode = "inline"  # "inline" or "batch"
 
         # Setup directories
         self.input_dir = Path("output") / book_title / input_dir
@@ -336,12 +340,17 @@ class BaseMarkdownProcessor(ABC):
         prompt = self.build_prompt(content, unit_key, **context)
 
         # 2. Build validator that calls subclass's validate_output
-        def validator(response: str) -> Tuple[bool, str]:
-            cleaned = self.clean_response(response)
-            is_valid, reason = self.validate_output(content, cleaned, file_name_with_part)
-            if not is_valid:
-                self.on_validation_failure(file_name_with_part, reason, cleaned)
-            return is_valid, reason
+        # Skip validator if validation_mode is "batch"
+        if self.validation_mode == "inline":
+            def validator(response: str) -> Tuple[bool, str]:
+                cleaned = self.clean_response(response)
+                is_valid, reason = self.validate_output(content, cleaned, file_name_with_part)
+                if not is_valid:
+                    self.on_validation_failure(file_name_with_part, reason, cleaned)
+                return is_valid, reason
+        else:
+            # Batch mode: no inline validation
+            validator = None
 
         # 3. Call LLM with validation (auto-saves error outputs)
         result = self.generate_with_retry(
@@ -657,8 +666,16 @@ class BaseMarkdownProcessor(ABC):
                         self._record_unit_completion(unit, False)
                         logger.error(f"Failed to process {unit.id}: {e}")
 
-        # Aggregate results for multi-part files
-        self._aggregate_file_results(all_units, completed_results)
+        # Batch validation (if enabled)
+        if self.validation_mode == "batch" and not self.auto_save:
+            # Give subclass a chance to validate and save results
+            completed_results, failed_ids = self._batch_validate_and_save(
+                all_units, completed_results, failed_ids
+            )
+
+        # Aggregate results for multi-part files (only if auto_save is enabled)
+        if self.auto_save:
+            self._aggregate_file_results(all_units, completed_results)
 
         return self._create_summary(all_units, completed_ids, failed_ids)
 
@@ -745,9 +762,14 @@ class BaseMarkdownProcessor(ABC):
                 f"retries used {stats['retries_used']}/{total_retries}"
             )
 
-        # Save the result
-        with open(unit.output_path, 'w', encoding='utf-8') as f:
-            f.write(result)
+        # Save the result (only if auto_save is enabled)
+        if self.auto_save:
+            with open(unit.output_path, 'w', encoding='utf-8') as f:
+                f.write(result)
+        else:
+            # Batch validation mode: result will be saved after validation
+            # Ensure parent directory exists for later saving
+            unit.output_path.parent.mkdir(parents=True, exist_ok=True)
 
         return result
 
@@ -880,6 +902,34 @@ class BaseMarkdownProcessor(ABC):
 
             logger.info(f"Aggregated {len(units)} parts into {combined_path.name}")
 
+    def _batch_validate_and_save(
+        self,
+        all_units: List[WorkUnit],
+        completed_results: Dict[str, str],
+        failed_ids: set
+    ) -> Tuple[Dict[str, str], set]:
+        """
+        Extension point for batch validation and saving.
+
+        Subclasses can override this to implement custom batch validation logic.
+        Default implementation just saves all results and returns them as-is.
+
+        Args:
+            all_units: All work units
+            completed_results: Dict of unit_id -> processed content
+            failed_ids: Set of failed unit IDs
+
+        Returns:
+            Tuple of (validated_results, updated_failed_ids)
+        """
+        # Default: save all completed results
+        for unit in all_units:
+            if unit.id in completed_results:
+                with open(unit.output_path, 'w', encoding='utf-8') as f:
+                    f.write(completed_results[unit.id])
+
+        return completed_results, failed_ids
+
     def _create_summary(
         self,
         all_units: List[WorkUnit],
@@ -898,6 +948,7 @@ class BaseMarkdownProcessor(ABC):
             "total_units": total,
             "completed": completed,
             "failed": failed,
+            "failed_ids": failed_ids,  # Include failed IDs for retry logic
             "success_rate": completed / total if total > 0 else 0,
             # Include tracker stats
             "total_attempts": tracker_summary.get("total_attempts", 0),

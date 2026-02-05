@@ -8,13 +8,15 @@ fixing formatting, and organizing content structure.
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 import tiktoken
 
 from .base import BaseMarkdownProcessor
-from .utils.truncation import CompositeTruncationDetector
+from .utils.truncation import NGramTruncationDetector
+from .utils.agent_verifier import PolishVerificationAgent
+from .utils.verification_tools import VerificationTools, VerificationFile
 from .utils.image_restore import restore_lost_images
 from .utils.split_manager import SplitManager
 from .tracker import ProcessingTracker
@@ -135,7 +137,11 @@ class PolishProcessor(BaseMarkdownProcessor):
             resume=resume,
             use_longest_on_failure=use_longest_on_failure
         )
-        
+
+        # Enable batch validation mode
+        self.validation_mode = "batch"
+        self.auto_save = False
+
         self.skip_truncation_check = skip_truncation_check
         self.polish_models = polish_models or config.get("polish_models")
         self.book_structure = book_structure or {}
@@ -164,16 +170,15 @@ class PolishProcessor(BaseMarkdownProcessor):
         # Check if book has global notes chapter
         self.use_global_footnotes = self._has_notes_chapter()
 
-        # Initialize composite truncation detector with polish-specific prompt
-        polish_config = config.get('polish', {})
-        self.truncation_detector = CompositeTruncationDetector(
-            llm_client=self.llm_client,
+        # Initialize n-gram truncation detector for fast screening
+        self.ngram_detector = NGramTruncationDetector(
             min_unique_preserved_ratio=0.60,
-            allow_deduplication=True,
-            truncation_check_lines=polish_config.get('truncation_check_lines', 5),
-            truncation_models=polish_config.get('truncation_models'),
-            task_type="polish"
+            allow_deduplication=True
         )
+
+        # Initialize agent verifier for batch validation
+        # Will be initialized lazily when needed
+        self._agent_verifier = None
 
         # Initialize ProcessingTracker for audit trail
         tracker_path = self.output_dir / "processing_tracker.json"
@@ -192,7 +197,16 @@ class PolishProcessor(BaseMarkdownProcessor):
         # Log global footnote detection
         if self.use_global_footnotes:
             logger.info("Detected Notes chapter - using global footnote mode for academic content")
-    
+
+    @property
+    def agent_verifier(self) -> PolishVerificationAgent:
+        """Lazily initialize agent verifier when needed."""
+        if self._agent_verifier is None:
+            # Create empty tools instance - will be populated per batch
+            tools = VerificationTools({})
+            self._agent_verifier = PolishVerificationAgent(tools)
+        return self._agent_verifier
+
     def _has_notes_chapter(self) -> bool:
         """Check if book structure contains a notes chapter."""
         for chapter in self.book_structure.get('chapters', []):
@@ -410,7 +424,10 @@ class PolishProcessor(BaseMarkdownProcessor):
         file_name: str
     ) -> Tuple[bool, str]:
         """
-        Validate the polished output using truncation detection.
+        Validate the polished output with basic sanity checks.
+
+        Full validation (N-gram + Agent) is deferred to batch phase after all files processed.
+        This method performs basic checks to catch obvious failures early.
 
         Args:
             original: Original content
@@ -422,25 +439,23 @@ class PolishProcessor(BaseMarkdownProcessor):
         """
         # Skip truncation check for front/back matter files
         if "front_matter" in file_name.lower() or "back_matter" in file_name.lower():
-            logger.info(f"Skipping truncation check for {file_name} (front/back matter)")
             return True, "Truncation check skipped for front/back matter"
 
+        # Skip if flag is set
         if self.skip_truncation_check:
-            return True, "Truncation check skipped"
-        
-        is_truncated, reason, details = self.truncation_detector.detect(
-            original=original,
-            processed=processed
-        )
-        
-        # Log the summary
-        summary = self.truncation_detector.get_summary(is_truncated, reason, details)
-        if is_truncated:
-            logger.warning(f"{file_name} truncation analysis:\n{summary}")
-        else:
-            logger.info(f"{file_name} validation passed:\n{summary}")
-        
-        return not is_truncated, reason
+            return True, "Truncation check skipped by flag"
+
+        # Basic sanity check: processed should not be empty
+        if not processed.strip():
+            return False, "Empty output"
+
+        # Basic length check: processed should be at least 1% of original
+        # (Too aggressive check causes false positives; batch validation will do thorough check)
+        if len(processed) < len(original) * 0.01:
+            return False, f"Output suspiciously short: {len(processed)}/{len(original)} chars (< 1%)"
+
+        # Pass inline check - full validation in batch phase
+        return True, "Inline validation passed - full check deferred to batch"
     
     def get_split_strategy(self) -> str:
         """
@@ -559,4 +574,461 @@ class PolishProcessor(BaseMarkdownProcessor):
             True if context should be injected between parts
         """
         return self.processing_mode == "sequential"
+
+    def _get_original_content(self, file_key: str) -> str:
+        """
+        Get original content for a file key.
+
+        Args:
+            file_key: File key (e.g., "chapter_1" or "chapter_1.part1")
+
+        Returns:
+            Original content from input directory
+        """
+        # Handle both "chapter_1" and "chapter_1.part1" format
+        if ".part" in file_key:
+            base_key = file_key.split(".part")[0]
+        else:
+            base_key = file_key
+
+        input_file = self.input_dir / f"{base_key}.md"
+        if not input_file.exists():
+            logger.warning(f"Original file not found: {input_file}")
+            return ""
+
+        with open(input_file, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def _save_result(self, file_key: str, content: str) -> None:
+        """
+        Save processed result to output directory.
+
+        Args:
+            file_key: File key
+            content: Processed content
+        """
+        output_file = self.output_dir / f"{file_key}.md"
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        logger.debug(f"Saved result: {output_file.name}")
+
+    def _batch_validate_and_save(
+        self,
+        all_units: List,  # List[WorkUnit]
+        completed_results: Dict[str, str],
+        failed_ids: set
+    ) -> tuple:
+        """
+        Override base class method to implement two-phase validation.
+
+        Phase 1: N-gram screening (fast)
+        Phase 2: Agent verification (accurate)
+
+        Args:
+            all_units: All work units
+            completed_results: Dict of unit_id -> processed content
+            failed_ids: Set of failed unit IDs
+
+        Returns:
+            Tuple of (validated_results, updated_failed_ids)
+        """
+        from .utils.verification_tools import VerificationFile
+
+        if not completed_results:
+            return completed_results, failed_ids
+
+        # Separate newly processed units from already-saved units
+        # Only validate newly processed units to avoid re-validating stable results
+        newly_processed = {}
+        already_saved = {}
+
+        for unit in all_units:
+            unit_id = unit.id
+            if unit_id in completed_results:
+                # Check if this unit was just processed (output file doesn't exist or is older)
+                if not unit.output_path.exists():
+                    # Newly processed in this round
+                    newly_processed[unit_id] = completed_results[unit_id]
+                else:
+                    # Already saved from previous round - skip validation
+                    already_saved[unit_id] = completed_results[unit_id]
+
+        logger.info(f"Validating {len(newly_processed)} newly processed units, skipping {len(already_saved)} already saved")
+
+        # CRITICAL: Save all attempts for longest fallback strategy
+        # Only track newly processed units for attempt history
+        self._last_batch_attempts = newly_processed.copy()
+
+        if not newly_processed:
+            # No new units to validate, all are from previous rounds
+            return completed_results, failed_ids
+
+        # Check if truncation check should be skipped globally
+        if self.skip_truncation_check:
+            logger.info("Truncation check disabled by skip_truncation_check flag")
+            passed = list(newly_processed.keys())
+            # Save all and return
+            logger.info(f"Saving {len(passed)} units (validation skipped)")
+            for unit in all_units:
+                if unit.id in passed and unit.id in completed_results:
+                    with open(unit.output_path, 'w', encoding='utf-8') as f:
+                        f.write(completed_results[unit.id])
+            all_passed = passed + list(already_saved.keys())
+            self._aggregate_validated_files(all_units, all_passed, completed_results)
+            return completed_results, failed_ids
+
+        passed = []
+        suspicious = {}
+
+        # Phase 1: N-gram screening (only for newly processed units)
+        logger.info(f"Phase 1: N-gram screening for {len(newly_processed)} units")
+        for unit_id, processed in newly_processed.items():
+            # Skip validation for front/back matter
+            if "front_matter" in unit_id.lower() or "back_matter" in unit_id.lower():
+                passed.append(unit_id)
+                logger.debug(f"{unit_id}: Skipped (front/back matter)")
+                continue
+
+            # Get file_key from unit_id (e.g., "chapter_1.part1" -> "chapter_1")
+            file_key = unit_id.split('.part')[0] if '.part' in unit_id else unit_id
+            original = self._get_original_content(file_key)
+
+            is_truncated, reason, details = self.ngram_detector.detect(
+                original=original,
+                processed=processed
+            )
+
+            if not is_truncated:
+                # N-gram passed, will save later
+                passed.append(unit_id)
+                logger.debug(f"{unit_id}: N-gram passed")
+            else:
+                # Suspicious, queue for agent verification
+                suspicious[unit_id] = VerificationFile(
+                    key=unit_id,
+                    original=original,
+                    processed=processed
+                )
+                logger.debug(f"{unit_id}: N-gram flagged - {reason}")
+
+        logger.info(f"{len(passed)} units passed n-gram, {len(suspicious)} suspicious")
+
+        # Phase 2: Agent batch verification (if any suspicious)
+        if suspicious:
+            logger.info(f"Phase 2: Agent verification for {len(suspicious)} suspicious units")
+
+            try:
+                from .utils.agent_verifier import verify_batch
+
+                verification_results = verify_batch(
+                    files=suspicious,
+                    task_type="polish"
+                )
+
+                for result in verification_results:
+                    if result.status == "complete":
+                        # Agent confirmed complete
+                        passed.append(result.file_key)
+                        logger.info(f"{result.file_key}: Agent verified complete - {result.reason}")
+                    else:
+                        # Agent confirmed truncation - mark as failed
+                        failed_ids.add(result.file_key)
+                        # Remove from completed_results so it won't be saved
+                        if result.file_key in completed_results:
+                            del completed_results[result.file_key]
+                        logger.warning(f"{result.file_key}: Agent confirmed truncation - {result.reason}")
+
+            except Exception as e:
+                logger.error(f"Agent verification failed: {e}")
+                logger.warning("Marking all suspicious units as failed")
+                # Fallback: mark all suspicious as failed
+                for unit_id in suspicious.keys():
+                    failed_ids.add(unit_id)
+                    if unit_id in completed_results:
+                        del completed_results[unit_id]
+
+        # Save all newly passed units
+        logger.info(f"Saving {len(passed)} validated units")
+        for unit in all_units:
+            if unit.id in passed and unit.id in completed_results:
+                with open(unit.output_path, 'w', encoding='utf-8') as f:
+                    f.write(completed_results[unit.id])
+                logger.debug(f"Saved: {unit.output_path.name}")
+
+        # Include already_saved units as implicitly passed (they were validated in previous rounds)
+        all_passed = passed + list(already_saved.keys())
+
+        # Aggregate multi-part files
+        self._aggregate_validated_files(all_units, all_passed, completed_results)
+
+        return completed_results, failed_ids
+
+    def _aggregate_validated_files(
+        self,
+        all_units: List,
+        passed_unit_ids: List[str],
+        completed_results: Dict[str, str]
+    ):
+        """
+        Aggregate multi-part files after validation.
+
+        Similar to base class _aggregate_file_results but only for validated units.
+        """
+        from pdf2epub.processors.utils.work_unit import WorkUnitDiscovery
+
+        discovery = WorkUnitDiscovery(
+            self.input_dir,
+            self.output_dir,
+            splits_dir=self.splits_dir
+        )
+        file_groups = discovery.group_units_by_file(all_units)
+
+        for file_key, units in file_groups.items():
+            if len(units) <= 1:
+                continue  # Single file, no aggregation needed
+
+            # Check if all parts passed validation
+            if not all(u.id in passed_unit_ids for u in units):
+                logger.warning(f"Not all parts validated for {file_key}, skipping aggregation")
+                continue
+
+            # Aggregate in order
+            parts = [completed_results[u.id] for u in units if u.id in completed_results]
+            if not parts:
+                continue
+
+            aggregated = "\n\n".join(p for p in parts if p)
+
+            # Save combined file
+            combined_path = self.output_dir / f"{file_key}.md"
+            with open(combined_path, 'w', encoding='utf-8') as f:
+                f.write(aggregated)
+
+            logger.info(f"Aggregated {len(units)} parts into {combined_path.name}")
+
+    def _save_longest_attempts(
+        self,
+        failed_keys: List[str],
+        attempt_history: Dict[str, List[Dict]]
+    ) -> int:
+        """
+        Save the longest attempt for files that failed after max retries.
+
+        This is a fallback strategy: when a file fails validation after all retries,
+        we save the longest version rather than losing all content. The file is marked
+        with a warning note generated by the agent explaining the issue.
+
+        Args:
+            failed_keys: List of keys that failed all retries
+            attempt_history: Dict mapping key to list of attempts
+                            Each attempt: {'text': str, 'length': int, 'retry_count': int}
+
+        Returns:
+            Number of files saved
+        """
+        saved_count = 0
+
+        for key in failed_keys:
+            attempts = attempt_history.get(key, [])
+            if not attempts:
+                logger.error(f"{key}: No attempts recorded")
+                continue
+
+            # Find longest attempt
+            longest = max(attempts, key=lambda x: x['length'])
+
+            # Get original content for diagnostic
+            original = self._get_original_content(key)
+
+            # Generate diagnostic note
+            diagnostic_note = self._generate_diagnostic_note(
+                key=key,
+                original=original,
+                processed=longest['text'],
+                attempts_count=len(attempts)
+            )
+
+            # Prepend diagnostic note
+            content_with_note = diagnostic_note + "\n\n---\n\n" + longest['text']
+
+            # Save with note
+            self._save_result(key, content_with_note)
+
+            logger.warning(
+                f"{key}: Saved longest attempt ({longest['length']} chars) "
+                f"from {len(attempts)} attempts (retry {longest['retry_count']}) "
+                f"with diagnostic note - content may be incomplete"
+            )
+            saved_count += 1
+
+        return saved_count
+
+    def _generate_diagnostic_note(
+        self,
+        key: str,
+        original: str,
+        processed: str,
+        attempts_count: int
+    ) -> str:
+        """
+        Use agent to generate a diagnostic note explaining why the file failed.
+
+        The agent analyzes the failure and provides information about:
+        - What type of problem was detected
+        - Where in the content the problem likely occurs
+        - Recommendations for the user
+
+        Args:
+            key: File key
+            original: Original content
+            processed: Processed content (longest attempt)
+            attempts_count: Number of attempts made
+
+        Returns:
+            Diagnostic note in markdown format
+        """
+        try:
+            from pdf2epub.processors.utils.agent_verifier import get_verification_model
+            from pydantic_ai import Agent
+
+            model = get_verification_model()
+
+            # Create a simple agent for diagnostic
+            diagnostic_prompt = f"""You are analyzing a file that failed polish validation after {attempts_count} attempts.
+
+Your task: Write a brief diagnostic note (2-3 sentences) explaining:
+1. What type of problem was detected (truncation, corruption, etc.)
+2. Where in the content the problem likely occurs
+3. Brief suggestion for the user
+
+Keep it concise and actionable. Use markdown format.
+
+File: {key}
+Original length: {len(original)} chars
+Processed length: {len(processed)} chars
+Ratio: {len(processed)/len(original)*100:.1f}%
+
+Original ending (last 200 chars):
+{original[-200:]}
+
+Processed ending (last 200 chars):
+{processed[-200:]}
+"""
+
+            agent = Agent(model, output_type=str)
+            result = agent.run_sync(diagnostic_prompt)
+
+            # Format the diagnostic note
+            note = f"""<!-- DIAGNOSTIC NOTE: Auto-generated by agent verification -->
+> ⚠️ **Content may be incomplete** - This file failed validation after {attempts_count} attempts.
+> The longest version ({len(processed)} chars) has been saved.
+
+{result.output}
+
+---
+"""
+            return note
+
+        except Exception as e:
+            logger.warning(f"Failed to generate diagnostic note for {key}: {e}")
+            # Fallback to simple note
+            return f"""<!-- DIAGNOSTIC NOTE -->
+> ⚠️ **Content may be incomplete** - This file failed validation after {attempts_count} attempts.
+> Original: {len(original)} chars → Processed: {len(processed)} chars ({len(processed)/len(original)*100:.1f}%)
+> Please manually review this file for completeness.
+
+---
+"""
+
+    def process_all_files(self) -> Dict[str, Any]:
+        """
+        Process all files with retry and longest fallback.
+
+        This method wraps the base class processing with:
+        - Retry loop for failed files
+        - Attempt history tracking
+        - Longest fallback for persistent failures
+
+        Returns:
+            Summary statistics
+        """
+        # Configuration
+        max_retries = self.config.get('validation_strategy', {}).get('max_retries', 3)
+
+        # Track all attempts for longest fallback
+        # Maps unit_id -> list of {'text': str, 'length': int, 'retry_count': int}
+        attempt_history: Dict[str, List[Dict]] = {}
+
+        # Initialize tracking
+        retry_count = 0
+        failed_unit_ids = set()
+
+        while retry_count <= max_retries:
+            if retry_count == 0:
+                logger.info(f"Processing all files (max_retries: {max_retries})")
+            else:
+                logger.info(f"Retry attempt {retry_count}/{max_retries} for {len(failed_unit_ids)} failed units")
+
+            # Call base class processing
+            # This will call process_all_units() which calls _batch_validate_and_save()
+            summary = super().process_all_files()
+
+            # Extract failures from summary
+            new_failed_ids = summary.get('failed_ids', set())
+
+            # Record attempts from this round
+            # _batch_validate_and_save() stores attempts in self._last_batch_attempts
+            if hasattr(self, '_last_batch_attempts'):
+                for unit_id, result_text in self._last_batch_attempts.items():
+                    if unit_id not in attempt_history:
+                        attempt_history[unit_id] = []
+                    attempt_history[unit_id].append({
+                        'text': result_text,
+                        'length': len(result_text),
+                        'retry_count': retry_count
+                    })
+
+            if not new_failed_ids:
+                # Success! All files processed
+                logger.success(f"All files completed successfully on attempt {retry_count + 1}")
+                return summary
+
+            # Check if we should retry
+            if retry_count < max_retries:
+                logger.warning(
+                    f"{len(new_failed_ids)} units failed validation, "
+                    f"will retry (attempt {retry_count + 2}/{max_retries + 1})"
+                )
+                failed_unit_ids = new_failed_ids
+                retry_count += 1
+
+                # Mark failed units as pending in tracker so they'll be re-processed
+                for unit_id in failed_unit_ids:
+                    self.processing_tracker.reset_unit_status(unit_id)
+
+                continue
+            else:
+                # Max retries exhausted
+                logger.warning(
+                    f"{len(new_failed_ids)} units still failing after {max_retries + 1} attempts, "
+                    f"using longest fallback strategy"
+                )
+                failed_unit_ids = new_failed_ids
+                break
+
+        # Longest fallback for persistent failures
+        if failed_unit_ids:
+            failed_list = list(failed_unit_ids)
+            logger.info(f"Applying longest fallback to {len(failed_list)} failed units")
+            saved_count = self._save_longest_attempts(failed_list, attempt_history)
+            logger.info(f"Saved {saved_count} files with longest attempt (may be incomplete)")
+
+            # Update summary to reflect saved files
+            summary['succeeded'] = summary.get('succeeded', 0) + saved_count
+            summary['failed_with_fallback'] = saved_count
+
+        return summary
 

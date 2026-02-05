@@ -44,6 +44,7 @@ class CompositeTruncationDetector(BaseTruncationDetector):
         self.llm_client = llm_client
         self.truncation_models = truncation_models
         self.task_type = task_type
+        self.cheapest_model_configs = None  # Will be lazily computed if needed
 
         # Initialize sub-detectors
         self.ngram_detector = NGramTruncationDetector(

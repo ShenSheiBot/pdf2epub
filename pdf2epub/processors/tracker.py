@@ -483,6 +483,25 @@ class ProcessingTracker:
 
             self.save()
 
+    def reset_unit_status(self, unit_key: str):
+        """
+        Reset a unit's status to pending (used for retry after validation failure).
+
+        Args:
+            unit_key: Unit key to reset
+        """
+        with self._lock:
+            if unit_key in self.progress["units"]:
+                self.progress["units"][unit_key]["status"] = "pending"
+            else:
+                # Create new unit entry if doesn't exist
+                self.progress["units"][unit_key] = {
+                    "status": "pending",
+                    "attempts": [],
+                    "retry_count": 0
+                }
+            self.save()
+
     def migrate_unit_keys(self, old_to_new: Dict[str, str]):
         """
         Migrate unit data from old keys to new keys (used during resplit renumbering).

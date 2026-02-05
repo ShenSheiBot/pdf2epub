@@ -977,6 +977,42 @@ def batch_translate_command(args):
     max_retries = args.max_retries if args.max_retries is not None else batch_config.get('max_retries', 1)
     poll_interval = args.poll_interval if args.poll_interval is not None else batch_config.get('poll_interval', 60)
 
+    # Handle --cancel flag: cancel active job and clear job reference
+    if getattr(args, 'cancel', False):
+        translated_batch_dir = output_dir / "translated_batch"
+        state_file = translated_batch_dir / "batch_state.json"
+
+        if state_file.exists():
+            import json
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+
+            active_job = state.get('active_job_name')
+            if active_job:
+                logger.info(f"Cancelling active batch job: {active_job}")
+                try:
+                    from google import genai
+                    credentials = config.get('credentials', {}).get('providers', {})
+                    batch_provider = batch_config.get('provider', 'gemini')
+                    provider_config = credentials.get(batch_provider, {})
+                    api_key = provider_config.get('api_key')
+                    base_url = provider_config.get('base_url')
+
+                    client = genai.Client(api_key=api_key, http_options={'base_url': base_url})
+                    client.batches.cancel(name=active_job)
+                    logger.info(f"Cancelled job: {active_job}")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel job (may already be done): {e}")
+
+                # Clear job reference in state
+                state['active_job_name'] = None
+                state['active_job_requests'] = []
+                with open(state_file, 'w', encoding='utf-8') as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+                logger.info("Cleared job reference")
+        else:
+            logger.info("No active batch state found")
+
     # Initialize the batch translation processor
     processor = BatchTranslateProcessor(
         config=config,
@@ -1083,6 +1119,41 @@ def polish_batch_command(args):
     batch_config = config.get('batch', {})
     max_retries = args.max_retries or batch_config.get('max_retries', 1)
     poll_interval = args.poll_interval or batch_config.get('poll_interval', 60)
+
+    # Handle --cancel flag: cancel active job and clear job reference
+    if getattr(args, 'cancel', False):
+        polished_markdown_dir = output_dir / "polished_markdown"
+        state_file = polished_markdown_dir / "batch_state.json"
+
+        if state_file.exists():
+            with open(state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+
+            active_job = state.get('active_job_name')
+            if active_job:
+                logger.info(f"Cancelling active batch job: {active_job}")
+                try:
+                    from google import genai
+                    credentials = config.get('credentials', {}).get('providers', {})
+                    batch_provider = batch_config.get('provider', 'gemini')
+                    provider_config = credentials.get(batch_provider, {})
+                    api_key = provider_config.get('api_key')
+                    base_url = provider_config.get('base_url')
+
+                    client = genai.Client(api_key=api_key, http_options={'base_url': base_url})
+                    client.batches.cancel(name=active_job)
+                    logger.info(f"Cancelled job: {active_job}")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel job (may already be done): {e}")
+
+                # Clear job reference in state
+                state['active_job_name'] = None
+                state['active_job_requests'] = []
+                with open(state_file, 'w', encoding='utf-8') as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+                logger.info("Cleared job reference")
+        else:
+            logger.info("No active batch state found")
 
     try:
         # Initialize processor
@@ -1348,6 +1419,11 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         default=None,
         help="Seconds between job status polls (default: from config or 60)"
     )
+    polish_batch_parser.add_argument(
+        "--cancel",
+        action="store_true",
+        help="Cancel any active batch job and clear state before starting fresh"
+    )
     polish_batch_parser.set_defaults(func=polish_batch_command)
 
     # Translate subcommand
@@ -1441,6 +1517,11 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         "--no-entities",
         action="store_true",
         help="Force disable entity usage even if file exists"
+    )
+    batch_translate_parser.add_argument(
+        "--cancel",
+        action="store_true",
+        help="Cancel any active batch job and clear state before starting fresh"
     )
     batch_translate_parser.set_defaults(func=batch_translate_command)
 

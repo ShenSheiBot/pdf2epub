@@ -1011,16 +1011,27 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
 
                 for result in verification_results:
                     if result.status == "complete":
-                        validated_by_agent[result.key] = suspicious[result.key].processed
-                        logger.info(f"{result.key}: Agent verified complete - {result.reason}")
+                        validated_by_agent[result.file_key] = suspicious[result.file_key].processed
+                        logger.info(f"{result.file_key}: Agent verified complete - {result.reason}")
                     else:
-                        still_failed.append(result.key)
-                        logger.warning(f"{result.key}: Agent confirmed truncation - {result.reason}")
+                        still_failed.append(result.file_key)
+                        logger.warning(f"{result.file_key}: Agent confirmed truncation - {result.reason}")
 
             except Exception as e:
                 logger.error(f"Agent verification failed: {e}")
-                # Fall back to treating all suspicious as failed
-                still_failed = list(suspicious.keys())
+                # Fall back to saving all suspicious files anyway (don't lose translated content)
+                logger.warning(f"Saving {len(suspicious)} files despite verification failure")
+                for unit_key, vfile in suspicious.items():
+                    validated_by_agent[unit_key] = vfile.processed
+                    logger.info(f"{unit_key}: Saved despite verification error (content may need review)")
+
+        # Also save files that agent marked as truncated (don't lose translated content)
+        if still_failed and suspicious:
+            logger.warning(f"Saving {len(still_failed)} files that failed verification (may be incomplete)")
+            for unit_key in still_failed:
+                if unit_key in suspicious and unit_key not in validated_by_agent:
+                    validated_by_agent[unit_key] = suspicious[unit_key].processed
+                    logger.info(f"{unit_key}: Saved with truncation warning")
 
         # Combine validated results
         all_validated = {**passed, **validated_by_agent, **already_saved}

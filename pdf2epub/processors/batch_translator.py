@@ -43,6 +43,8 @@ class BatchTranslateState:
     processing_keys: List[str] = field(default_factory=list)
     # Track attempt history for longest fallback
     attempt_history: Dict[str, List[Dict]] = field(default_factory=dict)
+    # Track safety-blocked keys (need Anthropic fallback)
+    safety_blocked_keys: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
@@ -54,6 +56,7 @@ class BatchTranslateState:
             "completed_keys": self.completed_keys,
             "processing_keys": self.processing_keys,
             "attempt_history": self.attempt_history,
+            "safety_blocked_keys": self.safety_blocked_keys,
         }
 
     @classmethod
@@ -67,6 +70,7 @@ class BatchTranslateState:
             completed_keys=data.get("completed_keys", []),
             processing_keys=data.get("processing_keys", []),
             attempt_history=data.get("attempt_history", {}),
+            safety_blocked_keys=data.get("safety_blocked_keys", []),
         )
 
 
@@ -114,7 +118,7 @@ class BatchTranslateProcessor:
 
         # Setup directories
         self.input_dir = Path("output") / book_title / "polished_markdown"
-        self.output_dir = Path("output") / book_title / "translated_batch"
+        self.output_dir = Path("output") / book_title / "translated"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # State file for persistence
@@ -417,19 +421,65 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         """
         Get list of files that need processing.
 
+        Uses the same logic as WorkUnitDiscovery:
+        - Group files by base name
+        - If parts exist for a base name, use parts (skip aggregated file)
+        - If no parts exist, use the aggregated file
+        - Skip already completed files
+
         Returns:
             List of file stems (without .md extension)
         """
         # Get all markdown files from input directory
-        all_files = []
-        for file in sorted(self.input_dir.glob("*.md")):
-            file_stem = file.stem
-            # Skip already completed files
-            if file_stem not in state.completed_keys:
-                all_files.append(file_stem)
+        all_input_files = sorted(self.input_dir.glob("*.md"))
 
-        logger.info(f"Found {len(all_files)} files pending translation")
-        return all_files
+        # Group files by base name (same logic as WorkUnitDiscovery._group_files_by_base)
+        groups: dict[str, list[Path]] = {}
+        for file_path in all_input_files:
+            stem = file_path.stem
+            # Skip state/metadata files
+            if stem in ('batch_state', 'batch_metadata', 'processing_tracker'):
+                continue
+            # Extract base name
+            if '.part' in stem:
+                base_name = stem.split('.part')[0]
+            else:
+                base_name = stem
+            if base_name not in groups:
+                groups[base_name] = []
+            groups[base_name].append(file_path)
+
+        # For each group, decide which files to process
+        # Priority: part files > aggregated file (same as WorkUnitDiscovery)
+        pending_files = []
+        for base_name, files in groups.items():
+            part_files = [f for f in files if '.part' in f.stem]
+            combined_file = [f for f in files if '.part' not in f.stem]
+
+            if part_files:
+                # Use part files (skip aggregated file)
+                for pf in sorted(part_files, key=lambda p: self._extract_part_number(p.stem)):
+                    file_stem = pf.stem
+                    if file_stem not in state.completed_keys:
+                        pending_files.append(file_stem)
+            elif combined_file:
+                # No parts, use aggregated file
+                file_stem = combined_file[0].stem
+                if file_stem not in state.completed_keys:
+                    pending_files.append(file_stem)
+
+        logger.info(f"Found {len(pending_files)} files pending translation (parts preferred over aggregated)")
+        return pending_files
+
+    def _extract_part_number(self, stem: str) -> int:
+        """Extract part number from filename stem."""
+        if '.part' in stem:
+            try:
+                part_str = stem.split('.part')[1]
+                return int(part_str)
+            except (ValueError, IndexError):
+                pass
+        return 0
 
     def _read_file_content(self, file_key: str) -> str:
         """Read content from input file."""
@@ -459,6 +509,9 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         """
         Split content into parts if it exceeds token limit.
 
+        Only splits files that are not already parts (same as base.py _proactive_split_units).
+        If file_key already contains ".part", it won't be split again.
+
         Args:
             file_key: File identifier
             content: Markdown content to split
@@ -466,6 +519,10 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         Returns:
             List of (part_key, part_content) tuples
         """
+        # Don't split files that are already parts (same as base.py logic)
+        if '.part' in file_key:
+            return [(file_key, content)]
+
         token_count = self._count_tokens(content)
         max_tokens = self._get_max_tokens_per_part()
 
@@ -576,7 +633,9 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
             Summary statistics
         """
         # Load or initialize state
-        state = self._load_state() if self.resume else BatchTranslateState()
+        state = self._load_state() if self.resume else None
+        if state is None:
+            state = BatchTranslateState()
 
         # If resuming and job is active, continue from there
         if state.active_job_name and self.resume:
@@ -616,7 +675,13 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
             state.failed_keys = retry_files
             self._save_state(state)
 
-        # After exhausting retries, use longest fallback for remaining failures
+        # Try online translate fallback for remaining failures
+        if state.failed_keys:
+            still_failed = self._try_online_translate_fallback(state.failed_keys, state)
+            state.failed_keys = still_failed
+            self._save_state(state)
+
+        # After online fallback, use longest fallback for remaining failures
         if state.failed_keys:
             logger.info(f"Applying longest fallback for {len(state.failed_keys)} failed files")
             saved_count = self._save_longest_attempts(state.failed_keys, state.attempt_history)
@@ -741,6 +806,10 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         # Group responses by success/failure
         successful = {}
         failed_keys = []
+        safety_blocked = []
+
+        # Keywords indicating safety block
+        safety_keywords = ['PROHIBITED_CONTENT', 'safety', 'blocked', 'SAFETY', 'BLOCK']
 
         for response in responses:
             request_key = response.key
@@ -751,7 +820,14 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
                 continue
 
             if response.error:
-                logger.error(f"{request_key}: API error - {response.error}")
+                error_str = str(response.error)
+                # Check if this is a safety block
+                is_safety_block = any(kw in error_str for kw in safety_keywords)
+                if is_safety_block:
+                    logger.warning(f"{request_key}: Safety blocked - {error_str}")
+                    safety_blocked.append(request_key)
+                else:
+                    logger.error(f"{request_key}: API error - {error_str}")
                 failed_keys.append(request_key)
                 continue
 
@@ -776,7 +852,7 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
                 "retry_count": state.retry_count
             })
 
-        logger.info(f"Batch results: {len(successful)} successful, {len(failed_keys)} failed")
+        logger.info(f"Batch results: {len(successful)} successful, {len(failed_keys)} failed, {len(safety_blocked)} safety-blocked")
 
         # Validate successful results
         validated_keys, still_failed = self._validate_batch_results(successful)
@@ -787,6 +863,8 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         # Update state
         state.completed_keys.extend(validated_keys)
         state.failed_keys = all_failed_keys
+        # Track safety-blocked keys (need Anthropic fallback)
+        state.safety_blocked_keys = list(set(state.safety_blocked_keys + safety_blocked))
         state.active_job_name = None
         state.active_job_requests = []
         state.processing_keys = []
@@ -878,14 +956,14 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
         for result in verification_results:
             if result.status == "complete":
                 # Agent confirmed complete
-                result_data = successful[result.key]
-                self._save_result(result.key, suspicious[result.key].processed, result_data["metadata"])
+                result_data = successful[result.file_key]
+                self._save_result(result.file_key, suspicious[result.file_key].processed, result_data["metadata"])
                 passed_keys.append(result_data["metadata"]["file_key"])
-                logger.info(f"{result.key}: Agent verified as complete - {result.reason}")
+                logger.info(f"{result.file_key}: Agent verified as complete - {result.reason}")
             else:
                 # Agent confirmed truncation
-                failed_keys.append(result.key)
-                logger.warning(f"{result.key}: Agent confirmed truncation - {result.reason}")
+                failed_keys.append(result.file_key)
+                logger.warning(f"{result.file_key}: Agent confirmed truncation - {result.reason}")
 
         return passed_keys, failed_keys
 
@@ -1044,7 +1122,7 @@ Be concise but specific."""
                 self._aggregate_parts(base_name, parts)
 
     def _translate_toc(self) -> None:
-        """Translate TOC titles if book structure exists."""
+        """Translate TOC titles using TranslateProcessor's existing logic."""
         toc_file = Path("output") / self.book_title / "toc_tree.json"
         if not toc_file.exists():
             logger.info("No TOC file found, skipping TOC translation")
@@ -1053,40 +1131,10 @@ Be concise but specific."""
         logger.info("Translating TOC titles...")
 
         try:
-            with open(toc_file, 'r', encoding='utf-8') as f:
-                toc_tree = json.load(f)
-
-            # Collect all titles
-            titles_to_translate = []
-
-            def collect_titles(node):
-                if isinstance(node, dict):
-                    if "title" in node and node["title"]:
-                        titles_to_translate.append(node["title"])
-                    if "children" in node:
-                        for child in node["children"]:
-                            collect_titles(child)
-                elif isinstance(node, list):
-                    for item in node:
-                        collect_titles(item)
-
-            collect_titles(toc_tree)
-
-            if not titles_to_translate:
-                logger.info("No titles to translate in TOC")
-                return
-
-            # Build batch request for TOC translation
-            system_prompt = f"""Translate the following table of contents entries from {self.source_language} to {self.target_language}.
-
-Return ONLY the translations, one per line, in the same order.
-Do not add numbering or explanations."""
-
-            content = "\n".join(titles_to_translate)
-
-            # Use online LLM for TOC (small content, fast)
             from .translator import TranslateProcessor
-            temp_processor = TranslateProcessor(
+
+            # Create TranslateProcessor to use its TOC translation methods
+            processor = TranslateProcessor(
                 config=self.config,
                 book_title=self.book_title,
                 source_language=self.source_language,
@@ -1095,38 +1143,18 @@ Do not add numbering or explanations."""
                 resume=False
             )
 
-            # Generate translation
-            result = temp_processor.llm_client.generate_with_retry(
-                prompt=[{"role": "system", "content": system_prompt}, {"role": "user", "content": content}],
-                validator=None,
-                max_retries=2
-            )
+            # Use the existing well-tested TOC translation logic
+            reference_json = processor._build_toc_reference_json()
+            if not reference_json:
+                logger.info("No TOC entries to translate")
+                return
 
-            # Parse translations
-            translated_lines = result.strip().split('\n')
-            title_map = dict(zip(titles_to_translate, translated_lines))
-
-            # Update TOC tree
-            def update_titles(node):
-                if isinstance(node, dict):
-                    if "title" in node and node["title"] in title_map:
-                        node["title"] = title_map[node["title"]]
-                    if "children" in node:
-                        for child in node["children"]:
-                            update_titles(child)
-                elif isinstance(node, list):
-                    for item in node:
-                        update_titles(item)
-
-            update_titles(toc_tree)
-
-            # Save translated TOC
-            output_toc = Path("output") / self.book_title / "toc_tree_translated.json"
-            with open(output_toc, 'w', encoding='utf-8') as f:
-                json.dump(toc_tree, f, ensure_ascii=False, indent=2)
-
-            logger.success(f"Saved translated TOC to {output_toc}")
-            logger.success("TOC translation completed")
+            translations = processor._translate_toc_batch(reference_json)
+            if translations:
+                processor._save_toc_tree_translated(translations)
+                logger.success("TOC translation completed")
+            else:
+                logger.warning("TOC translation returned no results")
 
         except Exception as e:
             logger.error(f"Failed to translate TOC: {e}")
@@ -1145,3 +1173,144 @@ Do not add numbering or explanations."""
 
         # Continue waiting for completion
         return self._wait_for_completion(state, metadata_map)
+
+    def _try_online_translate_fallback(
+        self,
+        failed_keys: List[str],
+        state: BatchTranslateState
+    ) -> List[str]:
+        """
+        Try online translate for failed files.
+
+        - Safety-blocked files: Always use Anthropic (Gemini will block again)
+        - Other failures: Try online translate if count <= threshold
+
+        Args:
+            failed_keys: List of file keys that failed batch translate
+            state: Current batch state (contains safety_blocked_keys)
+
+        Returns:
+            List of keys that still failed after online translate
+        """
+        if not failed_keys:
+            return []
+
+        batch_config = self.config.get('batch', {})
+        threshold = batch_config.get('online_translate_fallback_threshold', 5)
+
+        # Separate safety-blocked from other failures
+        safety_blocked = [k for k in failed_keys if k in state.safety_blocked_keys]
+        other_failures = [k for k in failed_keys if k not in state.safety_blocked_keys]
+
+        # Safety-blocked files must use Anthropic regardless of count
+        files_to_process = safety_blocked.copy()
+
+        # Other failures only if below threshold
+        if other_failures and len(other_failures) <= threshold:
+            files_to_process.extend(other_failures)
+            logger.info(
+                f"Online translate fallback: {len(safety_blocked)} safety-blocked, "
+                f"{len(other_failures)} other failures (threshold: {threshold})"
+            )
+        elif other_failures:
+            logger.info(
+                f"Skipping online fallback for {len(other_failures)} non-safety failures "
+                f"(> threshold {threshold}). Processing {len(safety_blocked)} safety-blocked only."
+            )
+
+        if not files_to_process:
+            return failed_keys
+
+        logger.info(f"Attempting online translate fallback for {len(files_to_process)} files")
+
+        # Initialize LLM client for online translation
+        from pdf2epub.utils.llm_client import LLMClient
+
+        llm_client = LLMClient(self.config)
+
+        still_failed = []
+        recovered = []
+
+        for key in files_to_process:
+            is_safety_blocked = key in safety_blocked
+
+            # Read original content
+            # key might be a part key like "chapter_10.part1"
+            input_file = self.input_dir / f"{key}.md"
+            if not input_file.exists():
+                logger.error(f"{key}: Input file not found")
+                still_failed.append(key)
+                continue
+
+            original_content = input_file.read_text(encoding='utf-8')
+
+            # Build translation prompt
+            prompt = f"""Translate the following {self.source_language} text to {self.target_language}.
+Keep markdown formatting. Translate only the text, preserving all structure.
+
+{original_content}"""
+
+            # Choose model based on whether safety-blocked
+            if is_safety_blocked:
+                # Use Anthropic Sonnet for safety-blocked content (quality matters for translation)
+                model_configs = [
+                    {
+                        'provider': 'anthropic',
+                        'model': 'claude-sonnet-4-5-20250514',
+                        'max_retries': 2
+                    }
+                ]
+                logger.info(f"{key}: Using Anthropic Sonnet (safety-blocked by Gemini)")
+            else:
+                # Use configured translation models
+                translate_config = self.config.get('translation', {})
+                models = translate_config.get('models', [])
+                model_configs = [
+                    {
+                        'provider': m.get('provider', 'gemini'),
+                        'model': m.get('model', 'gemini-2.5-flash'),
+                        'max_retries': m.get('api_retries', 2)
+                    }
+                    for m in models
+                ] if models else [{'provider': 'anthropic', 'model': 'claude-sonnet-4-5-20250514', 'max_retries': 2}]
+                logger.info(f"{key}: Using online translate with configured models")
+
+            try:
+                # Generate translation
+                translated = llm_client.generate(
+                    prompt=prompt,
+                    model_configs=model_configs,
+                    operation_name=f"translate_fallback_{key}"
+                )
+
+                if translated and len(translated.strip()) > 100:
+                    # Save result
+                    output_file = self.output_dir / f"{key}.md"
+                    output_file.write_text(translated, encoding='utf-8')
+
+                    # Update state
+                    if key not in state.completed_keys:
+                        state.completed_keys.append(key)
+                    if key in state.safety_blocked_keys:
+                        state.safety_blocked_keys.remove(key)
+
+                    recovered.append(key)
+                    logger.success(f"{key}: Online translate succeeded ({len(translated)} chars)")
+                else:
+                    logger.warning(f"{key}: Online translate returned empty/short result")
+                    still_failed.append(key)
+
+            except Exception as e:
+                logger.error(f"{key}: Online translate error: {e}")
+                still_failed.append(key)
+
+        # Files not processed remain failed
+        not_processed = [k for k in failed_keys if k not in files_to_process]
+        still_failed.extend(not_processed)
+
+        logger.info(
+            f"Online translate fallback: {len(recovered)} recovered, "
+            f"{len(still_failed)} still failed"
+        )
+
+        return still_failed

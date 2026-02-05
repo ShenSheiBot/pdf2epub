@@ -240,19 +240,30 @@ class PolishVerificationAgent(AgentVerifier):
 
 Your task: Verify if polish results are complete or truncated.
 
+**CRITICAL: Split Files (.partN)**
+
+Files with names like `chapter_9.part2` are SPLIT FILES - they are INTENTIONALLY partial:
+- Split files contain only a PORTION of the original chapter (e.g., part2 of 3)
+- They are SUPPOSED to start mid-chapter and end mid-chapter
+- Do NOT compare them against the full original chapter
+- Only verify the content WITHIN the split is complete (no mid-sentence cuts, proper formatting)
+- A split file starting with a section heading like "## Boys' Love" is NORMAL - it's where the split was made
+- A split file ending before the chapter conclusion is NORMAL - the conclusion is in the next part
+
 **Judging Criteria:**
 
 ACCEPTABLE (status="complete"):
 - Format transformations: table → list, deduplication, OCR error cleanup, standardization
 - Content reorganization: paragraph merging, list formatting, heading cleanup
 - Whitespace normalization, punctuation fixes
-- The KEY is: all meaningful content is preserved, just reformatted
+- The KEY is: all meaningful content within THIS file/split is preserved, just reformatted
+- Split files that start/end at logical section boundaries
 
 TRUNCATION (status="truncated"):
 - Sentences cut off mid-way (not at punctuation)
 - Paragraphs ending abruptly with incomplete thoughts
-- Sudden stop without logical conclusion
-- Missing significant content that should be there
+- Sudden stop WITHOUT logical section boundary
+- Missing content that should be WITHIN this specific file/split
 
 **Tools Available:**
 - get_stats(file_key): Get length ratios, metadata
@@ -263,13 +274,14 @@ TRUNCATION (status="truncated"):
 **Strategy Suggestions:**
 
 1. Start with get_stats() to see the overall picture
-2. Use detect_content_type() to understand what you're dealing with
-3. Based on severity (length ratio) and type, decide how much to read:
+2. Check if file_key contains ".part" - if so, it's a split file, be lenient about missing start/end content
+3. Use detect_content_type() to understand what you're dealing with
+4. Based on severity (length ratio) and type, decide how much to read:
    - Ratio >70%: Likely OK, check end only
    - Ratio 50-70%: Check start, end, maybe middle
    - Ratio <50%: More suspicious, check multiple points
-4. For tables/indexes: Format changes are expected, focus on content preservation
-5. For prose: Check logical flow and sentence completion
+5. For tables/indexes: Format changes are expected, focus on content preservation
+6. For prose: Check logical flow and sentence completion WITHIN the file
 
 **Important:**
 - Tables/indexes often have EXTREME length reductions (50-95%) due to format cleanup - this is NORMAL
@@ -279,7 +291,7 @@ TRUNCATION (status="truncated"):
 - Only mark as truncated if you see:
   - Sentences cut off mid-word or mid-thought
   - Structural corruption (garbled text, broken tables)
-  - Missing expected sections (e.g., index missing entire alphabetical sections)
+  - Missing expected sections WITHIN this specific file (not in other parts)
 - When uncertain, read more segments to be sure
 
 **Output Format:**
@@ -300,19 +312,41 @@ class TranslationVerificationAgent(AgentVerifier):
     def _get_system_prompt(self) -> str:
         return """You are a translation completeness verification expert.
 
-Your task: Verify if translations are complete or truncated.
+Your task: Verify if translations are complete and correctly formatted.
+
+**CRITICAL: Bilingual Output Detection**
+
+A common translation error is producing BILINGUAL output instead of pure translation:
+- The model outputs Japanese original paragraph, then Chinese translation paragraph, alternating
+- This results in output length ~150-200% of input (nearly double)
+- Look for Japanese text (hiragana ぁ-ん, katakana ァ-ン) OUTSIDE of quote markers (> or 〈〉)
+- Japanese inside quotes (> 〈...〉) is ACCEPTABLE - these are intentional source quotes
+- Japanese OUTSIDE quotes in the body text is a BILINGUAL FORMAT ERROR
+
+If output ratio > 150% AND you see Japanese outside quotes, mark as "truncated" with reason "bilingual format error".
+
+**CRITICAL: Split Files (.partN)**
+
+Files with names like `chapter_9.part2` are SPLIT FILES - they are INTENTIONALLY partial:
+- Split files contain only a PORTION of the original chapter (e.g., part2 of 3)
+- They are SUPPOSED to start mid-chapter and end mid-chapter
+- Do NOT expect them to contain the full chapter's beginning or ending
+- Only verify the content WITHIN the split is fully translated (no mid-sentence cuts)
+- A split file starting with a section heading is NORMAL - it's where the split was made
 
 **Judging Criteria:**
 
 COMPLETE:
-- All source content has corresponding translation
+- Translation is in TARGET LANGUAGE ONLY (Chinese), except for intentional quotes
+- All source content WITHIN THIS FILE has corresponding translation
 - Translation ends at a logical point (end of paragraph, section, etc.)
 - No mid-sentence cuts
 
-TRUNCATED:
+TRUNCATED (or ERROR):
+- BILINGUAL FORMAT: Source language paragraphs mixed with translation paragraphs
 - Translation stops mid-sentence or mid-paragraph
-- Missing sections that exist in the original
-- Sudden stop without proper ending
+- Missing sections that exist in the original FILE (not other parts)
+- Sudden stop without proper ending WITHIN this file
 
 **Tools Available:**
 - get_stats(file_key): Get length ratios, metadata
@@ -322,10 +356,11 @@ TRUNCATED:
 
 **Strategy Suggestions:**
 
-1. Get stats to see length ratio (translations may be longer or shorter)
-2. Check the end of translation - does it end properly?
-3. Compare start/middle/end segments to ensure coverage
-4. For long files, sample multiple positions
+1. Get stats to see length ratio - if >150%, check for bilingual format
+2. Read segments of the TRANSLATION output, look for Japanese outside quotes
+3. Check if file_key contains ".part" - if so, it's a split file, be lenient on start/end
+4. Check the end of translation - does it end properly?
+5. Compare start/middle/end segments to ensure coverage WITHIN this file
 
 **Output Format:**
 Return a list of VerificationResult with:

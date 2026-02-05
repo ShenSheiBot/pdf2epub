@@ -15,7 +15,7 @@ from typing import Dict, Optional, Tuple, List, Any
 from loguru import logger
 from .base import BaseMarkdownProcessor
 from ..utils.common import parse_llm_json
-from .utils.truncation import LLMTruncationDetector
+from .utils.truncation import NGramTruncationDetector
 from .utils.split_manager import SplitManager
 from .tracker import ProcessingTracker
 from ..chapter_identity import ChapterIdentity
@@ -80,10 +80,12 @@ class TranslateProcessor(BaseMarkdownProcessor):
         
         # Initialize truncation detector
         translate_config = config.get('translation', {})
-        self.truncation_detector = LLMTruncationDetector(
-            llm_client=self.llm_client,
-            num_lines=translate_config.get('truncation_check_lines', 3),
-            truncation_models=translate_config.get('truncation_models')
+
+        # Use NGramTruncationDetector for fast screening (same as polish)
+        # Agent verification will handle accurate detection in Phase 2
+        self.truncation_detector = NGramTruncationDetector(
+            min_unique_preserved_ratio=0.60,
+            allow_deduplication=True
         )
         
         # Auto-detect entities if use_entities is None, otherwise use explicit value
@@ -116,6 +118,22 @@ class TranslateProcessor(BaseMarkdownProcessor):
             max_resplits=splitting_config.get('max_resplits', 3),
             consecutive_failures_threshold=splitting_config.get('consecutive_failures_threshold', 2)
         )
+
+        # Enable batch validation mode (validate after all files processed)
+        self.validation_mode = "batch"
+        self.auto_save = False
+        self._agent_verifier = None
+
+    @property
+    def agent_verifier(self):
+        """Lazy initialization of agent verifier for batch validation."""
+        if self._agent_verifier is None:
+            from .utils.agent_verifier import TranslationVerificationAgent
+            from .utils.verification_tools import VerificationTools
+
+            tools = VerificationTools(units={})
+            self._agent_verifier = TranslationVerificationAgent(tools)
+        return self._agent_verifier
 
     def get_operation_name(self, file_name: str) -> str:
         """Get the operation name for logging."""
@@ -850,6 +868,218 @@ SPECIFIC RULES FOR JAPANESE TO CHINESE:
             json.dump(toc_tree, f, ensure_ascii=False, indent=2)
 
         logger.success(f"Saved translated TOC to {output_path}")
+
+    def _get_original_content(self, file_key: str) -> str:
+        """
+        Get original content for a given file key.
+
+        Args:
+            file_key: File identifier (e.g., "chapter_3.part2")
+
+        Returns:
+            Original content string
+        """
+        # Get input file path
+        if file_key.endswith('.md'):
+            input_path = self.input_dir / file_key
+        else:
+            input_path = self.input_dir / f"{file_key}.md"
+
+        if not input_path.exists():
+            # Try without .md extension in case it's in splits dir
+            input_path = self.input_dir / "splits" / f"{file_key}.md"
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+
+        return input_path.read_text(encoding='utf-8')
+
+    def _save_result(self, file_key: str, content: str) -> None:
+        """
+        Save translation result to output directory.
+
+        Args:
+            file_key: File identifier
+            content: Translated content
+        """
+        # Determine output path
+        output_path = self.output_dir / "splits" / f"{file_key}.md"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write content
+        output_path.write_text(content, encoding='utf-8')
+        logger.debug(f"Saved translation result: {output_path}")
+
+    def _batch_validate_and_save(
+        self,
+        all_units: list,
+        completed_results: Dict[str, str],
+        failed_ids: List[str]
+    ) -> tuple:
+        """
+        Validate and save all completed translation results using two-phase validation.
+
+        Phase 1: LLMTruncationDetector screening (fast)
+        Phase 2: Agent verification for suspicious files (accurate)
+
+        Args:
+            all_units: List of all work units
+            completed_results: Dict mapping unit_key to translated content
+            failed_ids: List of unit keys that failed during processing
+
+        Returns:
+            Tuple of (validated_results dict, updated_failed_ids list)
+        """
+        from .utils.verification_tools import VerificationFile
+        from .utils.agent_verifier import verify_batch
+
+        if not completed_results:
+            logger.info("No completed results to validate")
+            return {}, failed_ids
+
+        # Separate newly processed from already-saved units
+        newly_processed = {}
+        already_saved = {}
+
+        for unit in all_units:
+            unit_id = unit.id
+            if unit_id not in completed_results:
+                continue
+
+            if not unit.output_path.exists():
+                newly_processed[unit_id] = completed_results[unit_id]
+            else:
+                already_saved[unit_id] = completed_results[unit_id]
+                logger.debug(f"Skipping validation for {unit_id} (already saved)")
+
+        logger.info(f"Validating {len(newly_processed)} newly processed units, skipping {len(already_saved)} already saved")
+
+        if not newly_processed:
+            return completed_results, failed_ids
+
+        # Phase 1: LLMTruncationDetector screening
+        logger.info(f"Phase 1: LLMTruncationDetector screening for {len(newly_processed)} units")
+
+        passed = {}
+        suspicious = {}
+
+        for unit_key, translated in newly_processed.items():
+            try:
+                original = self._get_original_content(unit_key)
+
+                # Use LLMTruncationDetector (same as inline validation)
+                is_truncated, reason, details = self.truncation_detector.detect(
+                    original=original,
+                    processed=translated,
+                    source_language=self.source_language,
+                    target_language=self.target_language
+                )
+
+                if not is_truncated:
+                    passed[unit_key] = translated
+                    logger.debug(f"{unit_key}: LLM detector passed - {reason}")
+                else:
+                    suspicious[unit_key] = VerificationFile(
+                        key=unit_key,
+                        original=original,
+                        processed=translated
+                    )
+                    logger.debug(f"{unit_key}: LLM detector flagged as suspicious - {reason}")
+
+            except Exception as e:
+                logger.error(f"Error in LLM screening for {unit_key}: {e}")
+                suspicious[unit_key] = VerificationFile(
+                    key=unit_key,
+                    original=self._get_original_content(unit_key),
+                    processed=translated
+                )
+
+        logger.info(f"{len(passed)} units passed LLM screening, {len(suspicious)} suspicious")
+
+        # Phase 2: Agent verification for suspicious files
+        validated_by_agent = {}
+        still_failed = []
+
+        if suspicious:
+            logger.info(f"Phase 2: Agent verification for {len(suspicious)} suspicious units")
+
+            try:
+                verification_results = verify_batch(
+                    files=suspicious,
+                    task_type="translate"
+                )
+
+                for result in verification_results:
+                    if result.status == "complete":
+                        validated_by_agent[result.key] = suspicious[result.key].processed
+                        logger.info(f"{result.key}: Agent verified complete - {result.reason}")
+                    else:
+                        still_failed.append(result.key)
+                        logger.warning(f"{result.key}: Agent confirmed truncation - {result.reason}")
+
+            except Exception as e:
+                logger.error(f"Agent verification failed: {e}")
+                # Fall back to treating all suspicious as failed
+                still_failed = list(suspicious.keys())
+
+        # Combine validated results
+        all_validated = {**passed, **validated_by_agent, **already_saved}
+
+        # Save validated units
+        logger.info(f"Saving {len(passed) + len(validated_by_agent)} validated units")
+
+        for unit_key, content in {**passed, **validated_by_agent}.items():
+            try:
+                self._save_result(unit_key, content)
+            except Exception as e:
+                logger.error(f"Failed to save {unit_key}: {e}")
+                still_failed.append(unit_key)
+
+        # Aggregate multi-part files
+        self._aggregate_validated_files(all_validated)
+
+        # Update failed_ids (convert to set, merge, keep as set)
+        updated_failed_ids = failed_ids.union(still_failed)
+
+        return all_validated, updated_failed_ids
+
+    def _aggregate_validated_files(self, validated_results: Dict[str, str]) -> None:
+        """
+        Aggregate multi-part translated files into single files.
+
+        Args:
+            validated_results: Dict of validated translations
+        """
+        # Group by base file name
+        from collections import defaultdict
+        base_files = defaultdict(list)
+
+        for unit_key in validated_results.keys():
+            # Extract base name (e.g., "chapter_3" from "chapter_3.part2")
+            if '.part' in unit_key:
+                base_name = unit_key.split('.part')[0]
+                base_files[base_name].append(unit_key)
+
+        # Aggregate each multi-part file
+        for base_name, parts in base_files.items():
+            if len(parts) <= 1:
+                continue
+
+            # Sort parts by part number
+            sorted_parts = sorted(parts, key=lambda x: int(x.split('.part')[1]))
+
+            # Concatenate content
+            aggregated = []
+            for part_key in sorted_parts:
+                part_path = self.output_dir / "splits" / f"{part_key}.md"
+                if part_path.exists():
+                    aggregated.append(part_path.read_text(encoding='utf-8'))
+
+            # Write aggregated file
+            if aggregated:
+                output_path = self.output_dir / f"{base_name}.md"
+                output_path.write_text('\n\n'.join(aggregated), encoding='utf-8')
+                logger.info(f"Aggregated {len(sorted_parts)} parts into {base_name}.md")
 
     def process_all_files(self) -> Dict[str, Any]:
         """

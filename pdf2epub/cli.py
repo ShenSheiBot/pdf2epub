@@ -917,6 +917,102 @@ def translate_command(args):
     return 0 if summary.get("success_rate", 0) == 1.0 else 1
 
 
+def batch_translate_command(args):
+    """Handle the batch translate subcommand."""
+    from .processors.batch_translator import BatchTranslateProcessor
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "batch_translate")
+
+    # Load book structure if available
+    output_dir = Path("output") / book_title
+    toc_tree_file = output_dir / "toc_tree.json"
+    structure_file = output_dir / "book_structure.json"
+    book_structure = None
+
+    import json
+    if toc_tree_file.exists():
+        with open(toc_tree_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from toc_tree.json")
+    elif structure_file.exists():
+        with open(structure_file, 'r', encoding='utf-8') as f:
+            book_structure = json.load(f)
+        logger.info("Loaded book structure from book_structure.json")
+
+    # Get language settings
+    target_language = args.target_language or config.get("translation", {}).get("target_language", "Chinese")
+
+    if args.source_language:
+        source_language = args.source_language
+    elif config.get("translation", {}).get("source_language"):
+        source_language = config["translation"]["source_language"]
+    elif book_structure and book_structure.get('language'):
+        source_language = book_structure.get('language')
+        logger.info(f"Auto-detected source language from book structure: {source_language}")
+    else:
+        source_language = "English"
+
+    logger.info(f"Starting batch translation for: {book_title}")
+    logger.info(f"Translation: {source_language} → {target_language}")
+
+    # Determine use_entities value based on flags
+    if args.no_entities:
+        use_entities = False
+    elif args.use_entities:
+        use_entities = True
+    else:
+        use_entities = None  # Auto-detect
+
+    # Get batch-specific settings
+    batch_config = config.get('batch', {})
+    max_retries = args.max_retries if args.max_retries is not None else batch_config.get('max_retries', 1)
+    poll_interval = args.poll_interval if args.poll_interval is not None else batch_config.get('poll_interval', 60)
+
+    # Initialize the batch translation processor
+    processor = BatchTranslateProcessor(
+        config=config,
+        book_title=book_title,
+        source_language=source_language,
+        target_language=target_language,
+        max_retries=max_retries,
+        poll_interval=poll_interval,
+        resume=args.resume,
+        use_entities=use_entities,
+        book_structure=book_structure
+    )
+
+    # Process all files
+    try:
+        summary = processor.process_all()
+
+        # Log summary
+        logger.info(f"\n=== Batch Translation Summary ===")
+        logger.info(f"Total: {summary['total']} files")
+        logger.info(f"Completed: {summary['completed']} files")
+        logger.info(f"Failed: {summary['failed']} files")
+
+        if summary['failed'] > 0:
+            logger.warning(f"{summary['failed']} files may be incomplete (check diagnostic notes)")
+        else:
+            logger.success("All files translated successfully!")
+
+        # Return exit code
+        return 0 if summary['failed'] == 0 else 1
+
+    except Exception as e:
+        logger.error(f"Batch translation failed: {e}")
+        return 1
+
+
 def patch_paper_command(args):
     """Execute the patch-paper command."""
     from .patch_paper_structure import patch_paper_structure
@@ -1303,7 +1399,51 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Don't use longest response on failure (overrides config.yaml)"
     )
     translate_parser.set_defaults(func=translate_command)
-    
+
+    # Batch translate subcommand
+    batch_translate_parser = subparsers.add_parser(
+        "translate-batch",
+        help="Batch translate polished markdown files using Gemini Batch API (50%% cost reduction)",
+        description="Translate markdown content using asynchronous batch processing"
+    )
+    batch_translate_parser.add_argument(
+        "--source-language",
+        help="Source language (default: from config or English)"
+    )
+    batch_translate_parser.add_argument(
+        "--target-language",
+        help="Target language (default: from config or Chinese)"
+    )
+    batch_translate_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress or active batch job"
+    )
+    batch_translate_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Maximum retries for validation failures (default: from config or 1)"
+    )
+    batch_translate_parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=None,
+        help="Seconds between status polls (default: from config or 60)"
+    )
+    batch_translate_parser.add_argument(
+        "--use-entities",
+        action="store_true",
+        default=None,
+        help="Force use of extracted entities (auto-detects by default)"
+    )
+    batch_translate_parser.add_argument(
+        "--no-entities",
+        action="store_true",
+        help="Force disable entity usage even if file exists"
+    )
+    batch_translate_parser.set_defaults(func=batch_translate_command)
+
     # Entity extraction subcommand
     entity_parser = subparsers.add_parser(
         "extract-entities",

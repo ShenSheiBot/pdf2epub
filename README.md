@@ -25,8 +25,12 @@
 
 1. **ocr-pages**：逐页进行 OCR，使用多模态 LLM 将每页转换成带有插图的 markdown
 2. **refine**：智能分析 TOC 结构，验证章节边界，生成精确的 toc_tree.json（支持无限层级嵌套）
-3. **polish**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
-4. **translate**：（可选）使用 LLM 翻译成目标语言
+3. **polish** / **polish-batch**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
+   - `polish`: 在线处理，实时反馈
+   - `polish-batch`: 批次处理，成本降低 50%，适合大量文件
+4. **translate** / **translate-batch**：（可选）使用 LLM 翻译成目标语言
+   - `translate`: 在线处理，实时反馈
+   - `translate-batch`: 批次处理，成本降低 50%，适合大量文件
 5. **build-epub**：基于 toc_tree.json 生成 EPUB
 
 ### EPUB 翻译工作流 (NEW - 保留原始格式)
@@ -60,6 +64,7 @@ uv run pdf2epub build-html-epub
 - breakdown / entity extraction：仅支持 gemini-2.5-pro，一般不会有审核问题
 - polish：deepseek-chat 或 claude-sonnet-4，仅当无审核压力时推荐gemini-2.5-pro
 - translate：deepseek-chat，claude-sonnet-4 翻译流畅度较差，仅当无审核压力时推荐gemini-2.5-pro
+- **polish-batch / translate-batch**：推荐 gemini-3-flash-preview (批次模式，成本降低 50%，适合大量文件)
 
 ## 日语OCR架构
 
@@ -429,6 +434,18 @@ output/
     ├── translated/processing_tracker.json          # 翻译进度
     └── output.epub            # 最终 EPUB
 ```
+
+## 📝 配置变更说明
+
+**重要**：项目已重构验证架构，以下配置参数已废弃：
+- `polish.truncation_check_lines` 和 `polish.truncation_models`
+- `translation.truncation_check_lines` 和 `translation.truncation_models`
+
+新架构使用 **N-gram Detector + Agent Verification** 两阶段验证，性能更快、成本更低、准确率更高。
+
+详细说明请查看：[CONFIG_CHANGES.md](./CONFIG_CHANGES.md)
+
+---
 
 ## ⚠️ 已弃用命令 (Deprecated Commands)
 

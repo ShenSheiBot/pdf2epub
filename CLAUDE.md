@@ -27,7 +27,8 @@ output/{title}/
 ├── toc_tree.json            # 目录结构（新版）
 ├── book_structure.json      # 目录结构（旧版）
 ├── refine_state.json        # Refine 阶段状态
-└── translated_metadata.json  # 翻译后的元数据
+├── translated_metadata.json  # 翻译后的元数据
+└── batch_state.json         # Batch 任务状态（活动任务追踪）
 ```
 
 **危险操作**：
@@ -64,7 +65,46 @@ title: "书名"  # 这个字段决定 output 目录名
 - **选项 2（创建新目录）**：推荐！安全选项
 - **选项 3（中止）**：安全
 
-### 4. --resume 参数（必须使用）
+### 4. Batch 任务状态管理
+
+当使用 batch 模式（`mode: batch` 在 config.yaml 中配置）时：
+
+**batch_state.json 文件**：
+- 记录活动的 batch 任务状态
+- 包含 `active_job_name`、`processing_keys` 等
+- **中断后此文件会保留**，用于恢复
+
+**中断处理**：
+- Ctrl+C 会自动取消正在运行的 batch job
+- 状态文件会被清理
+- API 费用会在取消时停止
+
+**重复提交保护**：
+- 如果有活动的 batch job，不用 `--resume` 启动会报错
+- 错误信息会提示使用 `--resume` 或手动取消
+
+**手动取消 batch job**：
+```bash
+# 查看当前 batch jobs
+uv run python -c "
+from pdf2epub.utils.batch_utils import GeminiBatchClient
+from pdf2epub.utils.common import load_config
+config = load_config('config.yaml')
+creds = config['credentials']['providers']['gemini-cf']
+client = GeminiBatchClient(api_key=creds['api_key'], base_url=creds['base_url'], model='any')
+for job in client.list_jobs(10):
+    print(f'{job.name} - {job.state.value}')
+"
+
+# 取消特定 job
+uv run python -c "
+from pdf2epub.utils.batch_utils import GeminiBatchClient
+# ... 同上 ...
+client.cancel('batches/xxxxx')
+"
+```
+
+### 5. --resume 参数（必须使用）
 
 **所有命令在中断后必须使用 `--resume`**：
 
@@ -212,6 +252,7 @@ cat "output/{title}/pages/ocr_progress.json"
 5. **不要用 `--limit` 测试后直接 build EPUB**（先全量翻译）
 6. **不要删除 `processing_tracker.json` 进度文件**
 7. **不要提交 `config.yaml` 和 `sa-keys.json` 到 git**
+8. **不要在 batch 任务运行时删除 `batch_state.json`**（会丢失任务追踪，导致重复提交或无法恢复）
 
 ---
 

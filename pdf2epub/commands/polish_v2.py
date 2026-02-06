@@ -47,11 +47,16 @@ def polish_v2_command(args):
 
     # Setup directories
     output_dir = Path("output") / book_title
-    input_dir = output_dir / "pages_merged"
+    # Try ocr_markdown first (refine output), then pages_merged (legacy)
+    input_dir = output_dir / "ocr_markdown"
+    if not input_dir.exists():
+        input_dir = output_dir / "pages_merged"
     polish_dir = output_dir / "polished_markdown"
 
     if not input_dir.exists():
-        logger.error(f"Input directory not found: {input_dir}")
+        logger.error(f"Input directory not found. Tried:")
+        logger.error(f"  - {output_dir / 'ocr_markdown'}")
+        logger.error(f"  - {output_dir / 'pages_merged'}")
         logger.info("Run 'pdf2epub refine' first to generate merged pages")
         return 1
 

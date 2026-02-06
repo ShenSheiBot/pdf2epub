@@ -319,11 +319,12 @@ def create_model_chain_from_config(
     Create model chain from configuration.
 
     Reads models from translation.models or polish.models.
+    Each model can specify 'mode': 'batch' or 'online' (default: 'online').
 
     Args:
         config: Full config dict
         task_type: "translate" or "polish"
-        include_batch: Whether to include batch entries
+        include_batch: Whether to include batch entries (legacy, overridden by explicit mode)
 
     Returns:
         List of ChainEntry
@@ -342,21 +343,78 @@ def create_model_chain_from_config(
     for model_config in models:
         provider = model_config.get('provider', 'gemini')
         model = model_config.get('model', 'gemini-2.0-flash')
-
-        if include_batch:
-            chain.append(ChainEntry(
-                provider=provider,
-                model=model,
-                mode="batch",
-            ))
+        # Read mode from config, default to 'online'
+        mode = model_config.get('mode', 'online')
 
         chain.append(ChainEntry(
             provider=provider,
             model=model,
-            mode="online",
+            mode=mode,
         ))
 
     return chain
+
+
+def _create_batch_client_from_config(
+    config: Optional[Dict[str, Any]],
+    model_chain: List[ChainEntry],
+) -> Optional[Any]:
+    """
+    Create a batch client from config if batch entries exist in chain.
+
+    Args:
+        config: Full config dict
+        model_chain: Model chain with potential batch entries
+
+    Returns:
+        GeminiBatchClient or None if no batch entries or missing config
+    """
+    if not config:
+        return None
+
+    # Find first batch entry
+    batch_entry = None
+    for entry in model_chain:
+        if entry.mode == "batch":
+            batch_entry = entry
+            break
+
+    if not batch_entry:
+        return None
+
+    # Get credentials for the batch provider
+    credentials = config.get('credentials', {}).get('providers', {})
+    provider_config = credentials.get(batch_entry.provider, {})
+
+    if not provider_config:
+        from loguru import logger
+        logger.warning(f"No credentials found for batch provider '{batch_entry.provider}'")
+        return None
+
+    api_key = provider_config.get('api_key')
+    base_url = provider_config.get('base_url')
+
+    if not api_key:
+        from loguru import logger
+        logger.warning(f"No api_key found for batch provider '{batch_entry.provider}'")
+        return None
+
+    # Get batch config
+    batch_config = config.get('batch', {})
+    poll_interval = batch_config.get('poll_interval', 60)
+
+    # Create batch client
+    from ..utils.batch_utils import GeminiBatchClient
+    from loguru import logger
+
+    logger.info(f"Creating batch client for {batch_entry.provider}/{batch_entry.model}")
+
+    return GeminiBatchClient(
+        api_key=api_key,
+        model=batch_entry.model,
+        poll_interval=poll_interval,
+        base_url=base_url,
+    )
 
 
 # ============================================================
@@ -587,6 +645,10 @@ def create_processing_pipeline_v2(
             include_batch=include_batch_mode or batch_client is not None,
         )
 
+    # Auto-create batch client if chain has batch entries and no client provided
+    if batch_client is None and any(e.mode == "batch" for e in model_chain):
+        batch_client = _create_batch_client_from_config(config, model_chain)
+
     # Create quota config (from config if available)
     if config:
         quota_config = create_quota_config_from_config(config)
@@ -653,4 +715,5 @@ def create_processing_pipeline_v2(
         batch_poll_interval=executor_cfg['batch_poll_interval'],
         split_max_tokens=split_cfg['default_max_tokens'],
         model_output_limits=split_cfg['model_output_limits'],  # P0-1: per-model token limits
+        output_dir=output_dir,  # For batch state persistence (resume)
     )

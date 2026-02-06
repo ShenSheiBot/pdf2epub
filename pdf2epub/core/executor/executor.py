@@ -16,9 +16,32 @@ from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from loguru import logger
 import time
 import threading
+import tiktoken
+
+from pathlib import Path
+
+# Lazy-loaded tokenizer for token counting
+_tokenizer = None
+
+def _get_tokenizer():
+    """Get or create tiktoken tokenizer (lazy loaded)."""
+    global _tokenizer
+    if _tokenizer is None:
+        _tokenizer = tiktoken.get_encoding("cl100k_base")
+    return _tokenizer
+
+def _count_tokens(text: str) -> int:
+    """Count tokens in text using tiktoken."""
+    if not text or not isinstance(text, str):
+        return 0
+    try:
+        return len(_get_tokenizer().encode(text))
+    except Exception:
+        return 0
 
 from ._protocol import WorkUnit, ChainEntry, ExecutionResult, ProcessResult
 from .state import UnitState, QuotaConfig, create_unit_state
+from .batch_state import PersistentBatchState, is_safety_error
 from ..hooks import CompositeHooks, ErrorType
 from ..types import is_sub_key
 
@@ -140,6 +163,7 @@ class Executor:
         network_circuit_breaker_threshold: int = 5,
         model_output_limits: Optional[Dict[str, int]] = None,
         persistence: Optional[Any] = None,  # For realtime saving
+        batch_state_dir: Optional[Path] = None,  # For batch state persistence
     ):
         """
         Initialize Executor.
@@ -160,6 +184,7 @@ class Executor:
             online_fallback_threshold: Max batch failures before online fallback
             network_circuit_breaker_threshold: Consecutive network failures to trigger abort
             model_output_limits: Per-model token limits (e.g., {"gemini-3-pro-preview": 8000})
+            batch_state_dir: Directory for batch state persistence (enables resume)
         """
         self._llm_client = llm_client
         self._model_chain = model_chain
@@ -178,9 +203,63 @@ class Executor:
         self._model_output_limits = model_output_limits or {}
         self._persistence = persistence  # For realtime saving on completion
 
+        # Batch state persistence
+        self._batch_state_dir = batch_state_dir
+        self._batch_state_file = batch_state_dir / "batch_state.json" if batch_state_dir else None
+        self._active_batch_state: Optional[PersistentBatchState] = None
+
+        # Register signal handler for batch cancellation on interrupt
+        if self._batch_client and self._batch_state_file:
+            import signal
+            self._original_sigint = signal.getsignal(signal.SIGINT)
+            self._original_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGINT, self._handle_interrupt)
+            signal.signal(signal.SIGTERM, self._handle_interrupt)
+
         # Circuit breaker state
         self._consecutive_network_failures = 0
         self._network_circuit_broken = False
+
+    def _handle_interrupt(self, signum: int, frame: Any) -> None:
+        """
+        Handle SIGINT/SIGTERM by cancelling active batch job.
+
+        This prevents wasted API costs when user interrupts processing.
+        The batch state file is cleared to allow clean restart.
+
+        Args:
+            signum: Signal number
+            frame: Current stack frame
+        """
+        import signal
+
+        # Only cancel if there's an active batch job
+        if self._active_batch_state and self._active_batch_state.active_job_name:
+            job_name = self._active_batch_state.active_job_name
+            logger.warning(f"Interrupt received, cancelling batch job: {job_name}")
+
+            try:
+                if self._batch_client:
+                    self._batch_client.cancel(job_name)
+                    logger.info(f"Cancelled batch job: {job_name}")
+            except Exception as e:
+                logger.warning(f"Failed to cancel batch job: {e}")
+
+            # Clear state file
+            if self._batch_state_file:
+                PersistentBatchState.clear(self._batch_state_file)
+                logger.info("Cleared batch state file")
+
+            self._active_batch_state = None
+
+        # Restore original handler and re-raise
+        if hasattr(self, '_original_sigint'):
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if hasattr(self, '_original_sigterm'):
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+
+        # Re-raise as KeyboardInterrupt for clean exit
+        raise KeyboardInterrupt("Batch job cancelled by user")
 
     def _get_split_threshold(self, model_name: Optional[str] = None) -> int:
         """
@@ -203,6 +282,7 @@ class Executor:
         self,
         units: List[WorkUnit],
         context_base: Optional["ProcessContext"] = None,
+        resume_batch: bool = False,
     ) -> ExecutionResult:
         """
         Execute all units - batch and online simultaneously.
@@ -224,6 +304,21 @@ class Executor:
         """
         if not units:
             return ExecutionResult()
+
+        # Check for active batch job (duplicate submission prevention)
+        # If there's an active job and we're NOT in resume mode, raise error
+        if self._batch_state_file and self._batch_state_file.exists():
+            existing_state = PersistentBatchState.load(self._batch_state_file)
+            if existing_state and existing_state.has_active_job():
+                if not resume_batch:
+                    raise RuntimeError(
+                        f"Active batch job exists: {existing_state.active_job_name}. "
+                        "Use --resume to continue the existing job, or cancel it manually."
+                    )
+                else:
+                    logger.info(
+                        f"Resuming active batch job: {existing_state.active_job_name}"
+                    )
 
         start_time = time.time()
 
@@ -265,6 +360,15 @@ class Executor:
                     batch_units.append(unit)
                 else:
                     online_units.append(unit)
+
+            # If too few units for batch, use online instead (same threshold as fallback)
+            if len(batch_units) <= self._online_fallback_threshold:
+                logger.info(
+                    f"Only {len(batch_units)} units for batch (<= {self._online_fallback_threshold}), "
+                    "using online instead"
+                )
+                online_units.extend(batch_units)
+                batch_units = []
         else:
             online_units = list(units)
 
@@ -453,6 +557,61 @@ class Executor:
         """
         # Use the state's get_batch_entry method which respects chain modifications
         return state.get_batch_entry()
+
+    def _convert_prompt_to_batch_contents(self, prompt: Any) -> List[Dict]:
+        """
+        Convert processor prompt to batch API contents format.
+
+        Handles different prompt formats:
+        - str: Simple text prompt
+        - list of {"type": "text", "text": ...}: Multi-part content
+        - list of {"role": ..., "content": ...}: Conversation format
+
+        For batch API, we need to flatten everything into a single user message
+        since batch doesn't support multi-turn conversations well.
+
+        Args:
+            prompt: Result from processor.build_prompt()
+
+        Returns:
+            List of content dicts for Gemini batch API
+        """
+        if isinstance(prompt, str):
+            # Simple string prompt
+            return [{"parts": [{"text": prompt}], "role": "user"}]
+
+        if isinstance(prompt, list):
+            # Check if it's conversation format (has 'role' keys)
+            if prompt and isinstance(prompt[0], dict) and "role" in prompt[0]:
+                # Conversation format - flatten to single prompt
+                # Extract all text parts and combine
+                text_parts = []
+                for msg in prompt:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", [])
+                    if isinstance(content, str):
+                        text_parts.append(f"[{role.upper()}]: {content}")
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and "text" in part:
+                                text_parts.append(f"[{role.upper()}]: {part['text']}")
+                            elif isinstance(part, str):
+                                text_parts.append(f"[{role.upper()}]: {part}")
+
+                combined = "\n\n".join(text_parts)
+                return [{"parts": [{"text": combined}], "role": "user"}]
+
+            # Multi-part content format (list of {"type": "text", "text": ...})
+            elif prompt and isinstance(prompt[0], dict) and "type" in prompt[0]:
+                text_parts = []
+                for part in prompt:
+                    if part.get("type") == "text" and "text" in part:
+                        text_parts.append(part["text"])
+                combined = "\n\n".join(text_parts)
+                return [{"parts": [{"text": combined}], "role": "user"}]
+
+        # Fallback: convert to string
+        return [{"parts": [{"text": str(prompt)}], "role": "user"}]
 
     def _process_online(
         self,
@@ -717,6 +876,9 @@ class Executor:
             # Build prompt
             prompt = self._processor.build_prompt(unit.content, context)
 
+            # Record start time for duration tracking
+            llm_start_time = time.time()
+
             # Call LLM
             response = self._llm_client.generate(
                 prompt=prompt,
@@ -724,8 +886,14 @@ class Executor:
                 operation_name=f"{self._processor.name}:{unit.id}",
             )
 
+            # Calculate duration
+            llm_duration = time.time() - llm_start_time
+
             # Clean response
             cleaned = self._processor.clean_response(response)
+
+            # Count output tokens
+            output_tokens = _count_tokens(cleaned)
 
             # Hooks: transform + validate (before processor.post_process)
             chapter_type = getattr(context, 'chapter_type', "") or ""
@@ -770,6 +938,8 @@ class Executor:
                     model=f"{entry.provider}/{entry.model}",
                     error_type="validation" if not hook_result.accepted else ("io_error" if not save_succeeded else None),
                     error_message=error_msg,
+                    output_tokens=output_tokens,
+                    duration_seconds=llm_duration,
                 )
                 self._tracker.record_attempt(unit.id, attempt)
 
@@ -1047,60 +1217,118 @@ class Executor:
         validation_failed: Set[str] = set()
         safety_blocked: Set[str] = set()
 
+        # Check for resume: if there's an active batch job, skip submission
+        resuming = False
+        job_name = None
+        units_to_process: Dict[str, WorkUnit] = {}
+
+        if self._batch_state_file:
+            existing_state = PersistentBatchState.load(self._batch_state_file)
+            if existing_state and existing_state.has_active_job():
+                # Resume from existing job
+                job_name = existing_state.active_job_name
+                self._active_batch_state = existing_state
+                resuming = True
+                logger.info(f"Resuming batch job: {job_name}")
+
+                # Reconstruct units_to_process from the saved processing_keys
+                for unit in units:
+                    if unit.id in existing_state.processing_keys:
+                        units_to_process[unit.id] = unit
+
+                # Log resume info
+                logger.info(f"  Processing keys: {len(existing_state.processing_keys)}")
+                logger.info(f"  Matched units: {len(units_to_process)}")
+
         try:
-            # Build requests (with pre-processing check)
+            # Build requests (skip if resuming)
             batch_requests: List[BatchRequest] = []
             unit_contexts: Dict[str, "ProcessContext"] = {}
-            units_to_process: Dict[str, WorkUnit] = {}  # Map key -> unit for result processing
 
-            for unit in units:
-                # Build context with WorkUnit metadata (same as online path)
-                if context_base is None:
-                    context = ProcessContext.from_work_unit(unit)
-                else:
-                    # Merge WorkUnit fields into context_base
-                    context = ProcessContext(
-                        file_key=unit.file_key,
-                        book_title=context_base.book_title,
-                        part_index=unit.part_index,
-                        total_parts=unit.total_parts,
-                        split_version=unit.split_version,
-                        source_language=context_base.source_language,
-                        target_language=context_base.target_language,
-                        content_type=context_base.content_type,
-                        chapter_type=unit.chapter_type or context_base.chapter_type,
-                        chapter_title=unit.chapter_title or context_base.chapter_title,
-                        chapter_number=unit.chapter_number or context_base.chapter_number,
-                        is_notes_chapter=(unit.chapter_type == "notes"),
-                        is_vertical_text=context_base.is_vertical_text,
-                        has_global_footnotes=context_base.has_global_footnotes,
-                        book_language=context_base.book_language,
-                        toc_path=unit.toc_path or context_base.toc_path,
-                        page_range=unit.page_range or context_base.page_range,
-                        extra=context_base.extra,
-                    )
-                unit_contexts[unit.id] = context
+            if resuming:
+                # Skip request building, just build contexts for result processing
+                for unit in units:
+                    if unit.id in units_to_process:
+                        if context_base is None:
+                            context = ProcessContext.from_work_unit(unit)
+                        else:
+                            context = ProcessContext(
+                                file_key=unit.file_key,
+                                book_title=context_base.book_title,
+                                part_index=unit.part_index,
+                                total_parts=unit.total_parts,
+                                split_version=unit.split_version,
+                                source_language=context_base.source_language,
+                                target_language=context_base.target_language,
+                                content_type=context_base.content_type,
+                                chapter_type=unit.chapter_type or context_base.chapter_type,
+                                chapter_title=unit.chapter_title or context_base.chapter_title,
+                                chapter_number=unit.chapter_number or context_base.chapter_number,
+                                is_notes_chapter=(unit.chapter_type == "notes"),
+                                is_vertical_text=context_base.is_vertical_text,
+                                has_global_footnotes=context_base.has_global_footnotes,
+                                book_language=context_base.book_language,
+                                toc_path=unit.toc_path or context_base.toc_path,
+                                page_range=unit.page_range or context_base.page_range,
+                                extra=context_base.extra,
+                            )
+                        unit_contexts[unit.id] = context
+            # Normal flow: build requests (skip if resuming)
+            if not resuming:
+                units_to_process = {}  # Reset for normal flow
 
-                # Pre-processing check (same as online path)
-                pre_result = self._hooks.pre_process(unit.id, unit.content, context)
-                if not pre_result.should_process:
-                    skipped.add(unit.id)
-                    if pre_result.fallback_result is not None:
-                        results[unit.id] = pre_result.fallback_result
-                        completed.add(unit.id)
-                    continue
+                for unit in units:
+                    # Build context with WorkUnit metadata (same as online path)
+                    if context_base is None:
+                        context = ProcessContext.from_work_unit(unit)
+                    else:
+                        # Merge WorkUnit fields into context_base
+                        context = ProcessContext(
+                            file_key=unit.file_key,
+                            book_title=context_base.book_title,
+                            part_index=unit.part_index,
+                            total_parts=unit.total_parts,
+                            split_version=unit.split_version,
+                            source_language=context_base.source_language,
+                            target_language=context_base.target_language,
+                            content_type=context_base.content_type,
+                            chapter_type=unit.chapter_type or context_base.chapter_type,
+                            chapter_title=unit.chapter_title or context_base.chapter_title,
+                            chapter_number=unit.chapter_number or context_base.chapter_number,
+                            is_notes_chapter=(unit.chapter_type == "notes"),
+                            is_vertical_text=context_base.is_vertical_text,
+                            has_global_footnotes=context_base.has_global_footnotes,
+                            book_language=context_base.book_language,
+                            toc_path=unit.toc_path or context_base.toc_path,
+                            page_range=unit.page_range or context_base.page_range,
+                            extra=context_base.extra,
+                        )
+                    unit_contexts[unit.id] = context
 
-                prompt = self._processor.build_prompt(unit.content, context)
+                    # Pre-processing check (same as online path)
+                    pre_result = self._hooks.pre_process(unit.id, unit.content, context)
+                    if not pre_result.should_process:
+                        skipped.add(unit.id)
+                        if pre_result.fallback_result is not None:
+                            results[unit.id] = pre_result.fallback_result
+                            completed.add(unit.id)
+                        continue
 
-                # Create BatchRequest with proper format
-                batch_requests.append(BatchRequest(
-                    key=unit.id,
-                    contents=[{"parts": [{"text": prompt}], "role": "user"}],
-                ))
-                units_to_process[unit.id] = unit
+                    prompt = self._processor.build_prompt(unit.content, context)
 
-            # Early return if all units were skipped
-            if not batch_requests:
+                    # Convert prompt to batch-compatible format
+                    # Prompt can be: str, list of content parts, or conversation format
+                    contents = self._convert_prompt_to_batch_contents(prompt)
+
+                    # Create BatchRequest with proper format
+                    batch_requests.append(BatchRequest(
+                        key=unit.id,
+                        contents=contents,
+                    ))
+                    units_to_process[unit.id] = unit
+
+            # Early return if all units were skipped (not applicable when resuming)
+            if not resuming and not batch_requests:
                 return ExecutionResult(
                     results=results,
                     completed=completed,
@@ -1108,9 +1336,35 @@ class Executor:
                     skipped=skipped,
                 )
 
-            # Submit batch job
-            job_name = self._batch_client.submit(batch_requests)
-            logger.info(f"Submitted batch job: {job_name} with {len(batch_requests)} units")
+            # Submit batch job (skip if resuming - we already have job_name)
+            if not resuming:
+                job_name = self._batch_client.submit(batch_requests)
+                logger.info(f"Submitted batch job: {job_name} with {len(batch_requests)} units")
+
+                # Save state immediately after submission (enables resume)
+                if self._batch_state_file:
+                    # Build metadata for resume
+                    batch_metadata = {}
+                    for req in batch_requests:
+                        unit = units_to_process.get(req.key)
+                        if unit:
+                            batch_metadata[req.key] = {
+                                "file_key": unit.file_key,
+                                "part_index": unit.part_index,
+                                "total_parts": unit.total_parts,
+                                "original_content": unit.content[:500],  # First 500 chars for debugging
+                            }
+
+                    self._active_batch_state = PersistentBatchState(
+                        active_job_name=job_name,
+                        processing_keys=list(units_to_process.keys()),
+                        batch_metadata=batch_metadata,
+                        retry_count=0,
+                        batch_provider=batch_entry.provider,
+                        batch_model=batch_entry.model,
+                    )
+                    self._active_batch_state.save(self._batch_state_file)
+                    logger.info(f"Saved batch state to {self._batch_state_file}")
 
             # Poll for completion
             while True:
@@ -1160,6 +1414,12 @@ class Executor:
                             self._tracker.record_attempt(unit_id, attempt)
 
                     failed.update(units_to_process.keys())
+
+                    # Clear batch state on failure
+                    if self._batch_state_file:
+                        PersistentBatchState.clear(self._batch_state_file)
+                        self._active_batch_state = None
+
                     return ExecutionResult(
                         results=results,
                         completed=completed,
@@ -1205,6 +1465,12 @@ class Executor:
                             self._tracker.record_attempt(unit_id, attempt)
 
                     failed.update(units_to_process.keys())
+
+                    # Clear batch state on cancellation/expiry
+                    if self._batch_state_file:
+                        PersistentBatchState.clear(self._batch_state_file)
+                        self._active_batch_state = None
+
                     return ExecutionResult(
                         results=results,
                         completed=completed,
@@ -1284,13 +1550,16 @@ class Executor:
                     if state:
                         state.record_attempt(final)
 
-                    # Record to tracker
+                    # Record to tracker with token count
                     if self._tracker and not is_sub_key(unit_id):
                         from ..tracking import AttemptRecord
+                        output_tokens = _count_tokens(final)
                         attempt = AttemptRecord(
                             timestamp=time.time(),
                             status="completed",
                             model=f"{batch_entry.provider}/{batch_entry.model}",
+                            output_tokens=output_tokens,
+                            # Note: batch mode doesn't have per-unit duration
                         )
                         self._tracker.record_attempt(unit_id, attempt)
                 else:
@@ -1327,6 +1596,12 @@ class Executor:
             import traceback
             logger.debug(traceback.format_exc())
             failed.update(u.id for u in units if u.id not in skipped and u.id not in completed)
+
+        # Clear batch state on completion (success or failure)
+        if self._batch_state_file:
+            PersistentBatchState.clear(self._batch_state_file)
+            self._active_batch_state = None
+            logger.debug("Cleared batch state after processing")
 
         # Calculate actual attempts (only units that were submitted to batch)
         actual_attempts = len(batch_requests) if batch_requests else 0

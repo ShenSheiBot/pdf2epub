@@ -78,6 +78,7 @@ class ProcessingPipelineV2:
         batch_poll_interval: int = 60,
         split_max_tokens: int = 4000,
         model_output_limits: Optional[Dict[str, int]] = None,
+        output_dir: Optional[Path] = None,
     ):
         """
         Initialize pipeline.
@@ -102,6 +103,7 @@ class ProcessingPipelineV2:
             batch_poll_interval: Seconds between batch status polls
             split_max_tokens: Default max tokens per split part for dynamic splitting
             model_output_limits: Per-model token limits (e.g., {"gemini-3-pro-preview": 8000})
+            output_dir: Output directory for batch state persistence (enables resume)
         """
         self._processor = processor
         self._llm_client = llm_client
@@ -114,6 +116,7 @@ class ProcessingPipelineV2:
         self._context_injector = context_injector
         self._book_structure = book_structure
         self._batch_retry_threshold = batch_retry_threshold
+        self._output_dir = output_dir
 
         # Create executor if not provided
         if executor:
@@ -143,12 +146,14 @@ class ProcessingPipelineV2:
                 online_fallback_threshold=batch_retry_threshold,
                 model_output_limits=model_output_limits,  # P0-1: per-model token limits
                 persistence=persistence,  # Realtime save on completion
+                batch_state_dir=output_dir,  # For batch state persistence (resume)
             )
 
     def process_all(
         self,
         units: List[WorkUnit],
-        context_base: Optional["ProcessContext"] = None
+        context_base: Optional["ProcessContext"] = None,
+        resume: bool = False,
     ) -> "ProcessingResultV2":
         """
         Process all units.
@@ -156,6 +161,7 @@ class ProcessingPipelineV2:
         Args:
             units: Units to process
             context_base: Base context for all units
+            resume: If True, allow resuming active batch jobs
 
         Returns:
             ProcessingResultV2 with statistics
@@ -187,7 +193,7 @@ class ProcessingPipelineV2:
         logger.info(f"Processing {len(pending_units)}/{len(units)} units")
 
         # Step 3: Execute via Executor
-        exec_result = self._executor.execute(pending_units, context_base)
+        exec_result = self._executor.execute(pending_units, context_base, resume_batch=resume)
 
         # Step 4: Save raw results
         for key, content in exec_result.results.items():
@@ -237,13 +243,14 @@ class ProcessingPipelineV2:
                 key, content,
                 warning="LONGEST_FALLBACK: validation failed after max retries"
             )
-            self._mark_complete(key, fallback=True)
+            self._mark_complete(key, content=content, fallback=True)
 
         # Promote normal successful results
         if normal_keys:
             self._persistence.promote_batch(list(normal_keys))
             for key in normal_keys:
-                self._mark_complete(key)
+                content = exec_result.results.get(key, "")
+                self._mark_complete(key, content=content)
 
         # Step 9: Mark failures via attempt record (only real units)
         from .tracking import AttemptRecord
@@ -327,27 +334,41 @@ class ProcessingPipelineV2:
         for key in all_keys:
             if not self._tracker.is_unit_complete(key):
                 pending.add(key)
-            elif not (self._persistence.has_raw(key) or self._persistence.has_validated(key)):
-                # Safety: tracker says complete but file missing - must reprocess
+            elif not self._persistence.has_validated(key):
+                # Safety: tracker says complete but validated file missing - must reprocess
+                # Note: raw file existing is not enough - it's just intermediate state
                 logger.warning(
-                    f"{key}: Tracker shows complete but file missing, will reprocess"
+                    f"{key}: Tracker shows complete but validated file missing, will reprocess"
                 )
                 pending.add(key)
         return pending
 
-    def _mark_complete(self, key: str, fallback: bool = False):
+    def _mark_complete(self, key: str, content: str = "", fallback: bool = False):
         """
         Mark a key as complete in tracker via successful attempt record.
 
         Args:
             key: The file key
+            content: The processed content (for token counting)
             fallback: If True, marks as completed via longest fallback (for audit)
         """
+        import tiktoken
+
+        # Count output tokens
+        output_tokens = 0
+        if content:
+            try:
+                tokenizer = tiktoken.get_encoding("cl100k_base")
+                output_tokens = len(tokenizer.encode(content))
+            except Exception:
+                pass
+
         from .tracking import AttemptRecord
         attempt = AttemptRecord(
             timestamp=time.time(),
             status="completed_fallback" if fallback else "completed",
             model="executor",  # Generic marker
+            output_tokens=output_tokens,
         )
         self._tracker.record_attempt(key, attempt)
 

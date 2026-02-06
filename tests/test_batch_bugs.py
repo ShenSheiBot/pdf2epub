@@ -63,7 +63,7 @@ def create_executor(
     llm_client: Optional[FakeLLMClient] = None,
     batch_client: Optional[FakeBatchClient] = None,
     quota_config: Optional[QuotaConfig] = None,
-    online_fallback_threshold: int = 10,
+    online_fallback_threshold: int = 0,  # Disable batch->online threshold for testing
     **kwargs,
 ) -> Executor:
     """Create executor with fake components."""
@@ -174,7 +174,7 @@ class TestBug1_BatchValidationNoApplyEffect:
             chain, hooks, fake_llm,
             batch_client=batch_client,
             quota_config=quota,
-            online_fallback_threshold=100,  # High threshold to see batch behavior
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})
@@ -264,7 +264,7 @@ class TestBug1_BatchValidationNoApplyEffect:
             chain, hooks, fake_llm,
             batch_client=batch_client,
             quota_config=quota,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})
@@ -734,7 +734,7 @@ class TestBatchBugsIntegration:
             chain, hooks, fake_llm,
             batch_client=batch_client,
             quota_config=quota,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})

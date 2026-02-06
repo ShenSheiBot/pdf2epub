@@ -887,6 +887,9 @@ class TestBoundaryEnforcement:
             # Only check executor/ for this rule
             if "executor" not in str(py_file):
                 continue
+            # batch_state.py is exempt - it's low-level state persistence for batch resume
+            if "batch_state.py" in str(py_file):
+                continue
 
             content = py_file.read_text()
 

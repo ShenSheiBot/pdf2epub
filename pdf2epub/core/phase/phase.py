@@ -135,7 +135,8 @@ class Phase:
             )
 
         # Process via pipeline (Pipeline's persistence handles saving)
-        result = self._pipeline.process_all(units)
+        # Pass resume flag for batch state handling
+        result = self._pipeline.process_all(units, resume=resume)
 
         duration = time.time() - start_time
 

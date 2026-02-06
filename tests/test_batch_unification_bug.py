@@ -117,7 +117,7 @@ def create_executor(
     llm_client: Optional[FakeLLMClient] = None,
     batch_client: Optional[FakeBatchClient] = None,
     quota_config: Optional[QuotaConfig] = None,
-    online_fallback_threshold: int = 10,
+    online_fallback_threshold: int = 0,  # Disable batch->online threshold for testing
     **kwargs,
 ) -> Executor:
     """Create executor with fake components."""
@@ -234,7 +234,7 @@ class TestBatchNoErrorClassification:
         executor = create_executor(
             chain, accepting_hooks, fake_llm,
             batch_client=batch_client,
-            online_fallback_threshold=100,  # Force online fallback
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         # Track if error classifier was called
@@ -303,7 +303,7 @@ class TestBatchNoQuotaDecrement:
             chain, accepting_hooks, fake_llm,
             batch_client=batch_client,
             quota_config=quota,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})
@@ -382,7 +382,7 @@ class TestBatchNoChainAdvance:
         executor = create_executor(
             chain, accepting_hooks, fake_llm,
             batch_client=batch_client,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})
@@ -457,7 +457,7 @@ class TestBatchNoPerUnitAttribution:
         executor = create_executor(
             chain, accepting_hooks, fake_llm,
             batch_client=batch_client,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({
@@ -529,7 +529,7 @@ class TestBatchValidationNotTracked:
             batch_chain, hooks, fake_llm,
             batch_client=batch_client,
             quota_config=quota,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})
@@ -618,7 +618,7 @@ class TestBatchVsOnlineComparison:
             batch_chain, accepting_hooks, batch_llm,
             batch_client=batch_client,
             quota_config=quota,
-            online_fallback_threshold=100,
+            online_fallback_threshold=0,  # Disable threshold to force batch path
         )
 
         units = create_units({"unit1": SHORT_CHAPTER})

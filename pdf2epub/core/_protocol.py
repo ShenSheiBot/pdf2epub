@@ -63,6 +63,9 @@ class ProcessContext:
     toc_path: Optional[str] = None
     page_range: Optional[Tuple[int, int]] = None
 
+    # === Unit type (for special units) ===
+    unit_type: str = "content"  # "content", "toc", "metadata"
+
     # === Extension fields ===
     extra: Optional[Dict[str, Any]] = None
 
@@ -189,6 +192,7 @@ class ProcessContext:
             book_language=book_language,
             toc_path=unit.toc_path,
             page_range=unit.page_range,
+            unit_type=unit.unit_type,
         )
 
 

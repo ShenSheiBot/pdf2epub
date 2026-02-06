@@ -246,11 +246,9 @@ class ProcessingPipelineV2:
             self._mark_complete(key, content=content, fallback=True)
 
         # Promote normal successful results
+        # Note: Don't call _mark_complete here - Executor already recorded the attempt
         if normal_keys:
             self._persistence.promote_batch(list(normal_keys))
-            for key in normal_keys:
-                content = exec_result.results.get(key, "")
-                self._mark_complete(key, content=content)
 
         # Step 9: Mark failures via attempt record (only real units)
         from .tracking import AttemptRecord

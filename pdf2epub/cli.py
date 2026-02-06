@@ -499,11 +499,18 @@ def build_epub_command(args):
         return 1
 
     # Determine markdown directory
+    # V2 architecture stores results in validated/ subdirectory
     if args.translated:
-        markdown_dir = output_dir / "translated"
+        markdown_dir = output_dir / "translated" / "validated"
+        if not markdown_dir.exists():
+            # Fallback to old path for backwards compatibility
+            markdown_dir = output_dir / "translated"
         logger.info("Building EPUB from translated markdown...")
     else:
-        markdown_dir = output_dir / "polished_markdown"
+        markdown_dir = output_dir / "polished_markdown" / "validated"
+        if not markdown_dir.exists():
+            # Fallback to old path for backwards compatibility
+            markdown_dir = output_dir / "polished_markdown"
         logger.info("Building EPUB from polished markdown...")
 
     if not markdown_dir.exists():

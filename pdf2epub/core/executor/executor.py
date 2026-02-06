@@ -709,7 +709,7 @@ class Executor:
                         # Virtual unit - create from state
                         # Derive file_key from unit_id (strip .sub/.part suffix)
                         file_key = unit_id
-                        if '.sub' in file_key:
+                        if is_sub_key(file_key):
                             file_key = file_key.rsplit('.sub', 1)[0]
                         if '.part' in file_key:
                             file_key = file_key.rsplit('.part', 1)[0]

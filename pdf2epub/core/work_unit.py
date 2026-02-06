@@ -17,8 +17,14 @@ from typing import Optional, Tuple, Dict, List, Any, Set
 from dataclasses import dataclass, field
 from loguru import logger
 import tiktoken
+import re
 
 from ..chapter_identity import ChapterIdentity
+
+
+# Pattern for .sub key detection: .sub followed by digits
+# (local copy to avoid circular import from types.py)
+_SUB_KEY_PATTERN = re.compile(r'\.sub\d+')
 
 
 # ============================================================
@@ -111,12 +117,14 @@ class WorkUnit:
     def _validate_naming(self):
         """Verify naming matches split_type - structural constraint."""
         if self.split_type == SplitType.PROACTIVE:
-            if ".part" not in self.id or ".sub" in self.id:
+            # PROACTIVE must have .part and must NOT match .sub\d+ pattern
+            if ".part" not in self.id or _SUB_KEY_PATTERN.search(self.id):
                 raise ValueError(
                     f"Proactive split must use .part naming (not .sub): {self.id}"
                 )
         elif self.split_type == SplitType.DYNAMIC:
-            if ".sub" not in self.id:
+            # DYNAMIC must match .sub\d+ pattern
+            if not _SUB_KEY_PATTERN.search(self.id):
                 raise ValueError(
                     f"Dynamic split must use .sub naming: {self.id}"
                 )

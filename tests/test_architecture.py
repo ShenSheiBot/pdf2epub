@@ -105,7 +105,7 @@ FORBIDDEN_EXECUTOR_METHODS: Set[str] = {
 }
 
 # Directories to check
-PROCESSORS_DIR = Path('pdf2epub/processors_v2')
+PROCESSORS_DIR = Path('pdf2epub/processors')
 CORE_DIR = Path('pdf2epub/core')
 VALIDATORS_DIR = Path('pdf2epub/validators')
 HOOKS_DIR = Path('pdf2epub/core/hooks')
@@ -2018,3 +2018,75 @@ class TestFallbackObservability:
         assert hasattr(ResultPersistence, 'save_with_warning'), (
             "ResultPersistence must have save_with_warning method"
         )
+
+
+class TestSubKeyDetection:
+    """
+    .sub detection must use is_sub_key(), not unreliable '.sub' in patterns.
+
+    Problem: '.sub' in stem falsely matches normal filenames like chapter.subtitle.md
+    Correct: is_sub_key() uses regex r'\\.sub\\d+' to precisely match .sub0, .sub1, etc.
+    """
+
+    def test_no_unreliable_sub_detection_in_codebase(self):
+        """Forbid unreliable '.sub' in patterns for .sub detection."""
+        pdf2epub_dir = Path("pdf2epub")
+        violations = []
+
+        # Patterns that indicate unreliable .sub detection
+        unreliable_patterns = [
+            (r"['\"]\.sub['\"]\s+in\s+", "'.sub' in (unreliable substring check)"),
+            (r"\.endswith\s*\(\s*['\"]\.sub", ".endswith('.sub') (unreliable)"),
+            (r"\.startswith\s*\(\s*['\"]\.sub", ".startswith('.sub') (unreliable)"),
+        ]
+
+        for py_file in pdf2epub_dir.rglob("*.py"):
+            if "__pycache__" in str(py_file):
+                continue
+
+            content = py_file.read_text()
+            lines = content.split('\n')
+
+            for i, line in enumerate(lines, 1):
+                # Skip comments
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue
+
+                for pattern, description in unreliable_patterns:
+                    if re.search(pattern, line):
+                        violations.append(f"{py_file}:{i} - {description}")
+
+        assert not violations, (
+            f"Unreliable .sub detection found. Use is_sub_key() from core.types instead:\n" +
+            "\n".join(f"  - {v}" for v in violations)
+        )
+
+    def test_is_sub_key_regex_is_strict(self):
+        """is_sub_key() must use strict regex, must not false-positive on normal filenames."""
+        from pdf2epub.core.types import is_sub_key
+
+        # Valid .sub keys (should return True)
+        valid_sub_keys = [
+            "chapter_1.sub0",
+            "chapter_1.sub1",
+            "chapter_1.sub99",
+            "chapter_1.part1.sub0",
+            "page_001.sub0",
+        ]
+
+        # Invalid - normal file names (should return False)
+        invalid_sub_keys = [
+            "chapter.subtitle",
+            "subchapter_1",
+            "chapter_1.subscription",
+            "chapter_1.sub",
+            "chapter_1.subnote",
+            "my.sublime.chapter",
+        ]
+
+        for key in valid_sub_keys:
+            assert is_sub_key(key), f"is_sub_key() should return True for valid .sub key: {key}"
+
+        for key in invalid_sub_keys:
+            assert not is_sub_key(key), f"is_sub_key() should return False for normal file: {key}"

@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 
 from pdf2epub.utils.llm_client import LLMClient
-from pdf2epub.processors.tracker import ProcessingTracker
+from pdf2epub.core.tracking import ProcessingTracker
 
 from .prompts import create_compressed_translation_prompt, create_compressed_retry_prompt
 

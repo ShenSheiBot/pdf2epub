@@ -1,23 +1,14 @@
 """
-Test for .sub promotion bug - P0 issue.
+Test .sub virtual unit handling.
 
-Bug: Virtual .sub units created by dynamic splitting leak into:
-1. ExecutionResult.results (Executor doesn't clean them after aggregation)
-2. Pipeline promotes them to validated/ (using results.keys() directly)
-3. Tracker records them as completed units
-4. Statistics include inflated counts
+Design contract (types.py:64-68): .sub units created by dynamic splitting should:
+1. BE in ExecutionResult.results - so Pipeline can save to raw/ for debugging
+2. NOT be promoted to validated/ - Pipeline filters via filter_sub_keys()
+3. NOT be tracked as completed units - Executor removes from completed set
+4. NOT inflate statistics - not counted in completed set
 
-Design contract (from design doc): .sub units are "virtual" and should NOT:
-- Appear in ExecutionResult.results (only parent's aggregated result)
-- Be promoted to validated/
-- Be tracked as completed units
-- Inflate completed count
-
-.sub units MAY:
-- Appear in raw/ (for debugging only)
-
-These tests MUST FAIL to prove the bug exists.
-Each test's expected value describes CORRECT behavior.
+Key insight: .sub belongs in raw/ (debug artifact) but not validated/ (next phase input).
+Pipeline handles this correctly at pipeline_v2.py:202-210.
 """
 
 import pytest
@@ -264,12 +255,11 @@ class TestExecutorSubHandling:
         )
         result = executor.execute([unit])
 
-        # THE BUG: .sub keys should NOT be in completed
+        # .sub keys should NOT be in completed (per types.py:67)
         sub_keys_in_completed = [k for k in result.completed if is_sub_key(k)]
 
-        # This assertion MUST FAIL to prove the bug exists
         assert len(sub_keys_in_completed) == 0, (
-            f"BUG EXPOSED: .sub keys found in ExecutionResult.completed: {sub_keys_in_completed}. "
+            f".sub keys found in completed: {sub_keys_in_completed}. "
             f"Virtual .sub units should not be counted as completed units."
         )
 
@@ -307,9 +297,9 @@ class TestExecutorSubHandling:
         # Filter out .sub to get correct count
         real_completed = filter_sub_keys(result.completed)
 
-        # This assertion MUST FAIL if .sub keys are in completed
+        # completed should not include .sub keys (per types.py:68)
         assert len(result.completed) == len(real_completed), (
-            f"BUG EXPOSED: completed count inflated by .sub units. "
+            f"completed count inflated by .sub units. "
             f"len(completed) = {len(result.completed)}, but should be {len(real_completed)}. "
             f".sub keys in completed: {[k for k in result.completed if is_sub_key(k)]}"
         )
@@ -321,26 +311,18 @@ class TestExecutorSubHandling:
 
 class TestPipelineMustNotPromoteSubKeys:
     """
-    BUG: Pipeline uses exec_result.results.keys() directly to promote,
-    which includes .sub keys that Executor left in results.
+    Pipeline must filter .sub from promotion to validated/.
 
-    CORRECT BEHAVIOR: Pipeline should filter out .sub keys before promoting.
-
-    These tests MUST FAIL to prove the bug exists.
+    Per types.py:65: .sub should "NOT be promoted to validated/"
+    Pipeline does this at pipeline_v2.py:202-210 via filter_sub_keys().
     """
 
     def test_pipeline_must_not_promote_sub_to_validated(self):
         """
-        CRITICAL BUG TEST: .sub keys must NOT be promoted to validated/.
+        .sub keys must NOT be promoted to validated/.
 
-        This test simulates what Pipeline does:
-        1. Get results from Executor
-        2. Calculate successful = results.keys() - failed
-        3. Promote successful to validated/
-
-        The bug is that .sub keys in results get promoted.
-
-        This test MUST FAIL to prove the bug exists.
+        Pipeline receives results containing .sub (for raw/ persistence),
+        but must filter them out before promoting to validated/.
         """
         from pdf2epub.core.pipeline_v2 import ProcessingPipelineV2
 
@@ -389,20 +371,18 @@ class TestPipelineMustNotPromoteSubKeys:
 
         result = pipeline.process_all([unit])
 
-        # THE BUG: Check what got promoted
+        # .sub should not be promoted (per types.py:65)
         sub_keys_promoted = [k for k in fake_persistence.promoted_keys if is_sub_key(k)]
 
-        # This assertion MUST FAIL to prove the bug exists
         assert len(sub_keys_promoted) == 0, (
-            f"BUG EXPOSED: .sub keys promoted to validated/: {sub_keys_promoted}. "
-            f"Design doc says .sub units should NOT appear in output directory."
+            f".sub keys promoted to validated/: {sub_keys_promoted}. "
+            f".sub units should stay in raw/, not be promoted to validated/."
         )
 
     def test_pipeline_tracker_must_not_mark_sub_as_completed(self):
         """
-        CRITICAL BUG TEST: Tracker should NOT record .sub as completed.
-
-        This test MUST FAIL to prove the bug exists.
+        Tracker should NOT record .sub as completed.
+        Per types.py:67: .sub should "NOT be tracked as completed/failed units"
         """
         from pdf2epub.core.pipeline_v2 import ProcessingPipelineV2
 
@@ -449,12 +429,11 @@ class TestPipelineMustNotPromoteSubKeys:
 
         result = pipeline.process_all([unit])
 
-        # THE BUG: Check what got marked complete in tracker
+        # .sub should not be tracked (per types.py:67)
         sub_keys_tracked = [k for k in fake_tracker.completed_keys if is_sub_key(k)]
 
-        # This assertion MUST FAIL to prove the bug exists
         assert len(sub_keys_tracked) == 0, (
-            f"BUG EXPOSED: .sub keys recorded as completed in tracker: {sub_keys_tracked}. "
+            f".sub keys recorded as completed in tracker: {sub_keys_tracked}. "
             f"Virtual units should not be tracked."
         )
 
@@ -465,18 +444,14 @@ class TestPipelineMustNotPromoteSubKeys:
 
 class TestProcessingResultMustExcludeSubFromStats:
     """
-    BUG: ProcessingResultV2.completed includes .sub units in count.
-
-    CORRECT: completed count should only count real units.
+    ProcessingResultV2.completed should only count real units.
+    Per types.py:68: .sub should "NOT be counted in statistics"
     """
 
     def test_pipeline_result_completed_count_must_exclude_sub(self):
         """
-        CRITICAL BUG TEST: Pipeline result's completed count must not include .sub.
-
+        Pipeline result's completed count must not include .sub.
         If we process 1 unit that splits into 2, completed should be 1, not 3.
-
-        This test MUST FAIL to prove the bug exists.
         """
         from pdf2epub.core.pipeline_v2 import ProcessingPipelineV2
 
@@ -527,11 +502,11 @@ class TestProcessingResultMustExcludeSubFromStats:
         # Count how many .sub keys are in the results dict
         sub_in_results = len([k for k in result.results if is_sub_key(k)])
 
-        # This assertion MUST FAIL if .sub keys inflate the count
+        # completed count should not include .sub (per types.py:68)
         assert result.completed == 1, (
-            f"BUG EXPOSED: completed count = {result.completed}, should be 1. "
-            f".sub keys in results.keys(): {[k for k in result.results if is_sub_key(k)]}. "
-            f"Statistics are inflated by virtual .sub units."
+            f"completed count = {result.completed}, should be 1. "
+            f".sub keys in results: {[k for k in result.results if is_sub_key(k)]}. "
+            f"Statistics should not count virtual .sub units."
         )
 
 
@@ -625,21 +600,18 @@ class TestSubKeyHelpers:
 
 
 # ============================================================
-# Test: .sub raw persistence inconsistency (P0 bug)
+# Test: .sub raw persistence (both success and failure paths)
 # ============================================================
 
-class TestSubRawPersistenceInconsistency:
+class TestSubRawPersistence:
     """
-    P0 BUG: .sub saving to raw/ is inconsistent between success and failure.
+    .sub children should remain in results for raw/ persistence.
 
-    Design doc says (types.py:64): .sub should "Be saved to raw/ (for debugging)"
-    Pipeline saves raw (pipeline_v2.py:198-200): iterates exec_result.results.items()
+    Per types.py:64: .sub should "Be saved to raw/ (for debugging)"
+    Pipeline saves raw via exec_result.results.items() (pipeline_v2.py:198-200)
 
-    BUT:
-    - Success path (executor.py:698-699): .sub children get POPPED from results
-    - Failure path (executor.py:687-690): break exits before pop, .sub STAYS in results
-
-    Result: FAILURE saves .sub to raw, SUCCESS does not. Contradicts design doc.
+    Both success and failure paths should keep .sub in results.
+    Executor removes .sub from completed (for stats) but NOT from results.
     """
 
     @pytest.fixture
@@ -744,34 +716,22 @@ class TestSubRawPersistenceInconsistency:
         assert result.splits_performed > 0, "Split should have occurred"
         assert "chapter_1" in result.completed, "Parent should complete via aggregation"
 
-        # THE BUG: .sub children should be in results for raw/ persistence
-        # Design doc (types.py:64): "Be saved to raw/ (for debugging)"
-        # Pipeline (pipeline_v2.py:198-200): saves exec_result.results.items() to raw/
-        #
-        # For .sub to be saved to raw/, they MUST be in exec_result.results
+        # .sub children should be in results for raw/ persistence (per types.py:64)
+        # Pipeline saves exec_result.results.items() to raw/ (pipeline_v2.py:198-200)
         sub_keys_in_results = [k for k in result.results.keys() if is_sub_key(k)]
 
-        # This assertion MUST FAIL to prove the bug exists
-        # Expected: .sub0 and .sub1 should be in results for raw persistence
-        # Actual: they got popped at executor.py:698-699
         assert len(sub_keys_in_results) >= 2, (
-            f"BUG EXPOSED: .sub keys missing from results after successful aggregation. "
+            f".sub keys missing from results after successful aggregation. "
             f"Found: {sub_keys_in_results}. "
-            f"Design doc says .sub should 'Be saved to raw/ (for debugging)' (types.py:64). "
-            f"But executor.py:698-699 pops them, so Pipeline can't save to raw/. "
-            f"Result: success path doesn't persist .sub to raw/, violating design contract."
+            f".sub should remain in results so Pipeline can save to raw/ for debugging."
         )
 
-    def test_sub_is_in_results_on_failure_proving_inconsistency(self):
+    def test_sub_is_in_results_on_failure_path_too(self):
         """
-        Contrast test: When aggregation FAILS, .sub children REMAIN in results.
+        When aggregation fails, .sub children also remain in results.
 
-        This test should PASS, proving the inconsistency:
-        - Failure path: .sub in results → saved to raw/
-        - Success path: .sub popped → NOT saved to raw/ (bug)
-
-        The break at executor.py:689 exits before the else clause (executor.py:691-700)
-        which contains the pop. So on failure, .sub stays in results.
+        Both success and failure paths should keep .sub in results for raw/ persistence.
+        This ensures consistent behavior regardless of aggregation outcome.
         """
         # Setup: parent fails first (triggers split), .sub0 succeeds, .sub1 LLM errors
         #

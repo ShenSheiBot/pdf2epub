@@ -432,7 +432,7 @@ class LLMClient:
             Exception: If all models and retries fail
         """
         # Import here to avoid circular dependency
-        from ..processors.validation_strategy import ValidationStrategy
+        from ..core.tracking import ValidationStrategy
 
         # Use provided strategy or create default
         if validation_strategy is None:

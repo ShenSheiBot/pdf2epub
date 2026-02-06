@@ -195,9 +195,11 @@ class ProcessingPipelineV2:
         # Step 3: Execute via Executor
         exec_result = self._executor.execute(pending_units, context_base, resume_batch=resume)
 
-        # Step 4: Save raw results
+        # Step 4: Save .sub results to raw/ (Executor already saved non-.sub in realtime)
+        # Executor skips .sub for crash safety reasons, so Pipeline handles them here
         for key, content in exec_result.results.items():
-            self._persistence.save_raw(key, content)
+            if is_sub_key(key):
+                self._persistence.save_raw(key, content)
 
         # Step 5: Filter out .sub virtual units from processing
         # .sub units are Executor's runtime splits - they should:

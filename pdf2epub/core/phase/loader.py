@@ -53,8 +53,9 @@ class PartBasedLoader:
                 continue
 
             stem = path.stem
-            # Skip .sub files (Executor's virtual splits, not persisted)
-            if '.sub' in stem:
+            # Skip .sub files (Executor's virtual splits)
+            # Use is_sub_key() for reliable detection (matches .sub + digits pattern)
+            if is_sub_key(stem):
                 continue
 
             if '.part' in stem:

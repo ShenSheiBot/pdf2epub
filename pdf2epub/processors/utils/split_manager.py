@@ -18,7 +18,7 @@ from loguru import logger
 import tiktoken
 
 from .content_splitter import split_content
-from ..tracker import ProcessingTracker, SplitRecord, ErrorType
+from ...core.tracking import ProcessingTracker, SplitRecord, ErrorType
 from ...chapter_identity import ChapterIdentity
 
 # Initialize tokenizer

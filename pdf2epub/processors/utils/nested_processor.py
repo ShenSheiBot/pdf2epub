@@ -22,7 +22,7 @@ from loguru import logger
 import tiktoken
 
 from .splitter_strategies import ContentSplitter, MarkdownStructureSplitter
-from ..tracker import ProcessingTracker, AttemptRecord, SplitRecord, ErrorType
+from ...core.tracking import ProcessingTracker, AttemptRecord, SplitRecord, ErrorType
 
 
 def classify_error(exception: Exception) -> str:

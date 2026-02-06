@@ -57,10 +57,9 @@ class BaseMarkdownProcessor(ABC):
         self.resume = resume
         self.use_longest_on_failure = use_longest_on_failure
 
-        # Setup directories
+        # Setup directories (V2 infrastructure handles directory creation)
         self.input_dir = Path("output") / book_title / input_dir
         self.output_dir = Path("output") / book_title / output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ==================== ProcessorProtocol methods ====================
 

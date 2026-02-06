@@ -497,18 +497,17 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
                     backref_chapter = ref_chapters[0]
                     fnref_id = f"fnref-{backref_chapter}-{fn_key}"
                     # Always use file name, even for same-file backrefs
-                    backref_identity = ChapterIdentity.parse(backref_chapter)
-                    backref_link = f"{backref_identity.html_name}#{fnref_id}" if backref_identity else f"{backref_chapter}.html#{fnref_id}"
+                    backref_link = f"{footnote_manager.get_html_filename(backref_chapter)}#{fnref_id}"
                 else:
                     # Fallback - still use file name
                     fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                    backref_link = f"{source_identity.html_name}#{fnref_id}" if source_identity else f"{source_chapter}.html#{fnref_id}"
+                    backref_link = f"{footnote_manager.get_html_filename(source_chapter)}#{fnref_id}"
             else:
                 # Single-part chapter, use simple ID with unique prefix
                 fn_id = f"fn:{fn_key}"
                 fnref_id = f"fnref-{source_chapter}-{fn_key}"
                 # Use file name even for single-part chapters
-                backref_link = f"{source_identity.html_name}#{fnref_id}" if source_identity else f"{source_chapter}.html#{fnref_id}"
+                backref_link = f"{footnote_manager.get_html_filename(source_chapter)}#{fnref_id}"
 
             # Convert to HTML footnote definition (using same format as GLOBAL mode)
             processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
@@ -529,7 +528,7 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
 
                 # Default local reference - use file name for consistency
                 fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                source_html = source_identity.html_name if source_identity else f"{source_chapter}.html"
+                source_html = footnote_manager.get_html_filename(source_chapter)
                 return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{fn_key}">[{fn_key}]</a></sup>'
 
             # Replace footnote references
@@ -668,26 +667,14 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
 
                         if ref_file:
                             # Use the actual file containing the reference
-                            ref_identity = ChapterIdentity.parse(ref_file)
-                            if ref_identity:
-                                backref_link = f"{ref_identity.html_name}#{fnref_id}"
-                            else:
-                                backref_link = f"{ref_file.replace('.part', '_part')}.html#{fnref_id}"
+                            backref_link = f"{footnote_manager.get_html_filename(ref_file)}#{fnref_id}"
                         elif hasattr(footnote_manager, 'local_chapter_groups') and ref_unit_id in footnote_manager.local_chapter_groups:
                             # Fallback: use the first part file
                             first_part = footnote_manager.local_chapter_groups[ref_unit_id][0]
-                            ref_identity = ChapterIdentity.parse(first_part)
-                            if ref_identity:
-                                backref_link = f"{ref_identity.html_name}#{fnref_id}"
-                            else:
-                                backref_link = f"{first_part.replace('.part', '_part')}.html#{fnref_id}"
+                            backref_link = f"{footnote_manager.get_html_filename(first_part)}#{fnref_id}"
                         else:
                             # Single file chapter
-                            ref_identity = ChapterIdentity.parse(ref_unit_id)
-                            if ref_identity:
-                                backref_link = f"{ref_identity.html_name}#{fnref_id}"
-                            else:
-                                backref_link = f"{ref_unit_id.replace('.part', '_part')}.html#{fnref_id}"
+                            backref_link = f"{footnote_manager.get_html_filename(ref_unit_id)}#{fnref_id}"
                         backref_html = f' <a class="footnote-backref" href="{backref_link}" title="Jump back to footnote {fn_key} in the text">↩</a>'
 
                     # Output as HTML with occurrence-based ID and backref

@@ -83,7 +83,8 @@ def find_chapter_file(unit_id: str, markdown_dir: Path) -> Optional[Path]:
         unit_id: Unit ID like "chapter_12" or "chapter_7.1.1"
         markdown_dir: Directory containing markdown files
 
-    Returns the base file (not .part2, .part3, etc.)
+    Returns the base file (first part if split).
+    Handles nested splits like chapter_25.part1.part1.md
     """
     # Try exact match first
     exact_file = markdown_dir / f"{unit_id}.md"
@@ -95,6 +96,11 @@ def find_chapter_file(unit_id: str, markdown_dir: Path) -> Optional[Path]:
     if part1_file.exists():
         return part1_file
 
+    # Try nested part1.part1 file (when part1 was further split)
+    nested_part1_file = markdown_dir / f"{unit_id}.part1.part1.md"
+    if nested_part1_file.exists():
+        return nested_part1_file
+
     return None
 
 
@@ -104,23 +110,54 @@ def find_part_files(base_file: Path) -> List[Path]:
 
     Given chapter_10.38_intro.md or chapter_10.38_intro.part1.md,
     returns [part1, part2, part3, ...] in order.
+
+    Handles nested splits like:
+    - chapter_25.part1.part1.md
+    - chapter_25.part1.part2.md
+    - chapter_25.part2.md
+    - chapter_25.part3.md
     """
     if base_file is None:
         return []
 
-    # Get the base name without .partN.md
+    # Get the base name without ALL .partN suffixes
     name = base_file.name
-    if '.part' in name:
-        # chapter_10.38_intro.part1.md -> chapter_10.38_intro
-        base_pattern = name.rsplit('.part', 1)[0]
-    else:
-        # chapter_10.38_intro.md -> chapter_10.38_intro
-        base_pattern = name.rsplit('.md', 1)[0]
+    stem = name.rsplit('.md', 1)[0]  # Remove .md
 
-    # Find all part files
-    part_files = sorted(base_file.parent.glob(f"{base_pattern}.part*.md"))
+    # Strip all .partN suffixes to get true base
+    # chapter_25.part1.part1 -> chapter_25
+    base_pattern = stem
+    while '.part' in base_pattern:
+        base_pattern = base_pattern.rsplit('.part', 1)[0]
+
+    # Find all part files (including nested)
+    # This matches chapter_25.part1.md, chapter_25.part2.md, chapter_25.part1.part1.md, etc.
+    part_files = list(base_file.parent.glob(f"{base_pattern}.part*.md"))
 
     if part_files:
+        # Sort by extracting part numbers
+        def sort_key(p: Path):
+            # chapter_25.part1.part2.md -> [1, 2]
+            # chapter_25.part2.md -> [2]
+            stem = p.stem
+            parts = []
+            remaining = stem
+            while '.part' in remaining:
+                idx = remaining.index('.part')
+                remaining = remaining[idx + 5:]  # Skip ".part"
+                # Extract number
+                num_str = ""
+                for c in remaining:
+                    if c.isdigit():
+                        num_str += c
+                    else:
+                        break
+                if num_str:
+                    parts.append(int(num_str))
+                    remaining = remaining[len(num_str):]
+            return parts
+
+        part_files = sorted(part_files, key=sort_key)
         return part_files
     else:
         # No part files, return the single file
@@ -782,6 +819,9 @@ def build_epub(config: BuildEpubConfig) -> Path:
     # Generate hierarchical TOC
     generate_hierarchical_toc_ncx(epub_structure, config.book_title, epub_dir / "toc.ncx")
     generate_hierarchical_toc_html(epub_structure, config.book_title, epub_dir / "text" / "toc.html", language)
+
+    # Configure footnote manager with epub structure (for HTML filename mapping)
+    footnote_manager.configure_from_structure(epub_structure)
 
     # Process and convert chapters
     all_html_files = []

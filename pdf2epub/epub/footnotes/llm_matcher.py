@@ -38,8 +38,13 @@ class LLMSectionMatcher:
         Returns:
             True if loaded successfully, False otherwise
         """
-        # toc_tree.json is in the parent of markdown_dir (output_dir)
+        # toc_tree.json is in the output directory
+        # For translated/validated, we need to go up two levels
+        # For polished_markdown, we need to go up one level
         toc_path = self.markdown_dir.parent / "toc_tree.json"
+        if not toc_path.exists():
+            # Try one more level up (for translated/validated structure)
+            toc_path = self.markdown_dir.parent.parent / "toc_tree.json"
         if not toc_path.exists():
             logger.warning(f"toc_tree.json not found at {toc_path}")
             return False

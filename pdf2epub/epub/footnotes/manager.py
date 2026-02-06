@@ -70,6 +70,10 @@ class FootnoteManager:
         # Runtime counter for section-based occurrence tracking
         self._section_occurrence_counter: Dict[Tuple[str, str], int] = {}
 
+        # Mapping from markdown stems to HTML filenames (for nested parts)
+        # e.g., {"chapter_25.part1.part1": "chapter_25_part1.html"}
+        self._html_filename_mapping: Dict[str, str] = {}
+
         # Analyze the footnote structure
         self._analyze_footnote_structure()
 
@@ -254,6 +258,62 @@ class FootnoteManager:
         """Get the detected footnote style."""
         return self.style
 
+    def configure_from_structure(self, epub_structure: List[Dict]) -> None:
+        """
+        Configure HTML filename mapping from epub_structure.
+
+        This builds the mapping from markdown stems to HTML filenames,
+        needed for nested part files where ChapterIdentity can't parse
+        the filename (e.g., chapter_25.part1.part1 -> chapter_25_part1.html).
+
+        Args:
+            epub_structure: The hierarchical structure from build_epub_structure()
+        """
+        mapping = {}
+
+        def walk(entries):
+            for entry in entries:
+                if 'file_path' in entry and 'unit_id' in entry:
+                    unit_id = entry['unit_id']
+                    part_files = entry.get('part_files', [entry['file_path']])
+                    for idx, part_file in enumerate(part_files):
+                        stem = Path(part_file).stem
+                        if len(part_files) > 1:
+                            mapping[stem] = f"{unit_id}_part{idx + 1}.html"
+                        else:
+                            mapping[stem] = f"{unit_id}.html"
+                if 'children' in entry:
+                    walk(entry['children'])
+
+        walk(epub_structure)
+        self._html_filename_mapping = mapping
+        logger.debug(f"Configured HTML filename mapping with {len(mapping)} entries")
+
+    def get_html_filename(self, markdown_stem: str) -> str:
+        """
+        Get the HTML filename for a markdown file stem.
+
+        Uses the explicit mapping first, then falls back to ChapterIdentity parsing,
+        then to simple string replacement.
+
+        Args:
+            markdown_stem: The markdown file stem (e.g., "chapter_25.part1.part1")
+
+        Returns:
+            HTML filename (e.g., "chapter_25_part1.html")
+        """
+        # Try explicit mapping first (for nested parts)
+        if markdown_stem in self._html_filename_mapping:
+            return self._html_filename_mapping[markdown_stem]
+
+        # Try ChapterIdentity parsing
+        identity = ChapterIdentity.parse(markdown_stem)
+        if identity:
+            return identity.html_name
+
+        # Fallback: simple replacement (may be wrong for nested parts)
+        return f"{markdown_stem.replace('.part', '_part')}.html"
+
     def _chapter_sort_key(self, chapter_name: str) -> tuple:
         """
         Generate a sort key for chapter names to maintain proper order.
@@ -308,8 +368,7 @@ class FootnoteManager:
                             # Cross-part reference within the same chapter
                             fn_id = f"fn:{key}:{occurrence_num}"
                             fnref_id = f"fnref-{source_chapter}-{key}"
-                            target_identity = ChapterIdentity.parse(target_chapter)
-                            html_target = target_identity.html_name if target_identity else f"{target_chapter}.html"
+                            html_target = self.get_html_filename(target_chapter)
                             return (
                                 f'<sup id="{fnref_id}">'
                                 f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{key}]</a>'
@@ -318,7 +377,7 @@ class FootnoteManager:
 
             # Single file chapter or no multi-part mapping
             fnref_id = f"fnref-{source_chapter}-{key}"
-            source_html = source_identity.html_name if source_identity else f"{source_chapter.replace('.part', '_part')}.html"
+            source_html = self.get_html_filename(source_chapter)
             return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{key}:1">[{key}]</a></sup>'
 
         # Global style: try section-based mapping first, then fall back to occurrence mapping
@@ -346,8 +405,7 @@ class FootnoteManager:
                     # Generate HTML link
                     # Use base_chapter (unit_id) for fnref_id to match the backref in definition
                     fnref_id = f"fnref-{base_chapter}-{key}-{occurrence}"
-                    target_identity = ChapterIdentity.parse(target_chapter)
-                    html_target = target_identity.html_name if target_identity else f"{target_chapter.replace('.part', '_part')}.html"
+                    html_target = self.get_html_filename(target_chapter)
 
                     # Use occurrence number for the anchor
                     fn_id = f"fn:{key}:{occurrence}"
@@ -391,8 +449,7 @@ class FootnoteManager:
             if target_chapter == source_chapter:
                 # Same file reference
                 fnref_id = f"fnref-{source_chapter}-{original_key}"
-                source_identity = ChapterIdentity.parse(source_chapter)
-                html_target = source_identity.html_name if source_identity else f"{source_chapter.replace('.part', '_part')}.html"
+                html_target = self.get_html_filename(source_chapter)
                 occ_num = occurrence_num if occurrence_num else 1
                 return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}#fn:{key}:{occ_num}">[{display_key}]</a></sup>'
             else:
@@ -414,9 +471,7 @@ class FootnoteManager:
                     logger.debug(f"No mapping found for {base_source_chapter}, using default ID")
 
                 fnref_id = f"fnref-{source_chapter}-{original_key}"
-
-                target_identity = ChapterIdentity.parse(target_chapter)
-                html_target = target_identity.html_name if target_identity else f"{target_chapter.replace('.part', '_part')}.html"
+                html_target = self.get_html_filename(target_chapter)
 
                 return (
                     f'<sup id="{fnref_id}">'

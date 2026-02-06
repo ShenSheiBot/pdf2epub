@@ -694,9 +694,9 @@ class Executor:
                             results[unit_id] = aggregated
                             completed.add(unit_id)
                             logger.info(f"{unit_id}: Aggregated {len(state.children)} children")
-                            # Remove .sub children from results/completed (internal detail)
+                            # Remove .sub children from completed (for stats), but keep in results
+                            # so Pipeline can save them to raw/ for debugging (per types.py:64)
                             for child_id in state.children:
-                                results.pop(child_id, None)
                                 completed.discard(child_id)
                         continue
 

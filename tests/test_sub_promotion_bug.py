@@ -137,20 +137,18 @@ class FakeTracker:
 
 
 # ============================================================
-# Test: Executor.execute() results should NOT contain .sub keys
+# Test: Executor .sub handling (results vs completed)
 # ============================================================
 
-class TestExecutorResultsMustNotContainSubKeys:
+class TestExecutorSubHandling:
     """
-    BUG: After dynamic splitting and aggregation, Executor leaves .sub
-    children's results in ExecutionResult.results instead of cleaning them up.
+    After dynamic splitting and aggregation:
 
-    CORRECT BEHAVIOR (expected): Only parent's aggregated result should be
-    in ExecutionResult.results. Children .sub should be removed after aggregation.
+    1. .sub SHOULD be in results - for raw/ persistence (types.py:64)
+    2. .sub should NOT be in completed - not tracked as units (types.py:67)
+    3. .sub should NOT inflate statistics (types.py:68)
 
-    CURRENT BEHAVIOR (bug): Children .sub results remain in results dict.
-
-    These tests MUST FAIL to prove the bug exists.
+    Pipeline handles filtering .sub before promoting to validated/.
     """
 
     @pytest.fixture
@@ -190,17 +188,17 @@ class TestExecutorResultsMustNotContainSubKeys:
         hooks._validators = [validator]
         return hooks
 
-    def test_executor_results_must_not_contain_sub_keys_after_split(
+    def test_executor_results_should_contain_sub_keys_for_raw_persistence(
         self, hooks_reject_first_then_accept
     ):
         """
-        CRITICAL BUG TEST: After split and aggregation, .sub keys should NOT
-        be in ExecutionResult.results.
+        After split and aggregation, .sub keys SHOULD be in ExecutionResult.results
+        so Pipeline can save them to raw/ for debugging (per types.py:64).
 
-        This test MUST FAIL with current buggy code.
+        Design doc (types.py:64): .sub should "Be saved to raw/ (for debugging)"
+        Pipeline saves raw: for key, content in exec_result.results.items(): save_raw()
 
-        Expected (correct): results.keys() == {"chapter_1"}
-        Actual (bug): results.keys() == {"chapter_1", "chapter_1.sub0", "chapter_1.sub1"}
+        For .sub to be saved to raw/, they MUST remain in results.
         """
         fake_llm = FakeLLMClient(default_response="processed content")
 
@@ -230,23 +228,21 @@ class TestExecutorResultsMustNotContainSubKeys:
             "Parent should complete via aggregation after children complete"
         )
 
-        # THE BUG: .sub keys should NOT be in results
+        # .sub keys SHOULD be in results for raw/ persistence
         sub_keys_in_results = [k for k in result.results.keys() if is_sub_key(k)]
 
-        # This assertion MUST FAIL to prove the bug exists
-        assert len(sub_keys_in_results) == 0, (
-            f"BUG EXPOSED: .sub keys found in ExecutionResult.results: {sub_keys_in_results}. "
-            f"Design doc says .sub units should NOT appear in results after aggregation. "
-            f"Only parent's aggregated result should be present."
+        # Per types.py:64: .sub should "Be saved to raw/ (for debugging)"
+        # This requires them to be in results so Pipeline can save them
+        assert len(sub_keys_in_results) >= 2, (
+            f".sub keys should be in results for raw/ persistence. Found: {sub_keys_in_results}"
         )
 
     def test_executor_completed_must_not_contain_sub_keys(
         self, hooks_reject_first_then_accept
     ):
         """
-        CRITICAL BUG TEST: .sub keys should NOT be in ExecutionResult.completed.
-
-        This test MUST FAIL with current buggy code.
+        .sub keys should NOT be in ExecutionResult.completed.
+        Per types.py:67: .sub should "NOT be tracked as completed/failed units"
         """
         fake_llm = FakeLLMClient(default_response="processed content")
         splitter = FakeSplitter(["Part 1 content", "Part 2 content"])
@@ -281,13 +277,12 @@ class TestExecutorResultsMustNotContainSubKeys:
         self, hooks_reject_first_then_accept
     ):
         """
-        CRITICAL BUG TEST: Statistics should not count .sub units.
+        Statistics should not count .sub units.
+        Per types.py:68: .sub should "NOT be counted in statistics"
 
         If we have 1 unit that splits into 2 children:
         - completed count should be 1 (only parent)
         - NOT 3 (parent + 2 children)
-
-        This test MUST FAIL with current buggy code.
         """
         fake_llm = FakeLLMClient(default_response="processed content")
         splitter = FakeSplitter(["Part 1", "Part 2"])
@@ -627,3 +622,233 @@ class TestSubKeyHelpers:
         keys = {"chapter_1", "chapter_1.sub0", "chapter_1.sub1", "chapter_2"}
         filtered = filter_sub_keys(keys)
         assert filtered == {"chapter_1", "chapter_2"}
+
+
+# ============================================================
+# Test: .sub raw persistence inconsistency (P0 bug)
+# ============================================================
+
+class TestSubRawPersistenceInconsistency:
+    """
+    P0 BUG: .sub saving to raw/ is inconsistent between success and failure.
+
+    Design doc says (types.py:64): .sub should "Be saved to raw/ (for debugging)"
+    Pipeline saves raw (pipeline_v2.py:198-200): iterates exec_result.results.items()
+
+    BUT:
+    - Success path (executor.py:698-699): .sub children get POPPED from results
+    - Failure path (executor.py:687-690): break exits before pop, .sub STAYS in results
+
+    Result: FAILURE saves .sub to raw, SUCCESS does not. Contradicts design doc.
+    """
+
+    @pytest.fixture
+    def hooks_accept_all(self):
+        """Hooks that accept everything (children succeed, aggregation succeeds)."""
+        hooks = CompositeHooks()
+        hooks._error_classifier = DefaultErrorClassifier()
+        validator = MagicMock()
+        validator.name = "accept_all"
+        validator.validate.return_value = MagicMock(accepted=True, context_ready=False)
+        hooks._validators = [validator]
+        return hooks
+
+    @pytest.fixture
+    def hooks_fail_one_child(self):
+        """
+        Hooks that fail one .sub child, causing aggregation to fail.
+        Parent: reject first call (trigger split), then never called again because agg fails.
+        Children: .sub0 succeeds, .sub1 fails.
+        """
+        call_count = {}
+
+        def failing_validator(key, orig, processed):
+            call_count[key] = call_count.get(key, 0) + 1
+
+            # .sub1 always fails
+            if key.endswith(".sub1"):
+                return MagicMock(accepted=False, context_ready=False)
+            # .sub0 succeeds
+            if is_sub_key(key):
+                return MagicMock(accepted=True, context_ready=False)
+            # Parent: reject first to trigger split
+            if call_count[key] == 1:
+                return MagicMock(accepted=False, context_ready=False)
+            return MagicMock(accepted=True, context_ready=False)
+
+        hooks = CompositeHooks()
+        hooks._error_classifier = DefaultErrorClassifier()
+        validator = MagicMock()
+        validator.name = "fail_one_child"
+        validator.validate = failing_validator
+        hooks._validators = [validator]
+        return hooks
+
+    def test_sub_should_remain_in_results_for_raw_persistence_on_success(
+        self, hooks_accept_all
+    ):
+        """
+        BUG: When aggregation succeeds, .sub children are POPPED from results,
+        so Pipeline cannot save them to raw/ for debugging.
+
+        Design doc says: .sub should "Be saved to raw/ (for debugging)" (types.py:64)
+        Pipeline does: for key, content in exec_result.results.items(): save_raw(key, content)
+        Executor bug: pops .sub from results after successful aggregation (executor.py:698-699)
+
+        Expected (correct behavior): .sub should REMAIN in results so Pipeline can save to raw/
+        Actual (bug): .sub is POPPED, Pipeline never sees it, raw/ is incomplete
+
+        This test MUST FAIL to prove the bug exists.
+        """
+        # Setup: parent rejected on first call to trigger split (with validation quota=1),
+        # then all .sub children succeed
+        parent_call = {"count": 0}
+
+        def split_then_succeed(key, orig, processed):
+            if is_sub_key(key):
+                return MagicMock(accepted=True, context_ready=False)
+            parent_call["count"] += 1
+            if parent_call["count"] == 1:
+                return MagicMock(accepted=False, context_ready=False)
+            return MagicMock(accepted=True, context_ready=False)
+
+        hooks = CompositeHooks()
+        hooks._error_classifier = DefaultErrorClassifier()
+        validator = MagicMock()
+        validator.name = "split_then_succeed"
+        validator.validate = split_then_succeed
+        hooks._validators = [validator]
+
+        fake_llm = FakeLLMClient(default_response="processed content")
+        splitter = FakeSplitter(["Part 1 content", "Part 2 content"])
+
+        executor = Executor(
+            llm_client=fake_llm,
+            model_chain=[ChainEntry(provider="fake", model="fake", mode="online")],
+            processor=SimpleProcessor(),
+            hooks=hooks,
+            splitter=splitter,
+            max_workers=1,
+            # Critical: validation quota=1 means first failure triggers split
+            quota_config=QuotaConfig(total=2, per_type={ErrorType.VALIDATION: 1}),
+        )
+
+        unit = WorkUnit(
+            id="chapter_1",
+            file_key="ch1",
+            content="Line 1\nLine 2\nLine 3\nLine 4"
+        )
+        result = executor.execute([unit])
+
+        # Sanity check: split occurred and parent completed
+        assert result.splits_performed > 0, "Split should have occurred"
+        assert "chapter_1" in result.completed, "Parent should complete via aggregation"
+
+        # THE BUG: .sub children should be in results for raw/ persistence
+        # Design doc (types.py:64): "Be saved to raw/ (for debugging)"
+        # Pipeline (pipeline_v2.py:198-200): saves exec_result.results.items() to raw/
+        #
+        # For .sub to be saved to raw/, they MUST be in exec_result.results
+        sub_keys_in_results = [k for k in result.results.keys() if is_sub_key(k)]
+
+        # This assertion MUST FAIL to prove the bug exists
+        # Expected: .sub0 and .sub1 should be in results for raw persistence
+        # Actual: they got popped at executor.py:698-699
+        assert len(sub_keys_in_results) >= 2, (
+            f"BUG EXPOSED: .sub keys missing from results after successful aggregation. "
+            f"Found: {sub_keys_in_results}. "
+            f"Design doc says .sub should 'Be saved to raw/ (for debugging)' (types.py:64). "
+            f"But executor.py:698-699 pops them, so Pipeline can't save to raw/. "
+            f"Result: success path doesn't persist .sub to raw/, violating design contract."
+        )
+
+    def test_sub_is_in_results_on_failure_proving_inconsistency(self):
+        """
+        Contrast test: When aggregation FAILS, .sub children REMAIN in results.
+
+        This test should PASS, proving the inconsistency:
+        - Failure path: .sub in results → saved to raw/
+        - Success path: .sub popped → NOT saved to raw/ (bug)
+
+        The break at executor.py:689 exits before the else clause (executor.py:691-700)
+        which contains the pop. So on failure, .sub stays in results.
+        """
+        # Setup: parent fails first (triggers split), .sub0 succeeds, .sub1 LLM errors
+        #
+        # Key: .sub1 must have no fallback (LLM never returns content).
+        # Using FakeErrorType.VALIDATION causes LLM to throw, so no content is stored.
+        # Then when quota exhausted, no fallback available → truly fails.
+
+        call_count = {}
+
+        def fail_one_child(key, orig, processed):
+            """Validator - only called if LLM succeeded."""
+            call_count[key] = call_count.get(key, 0) + 1
+            # .sub0 and parent (when called) succeed
+            if is_sub_key(key) and ".sub0" in key:
+                return MagicMock(accepted=True, context_ready=False)
+            # Parent: reject first to trigger split
+            if call_count[key] == 1:
+                return MagicMock(accepted=False, context_ready=False)
+            return MagicMock(accepted=True, context_ready=False)
+
+        hooks = CompositeHooks()
+        hooks._error_classifier = DefaultErrorClassifier()
+        validator = MagicMock()
+        validator.name = "fail_one_child"
+        validator.validate = fail_one_child
+        hooks._validators = [validator]
+
+        # Configure FakeLLMClient to throw error for .sub1
+        # This prevents any content from being stored as fallback
+        fake_llm = FakeLLMClient(default_response="processed content")
+        # .sub1 always throws validation error at LLM level (before validator even sees it)
+        fake_llm.set_response("chapter_1.sub1", FakeResponse(
+            error=FakeErrorType.VALIDATION,
+            succeed_after_n_calls=0,  # Always fail
+        ))
+
+        splitter = FakeSplitter(["Part 1 content", "Part 2 content"])
+
+        executor = Executor(
+            llm_client=fake_llm,
+            model_chain=[ChainEntry(provider="fake", model="fake", mode="online")],
+            processor=SimpleProcessor(),
+            hooks=hooks,
+            splitter=splitter,
+            max_workers=1,
+            # Parent: validation quota=1 means first failure triggers split
+            # .sub1: validation quota=1 means LLM error exhausts quota → no fallback → fails
+            quota_config=QuotaConfig(total=3, per_type={ErrorType.VALIDATION: 1}),
+        )
+
+        unit = WorkUnit(
+            id="chapter_1",
+            file_key="ch1",
+            content="Line 1\nLine 2\nLine 3\nLine 4"
+        )
+        result = executor.execute([unit])
+
+        # Sanity check: split occurred
+        assert result.splits_performed > 0, "Split should have occurred"
+
+        # .sub1 should truly fail (no fallback because LLM never returned content)
+        assert "chapter_1.sub1" in result.failed, (
+            f".sub1 should be in failed set (LLM errored, no fallback). "
+            f"failed={result.failed}, completed={result.completed}"
+        )
+
+        # Parent should fail (aggregation failed because .sub1 failed)
+        assert "chapter_1" in result.failed, (
+            f"Parent should be in failed set because .sub1 failed. "
+            f"failed={result.failed}, completed={result.completed}"
+        )
+
+        # THE KEY ASSERTION: On failure path, successful .sub children should remain
+        # in results because the break at executor.py:689 exits before pop (executor.py:698-699)
+        assert "chapter_1.sub0" in result.results, (
+            f"Expected chapter_1.sub0 in results on failure path. "
+            f"Found keys: {list(result.results.keys())}. "
+            f"This proves: on failure, successful children stay in results (can be saved to raw/). "
+            f"Contrast with success path where children are popped (cannot be saved to raw/)."
+        )

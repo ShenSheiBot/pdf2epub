@@ -314,9 +314,9 @@ class Executor:
                 results.update(batch_result.results)
                 completed.update(batch_result.completed)
                 skipped.update(batch_result.skipped)
-                # Batch counts all units as attempts (1 LLM call per unit)
-                total_attempts += len(batch_units)
-                successful_attempts += len(batch_result.completed)
+                # Use actual attempts from batch result (excludes pre_process skipped units)
+                total_attempts += batch_result.total_attempts
+                successful_attempts += batch_result.successful_attempts
 
                 # Handle batch failures with online fallback
                 batch_failed = batch_result.failed | batch_result.validation_failed
@@ -351,15 +351,29 @@ class Executor:
                         max_depth_reached = max(max_depth_reached, fallback_result.max_depth_reached)
                     else:
                         # Too many failures - retry with new batch job
-                        logger.info(f"Retrying {len(failed_units)} units with new batch job")
-                        retry_result = self._process_batch(
-                            failed_units, batch_entry, context_base, originals, unit_states
-                        )
+                        # Check if a different batch entry is available after failures
+                        # Use first unit's state as representative
+                        first_failed = failed_units[0]
+                        first_state = unit_states[first_failed.id]
+                        new_batch_entry = self._get_batch_entry_for_state(first_state)
+
+                        if new_batch_entry and new_batch_entry != batch_entry:
+                            logger.info(f"Retrying {len(failed_units)} units with different batch model: {new_batch_entry.model}")
+                            retry_result = self._process_batch(
+                                failed_units, new_batch_entry, context_base, originals, unit_states
+                            )
+                        else:
+                            # No new batch entry available, still retry with same entry
+                            # (this preserves original behavior for single-batch-entry chains)
+                            logger.info(f"Retrying {len(failed_units)} units with batch job")
+                            retry_result = self._process_batch(
+                                failed_units, batch_entry, context_base, originals, unit_states
+                            )
                         results.update(retry_result.results)
                         completed.update(retry_result.completed)
-                        # Count retry batch attempts
-                        total_attempts += len(failed_units)
-                        successful_attempts += len(retry_result.completed)
+                        # Use actual attempts from retry result
+                        total_attempts += retry_result.total_attempts
+                        successful_attempts += retry_result.successful_attempts
                         # Remaining failures after retry go to online fallback
                         retry_failed = retry_result.failed | retry_result.validation_failed
                         if retry_failed:
@@ -422,6 +436,23 @@ class Executor:
             if entry.mode == "batch":
                 return entry
         return None
+
+    def _get_batch_entry_for_state(self, state: UnitState) -> Optional[ChainEntry]:
+        """
+        Get the first available batch entry for a unit's current state.
+
+        This is used for batch retry to get the next available batch model
+        after the first batch model failed. The state's chain may have been
+        modified by apply_effect to remove exhausted entries.
+
+        Args:
+            state: The UnitState to check
+
+        Returns:
+            The first batch ChainEntry from the unit's current chain, or None
+        """
+        # Use the state's get_batch_entry method which respects chain modifications
+        return state.get_batch_entry()
 
     def _process_online(
         self,
@@ -1095,11 +1126,22 @@ class Executor:
                     error = Exception(error_msg)
                     error_type, effect = self._hooks.classify_error(error)
 
+                    # For job-level batch failures, we should advance the chain
+                    # to try a different batch model on retry. Force remove_current_model=True.
+                    # This ensures _get_batch_entry_for_state returns the next batch model.
+                    from ..hooks import ErrorEffect
+                    batch_fail_effect = ErrorEffect(
+                        remove_current_model=True,  # Force advance to next model
+                        remove_provider=effect.remove_provider,
+                        remove_all_batch=effect.remove_all_batch,
+                        quota_type=effect.quota_type,
+                    )
+
                     # Apply effect to all units in this batch
                     for unit_id in units_to_process.keys():
                         state = unit_states.get(unit_id)
                         if state:
-                            state.apply_effect(effect, batch_entry)
+                            state.apply_effect(batch_fail_effect, batch_entry)
 
                         # Track by error type
                         if error_type == ErrorType.SAFETY:
@@ -1133,11 +1175,20 @@ class Executor:
                     error = Exception(error_msg)
                     error_type, effect = self._hooks.classify_error(error)
 
+                    # For job-level batch failures, we should advance the chain
+                    # to try a different batch model on retry. Force remove_current_model=True.
+                    batch_fail_effect = ErrorEffect(
+                        remove_current_model=True,  # Force advance to next model
+                        remove_provider=effect.remove_provider,
+                        remove_all_batch=effect.remove_all_batch,
+                        quota_type=effect.quota_type,
+                    )
+
                     # Apply effect to all units
                     for unit_id in units_to_process.keys():
                         state = unit_states.get(unit_id)
                         if state:
-                            state.apply_effect(effect, batch_entry)
+                            state.apply_effect(batch_fail_effect, batch_entry)
 
                         if error_type == ErrorType.SAFETY:
                             safety_blocked.add(unit_id)
@@ -1243,11 +1294,20 @@ class Executor:
                         )
                         self._tracker.record_attempt(unit_id, attempt)
                 else:
-                    # Validation failed - record attempt for longest fallback
+                    # Validation failed
+                    # 1. Classify as validation error and get effect
+                    error_type = ErrorType.VALIDATION
+                    effect = self._hooks._error_classifier.get_effect(error_type)
+
+                    # 2. Apply effect to decrement quota (CRITICAL: was missing before)
+                    if state:
+                        state.apply_effect(effect, batch_entry)
+
+                    # 3. Record attempt for longest fallback
                     if state:
                         state.record_attempt(transformed)
 
-                    # Record to tracker with rejection reason (P1-6 fix)
+                    # 4. Record to tracker with rejection reason (P1-6 fix)
                     if self._tracker and not is_sub_key(unit_id):
                         from ..tracking import AttemptRecord
                         error_msg = hook_result.rejection_reason or "Validation rejected"
@@ -1268,6 +1328,12 @@ class Executor:
             logger.debug(traceback.format_exc())
             failed.update(u.id for u in units if u.id not in skipped and u.id not in completed)
 
+        # Calculate actual attempts (only units that were submitted to batch)
+        actual_attempts = len(batch_requests) if batch_requests else 0
+        # Calculate successful attempts: completed units minus skipped units
+        # (skipped units are marked as completed but don't count as batch attempts)
+        actual_successes = len(completed - skipped)
+
         return ExecutionResult(
             results=results,
             completed=completed,
@@ -1275,4 +1341,6 @@ class Executor:
             skipped=skipped,
             safety_blocked=safety_blocked,
             validation_failed=validation_failed,
+            total_attempts=actual_attempts,
+            successful_attempts=actual_successes,
         )

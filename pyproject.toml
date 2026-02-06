@@ -50,3 +50,14 @@ packages = ["pdf2epub"]
 dev = [
     "pytest>=8.4.2",
 ]
+
+[tool.pytest.ini_options]
+# Disable logfire plugin (not used directly)
+addopts = "-p no:logfire"
+# Filter deprecation warnings from third-party dependencies (pydantic-ai -> logfire -> opentelemetry)
+filterwarnings = [
+    "ignore::DeprecationWarning:opentelemetry.*:",
+    "ignore:You should use `Logger`:DeprecationWarning",
+    "ignore:You should use `LoggerProvider`:DeprecationWarning",
+    "ignore:You should use `ProxyLoggerProvider`:DeprecationWarning",
+]

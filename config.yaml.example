@@ -140,6 +140,38 @@ validation_strategy:
   fallback_between_models: true
   validate_chinese_translation: false
 
+# Validation Configuration (for polish / translate commands)
+# ==========================================================
+validation_v2:
+  # Truncation detection settings
+  truncation:
+    min_unique_preserved_ratio: 0.60  # N-gram unique content threshold
+    allow_deduplication: true          # Whether deduplication is acceptable
+    truncation_check_lines: 5          # Lines to check with LLM fallback
+    enable_llm_fallback: true          # Use LLM to verify N-gram results
+
+  # Hooks configuration
+  hooks:
+    length_ratio:
+      min_ratio: 0.3   # Minimum result/original length ratio
+      max_ratio: 3.0   # Maximum result/original length ratio
+    skip_chapter_types:
+      - front_matter
+      - back_matter
+      - toc
+      - notes
+      - appendix
+    skip_short_content_chars: 50  # Skip validation for content < N chars
+
+  # Retry quotas per error type
+  quotas:
+    total: 5           # Total retries per unit
+    network: 3         # Network error retries
+    validation: 1      # Validation error retries
+    truncation: 2      # Truncation error retries (switches model)
+    rate_limit: 3      # Rate limit retries
+    timeout: 3         # Timeout retries
+
 # Model Output Limits
 # ===================
 # Practical reliable output tokens per model

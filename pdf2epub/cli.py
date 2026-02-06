@@ -21,70 +21,9 @@ logger = configure_logging()
 
 
 def polish_command(args):
-    """Handle the polish subcommand."""
-    # Load configuration
-    config = load_config(args.config)
-    book_title = config.get("title")
-    
-    if not book_title:
-        logger.error("No title found in config.yaml")
-        return 1
-
-    # Configure file logging
-    configure_logging(book_title, "polish")
-
-    logger.info(f"Starting polish process for: {book_title}")
-    if args.content_type != "auto":
-        logger.info(f"Content type: {args.content_type}")
-    
-    # Load book structure if available
-    # Prefer toc_tree.json (from refine) over book_structure.json (from breakdown)
-    output_dir = Path("output") / book_title
-    toc_tree_file = output_dir / "toc_tree.json"
-    structure_file = output_dir / "book_structure.json"
-    book_structure = None
-
-    import json
-    if toc_tree_file.exists():
-        with open(toc_tree_file, 'r', encoding='utf-8') as f:
-            book_structure = json.load(f)
-        logger.info("Loaded book structure from toc_tree.json for context-aware polishing")
-    elif structure_file.exists():
-        with open(structure_file, 'r', encoding='utf-8') as f:
-            book_structure = json.load(f)
-        logger.info("Loaded book structure from book_structure.json for context-aware polishing")
-    
-    # Initialize the polish processor
-    # Get use_longest_on_failure from config if not explicitly set in CLI
-    validation_config = config.get('validation_strategy', {})
-    # Use config value as default, CLI flag overrides if provided
-    if hasattr(args, 'use_longest_on_failure') and args.use_longest_on_failure is not None:
-        use_longest_on_failure = args.use_longest_on_failure
-    else:
-        use_longest_on_failure = validation_config.get('use_longest_on_failure', False)
-
-    processor = PolishProcessor(
-        config=config,
-        book_title=book_title,
-        max_workers=args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4),
-        resume=args.resume,
-        skip_truncation_check=args.skip_truncation_check,
-        polish_models=config.get("polish_models"),
-        content_type=args.content_type,
-        use_longest_on_failure=use_longest_on_failure,
-        book_structure=book_structure
-    )
-    
-    # Process all files
-    summary = processor.process_all_files()
-    
-    # Check for errors
-    if summary.get("error"):
-        logger.error(f"Processing failed: {summary['error']}")
-        return 1
-    
-    # Return exit code based on success rate
-    return 0 if summary.get("success_rate", 0) == 1.0 else 1
+    """Handle the polish subcommand - uses V2 pipeline."""
+    from .commands import polish_v2_command
+    return polish_v2_command(args)
 
 
 def breakdown_command(args):
@@ -837,84 +776,11 @@ def build_html_epub_command(args):
 
 
 def translate_command(args):
-    """Handle the translate subcommand."""
-    # Load configuration
-    config = load_config(args.config)
-    book_title = config.get("title")
+    """Handle the translate subcommand - uses V2 pipeline."""
+    from .commands import translate_v2_command
+    return translate_v2_command(args)
 
-    if not book_title:
-        logger.error("No title found in config.yaml")
-        return 1
 
-    # Configure file logging
-    configure_logging(book_title, "translate")
-
-    # Load book structure if available
-    # Prefer toc_tree.json (from refine) over book_structure.json (from breakdown)
-    output_dir = Path("output") / book_title
-    toc_tree_file = output_dir / "toc_tree.json"
-    structure_file = output_dir / "book_structure.json"
-    book_structure = None
-
-    import json
-    if toc_tree_file.exists():
-        with open(toc_tree_file, 'r', encoding='utf-8') as f:
-            book_structure = json.load(f)
-        logger.info("Loaded book structure from toc_tree.json")
-    elif structure_file.exists():
-        with open(structure_file, 'r', encoding='utf-8') as f:
-            book_structure = json.load(f)
-        logger.info("Loaded book structure from book_structure.json")
-
-    # Get language settings
-    # Priority: args > config > book_structure > default
-    target_language = args.target_language or config.get("target_language", "Chinese")
-
-    if args.source_language:
-        source_language = args.source_language
-    elif config.get("source_language"):
-        source_language = config.get("source_language")
-    elif book_structure and book_structure.get('language'):
-        source_language = book_structure.get('language')
-        logger.info(f"Auto-detected source language from book structure: {source_language}")
-    else:
-        source_language = "Japanese"
-
-    logger.info(f"Starting translation for: {book_title}")
-    logger.info(f"Translation: {source_language} → {target_language}")
-
-    # Determine use_entities value based on flags
-    if args.no_entities:
-        use_entities = False
-    elif args.use_entities:
-        use_entities = True
-    else:
-        use_entities = None  # Auto-detect
-
-    # Initialize the translation processor
-    processor = TranslateProcessor(
-        config=config,
-        book_title=book_title,
-        source_language=source_language,
-        target_language=target_language,
-        max_workers=args.max_workers if args.max_workers is not None else config.get('max_concurrent_workers', 4),
-        resume=args.resume,
-        translation_models=config.get('translation', {}).get('models'),
-        use_entities=use_entities,
-        use_longest_on_failure=args.use_longest_on_failure if args.use_longest_on_failure is not None else config.get('validation_strategy', {}).get('use_longest_on_failure', False),
-        book_structure=book_structure
-    )
-    
-    # Process all files
-    summary = processor.process_all_files()
-    
-    # Check for errors
-    if summary.get("error"):
-        logger.error(f"Processing failed: {summary['error']}")
-        return 1
-    
-    # Return exit code based on success rate
-    return 0 if summary.get("success_rate", 0) == 1.0 else 1
 
 
 def batch_translate_command(args):
@@ -1078,123 +944,6 @@ def patch_paper_command(args):
         logger.info("You can now run 'pdf2epub ocr' to process the document as a single chapter")
 
     return 0 if success else 1
-
-
-def polish_batch_command(args):
-    """Handle the polish-batch subcommand (using Gemini Batch API)."""
-    from pdf2epub.processors.batch_polisher import BatchPolishProcessor
-    import json
-
-    # Load configuration
-    config = load_config(args.config)
-    book_title = config.get("title")
-
-    if not book_title:
-        logger.error("No title found in config.yaml")
-        return 1
-
-    # Configure file logging
-    configure_logging(book_title, "polish-batch")
-
-    logger.info(f"Starting batch polish for: {book_title}")
-    if args.content_type != "auto":
-        logger.info(f"Content type: {args.content_type}")
-
-    # Load book structure if available
-    output_dir = Path("output") / book_title
-    toc_tree_file = output_dir / "toc_tree.json"
-    structure_file = output_dir / "book_structure.json"
-    book_structure = None
-
-    if toc_tree_file.exists():
-        with open(toc_tree_file, 'r', encoding='utf-8') as f:
-            book_structure = json.load(f)
-        logger.info("Loaded book structure from toc_tree.json")
-    elif structure_file.exists():
-        with open(structure_file, 'r', encoding='utf-8') as f:
-            book_structure = json.load(f)
-        logger.info("Loaded book structure from book_structure.json")
-
-    # Get batch config
-    batch_config = config.get('batch', {})
-    max_retries = args.max_retries or batch_config.get('max_retries', 1)
-    poll_interval = args.poll_interval or batch_config.get('poll_interval', 60)
-
-    # Handle --cancel flag: cancel active job and clear job reference
-    if getattr(args, 'cancel', False):
-        polished_markdown_dir = output_dir / "polished_markdown"
-        state_file = polished_markdown_dir / "batch_state.json"
-
-        if state_file.exists():
-            with open(state_file, 'r', encoding='utf-8') as f:
-                state = json.load(f)
-
-            active_job = state.get('active_job_name')
-            if active_job:
-                logger.info(f"Cancelling active batch job: {active_job}")
-                try:
-                    from google import genai
-                    credentials = config.get('credentials', {}).get('providers', {})
-                    batch_provider = batch_config.get('provider', 'gemini')
-                    provider_config = credentials.get(batch_provider, {})
-                    api_key = provider_config.get('api_key')
-                    base_url = provider_config.get('base_url')
-
-                    client = genai.Client(api_key=api_key, http_options={'base_url': base_url})
-                    client.batches.cancel(name=active_job)
-                    logger.info(f"Cancelled job: {active_job}")
-                except Exception as e:
-                    logger.warning(f"Failed to cancel job (may already be done): {e}")
-
-                # Clear job reference in state
-                state['active_job_name'] = None
-                state['active_job_requests'] = []
-                with open(state_file, 'w', encoding='utf-8') as f:
-                    json.dump(state, f, ensure_ascii=False, indent=2)
-                logger.info("Cleared job reference")
-        else:
-            logger.info("No active batch state found")
-
-    try:
-        # Initialize processor
-        processor = BatchPolishProcessor(
-            config=config,
-            book_title=book_title,
-            book_structure=book_structure,
-            content_type=args.content_type,
-            max_retries=max_retries,
-            poll_interval=poll_interval,
-            resume=args.resume
-        )
-
-        # Process all files
-        summary = processor.process_all()
-
-        # Check results
-        if summary.get("status") == "interrupted":
-            logger.warning(f"Processing interrupted. Job: {summary.get('job_name')}")
-            logger.info("Run with --resume to continue")
-            return 1
-
-        if summary.get("status") == "failed":
-            logger.error(f"Batch processing failed: {summary.get('error')}")
-            return 1
-
-        # Log summary
-        if summary.get("success_rate", 0) == 1.0:
-            logger.success("Batch polish completed successfully!")
-        else:
-            logger.warning(
-                f"Batch polish completed with {summary.get('failed', 0)} failures"
-            )
-
-        return 0 if summary.get("success_rate", 0) == 1.0 else 1
-
-    except Exception as e:
-        logger.error(f"Batch polish failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
 
 
 def main():
@@ -1389,42 +1138,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Don't use longest response on failure (overrides config.yaml)"
     )
     polish_parser.set_defaults(func=polish_command)
-
-    # Polish Batch subcommand (using Gemini Batch API)
-    polish_batch_parser = subparsers.add_parser(
-        "polish-batch",
-        help="Polish OCR-extracted markdown using Gemini Batch API (50%% cost reduction)",
-        description="Clean up and format OCR-extracted markdown using asynchronous batch processing"
-    )
-    polish_batch_parser.add_argument(
-        "--content-type",
-        choices=["academic", "japanese", "general", "auto"],
-        default="auto",
-        help="Type of content to polish (default: auto-detect)"
-    )
-    polish_batch_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from previous progress (including active batch jobs)"
-    )
-    polish_batch_parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=None,
-        help="Maximum retries for validation failures (default: from config or 3)"
-    )
-    polish_batch_parser.add_argument(
-        "--poll-interval",
-        type=int,
-        default=None,
-        help="Seconds between job status polls (default: from config or 60)"
-    )
-    polish_batch_parser.add_argument(
-        "--cancel",
-        action="store_true",
-        help="Cancel any active batch job and clear state before starting fresh"
-    )
-    polish_batch_parser.set_defaults(func=polish_batch_command)
 
     # Translate subcommand
     translate_parser = subparsers.add_parser(

@@ -72,9 +72,19 @@ class EpubConfig:
 
         if self.markdown_dir is None:
             if self.use_translated:
-                self.markdown_dir = self.input_dir / "translated"
+                # V2 architecture uses validated/ subdirectory
+                validated_dir = self.input_dir / "translated" / "validated"
+                if validated_dir.exists():
+                    self.markdown_dir = validated_dir
+                else:
+                    self.markdown_dir = self.input_dir / "translated"
             else:
-                self.markdown_dir = self.input_dir / "polished_markdown"
+                # V2 architecture uses validated/ subdirectory
+                validated_dir = self.input_dir / "polished_markdown" / "validated"
+                if validated_dir.exists():
+                    self.markdown_dir = validated_dir
+                else:
+                    self.markdown_dir = self.input_dir / "polished_markdown"
 
         if self.images_dir is None:
             self.images_dir = self.input_dir / "images"

@@ -157,13 +157,25 @@ class SplitManager:
         )
 
         # Build part infos
+        # Note: splitters may modify whitespace (e.g., '\n\n\n' -> '\n\n'),
+        # so we find part boundaries in original content by matching endings
         part_infos = []
         char_pos = 0
         for i, part in enumerate(parts, 1):
+            # Find start by matching beginning of stripped part
             part_start = content.find(part.strip()[:100], char_pos)
             if part_start == -1:
                 part_start = char_pos
-            part_end = part_start + len(part)
+
+            # Find end by matching ending of stripped part in original content
+            # This handles cases where splitter changed whitespace
+            part_end_text = part.strip()[-100:] if len(part.strip()) >= 100 else part.strip()
+            part_end_pos = content.find(part_end_text, part_start)
+            if part_end_pos != -1:
+                part_end = part_end_pos + len(part_end_text)
+            else:
+                # Fallback: use len(part) but this may be inaccurate
+                part_end = part_start + len(part)
 
             part_infos.append(PartInfo(
                 index=i,

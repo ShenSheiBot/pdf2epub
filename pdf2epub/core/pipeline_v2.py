@@ -16,7 +16,7 @@ import time
 from .types import SplitType, is_sub_key, filter_sub_keys
 from .executor import (
     WorkUnit, ExecutionResult, ChainEntry,
-    Executor,
+    Executor, DiskFirstSaver,
     QuotaConfig, chain_from_model_configs,
 )
 from .hooks import (
@@ -25,6 +25,7 @@ from .hooks import (
 )
 from .persistence import ResultPersistence
 from .tracking import ProcessingTracker
+from .promoter import Promoter
 
 if TYPE_CHECKING:
     from ._protocol import ProcessContext, ProcessorProtocol, BatchValidator
@@ -70,6 +71,7 @@ class ProcessingPipelineV2:
         content_splitter: Optional["ContentSplitter"] = None,
         context_injector: Optional["ContextInjector"] = None,
         book_structure: Optional["BookStructure"] = None,
+        promoter: Optional[Promoter] = None,
         # Configuration
         model_chain: Optional[List[ChainEntry]] = None,
         quota_config: Optional[QuotaConfig] = None,
@@ -118,6 +120,12 @@ class ProcessingPipelineV2:
         self._batch_retry_threshold = batch_retry_threshold
         self._output_dir = output_dir
 
+        # Create promoter if not provided
+        self._promoter = promoter or Promoter(persistence)
+
+        # Create saver for executor (disk-first architecture)
+        saver = DiskFirstSaver(persistence, tracker)
+
         # Create executor if not provided
         if executor:
             self._executor = executor
@@ -139,13 +147,12 @@ class ProcessingPipelineV2:
                 quota_config=quota_config,
                 max_workers=max_workers,
                 context_injector=context_injector,
-                tracker=tracker,
+                saver=saver,  # Disk-first saver (replaces persistence + tracker)
                 splitter=content_splitter,  # For dynamic splitting on failure
                 split_max_tokens=split_max_tokens,
                 batch_poll_interval=batch_poll_interval,
                 online_fallback_threshold=batch_retry_threshold,
                 model_output_limits=model_output_limits,  # P0-1: per-model token limits
-                persistence=persistence,  # Realtime save on completion
                 batch_state_dir=output_dir,  # For batch state persistence (resume)
             )
 
@@ -193,17 +200,12 @@ class ProcessingPipelineV2:
         logger.info(f"Processing {len(pending_units)}/{len(units)} units")
 
         # Step 3: Execute via Executor
+        # Executor handles all disk writes via DiskFirstSaver (including .sub units)
         exec_result = self._executor.execute(pending_units, context_base, resume_batch=resume)
 
-        # Step 4: Save .sub results to raw/ (Executor already saved non-.sub in realtime)
-        # Executor skips .sub for crash safety reasons, so Pipeline handles them here
-        for key, content in exec_result.results.items():
-            if is_sub_key(key):
-                self._persistence.save_raw(key, content)
-
-        # Step 5: Filter out .sub virtual units from processing
+        # Step 4: Filter out .sub virtual units from processing
         # .sub units are Executor's runtime splits - they should:
-        # - Remain in raw/ (already saved above, good for debugging)
+        # - Remain in raw/ (Executor saved them for debugging)
         # - NOT be promoted to validated/
         # - NOT be tracked as completed/failed units
         # - NOT inflate statistics
@@ -215,7 +217,7 @@ class ProcessingPipelineV2:
         if sub_keys:
             logger.debug(f"Filtering {len(sub_keys)} .sub virtual units from processing")
 
-        # Step 6: Batch validation (if configured)
+        # Step 5: Batch validation (if configured)
         # Only validate real units, not .sub children
         # Pass screener_passed as skip_keys - these already passed individual screeners
         batch_failed: Set[str] = set()
@@ -227,12 +229,13 @@ class ProcessingPipelineV2:
                 screener_passed=exec_result.screener_passed
             )
 
-        # Step 7: Determine final failures (only real units)
+        # Step 6: Determine final failures (only real units)
         # Note: longest-fallback is handled by Executor (per design v2)
         real_failed = filter_sub_keys(exec_result.failed)  # Filter .sub from executor failures
         all_failed = real_failed | batch_failed
 
-        # Step 8: Promote successful to validated (only real units)
+        # Step 7: Promote successful to validated (only real units)
+        # Use Promoter (not direct persistence access)
         # Separate fallback results from normal results for proper warning handling
         successful = real_result_keys - all_failed
         fallback_keys = exec_result.fallback_used & successful  # Only successful fallbacks
@@ -241,18 +244,18 @@ class ProcessingPipelineV2:
         # Save fallback results with warning header (for audit/traceability)
         for key in fallback_keys:
             content = exec_result.results[key]
-            self._persistence.save_with_warning(
+            self._promoter.save_with_warning(
                 key, content,
                 warning="LONGEST_FALLBACK: validation failed after max retries"
             )
             self._mark_complete(key, content=content, fallback=True)
 
-        # Promote normal successful results
+        # Promote normal successful results via Promoter
         # Note: Don't call _mark_complete here - Executor already recorded the attempt
         if normal_keys:
-            self._persistence.promote_batch(list(normal_keys))
+            self._promoter.promote_batch(list(normal_keys))
 
-        # Step 9: Mark failures via attempt record (only real units)
+        # Step 8: Mark failures via attempt record (only real units)
         from .tracking import AttemptRecord
         for key in all_failed:
             attempt = AttemptRecord(
@@ -402,9 +405,8 @@ class ProcessingPipelineV2:
                 ):
                     skip_keys.add(key)
 
-        # Log skip info
-        if skip_keys:
-            logger.info(f"Batch validation: skipping {len(skip_keys)} keys (screener passed or chapter_type skip)")
+        # Log skip info (always log for debugging)
+        logger.info(f"Batch validation: skip_keys={len(skip_keys)} (screener_passed={len(screener_passed or set())}, results={len(results)})")
 
         # Create verification files (only for keys NOT in skip_keys)
         files = {}
@@ -440,7 +442,11 @@ class ProcessingPipelineV2:
                     })
 
             except Exception as e:
+                # CONSERVATIVE STRATEGY: Mark all units as failed on validator error
+                # This ensures we don't promote potentially invalid results
                 logger.error(f"Batch validator {validator.name} error: {e}")
+                logger.warning(f"Marking {len(files)} units as validation failed (conservative)")
+                failed.update(files.keys())
 
         return failed
 

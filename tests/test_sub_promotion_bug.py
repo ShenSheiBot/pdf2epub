@@ -13,7 +13,7 @@ Pipeline handles this correctly at pipeline_v2.py:202-210.
 
 import pytest
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple, Any, Optional
 from unittest.mock import MagicMock
 from dataclasses import dataclass, field
 import tempfile
@@ -87,6 +87,18 @@ class FakePersistence:
     def save_raw(self, key: str, content: str):
         self.saved_raw[key] = content
 
+    def get_raw(self, key: str) -> Optional[str]:
+        """Get raw content (for disk-first aggregation)."""
+        return self.saved_raw.get(key)
+
+    def has_raw(self, key: str) -> bool:
+        """Check if raw file exists."""
+        return key in self.saved_raw
+
+    def has_validated(self, key: str) -> bool:
+        """Check if validated file exists."""
+        return key in self.saved_validated
+
     def save_with_warning(self, key: str, content: str, warning: str = ""):
         self.saved_validated[key] = content
         self.warning_keys.add(key)
@@ -96,6 +108,12 @@ class FakePersistence:
             self.promoted_keys.add(key)
             if key in self.saved_raw:
                 self.saved_validated[key] = self.saved_raw[key]
+
+    def promote_to_validated(self, key: str):
+        """Promote single key to validated."""
+        self.promoted_keys.add(key)
+        if key in self.saved_raw:
+            self.saved_validated[key] = self.saved_raw[key]
 
 
 # ============================================================

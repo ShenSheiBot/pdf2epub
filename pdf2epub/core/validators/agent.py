@@ -228,42 +228,69 @@ class AgentVerifier:
         """Get system prompt (to be overridden by subclasses)."""
         raise NotImplementedError("Subclasses must implement _get_system_prompt")
 
-    async def verify_async(self, file_keys: List[str]) -> List[VerificationResult]:
+    async def verify_async(self, file_keys: List[str], batch_size: int = 15) -> List[VerificationResult]:
         """
-        Verify files asynchronously.
+        Verify files asynchronously in batches to avoid context overflow.
 
         Args:
             file_keys: List of file keys to verify
+            batch_size: Max files per agent call (default 15 to stay within context limits)
 
         Returns:
             List of VerificationResult
         """
-        import json
+        all_results = []
+        total_batches = (len(file_keys) + batch_size - 1) // batch_size
 
-        state = VerificationState(
-            files_to_verify=file_keys,
-            task_type=self.task_type
-        )
+        # Process in batches to avoid context overflow
+        for batch_idx, i in enumerate(range(0, len(file_keys), batch_size)):
+            batch_keys = file_keys[i:i + batch_size]
+            logger.info(f"Verifying batch {batch_idx + 1}/{total_batches}: {len(batch_keys)} files")
 
-        result = await self.agent.run(
-            f"Verify the following {len(file_keys)} files: {', '.join(file_keys)}",
-            deps=state
-        )
+            state = VerificationState(
+                files_to_verify=batch_keys,
+                task_type=self.task_type
+            )
 
-        # With output_type specified, output contains the structured data
-        return result.output
+            try:
+                result = await self.agent.run(
+                    f"Verify the following {len(batch_keys)} files: {', '.join(batch_keys)}. "
+                    f"Be concise - only use tools when necessary, summarize findings briefly.",
+                    deps=state
+                )
+                all_results.extend(result.output)
+            except Exception as e:
+                # If batch fails (e.g., context overflow), try smaller batches
+                logger.warning(f"Batch {batch_idx + 1} failed: {e}, trying smaller batches")
+                if batch_size > 5:
+                    # Retry with smaller batch size
+                    sub_results = await self.verify_async(batch_keys, batch_size=batch_size // 2)
+                    all_results.extend(sub_results)
+                else:
+                    # Fail fast: mark as truncated so they get retried on --resume
+                    logger.error(f"Verification failed for batch, marking as truncated: {batch_keys}")
+                    for key in batch_keys:
+                        all_results.append(VerificationResult(
+                            file_key=key,
+                            status="truncated",
+                            reason=f"Verification agent error: {str(e)[:100]}",
+                            confidence="low"
+                        ))
 
-    def verify(self, file_keys: List[str]) -> List[VerificationResult]:
+        return all_results
+
+    def verify(self, file_keys: List[str], batch_size: int = 15) -> List[VerificationResult]:
         """
         Verify files (synchronous wrapper).
 
         Args:
             file_keys: List of file keys to verify
+            batch_size: Max files per agent call
 
         Returns:
             List of VerificationResult
         """
-        return asyncio.run(self.verify_async(file_keys))
+        return asyncio.run(self.verify_async(file_keys, batch_size))
 
 
 class PolishVerificationAgent(AgentVerifier):
@@ -445,7 +472,17 @@ class PolishBatchValidator:
     Batch validator for polish results.
 
     Implements BatchValidator protocol for use with new validation architecture.
+    Uses batched verification to avoid context overflow.
     """
+
+    def __init__(self, batch_size: int = 15):
+        """
+        Initialize validator.
+
+        Args:
+            batch_size: Max files per agent call (default 15)
+        """
+        self._batch_size = batch_size
 
     @property
     def name(self) -> str:
@@ -471,9 +508,9 @@ class PolishBatchValidator:
         verifier = PolishVerificationAgent(tools)
         file_keys = list(files.keys())
 
-        logger.info(f"PolishBatchValidator: Verifying {len(file_keys)} files")
+        logger.info(f"PolishBatchValidator: Verifying {len(file_keys)} files (batch_size={self._batch_size})")
 
-        results = verifier.verify(file_keys)
+        results = verifier.verify(file_keys, batch_size=self._batch_size)
 
         # Convert VerificationResult to CoreValidationResult
         return {
@@ -492,7 +529,17 @@ class TranslationBatchValidator:
     Batch validator for translation results.
 
     Implements BatchValidator protocol for use with new validation architecture.
+    Uses batched verification to avoid context overflow.
     """
+
+    def __init__(self, batch_size: int = 15):
+        """
+        Initialize validator.
+
+        Args:
+            batch_size: Max files per agent call (default 15)
+        """
+        self._batch_size = batch_size
 
     @property
     def name(self) -> str:
@@ -518,9 +565,9 @@ class TranslationBatchValidator:
         verifier = TranslationVerificationAgent(tools)
         file_keys = list(files.keys())
 
-        logger.info(f"TranslationBatchValidator: Verifying {len(file_keys)} files")
+        logger.info(f"TranslationBatchValidator: Verifying {len(file_keys)} files (batch_size={self._batch_size})")
 
-        results = verifier.verify(file_keys)
+        results = verifier.verify(file_keys, batch_size=self._batch_size)
 
         # Convert VerificationResult to CoreValidationResult
         return {

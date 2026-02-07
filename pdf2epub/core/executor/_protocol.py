@@ -98,6 +98,8 @@ class ProcessResult:
     skipped: bool = False
     skip_reason: str = ""
     context_ready: bool = False  # Whether result is ready for context injection
+    output_tokens: int = 0       # Token count for statistics
+    duration_seconds: float = 0.0  # LLM call duration
 
 
 # ============================================================

@@ -200,6 +200,10 @@ class CompositeHooks:
         if screeners_passed:
             accepted = True
 
+        # Debug: log only first few and when context_ready is False (unexpected)
+        if not context_ready and len(self._validators) > 0:
+            logger.debug(f"{key}: post_process finished with context_ready=False (validators={[v.name for v in self._validators]})")
+
         return (transformed, HookResult(accepted=accepted, context_ready=context_ready))
 
     def classify_error(self, error: Exception) -> Tuple[ErrorType, ErrorEffect]:

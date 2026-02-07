@@ -42,13 +42,13 @@ def _count_tokens(text: str) -> int:
 from ._protocol import WorkUnit, ChainEntry, ExecutionResult, ProcessResult
 from .state import UnitState, QuotaConfig, create_unit_state
 from .batch_state import PersistentBatchState, is_safety_error
+from .saver import DiskFirstSaver
 from ..hooks import CompositeHooks, ErrorType
 from ..types import is_sub_key
 
 if TYPE_CHECKING:
     from .._protocol import ProcessContext, ProcessorProtocol
     from ..context import ContextInjector
-    from ..tracking import ProcessingTracker
     from ...processors.utils.splitter_strategies import ContentSplitter
 
 
@@ -155,14 +155,13 @@ class Executor:
         quota_config: Optional[QuotaConfig] = None,
         max_workers: int = 4,
         context_injector: Optional["ContextInjector"] = None,
-        tracker: Optional["ProcessingTracker"] = None,
+        saver: Optional[DiskFirstSaver] = None,
         splitter: Optional["ContentSplitter"] = None,
         split_max_tokens: int = 4000,
         batch_poll_interval: int = 60,
         online_fallback_threshold: int = 5,
         network_circuit_breaker_threshold: int = 5,
         model_output_limits: Optional[Dict[str, int]] = None,
-        persistence: Optional[Any] = None,  # For realtime saving
         batch_state_dir: Optional[Path] = None,  # For batch state persistence
     ):
         """
@@ -177,7 +176,7 @@ class Executor:
             quota_config: Quota configuration (default: QuotaConfig())
             max_workers: Maximum concurrent online workers
             context_injector: Optional context injector for sequential mode
-            tracker: Optional tracker for recording progress
+            saver: DiskFirstSaver for persistence (disk-first architecture)
             splitter: Optional content splitter for dynamic splitting
             split_max_tokens: Default max tokens per split part
             batch_poll_interval: Seconds between batch status polls
@@ -194,14 +193,13 @@ class Executor:
         self._quota_config = quota_config or QuotaConfig()
         self._max_workers = max_workers
         self._context_injector = context_injector
-        self._tracker = tracker
+        self._saver = saver  # DiskFirstSaver: ONLY persistence interface
         self._splitter = splitter
         self._split_max_tokens = split_max_tokens
         self._batch_poll_interval = batch_poll_interval
         self._online_fallback_threshold = online_fallback_threshold
         self._network_circuit_breaker_threshold = network_circuit_breaker_threshold
         self._model_output_limits = model_output_limits or {}
-        self._persistence = persistence  # For realtime saving on completion
 
         # Batch state persistence
         self._batch_state_dir = batch_state_dir
@@ -418,6 +416,7 @@ class Executor:
                 results.update(batch_result.results)
                 completed.update(batch_result.completed)
                 skipped.update(batch_result.skipped)
+                screener_passed.update(batch_result.screener_passed)
                 # Use actual attempts from batch result (excludes pre_process skipped units)
                 total_attempts += batch_result.total_attempts
                 successful_attempts += batch_result.successful_attempts
@@ -679,23 +678,42 @@ class Executor:
 
                     # Aggregation unit: aggregate children directly, no LLM call
                     if state.is_aggregation:
-                        # All children must be in completed (checked by _get_ready_ids)
+                        # All children must be completed (checked by _get_ready_ids)
+                        # DISK-FIRST: Read child results from disk, not memory
                         child_results = []
+                        aggregation_failed = False
                         for child_id in sorted(state.children):
-                            if child_id in results:
-                                child_results.append(results[child_id])
+                            # Try disk first (truth source), fallback to memory
+                            content = None
+                            if self._saver:
+                                content = self._saver.load(child_id)
+                            if content is None and child_id in results:
+                                content = results[child_id]
+
+                            if content is not None:
+                                child_results.append(content)
                             else:
-                                # Child failed - aggregation fails
+                                # Child not found - aggregation fails
+                                logger.warning(f"{unit_id}: Child {child_id} not found on disk or in memory")
                                 failed.add(unit_id)
+                                aggregation_failed = True
                                 break
-                        else:
-                            # All children succeeded
+
+                        if not aggregation_failed:
+                            # All children succeeded - aggregate
                             aggregated = "\n\n".join(child_results)
                             results[unit_id] = aggregated
                             completed.add(unit_id)
+
+                            # Save aggregated result via saver
+                            if self._saver:
+                                current_entry = state.get_current_entry() or self._model_chain[0] if self._model_chain else None
+                                model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "aggregation"
+                                with self._saver.attempt(unit_id, model_str) as attempt:
+                                    attempt.success(aggregated, output_tokens=_count_tokens(aggregated))
+
                             logger.info(f"{unit_id}: Aggregated {len(state.children)} children")
-                            # Remove .sub children from completed (for stats), but keep in results
-                            # so Pipeline can save them to raw/ for debugging (per types.py:64)
+                            # Remove .sub children from completed set (for stats)
                             for child_id in state.children:
                                 completed.discard(child_id)
                         continue
@@ -765,11 +783,21 @@ class Executor:
                         result = future.result()
                         total_attempts += 1  # Count every LLM attempt
 
+                        # Get model string for attempt recording
+                        current_entry = state.get_current_entry()
+                        model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "unknown"
+
                         if result.skipped:
                             skipped.add(unit_id)
                             if result.content is not None:
                                 results[unit_id] = result.content
                             completed.add(unit_id)
+
+                            # Record skip via saver (disk-first)
+                            if self._saver:
+                                with self._saver.attempt(unit_id, model_str) as attempt:
+                                    attempt.skip(result.skip_reason or "pre-process filter", result.content)
+
                             logger.debug(f"{unit_id}: Skipped - {result.skip_reason}")
 
                         elif result.success:
@@ -777,14 +805,16 @@ class Executor:
                             results[unit_id] = result.content
                             completed.add(unit_id)
 
-                            # REALTIME SAVE: Save file BEFORE updating tracker
-                            # This ensures atomicity: if interrupted after save,
-                            # tracker will be updated on next run
-                            if self._persistence and not is_sub_key(unit_id):
-                                try:
-                                    self._persistence.save_raw(unit_id, result.content)
-                                except Exception as e:
-                                    logger.warning(f"{unit_id}: Failed to save raw: {e}")
+                            # Record success via saver (disk-first)
+                            # Saver writes file THEN records to tracker
+                            if self._saver:
+                                with self._saver.attempt(unit_id, model_str) as attempt:
+                                    attempt.success(
+                                        result.content,
+                                        output_tokens=result.output_tokens,
+                                        duration_seconds=result.duration_seconds,
+                                        context_ready=result.context_ready,
+                                    )
 
                             # Track screener-passed (context_ready = passed individual screener)
                             if result.context_ready:
@@ -802,7 +832,7 @@ class Executor:
                             requeued, split_depth = self._handle_failure(
                                 unit_id, result, state, unit_states,
                                 pending, completed, failed, safety_blocked, validation_failed,
-                                results, fallback_used
+                                results, fallback_used, model_str
                             )
                             if requeued:
                                 total_requeued += 1
@@ -815,6 +845,14 @@ class Executor:
                         import traceback
                         logger.error(f"{unit_id}: Unexpected error: {e}")
                         logger.debug(f"{unit_id}: Traceback:\n{traceback.format_exc()}")
+
+                        # Record failure via saver
+                        if self._saver:
+                            current_entry = state.get_current_entry()
+                            model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "unknown"
+                            with self._saver.attempt(unit_id, model_str) as attempt:
+                                attempt.failure("unknown", str(e)[:500])
+
                         failed.add(unit_id)
 
         return ExecutionResult(
@@ -843,6 +881,9 @@ class Executor:
         """
         Process a single unit (runs in thread pool).
 
+        IMPORTANT: This method does NOT do any persistence!
+        All saving/tracking is handled by the caller via DiskFirstSaver.
+
         Args:
             unit: Unit to process
             state: Unit's state
@@ -850,10 +891,8 @@ class Executor:
             original: Original content
 
         Returns:
-            ProcessResult
+            ProcessResult with content/error and metadata (tokens, duration)
         """
-        from .._protocol import ProcessContext as PC
-
         # Pre-processing
         pre_result = self._hooks.pre_process(unit.id, unit.content, context)
         if not pre_result.should_process:
@@ -908,56 +947,26 @@ class Executor:
             else:
                 final = transformed
 
-            # Record attempt for longest fallback
+            # Record attempt for longest fallback (in-memory state)
             state.record_attempt(final)
 
-            # ATOMICITY FIX: Save file BEFORE recording to tracker
-            # This ensures that if we crash after save, tracker can be fixed on next run
-            # If we crash after tracker but before save, the file is lost permanently
-            save_succeeded = True
-            if hook_result.accepted and self._persistence and not is_sub_key(unit.id):
-                try:
-                    self._persistence.save_raw(unit.id, final)
-                except Exception as e:
-                    logger.warning(f"{unit.id}: Failed to save raw in _process_single: {e}")
-                    save_succeeded = False
-
-            # Only record to tracker if save succeeded (atomicity guarantee)
-            # Skip .sub virtual units - they should not be tracked
-            if self._tracker and not is_sub_key(unit.id):
-                from ..tracking import AttemptRecord
-                # Use rejection_reason if available (P1-6 fix)
-                # ATOMICITY: Only record "completed" if save succeeded
-                is_completed = hook_result.accepted and save_succeeded
-                error_msg = hook_result.rejection_reason if not hook_result.accepted else None
-                if not save_succeeded:
-                    error_msg = "File save failed"
-                attempt = AttemptRecord(
-                    timestamp=time.time(),
-                    status="completed" if is_completed else "failed",
-                    model=f"{entry.provider}/{entry.model}",
-                    error_type="validation" if not hook_result.accepted else ("io_error" if not save_succeeded else None),
-                    error_message=error_msg,
-                    output_tokens=output_tokens,
-                    duration_seconds=llm_duration,
-                )
-                self._tracker.record_attempt(unit.id, attempt)
-
-            if hook_result.accepted and save_succeeded:
+            # Return result - caller handles all persistence via saver
+            if hook_result.accepted:
                 return ProcessResult(
                     success=True,
                     content=final,
                     context_ready=hook_result.context_ready,
+                    output_tokens=output_tokens,
+                    duration_seconds=llm_duration,
                 )
             else:
-                # Include rejection reason or save failure in error for better debugging
-                if not save_succeeded:
-                    error_detail = "File save failed"
-                else:
-                    error_detail = hook_result.rejection_reason or "Validation failed"
+                # Validation failed
+                error_detail = hook_result.rejection_reason or "Validation failed"
                 return ProcessResult(
                     success=False,
                     error=Exception(error_detail),
+                    output_tokens=output_tokens,
+                    duration_seconds=llm_duration,
                 )
 
         except Exception as e:
@@ -979,6 +988,7 @@ class Executor:
         validation_failed: Set[str],
         results: Dict[str, str],
         fallback_used: Set[str],
+        model_str: str = "unknown",
     ) -> Tuple[bool, int]:
         """
         Handle a failed processing result.
@@ -1009,9 +1019,10 @@ class Executor:
             # Reset counter on non-network error (network is working)
             self._consecutive_network_failures = 0
 
-        # Get current entry before applying effect
+        # Get current entry before applying effect (use passed model_str if available)
         current_entry = state.get_current_entry()
-        model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "unknown"
+        if model_str == "unknown" and current_entry:
+            model_str = f"{current_entry.provider}/{current_entry.model}"
 
         # Apply effect to state
         state.apply_effect(effect, current_entry)
@@ -1022,17 +1033,10 @@ class Executor:
         elif error_type == ErrorType.VALIDATION:
             validation_failed.add(unit_id)
 
-        # Record to tracker with full error details (P0-2 fix)
-        if self._tracker and not is_sub_key(unit_id):
-            from ..tracking import AttemptRecord
-            attempt = AttemptRecord(
-                timestamp=time.time(),
-                status="failed",
-                model=model_str,
-                error_type=error_type.value,
-                error_message=error_msg,
-            )
-            self._tracker.record_attempt(unit_id, attempt)
+        # Record failure via saver (disk-first)
+        if self._saver:
+            with self._saver.attempt(unit_id, model_str) as attempt:
+                attempt.failure(error_type.value, error_msg)
 
         # Check if can retry (use effect.quota_type, not error_type!)
         if state.can_retry(effect.quota_type):
@@ -1213,6 +1217,7 @@ class Executor:
         results: Dict[str, str] = {}
         completed: Set[str] = set()
         failed: Set[str] = set()
+        screener_passed: Set[str] = set()  # Keys that passed individual screener (skip batch validation)
         skipped: Set[str] = set()
         validation_failed: Set[str] = set()
         safety_blocked: Set[str] = set()
@@ -1312,6 +1317,13 @@ class Executor:
                         if pre_result.fallback_result is not None:
                             results[unit.id] = pre_result.fallback_result
                             completed.add(unit.id)
+
+                        # Record skip via saver
+                        if self._saver:
+                            model_str = f"{batch_entry.provider}/{batch_entry.model}"
+                            with self._saver.attempt(unit.id, model_str) as attempt:
+                                attempt.skip(pre_result.skip_reason or "pre-process filter", pre_result.fallback_result)
+
                         continue
 
                     prompt = self._processor.build_prompt(unit.content, context)
@@ -1379,6 +1391,7 @@ class Executor:
                     error_msg = str(job_info.error) if job_info.error else "batch job failed"
                     error = Exception(error_msg)
                     error_type, effect = self._hooks.classify_error(error)
+                    model_str = f"{batch_entry.provider}/{batch_entry.model}"
 
                     # For job-level batch failures, we should advance the chain
                     # to try a different batch model on retry. Force remove_current_model=True.
@@ -1401,17 +1414,10 @@ class Executor:
                         if error_type == ErrorType.SAFETY:
                             safety_blocked.add(unit_id)
 
-                        # Record to tracker for persistent fallback
-                        if self._tracker and not is_sub_key(unit_id):
-                            from ..tracking import AttemptRecord
-                            attempt = AttemptRecord(
-                                timestamp=time.time(),
-                                status="failed",
-                                model=f"{batch_entry.provider}/{batch_entry.model}",
-                                error_type=error_type.value,
-                                error_message=error_msg[:200] if error_msg else None,
-                            )
-                            self._tracker.record_attempt(unit_id, attempt)
+                        # Record failure via saver
+                        if self._saver:
+                            with self._saver.attempt(unit_id, model_str) as attempt:
+                                attempt.failure(error_type.value, error_msg[:200] if error_msg else "Job failed")
 
                     failed.update(units_to_process.keys())
 
@@ -1434,9 +1440,11 @@ class Executor:
                     error_msg = str(job_info.error) if job_info.error else f"batch job {job_info.state.name}"
                     error = Exception(error_msg)
                     error_type, effect = self._hooks.classify_error(error)
+                    model_str = f"{batch_entry.provider}/{batch_entry.model}"
 
                     # For job-level batch failures, we should advance the chain
                     # to try a different batch model on retry. Force remove_current_model=True.
+                    from ..hooks import ErrorEffect
                     batch_fail_effect = ErrorEffect(
                         remove_current_model=True,  # Force advance to next model
                         remove_provider=effect.remove_provider,
@@ -1453,16 +1461,10 @@ class Executor:
                         if error_type == ErrorType.SAFETY:
                             safety_blocked.add(unit_id)
 
-                        if self._tracker and not is_sub_key(unit_id):
-                            from ..tracking import AttemptRecord
-                            attempt = AttemptRecord(
-                                timestamp=time.time(),
-                                status="failed",
-                                model=f"{batch_entry.provider}/{batch_entry.model}",
-                                error_type=error_type.value,
-                                error_message=error_msg[:200] if error_msg else None,
-                            )
-                            self._tracker.record_attempt(unit_id, attempt)
+                        # Record failure via saver
+                        if self._saver:
+                            with self._saver.attempt(unit_id, model_str) as attempt:
+                                attempt.failure(error_type.value, error_msg[:200] if error_msg else "Job cancelled")
 
                     failed.update(units_to_process.keys())
 
@@ -1496,6 +1498,8 @@ class Executor:
                     logger.warning(f"Batch response error for {resp.key}: {resp.error}")
 
             # Process each result
+            model_str = f"{batch_entry.provider}/{batch_entry.model}"
+
             for unit_id, unit in units_to_process.items():
                 state = unit_states.get(unit_id)
 
@@ -1512,17 +1516,10 @@ class Executor:
                     if error_type == ErrorType.SAFETY:
                         safety_blocked.add(unit_id)
 
-                    # Record to tracker
-                    if self._tracker and not is_sub_key(unit_id):
-                        from ..tracking import AttemptRecord
-                        attempt = AttemptRecord(
-                            timestamp=time.time(),
-                            status="failed",
-                            model=f"{batch_entry.provider}/{batch_entry.model}",
-                            error_type=error_type.value,
-                            error_message=error_msg[:200] if error_msg else None,
-                        )
-                        self._tracker.record_attempt(unit_id, attempt)
+                    # Record failure via saver
+                    if self._saver:
+                        with self._saver.attempt(unit_id, model_str) as attempt:
+                            attempt.failure(error_type.value, error_msg[:200] if error_msg else "Unknown")
 
                     failed.add(unit_id)
                     continue
@@ -1546,29 +1543,19 @@ class Executor:
                     results[unit_id] = final
                     completed.add(unit_id)
 
-                    # REALTIME SAVE: Save file immediately (same as online mode)
-                    if self._persistence and not is_sub_key(unit_id):
-                        try:
-                            self._persistence.save_raw(unit_id, final)
-                        except Exception as e:
-                            logger.warning(f"{unit_id}: Failed to save raw: {e}")
+                    # Track screener-passed (context_ready = passed individual screener)
+                    if hook_result.context_ready:
+                        screener_passed.add(unit_id)
 
-                    # Record successful attempt for longest fallback
+                    # Record successful attempt for longest fallback (in-memory)
                     if state:
                         state.record_attempt(final)
 
-                    # Record to tracker with token count
-                    if self._tracker and not is_sub_key(unit_id):
-                        from ..tracking import AttemptRecord
+                    # Record success via saver (disk-first)
+                    if self._saver:
                         output_tokens = _count_tokens(final)
-                        attempt = AttemptRecord(
-                            timestamp=time.time(),
-                            status="completed",
-                            model=f"{batch_entry.provider}/{batch_entry.model}",
-                            output_tokens=output_tokens,
-                            # Note: batch mode doesn't have per-unit duration
-                        )
-                        self._tracker.record_attempt(unit_id, attempt)
+                        with self._saver.attempt(unit_id, model_str) as attempt:
+                            attempt.success(final, output_tokens=output_tokens, context_ready=hook_result.context_ready)
                 else:
                     # Validation failed
                     # 1. Classify as validation error and get effect
@@ -1579,22 +1566,15 @@ class Executor:
                     if state:
                         state.apply_effect(effect, batch_entry)
 
-                    # 3. Record attempt for longest fallback
+                    # 3. Record attempt for longest fallback (in-memory)
                     if state:
                         state.record_attempt(transformed)
 
-                    # 4. Record to tracker with rejection reason (P1-6 fix)
-                    if self._tracker and not is_sub_key(unit_id):
-                        from ..tracking import AttemptRecord
+                    # 4. Record failure via saver
+                    if self._saver:
                         error_msg = hook_result.rejection_reason or "Validation rejected"
-                        attempt = AttemptRecord(
-                            timestamp=time.time(),
-                            status="failed",
-                            model=f"{batch_entry.provider}/{batch_entry.model}",
-                            error_type="validation",
-                            error_message=error_msg,
-                        )
-                        self._tracker.record_attempt(unit_id, attempt)
+                        with self._saver.attempt(unit_id, model_str) as attempt:
+                            attempt.failure("validation", error_msg)
 
                     validation_failed.add(unit_id)
 
@@ -1616,6 +1596,9 @@ class Executor:
         # (skipped units are marked as completed but don't count as batch attempts)
         actual_successes = len(completed - skipped)
 
+        # Debug: log screener_passed count for batch validation skip
+        logger.info(f"Batch processing complete: completed={len(completed)}, screener_passed={len(screener_passed)}")
+
         return ExecutionResult(
             results=results,
             completed=completed,
@@ -1623,6 +1606,7 @@ class Executor:
             skipped=skipped,
             safety_blocked=safety_blocked,
             validation_failed=validation_failed,
+            screener_passed=screener_passed,  # Pass to pipeline for batch validation skip
             total_attempts=actual_attempts,
             successful_attempts=actual_successes,
         )

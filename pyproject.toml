@@ -34,6 +34,8 @@ dependencies = [
     "mobi>=0.4.1",
     "pydantic-ai>=1.0.8",
     "sentence-transformers>=2.2.0",
+    "pikepdf>=10.3.0",
+    "rapidfuzz>=3.14.3",
 ]
 
 [project.scripts]

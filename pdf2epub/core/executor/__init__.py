@@ -33,6 +33,7 @@ from .state import (
 )
 
 from .executor import Executor, handle_split
+from .saver import DiskFirstSaver, AttemptContext
 
 __all__ = [
     # Protocol and types
@@ -51,4 +52,7 @@ __all__ = [
     # Executor
     'Executor',
     'handle_split',
+    # Saver (disk-first persistence)
+    'DiskFirstSaver',
+    'AttemptContext',
 ]

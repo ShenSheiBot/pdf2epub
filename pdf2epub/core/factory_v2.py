@@ -20,7 +20,7 @@ from .hooks import (
     # Transformers
     RestoreImagesTransformer, RemoveArtifactsTransformer, StripTransformer,
     # Validators
-    LengthRatioValidator, TruncationValidator, CompositeTruncationValidator,
+    TruncationValidator, CompositeTruncationValidator,
     # Skip validators
     ChapterTypeSkipper, ShortContentSkipper,
     # Error classifiers
@@ -32,8 +32,9 @@ from .persistence import ResultPersistence
 from .tracking import ProcessingTracker
 from .context import ContextInjector
 from .book_structure import BookStructure
+from .promoter import Promoter
 from ..processors.utils.split_manager import SplitManager
-from ..processors.utils.splitter_strategies import SimpleSplitter
+from ..processors.utils.splitter_strategies import MarkdownStructureSplitter
 from .validators import (
     TranslationBatchValidator,
     PolishBatchValidator,
@@ -224,15 +225,7 @@ def create_hooks_from_config(
     # Validators
     validators = []
 
-    # Length ratio validator (configurable thresholds)
-    validators.append(LengthRatioValidator(
-        min_ratio=hooks_config['length_ratio']['min_ratio'],
-        max_ratio=hooks_config['length_ratio']['max_ratio'],
-        role="screener",
-        context_ready=True,
-    ))
-
-    # Truncation validator - only for same-language tasks (polish)
+    # Truncation validator (N-gram based) - the only meaningful content validator
     # For translation, length ratios vary too much
     if task_type != "translate":
         if llm_client and truncation_config['enable_llm_fallback']:
@@ -452,17 +445,8 @@ def create_default_hooks(
     if restore_images:
         transformers.insert(0, RestoreImagesTransformer())
 
-    # Validators
-    validators = [
-        LengthRatioValidator(
-            min_ratio=length_min_ratio,
-            max_ratio=length_max_ratio,
-            role="screener",
-            context_ready=True,
-        ),
-    ]
-
-    # Add truncation for polish
+    # Validators - only truncation (N-gram) is meaningful
+    validators = []
     if task_type != "translate":
         validators.append(TruncationValidator(
             min_unique_preserved_ratio=truncation_min_ratio,
@@ -609,8 +593,12 @@ def create_processing_pipeline_v2(
         processor_name = processor.__class__.__name__
 
     def file_checker(key: str) -> bool:
-        """Check if output file exists (raw or validated)."""
-        return persistence.has_raw(key) or persistence.has_validated(key)
+        """Check if output file exists in validated/ (complete state).
+
+        DISK-FIRST ARCHITECTURE: Only validated files count as complete.
+        Raw files are intermediate state - they need promotion.
+        """
+        return persistence.has_validated(key)
 
     tracker = ProcessingTracker(tracker_path, processor_name, file_checker=file_checker)
 
@@ -681,7 +669,8 @@ def create_processing_pipeline_v2(
     )
 
     # Create content splitter for dynamic splitting in Executor
-    content_splitter = SimpleSplitter()
+    # Use MarkdownStructureSplitter to split at headings when possible
+    content_splitter = MarkdownStructureSplitter()
 
     # Create batch validators
     batch_validators = []
@@ -693,6 +682,9 @@ def create_processing_pipeline_v2(
 
     # Get executor config
     executor_cfg = get_executor_config(config)
+
+    # Create promoter for pipeline (disk-first architecture)
+    promoter = Promoter(persistence)
 
     # Create pipeline
     # Note: longest_fallback is handled by Executor, not Pipeline (per design v2)
@@ -708,6 +700,7 @@ def create_processing_pipeline_v2(
         content_splitter=content_splitter,
         context_injector=context_injector,
         book_structure=book_structure,
+        promoter=promoter,  # Disk-first: pipeline uses promoter for validated/
         model_chain=model_chain,
         quota_config=quota_config,
         max_workers=max_workers,

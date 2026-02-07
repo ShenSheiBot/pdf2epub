@@ -20,7 +20,7 @@ from .hooks import (
     # Transformers
     RestoreImagesTransformer, RemoveArtifactsTransformer, StripTransformer,
     # Validators
-    TruncationValidator, CompositeTruncationValidator,
+    TruncationValidator, CompositeTruncationValidator, LineCountValidator,
     # Skip validators
     ChapterTypeSkipper, ShortContentSkipper,
     # Error classifiers
@@ -100,7 +100,7 @@ def get_truncation_config(config: Dict[str, Any], task_type: str) -> Dict[str, A
             v2_config.get('truncation_check_lines') or
             task_config.get('truncation_check_lines', 5)
         ),
-        'enable_llm_fallback': v2_config.get('enable_llm_fallback', True),
+        'enable_llm_fallback': v2_config.get('enable_llm_fallback', False),  # Default False for batch efficiency
     }
 
 
@@ -133,11 +133,11 @@ def get_quota_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         'total': quotas.get('total', 5),
         'network': quotas.get('network', 3),
-        'validation': quotas.get('validation', 1),
-        'truncation': quotas.get('truncation', 2),
+        'validation': quotas.get('validation', 2), # 2 attempts (1 retry)
+        'truncation': quotas.get('truncation', 2), # 2 attempts (1 retry)
         'rate_limit': quotas.get('rate_limit', 3),
         'timeout': quotas.get('timeout', 3),
-        'content_filter': quotas.get('content_filter', 1),
+        'content_filter': quotas.get('content_filter', 2),
         'parse_error': quotas.get('parse_error', 2),
         'unknown': quotas.get('unknown', 2),
     }
@@ -225,9 +225,16 @@ def create_hooks_from_config(
     # Validators
     validators = []
 
-    # Truncation validator (N-gram based) - the only meaningful content validator
-    # For translation, length ratios vary too much
-    if task_type != "translate":
+    if task_type == "translate":
+        # For translation: use line count matching as screener
+        # N-gram doesn't work cross-language, but line counts should match
+        validators.append(LineCountValidator(
+            max_line_diff=3,
+            role="screener",
+            context_ready=True,
+        ))
+    else:
+        # For polish: use N-gram based truncation detection
         if llm_client and truncation_config['enable_llm_fallback']:
             # Use composite (N-gram + LLM fallback)
             validators.append(CompositeTruncationValidator(
@@ -338,11 +345,14 @@ def create_model_chain_from_config(
         model = model_config.get('model', 'gemini-2.0-flash')
         # Read mode from config, default to 'online'
         mode = model_config.get('mode', 'online')
+        # Read retries from config (None = use default: 1 for batch, 2 for online)
+        retries = model_config.get('retries', None)
 
         chain.append(ChainEntry(
             provider=provider,
             model=model,
             mode=mode,
+            retries=retries,
         ))
 
     return chain

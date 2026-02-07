@@ -51,6 +51,7 @@ from .validators import (
     NonEmptyValidator,
     TruncationValidator,
     CompositeTruncationValidator,
+    LineCountValidator,
 )
 
 from .skip_validators import (

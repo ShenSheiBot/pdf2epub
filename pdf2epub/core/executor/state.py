@@ -23,12 +23,13 @@ class QuotaConfig:
     Attributes:
         total: Maximum total retries across all error types
         per_type: Per-error-type quotas
+        per_entry: Default retry count per chain entry (applies to both batch and online)
     """
     total: int = 5
     per_type: Dict[ErrorType, int] = field(default_factory=lambda: {
         ErrorType.SAFETY: 999,        # Unlimited (just removes models)
         ErrorType.NETWORK: 3,
-        ErrorType.VALIDATION: 1,
+        ErrorType.VALIDATION: 2,      # 2 retries per entry before fallback
         ErrorType.TRUNCATION: 2,      # Truncation gets 2 retries (model switch)
         ErrorType.RATE_LIMIT: 3,
         ErrorType.TIMEOUT: 3,
@@ -36,6 +37,7 @@ class QuotaConfig:
         ErrorType.PARSE_ERROR: 2,
         ErrorType.UNKNOWN: 2,
     })
+    per_entry: int = 2  # Default retry count per chain entry
 
     def create_quotas(self) -> Dict[ErrorType, int]:
         """Create a copy of per-type quotas for a unit."""
@@ -48,13 +50,21 @@ class UnitState:
     Mutable state for a single unit.
 
     This state is modified during execution:
-    - chain shrinks as models fail
+    - chain shrinks as models fail (each entry has its own retry count)
     - quotas decrement on failures
     - attempts accumulate for longest fallback
+
+    Per-entry retry design:
+    - Each chain entry has retry_count (default from QuotaConfig.per_entry)
+    - On failure: current entry's count -1
+    - When count reaches 0: entry is removed, fallback to next
+    - This applies uniformly to batch and online entries
     """
     chain: List[ChainEntry]           # Available models (modified on failures)
     total_quota: int                  # Total retries remaining
     quotas: Dict[ErrorType, int]      # Per-type quotas
+    entry_retries: Dict[int, int] = field(default_factory=dict)  # Per-entry retry counts (index -> count)
+    default_entry_retries: int = 2  # Default retry count for new entries
 
     # Dependencies (unified dependency tree)
     depends_on: Set[str] = field(default_factory=set)  # Context injection deps
@@ -84,22 +94,50 @@ class UnitState:
         Apply error effect to state.
 
         This modifies:
-        - chain: removes models based on effect
+        - chain: removes models based on effect OR when per-entry retry exhausted
         - quotas: decrements appropriate quota
         - total_quota: decrements
+
+        Per-entry retry logic:
+        - Each failure decrements current entry's retry count
+        - When count reaches 0, entry is removed (regardless of remove_current_model flag)
+        - This provides uniform batch/online fallback behavior
         """
         with self._lock:
             if effect.remove_provider and current_entry:
                 # Safety block: remove all entries from same provider
                 self.chain = [e for e in self.chain if e.provider != current_entry.provider]
+                # Clear entry_retries since indices changed
+                self.entry_retries.clear()
             elif effect.remove_current_model and current_entry:
-                # Remove only current model
+                # Remove only current model immediately
                 if self.chain and self.chain[0] == current_entry:
                     self.chain.pop(0)
+                    # Shift indices in entry_retries
+                    self.entry_retries = {k-1: v for k, v in self.entry_retries.items() if k > 0}
+            else:
+                # Per-entry retry: decrement current entry's count
+                if self.chain:
+                    # Use entry's configured retries, or default (1 for batch, 2 for online)
+                    current_entry = self.chain[0]
+                    if current_entry.retries is not None:
+                        default_for_entry = current_entry.retries
+                    else:
+                        default_for_entry = 1 if current_entry.mode == "batch" else self.default_entry_retries
+                    current_retries = self.entry_retries.get(0, default_for_entry)
+                    current_retries -= 1
+                    if current_retries <= 0:
+                        # Entry exhausted, remove it
+                        self.chain.pop(0)
+                        # Shift indices
+                        self.entry_retries = {k-1: v for k, v in self.entry_retries.items() if k > 0}
+                    else:
+                        self.entry_retries[0] = current_retries
 
             if effect.remove_all_batch:
                 # Remove all batch entries
                 self.chain = [e for e in self.chain if e.mode != "batch"]
+                self.entry_retries.clear()
 
             # Decrement quotas
             if effect.quota_type in self.quotas:
@@ -186,6 +224,7 @@ def create_unit_state(
         chain=list(chain),  # Copy chain
         total_quota=quota_config.total,
         quotas=quota_config.create_quotas(),
+        default_entry_retries=quota_config.per_entry,
         depends_on=depends_on or set(),
         content=content,
         is_virtual=is_virtual,

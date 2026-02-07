@@ -229,6 +229,31 @@ class ProcessingPipelineV2:
                 screener_passed=exec_result.screener_passed
             )
 
+            # Step 5b: Retry batch validation failures via executor
+            # These units need to go back through executor's retry mechanism
+            if batch_failed:
+                logger.info(f"Batch validation failed for {len(batch_failed)} units, retrying via executor")
+                # Build retry units from originals
+                retry_units = [
+                    WorkUnit(id=key, file_key=key.rsplit('.part', 1)[0] if '.part' in key else key, content=originals[key])
+                    for key in batch_failed if key in originals
+                ]
+                if retry_units:
+                    # Execute retry - let executor decide batch/online based on chain state
+                    retry_result = self._executor.execute(retry_units, context_base, resume_batch=False)
+
+                    # Update results with retry outcomes
+                    for key in retry_result.completed:
+                        if key in retry_result.results:
+                            exec_result.results[key] = retry_result.results[key]
+                            batch_failed.discard(key)
+                            real_result_keys.add(key)
+
+                    # Merge stats
+                    exec_result.completed.update(retry_result.completed)
+                    exec_result.failed.update(retry_result.failed)
+                    exec_result.screener_passed.update(retry_result.screener_passed)
+
         # Step 6: Determine final failures (only real units)
         # Note: longest-fallback is handled by Executor (per design v2)
         real_failed = filter_sub_keys(exec_result.failed)  # Filter .sub from executor failures

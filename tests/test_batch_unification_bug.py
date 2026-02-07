@@ -296,8 +296,10 @@ class TestBatchNoQuotaDecrement:
 
         fake_llm = FakeLLMClient(default_response="online result")
 
-        # Very low quota - if decremented, retries would be limited
-        quota = QuotaConfig(total=1, per_type={ErrorType.NETWORK: 1})
+        # Quota of 2 allows: 1 for batch failure + 1 for online fallback
+        # If quota wasn't decremented by batch, this would still work
+        # (proving nothing). With quota=2 and proper decrement, both happen.
+        quota = QuotaConfig(total=2, per_type={ErrorType.NETWORK: 2})
 
         executor = create_executor(
             chain, accepting_hooks, fake_llm,

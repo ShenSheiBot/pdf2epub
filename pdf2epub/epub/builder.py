@@ -438,8 +438,8 @@ a { text-decoration: none; }
             opf = f"""<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="BookId">
     <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
-        <dc:title>{html.escape(self.config.book_title)}</dc:title>
-        <dc:creator opf:role="aut">{html.escape(self.config.author)}</dc:creator>
+        <dc:title>{html.escape(self.config.book_title or "Unknown")}</dc:title>
+        <dc:creator opf:role="aut">{html.escape(self.config.author or "Unknown")}</dc:creator>
         <dc:language>{self.config.language}</dc:language>
         <dc:identifier id="BookId" opf:scheme="UUID">{uid}</dc:identifier>
         <dc:date>{date}</dc:date>
@@ -463,6 +463,8 @@ a { text-decoration: none; }
             if all_html_files:
                 # Use provided list of HTML files (for proper ordering with multi-part chapters)
                 for html_file in all_html_files:
+                    if html_file is None:
+                        continue
                     item_id = html_file.replace(".html", "").replace(" ", "_").replace("-", "_")
                     opf += f"""        <item id="{item_id}" href="text/{html_file}" media-type="application/xhtml+xml"/>
 """
@@ -507,6 +509,8 @@ a { text-decoration: none; }
             if all_html_files:
                 # Use the exact order of HTML files (important for multi-part chapters)
                 for html_file in all_html_files:
+                    if html_file is None:
+                        continue
                     if html_file != "cover.html" and html_file != "toc.html":  # Already added
                         item_id = html_file.replace(".html", "").replace(" ", "_").replace("-", "_")
                         opf += f"""        <itemref idref="{item_id}"/>
@@ -538,7 +542,9 @@ a { text-decoration: none; }
             logger.success(f"Created content.opf: {output_path}")
             return True
         except Exception as e:
+            import traceback
             logger.error(f"Failed to create content.opf: {e}")
+            logger.error(traceback.format_exc())
             return False
     
     def _get_image_media_type(self, suffix: str) -> Optional[str]:

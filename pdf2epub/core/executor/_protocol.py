@@ -36,10 +36,17 @@ class ChainEntry:
 
     The chain contains both batch and online entries.
     Mode determines how the entry is executed.
+
+    Attributes:
+        provider: Provider name ("gemini", "deepseek", "anthropic")
+        model: Model name ("gemini-2.0-flash", "deepseek-chat")
+        mode: Execution mode ("batch" or "online")
+        retries: Number of retry chances (None = use default: 1 for batch, 2 for online)
     """
     provider: str                      # "gemini", "deepseek", "anthropic"
     model: str                         # "gemini-2.0-flash", "deepseek-chat"
     mode: Literal["batch", "online"]   # Execution mode
+    retries: Optional[int] = None      # Per-entry retry count (None = use default)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for LLM client."""

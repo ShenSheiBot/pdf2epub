@@ -124,7 +124,14 @@ def translate_v2_command(args):
 
     # Get configuration overrides from args
     max_workers = getattr(args, 'max_workers', None)
-    sequential_mode = not getattr(args, 'parallel', False)
+    # CLI --parallel overrides config; otherwise use config's processing_mode
+    if getattr(args, 'parallel', False):
+        sequential_mode = False
+    else:
+        # Check translation section first, then top-level
+        translation_config = config.get('translation', {})
+        processing_mode = translation_config.get('processing_mode', config.get('processing_mode', 'sequential'))
+        sequential_mode = processing_mode != 'parallel'
     skip_validation = getattr(args, 'skip_validation', False)
 
     # Create Pipeline V2 using config-based factory

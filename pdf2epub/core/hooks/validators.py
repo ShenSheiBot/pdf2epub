@@ -346,3 +346,85 @@ class CompositeTruncationValidator:
         except Exception as e:
             logger.warning(f"{key}: Composite truncation check error: {e}")
             return HookResult(accepted=True, context_ready=self._context_ready)
+
+
+class LineCountValidator:
+    """
+    Line count based truncation detection for translation.
+
+    Compares non-empty line counts between original and translated.
+    For translation, line counts should be approximately equal since
+    we translate line-by-line.
+
+    This is a fast screener that catches obvious truncation without
+    needing cross-language n-gram analysis.
+    """
+
+    def __init__(
+        self,
+        max_line_diff: int = 3,
+        role: Literal["screener", "final"] = "screener",
+        context_ready: bool = True
+    ):
+        """
+        Initialize line count validator.
+
+        Args:
+            max_line_diff: Maximum allowed difference in non-empty line counts
+            role: "screener" (OR logic) or "final" (AND logic)
+            context_ready: If True, passing means result can be used for context injection
+        """
+        self._max_line_diff = max_line_diff
+        self._role = role
+        self._context_ready = context_ready
+
+    @property
+    def name(self) -> str:
+        return "LineCountValidator"
+
+    @property
+    def role(self) -> str:
+        return self._role
+
+    def validate(self, key: str, original: str, result: str) -> HookResult:
+        """
+        Validate by comparing non-empty line counts.
+
+        Args:
+            key: Unit identifier
+            original: Original content
+            result: Translated content
+
+        Returns:
+            HookResult
+        """
+        # Filter empty lines
+        orig_lines = [l for l in original.split('\n') if l.strip()]
+        result_lines = [l for l in result.split('\n') if l.strip()]
+
+        orig_count = len(orig_lines)
+        result_count = len(result_lines)
+        diff = abs(orig_count - result_count)
+
+        is_valid = diff <= self._max_line_diff
+
+        if not is_valid:
+            logger.debug(
+                f"{key}: Line count mismatch: {orig_count} -> {result_count} (diff={diff})"
+            )
+
+        if self._role == "screener":
+            if is_valid:
+                return HookResult(accepted=True, context_ready=self._context_ready)
+            else:
+                # Screener: mismatch detected but continue to next validator
+                return HookResult(accepted=True, context_ready=False)
+        else:  # final
+            if is_valid:
+                return HookResult(accepted=True, context_ready=self._context_ready)
+            else:
+                return HookResult(
+                    accepted=False,
+                    context_ready=False,
+                    rejection_reason=f"Line count mismatch: {orig_count} -> {result_count} (diff={diff}, max={self._max_line_diff})"
+                )

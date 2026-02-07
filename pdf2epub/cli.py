@@ -819,6 +819,12 @@ def patch_paper_command(args):
     return 0 if success else 1
 
 
+def cancel_batch_command(args):
+    """Cancel active batch jobs."""
+    from .commands.cancel_batch import run
+    return run(args)
+
+
 def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
@@ -1224,6 +1230,24 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Don't preserve original TOC entries as metadata"
     )
     patch_parser.set_defaults(func=patch_paper_command)
+
+    # Cancel batch subcommand
+    cancel_batch_parser = subparsers.add_parser(
+        "cancel-batch",
+        help="Cancel active batch jobs",
+        description="Cancel all active batch jobs for the current project"
+    )
+    cancel_batch_parser.add_argument(
+        "-c", "--config",
+        default="config.yaml",
+        help="Path to config file (default: config.yaml)"
+    )
+    cancel_batch_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Cancel ALL batch jobs from API (not just from state files)"
+    )
+    cancel_batch_parser.set_defaults(func=cancel_batch_command)
 
     # Parse arguments
     args = parser.parse_args()

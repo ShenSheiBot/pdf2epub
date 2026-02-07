@@ -357,7 +357,7 @@ class DefaultErrorClassifier:
 
     NETWORK_KEYWORDS = [
         "connection error", "network error", "connection refused",
-        "503", "502", "504", "unavailable", "unreachable",
+        "503", "502", "504", "404", "not found", "unavailable", "unreachable",
         "ssl", "handshake", "reset by peer", "connection reset",
         "dns", "socket error",
     ]
@@ -371,6 +371,7 @@ class DefaultErrorClassifier:
         "validation failed", "too short", "too long",
         "missing", "empty response", "invalid format",
         "too large", "exceeded", "limit",  # Batch-specific: request shape issues
+        "line count", "mismatch",  # LineCountValidator
     ]
 
     TRUNCATION_KEYWORDS = [

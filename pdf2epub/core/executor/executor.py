@@ -1546,6 +1546,13 @@ class Executor:
                     results[unit_id] = final
                     completed.add(unit_id)
 
+                    # REALTIME SAVE: Save file immediately (same as online mode)
+                    if self._persistence and not is_sub_key(unit_id):
+                        try:
+                            self._persistence.save_raw(unit_id, final)
+                        except Exception as e:
+                            logger.warning(f"{unit_id}: Failed to save raw: {e}")
+
                     # Record successful attempt for longest fallback
                     if state:
                         state.record_attempt(final)

@@ -459,7 +459,7 @@ class GeminiBatchClient:
         for job in client.batches.list():
             jobs.append(BatchJobInfo(
                 name=job.name,
-                state=BatchJobState(job.state.name),
+                state=BatchJobState.from_api_state(job.state.name),
                 model=self.model
             ))
             if len(jobs) >= limit:

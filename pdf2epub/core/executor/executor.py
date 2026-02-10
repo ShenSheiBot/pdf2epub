@@ -771,8 +771,12 @@ class Executor:
             for uid, (unit, context) in units_to_process.items():
                 resp = response_map.get(uid)
 
-                if resp is None or resp.error:
-                    error_msg = str(resp.error) if resp and resp.error else "No response"
+                if resp is None or resp.error or resp.text is None:
+                    error_msg = str(resp.error) if resp and resp.error else "No response or empty text"
+                    # Log raw response for debugging when text is None but no error
+                    if resp and not resp.error and resp.text is None:
+                        raw = getattr(resp, 'raw_response', None)
+                        logger.debug(f"{uid}: Batch response has no text. Raw: {str(raw)[:500]}")
                     results.append((uid, ProcessResult(
                         success=False,
                         error=Exception(error_msg),

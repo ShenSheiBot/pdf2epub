@@ -354,6 +354,10 @@ class Executor:
                         if agg_result:
                             results[uid] = agg_result
                             completed.add(uid)
+                        else:
+                            # Child data lost (disk corruption during resume), mark as failed
+                            failed.add(uid)
+                            logger.error(f"{uid}: Aggregation failed - child data missing")
                         continue
 
                     # Check chain[0].mode

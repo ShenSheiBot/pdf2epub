@@ -605,8 +605,10 @@ Return JSON:
 
             pdf_data = self._prepare_pdf(pdf_path, include_pages=batch_pages)
             if pdf_data is None:
-                logger.warning(f"Failed to prepare batch {i+1}, skipping")
-                continue
+                raise RuntimeError(
+                    f"Failed to prepare batch {i+1} (pages {batch_start}-{batch_end}). "
+                    f"Cannot generate incomplete TOC structure."
+                )
 
             prompt = f"""
 Match this Table of Contents structure with the actual content in the PDF.
@@ -648,8 +650,10 @@ Only include chapters whose title heading appears in pages {batch_start}-{batch_
                     logger.warning(f"503 error in batch {i+1}, retrying with rasterization...")
                     pdf_data = self._prepare_pdf_rasterized(pdf_path, include_pages=batch_pages)
                     if pdf_data is None:
-                        logger.warning(f"Rasterization failed for batch {i+1}, skipping")
-                        continue
+                        raise RuntimeError(
+                            f"Rasterization failed for batch {i+1} (pages {batch_start}-{batch_end}). "
+                            f"Cannot generate incomplete TOC structure."
+                        )
                     parts = [prompt, Part.from_bytes(data=pdf_data, mime_type="application/pdf")]
                     response_text = self.structure_client.generate_content_stream(
                         model=self.structure_model,
@@ -1151,8 +1155,10 @@ Return JSON:
 
             pdf_data = self._prepare_pdf(pdf_path, include_pages=batch_pages)
             if pdf_data is None:
-                logger.warning(f"Failed to prepare batch {i+1}, skipping")
-                continue
+                raise RuntimeError(
+                    f"Failed to prepare batch {i+1} (pages {batch_start}-{batch_end}). "
+                    f"Cannot generate incomplete structure."
+                )
 
             # Build batch-specific prompt
             prompt = self._build_direct_analysis_prompt(
@@ -1176,8 +1182,10 @@ Return JSON:
                     logger.warning(f"503 error in batch {i+1}, retrying with rasterization...")
                     pdf_data = self._prepare_pdf_rasterized(pdf_path, include_pages=batch_pages)
                     if pdf_data is None:
-                        logger.warning(f"Rasterization failed for batch {i+1}, skipping")
-                        continue
+                        raise RuntimeError(
+                            f"Rasterization failed for batch {i+1} (pages {batch_start}-{batch_end}). "
+                            f"Cannot generate incomplete structure."
+                        )
                     parts = [prompt, Part.from_bytes(data=pdf_data, mime_type="application/pdf")]
                     response_text = self.structure_client.generate_content_stream(
                         model=self.structure_model,

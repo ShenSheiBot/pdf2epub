@@ -193,6 +193,17 @@ def add_page_number_patches(pdf_path, output_path=None):
         return Path(pdf_path)
 
 
+def _has_page_stamps(pdf_path) -> bool:
+    """Check if a processed PDF has 'PDF Page: X' stamps on the first page."""
+    try:
+        doc = fitz.open(pdf_path)
+        text = doc[0].get_text()
+        doc.close()
+        return 'PDF Page:' in text
+    except Exception:
+        return False
+
+
 def preprocess_pdf(input_pdf, output_dir):
     """
     Preprocess PDF: add page number patches and compress if necessary.
@@ -214,10 +225,13 @@ def preprocess_pdf(input_pdf, output_dir):
     processed_pdf = output_dir / "input.pdf"
     original_pdf = output_dir / "input_original.pdf"
 
-    # If already processed, just return the processed file
+    # If already processed, verify stamps are present before reusing
     if processed_pdf.exists() and original_pdf.exists():
-        logger.info("Using existing preprocessed PDF")
-        return processed_pdf
+        if _has_page_stamps(processed_pdf):
+            logger.info("Using existing preprocessed PDF (stamps verified)")
+            return processed_pdf
+        else:
+            logger.warning("Existing input.pdf missing page stamps, re-patching...")
 
     # First time processing - save the original
     if not original_pdf.exists():

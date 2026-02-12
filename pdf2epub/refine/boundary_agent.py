@@ -87,11 +87,16 @@ class Section(BaseModel):
     original_index: Optional[int] = None  # Index in original children, None if inserted
 
 
+# Hard cap on page adjustments to prevent catastrophic boundary moves
+MAX_ADJUSTMENT_PAGES = 10
+
+
 class ChapterState(BaseModel):
     """State for boundary verification of a chapter's sections."""
     sections: list[Section]
     pages_dir: str
     total_pages: int
+    insert_rejections: int = 0  # Consecutive insert_section rejections
 
 
 # Create the agent (lazy initialization)
@@ -135,7 +140,6 @@ Available tools:
 - adjust_start: Adjust a section's start page (automatically adjusts previous section's end)
 - set_split: Set a split point within a page (for when a section starts mid-page)
 - mark_verified: Mark a section as verified once you confirm the boundary is correct
-- remove_section: Remove a section that doesn't exist or should be merged
 - insert_section: Insert a new section when you find a gap with distinct content
 - check_issues: Check for gaps/overlaps/missing splits/possible mid-sentence cuts - call before saying "Done"
 
@@ -148,7 +152,7 @@ Process:
 6. If you find gaps between sections, read those pages and either:
    - Extend an adjacent section to cover the gap, OR
    - Insert a new section if there's a distinct chapter/heading
-7. If a section doesn't exist (OCR error), use remove_section
+7. If a section seems wrong, verify it by reading the page — it may just have a variant title
 
 IMPORTANT: When a section title appears mid-page (not line 1), you MUST call set_split before mark_verified. Otherwise the content before the title will be lost!
 
@@ -203,6 +207,22 @@ If issues remain, fix them or confirm they are intentional before finishing.
 
             section = sections[section_index]
             old_start = section.start_page
+
+            # Hard cap: reject adjustments larger than ±10 pages
+
+            delta = abs(new_start_page - old_start)
+            if delta > MAX_ADJUSTMENT_PAGES:
+                logger.warning(
+                    f"Rejected adjustment for '{section.title}': "
+                    f"p{old_start} -> p{new_start_page} (delta={delta})"
+                )
+                return (
+                    f"Error: Adjustment of {delta} pages is too large "
+                    f"(max ±{MAX_ADJUSTMENT_PAGES}). "
+                    f"Original: p{old_start}, proposed: p{new_start_page}. "
+                    f"Keep original start page if uncertain."
+                )
+
             section.start_page = new_start_page
             section.start_line = None  # Clear any split
             section.verified = False   # Need to re-verify
@@ -241,6 +261,21 @@ If issues remain, fix them or confirm they are intentional before finishing.
             section = sections[section_index]
             prev_section = sections[section_index - 1]
 
+            # Hard cap: reject splits too far from section's current start page
+
+            delta = abs(page_num - section.start_page)
+            if delta > MAX_ADJUSTMENT_PAGES:
+                logger.warning(
+                    f"Rejected split for '{section.title}': "
+                    f"page {page_num} vs current start p{section.start_page} (delta={delta})"
+                )
+                return (
+                    f"Error: Split page {page_num} is too far from section's current "
+                    f"start page {section.start_page} (delta={delta} pages, "
+                    f"max ±{MAX_ADJUSTMENT_PAGES}). "
+                    f"Use adjust_start first if the section start needs correction."
+                )
+
             # Set this section's start
             section.start_page = page_num
             section.start_line = line_num
@@ -275,45 +310,6 @@ If issues remain, fix them or confirm they are intentional before finishing.
             return _format_sections(sections)
 
         @_agent.tool
-        def remove_section(ctx: RunContext[ChapterState], section_index: int) -> str:
-            """Remove a section from the list.
-
-            Use when:
-            - A section doesn't actually exist (OCR/TOC error)
-            - A section should be merged with adjacent ones
-
-            The previous section's end_page is extended to cover the removed section's range.
-
-            Args:
-                section_index: Index of the section to remove
-
-            Returns:
-                Updated sections state as JSON.
-            """
-            logger.debug(f"Tool: remove_section(section_index={section_index})")
-            sections = ctx.deps.sections
-
-            if section_index < 0 or section_index >= len(sections):
-                return f"Error: Invalid section index {section_index}"
-
-            if len(sections) <= 1:
-                return "Error: Cannot remove the only section"
-
-            removed = sections[section_index]
-
-            # Extend previous section to cover this range, or extend next section backward
-            if section_index > 0:
-                sections[section_index - 1].end_page = removed.end_page
-                sections[section_index - 1].end_line = removed.end_line
-            elif section_index < len(sections) - 1:
-                sections[section_index + 1].start_page = removed.start_page
-                sections[section_index + 1].start_line = removed.start_line
-
-            sections.pop(section_index)
-            logger.info(f"Removed section '{removed.title}'")
-            return _format_sections(sections)
-
-        @_agent.tool
         def insert_section(ctx: RunContext[ChapterState], after_index: int, title: str, start_page: int, end_page: int) -> str:
             """Insert a new section after the specified index.
 
@@ -333,8 +329,45 @@ If issues remain, fix them or confirm they are intentional before finishing.
             logger.debug(f"Tool: insert_section(after_index={after_index}, title={title}, start_page={start_page}, end_page={end_page})")
             sections = ctx.deps.sections
 
+            # Circuit breaker: disable after 3 consecutive rejections
+            MAX_INSERT_REJECTIONS = 3
+            if ctx.deps.insert_rejections >= MAX_INSERT_REJECTIONS:
+                return (
+                    "Error: insert_section is disabled after repeated rejections. "
+                    "Focus on verifying existing sections with mark_verified."
+                )
+
             if after_index < -1 or after_index >= len(sections):
                 return f"Error: Invalid after_index {after_index}"
+
+            # Validate: new section must fit in a gap (no overlap with existing sections)
+            if after_index >= 0:
+                prev = sections[after_index]
+                if start_page <= prev.end_page:
+                    ctx.deps.insert_rejections += 1
+                    remaining = MAX_INSERT_REJECTIONS - ctx.deps.insert_rejections
+                    return (
+                        f"Error: Start page {start_page} overlaps with previous section "
+                        f"'{prev.title}' ending at page {prev.end_page}. "
+                        f"New sections can only fill gaps between existing sections. "
+                        f"({remaining} attempts remaining before insert_section is disabled)"
+                    )
+
+            insert_pos = after_index + 1
+            if insert_pos < len(sections):
+                next_sec = sections[insert_pos]
+                if end_page >= next_sec.start_page:
+                    ctx.deps.insert_rejections += 1
+                    remaining = MAX_INSERT_REJECTIONS - ctx.deps.insert_rejections
+                    return (
+                        f"Error: End page {end_page} overlaps with next section "
+                        f"'{next_sec.title}' starting at page {next_sec.start_page}. "
+                        f"New sections can only fill gaps between existing sections. "
+                        f"({remaining} attempts remaining before insert_section is disabled)"
+                    )
+
+            # Success — reset rejection counter
+            ctx.deps.insert_rejections = 0
 
             # Create new section
             new_section = Section(
@@ -344,18 +377,16 @@ If issues remain, fix them or confirm they are intentional before finishing.
                 verified=False,
             )
 
-            # Adjust adjacent sections
+            # Tighten adjacent boundaries to abut the new section
             if after_index >= 0:
-                # Shrink the previous section's end
                 sections[after_index].end_page = start_page - 1
                 sections[after_index].end_line = None
 
-            insert_pos = after_index + 1
             if insert_pos < len(sections):
-                # Shrink the next section's start if needed
-                if sections[insert_pos].start_page <= end_page:
-                    sections[insert_pos].start_page = end_page + 1
-                    sections[insert_pos].start_line = None
+                next_sec = sections[insert_pos]
+                if next_sec.start_page == end_page + 2:
+                    # Close 1-page gap between new section and next
+                    next_sec.start_page = end_page + 1
 
             sections.insert(insert_pos, new_section)
             logger.info(f"Inserted section '{title}' at index {insert_pos} (p{start_page}-p{end_page})")

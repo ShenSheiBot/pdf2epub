@@ -172,7 +172,8 @@ class RefinedBreakdown:
             logger.info("Analyzing PDF structure...")
             toc_tree, book_metadata = self.structure_analyzer.analyze_pdf_structure(
                 processed_pdf, book_title,
-                state=self.state, state_path=state_file
+                state=self.state, state_path=state_file,
+                pages_dir=pages_dir
             )
 
             # Insert table_of_contents as a chapter if it exists
@@ -239,7 +240,7 @@ class RefinedBreakdown:
             self.state.save(state_file)
 
         # Note: Gap filling and overlap detection are now handled by the agent
-        # via insert_section/remove_section tools during boundary verification
+        # via insert_section tools during boundary verification
 
         # Step 2: Estimate tokens for all nodes
         logger.info("Estimating token counts...")

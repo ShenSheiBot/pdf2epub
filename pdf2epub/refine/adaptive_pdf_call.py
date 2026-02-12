@@ -70,7 +70,7 @@ class PdfPageLimitLearner:
             RuntimeError: If limit would go below minimum
         """
         self._had_503 = True
-        new_limit = attempted_pages // 2
+        new_limit = -(-attempted_pages // 2)  # ceiling division
         if new_limit < self._min_limit:
             raise RuntimeError(
                 f"Adaptive page limit ({new_limit}) below minimum ({self._min_limit}). "

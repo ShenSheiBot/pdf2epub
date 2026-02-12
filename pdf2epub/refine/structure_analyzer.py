@@ -72,6 +72,8 @@ class StructureAnalyzer:
         self.analysis_model = analysis_model
         self.config = config or {}
         self._corrupted_xref_pdfs: set = set()  # PDFs with known corrupted xref
+        self._rasterized_pdf_path: Optional[Path] = None  # Cached rasterized PDF path
+        self._prefer_rasterized: bool = False  # Set True after first successful rasterization
 
         # Initialize adaptive page limit learner
         adaptive_config = self.config.get('refine', {}).get('adaptive_page_limit', {})
@@ -381,6 +383,29 @@ Return ONLY the cleaned text, nothing else.
         """
         Prepare PDF for LLM by selecting/excluding specific pages.
 
+        If rasterization was previously triggered (503 error), automatically
+        uses the cached rasterized version for better API compatibility.
+        """
+        # If we've determined rasterization is needed, use cached rasterized PDF
+        if self._prefer_rasterized and self._rasterized_pdf_path:
+            logger.debug("Using rasterized PDF (503 fallback active)")
+            return self._prepare_pdf_internal(
+                self._rasterized_pdf_path,
+                include_pages=include_pages,
+                exclude_pages=exclude_pages
+            )
+
+        return self._prepare_pdf_internal(pdf_path, include_pages, exclude_pages)
+
+    def _prepare_pdf_internal(
+        self,
+        pdf_path: Path,
+        include_pages: Optional[List[int]] = None,
+        exclude_pages: Optional[List[int]] = None
+    ) -> Optional[bytes]:
+        """
+        Internal: Prepare PDF for LLM by selecting/excluding specific pages.
+
         If the PDF has corrupted xref (detected once, cached), always renders
         pages as images instead of using select().
         """
@@ -520,6 +545,45 @@ Return ONLY the cleaned text, nothing else.
             logger.error(f"Failed to render pages to PDF: {e}")
             return None
 
+    def _ensure_rasterized_pdf(self, pdf_path: Path, target_mb: float = 30.0) -> Optional[Path]:
+        """
+        Ensure a rasterized version of the PDF exists (session-level cache).
+
+        Creates rasterized PDF on first call, returns cached path on subsequent calls.
+        The rasterized PDF is stored at pdf_path.parent / "input_rasterized.pdf".
+
+        Returns:
+            Path to rasterized PDF, or None if rasterization fails
+        """
+        # Check in-memory cache
+        if self._rasterized_pdf_path and self._rasterized_pdf_path.exists():
+            return self._rasterized_pdf_path
+
+        # Check disk cache
+        cache_path = pdf_path.parent / "input_rasterized.pdf"
+        if cache_path.exists():
+            logger.info(f"Using cached rasterized PDF: {cache_path}")
+            self._rasterized_pdf_path = cache_path
+            self._prefer_rasterized = True
+            return cache_path
+
+        # Create new rasterized PDF (full book, no page subset)
+        logger.info("Creating rasterized PDF (JBIG2 binarization, full book)...")
+        success, stats = rasterize_to_limit(
+            pdf_path, cache_path, pages=None, target_mb=target_mb
+        )
+        if not success:
+            logger.warning("JBIG2 rasterization failed")
+            return None
+
+        logger.info(
+            f"Rasterized PDF saved: {stats.get('page_count', '?')} pages, "
+            f"{stats['output_size_mb']:.1f} MB ({stats['method']} @ {stats['dpi']} DPI)"
+        )
+        self._rasterized_pdf_path = cache_path
+        self._prefer_rasterized = True
+        return cache_path
+
     def _prepare_pdf_rasterized(
         self,
         pdf_path: Path,
@@ -527,10 +591,10 @@ Return ONLY the cleaned text, nothing else.
         target_mb: float = 30.0
     ) -> Optional[bytes]:
         """
-        Prepare PDF using JBIG2 rasterization (for 503 fallback).
+        Prepare PDF using cached JBIG2 rasterization (for 503 fallback).
 
-        Rasterizes specified pages with binarization, producing a much smaller
-        PDF that Gemini can process even under load.
+        Uses session-level cache: rasterizes full PDF once, then subsets from cache.
+        Sets _prefer_rasterized=True so subsequent calls use rasterized version.
 
         Args:
             pdf_path: Path to the source PDF
@@ -540,30 +604,13 @@ Return ONLY the cleaned text, nothing else.
         Returns:
             PDF bytes, or None if rasterization fails
         """
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        rasterized_path = self._ensure_rasterized_pdf(pdf_path, target_mb)
+        if rasterized_path is None:
+            return None
 
-        try:
-            success, stats = rasterize_to_limit(
-                pdf_path, tmp_path, include_pages, target_mb
-            )
-            if not success:
-                logger.warning("JBIG2 rasterization failed")
-                return None
-
-            logger.info(
-                f"Rasterized PDF: {stats.get('page_count', '?')} pages, "
-                f"{stats['output_size_mb']:.1f} MB ({stats['method']} @ {stats['dpi']} DPI)"
-            )
-
-            try:
-                with open(tmp_path, 'rb') as f:
-                    return f.read()
-            except OSError as e:
-                logger.error(f"Failed to read rasterized PDF: {e}")
-                return None
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        # Subset from rasterized PDF using normal _prepare_pdf logic
+        # (but bypass _prefer_rasterized check to avoid recursion)
+        return self._prepare_pdf_internal(rasterized_path, include_pages=include_pages)
 
     def analyze_pdf_structure(
         self,

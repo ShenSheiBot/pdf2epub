@@ -153,7 +153,7 @@ def run_adaptive_batches(
 
     logger.info(
         f"[{operation_name}] Processing {len(pages)} pages in {len(batches)} batch(es) "
-        f"(limit: {learner.limit}, overlap: {overlap})"
+        f"(limit: {learner.limit}, overlap: {overlap}, rasterize={can_rasterize})"
     )
 
     batch_idx = 0

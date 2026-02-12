@@ -31,6 +31,15 @@ from .adaptive_pdf_call import (
 )
 
 
+def _update_levels_recursive(chapters: List[Dict], target_level: int) -> None:
+    """Update level field for chapters and all descendants."""
+    for ch in chapters:
+        ch['level'] = target_level
+        children = ch.get('children', [])
+        if children:
+            _update_levels_recursive(children, target_level + 1)
+
+
 class StructureAnalyzer:
     """
     Analyzes PDF structure and discovers subsections.
@@ -630,6 +639,9 @@ Return ONLY the cleaned text, nothing else.
         # Validate and fix notes type - remove from non-notes chapters
         self._fix_invalid_notes_type(result.get('chapters', []))
 
+        # Fix containment overlaps: reparent siblings where one fully contains another
+        self._fix_containment_overlaps(result.get('chapters', []))
+
         # Final structural validation
         chapters = result.get('chapters', [])
         issues = validate_chapter_structure(chapters)
@@ -707,6 +719,73 @@ Return ONLY the cleaned text, nothing else.
             # Recursively check children
             if chapter.get('children'):
                 self._fix_invalid_notes_type(chapter['children'])
+
+    @staticmethod
+    def _fix_containment_overlaps(chapters: List[Dict]) -> None:
+        """
+        Fix siblings where one's page range fully contains another.
+
+        When sibling A (p100-300) fully contains sibling B (p100-200),
+        B should be a child of A, not a sibling. This is a deterministic
+        tree restructuring that doesn't require LLM judgment.
+
+        Mutates the list in place. Recurses into all children.
+        """
+        if not chapters or len(chapters) < 2:
+            # Still recurse into existing children
+            for ch in (chapters or []):
+                StructureAnalyzer._fix_containment_overlaps(ch.get('children', []))
+            return
+
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < len(chapters):
+                container = chapters[i]
+                c_start = container.get('start_page', 0)
+                c_end = container.get('end_page', 0)
+
+                j = i + 1
+                while j < len(chapters):
+                    sibling = chapters[j]
+                    s_start = sibling.get('start_page', 0)
+                    s_end = sibling.get('end_page', 0)
+
+                    if s_start >= c_start and s_end <= c_end:
+                        # sibling fully contained in container → reparent
+                        moved = chapters.pop(j)
+                        container.setdefault('children', []).append(moved)
+                        logger.info(
+                            f"Reparented '{moved.get('title', '')[:50]}' (p{s_start}-{s_end}) "
+                            f"as child of '{container.get('title', '')[:50]}' (p{c_start}-{c_end})"
+                        )
+                        changed = True
+                    elif c_start >= s_start and c_end <= s_end:
+                        # container fully contained in sibling → swap roles
+                        moved = chapters.pop(i)
+                        sibling.setdefault('children', []).append(moved)
+                        logger.info(
+                            f"Reparented '{moved.get('title', '')[:50]}' (p{c_start}-{c_end}) "
+                            f"as child of '{sibling.get('title', '')[:50]}' (p{s_start}-{s_end})"
+                        )
+                        changed = True
+                        break  # restart outer loop since i was removed
+                    else:
+                        j += 1
+
+                if changed:
+                    break  # restart from the top
+                i += 1
+
+        # Sort children by start_page and fix levels, then recurse
+        for ch in chapters:
+            children = ch.get('children', [])
+            if children:
+                parent_level = ch.get('level', 1)
+                children.sort(key=lambda c: c.get('start_page', 0))
+                _update_levels_recursive(children, parent_level + 1)
+                StructureAnalyzer._fix_containment_overlaps(children)
 
     def rebreakdown_chapter(
         self,

@@ -80,7 +80,12 @@ def is_transient_gemini_error(exception: Exception) -> bool:
     error_str = str(exception).lower()
     if any(term in error_str for term in ['prohibited', 'safety', 'blocked', 'harmful']):
         return False
-    
+
+    # Fail fast on Cloudflare 524 proxy timeouts — retrying won't help,
+    # the proxy cannot handle large PDF requests
+    if '524' in error_str and 'timeout' in error_str:
+        return False
+
     # Retry network and rate limit errors
     if isinstance(exception, (httpx.TimeoutException, httpx.ConnectError, ConnectionError)):
         return True

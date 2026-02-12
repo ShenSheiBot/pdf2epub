@@ -191,10 +191,22 @@ def run_adaptive_batches(
                     f"(new limit: {learner.limit})"
                 )
                 # Don't increment batch_idx — retry with smaller batch
+            elif _is_cloudflare_proxy_error(e):
+                raise RuntimeError(
+                    "Cloudflare proxy returned HTTP 524 (origin timeout). "
+                    "Cloudflare proxies cannot handle large PDF requests. "
+                    "Please use Vertex AI or a direct Gemini API endpoint instead."
+                ) from e
             else:
                 raise
 
     return results
+
+
+def _is_cloudflare_proxy_error(e: Exception) -> bool:
+    """Check if an exception is a Cloudflare 524 proxy timeout."""
+    err = str(e).lower()
+    return '524' in err and 'timeout' in err
 
 
 # ---------------------------------------------------------------------------

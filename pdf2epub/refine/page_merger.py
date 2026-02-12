@@ -102,9 +102,9 @@ class PageMerger:
         if not nodes:
             return ""
 
-        # Get the full page range
-        start_page = nodes[0].start_page
-        end_page = nodes[-1].end_page
+        # Get the full page range (use min/max in case nodes are not in page order)
+        start_page = min(n.start_page for n in nodes)
+        end_page = max(n.end_page for n in nodes)
         first_boundary = nodes[0].boundary_info or {}
 
         content_parts = []

@@ -18,6 +18,7 @@ from google.genai.types import Part
 from loguru import logger
 
 from ..utils.common import parse_llm_json
+from ..utils.network_utils import _retry_context
 from ..utils.llm_client import BoundLLMClient
 
 T = TypeVar('T')
@@ -163,7 +164,12 @@ def run_adaptive_batches(
         )
 
         try:
-            result = process_batch(batch, batch_idx, len(batches))
+            # Tell tenacity not to retry 503 — we handle it here by splitting
+            _retry_context.skip_503 = True
+            try:
+                result = process_batch(batch, batch_idx, len(batches))
+            finally:
+                _retry_context.skip_503 = False
             learner.report_success(len(batch))
             results.append(result)
             batch_idx += 1

@@ -4,6 +4,7 @@ Refactored network utilities using tenacity for cleaner retry logic.
 
 import base64
 import httpx
+import threading
 from loguru import logger
 from typing import Optional, Dict, Any, Union, List
 from typing import Any as Any  # Explicit for backward compatibility
@@ -73,6 +74,12 @@ class wait_exponential_with_self_max(wait_base):
         return wait_strategy(retry_state)
 
 
+# Thread-local context for retry behavior control.
+# When skip_503=True, 503 errors are NOT retried by tenacity —
+# they bubble up to run_adaptive_batches() which handles them by splitting.
+_retry_context = threading.local()
+
+
 # Define transient errors that should trigger retries
 def is_transient_gemini_error(exception: Exception) -> bool:
     """Check if a Gemini API error is transient and should be retried."""
@@ -85,6 +92,12 @@ def is_transient_gemini_error(exception: Exception) -> bool:
     # the proxy cannot handle large PDF requests
     if '524' in error_str and 'timeout' in error_str:
         return False
+
+    # When inside adaptive batching, don't retry 503 at tenacity level —
+    # let run_adaptive_batches() handle it by splitting into smaller batches
+    if getattr(_retry_context, 'skip_503', False):
+        if '503' in error_str or 'unavailable' in error_str:
+            return False
 
     # Retry network and rate limit errors
     if isinstance(exception, (httpx.TimeoutException, httpx.ConnectError, ConnectionError)):

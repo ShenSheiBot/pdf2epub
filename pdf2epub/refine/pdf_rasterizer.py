@@ -5,8 +5,6 @@ When Gemini API rejects certain PDF structures (503 error),
 this module provides JBIG2 rasterization as fallback.
 """
 
-import glob
-import io
 import struct
 import subprocess
 import tempfile
@@ -14,11 +12,61 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import fitz
+import numpy as np
 from loguru import logger
 from PIL import Image
+from tqdm import tqdm
 
 
-JBIG2_DPI_LEVELS = [150, 120, 100]
+JBIG2_DPI_LEVELS = [150, 120]
+
+
+def _otsu_threshold(img: Image.Image) -> int:
+    """
+    Calculate optimal binarization threshold using Otsu's method.
+
+    Args:
+        img: Grayscale PIL Image
+
+    Returns:
+        Optimal threshold value (0-255)
+    """
+    arr = np.array(img)
+    hist, _ = np.histogram(arr.flatten(), bins=256, range=(0, 256))
+    total = arr.size
+    sum_total = np.dot(np.arange(256), hist)
+
+    sum_bg, weight_bg, max_var, threshold = 0, 0, 0, 128  # default 128
+    for t in range(256):
+        weight_bg += hist[t]
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+        var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            threshold = t
+
+    return threshold
+
+
+def _binarize_image(img: Image.Image) -> Image.Image:
+    """
+    Convert grayscale image to binary using Otsu's adaptive threshold.
+
+    Args:
+        img: Grayscale PIL Image
+
+    Returns:
+        Binary (1-bit) PIL Image
+    """
+    threshold = _otsu_threshold(img)
+    return img.point(lambda x: 255 if x > threshold else 0, '1')
 
 
 def check_jbig2_available() -> bool:
@@ -182,7 +230,10 @@ def rasterize_pdf_jbig2(
     dpi: int = 150
 ) -> Tuple[bool, Dict]:
     """
-    Rasterize PDF pages to JBIG2 compressed PDF.
+    Rasterize PDF pages to JBIG2 compressed PDF using per-page mode.
+
+    Each page is individually rendered, binarized with Otsu's method,
+    and compressed with jbig2 in per-page mode (no symbol table).
 
     Args:
         pdf_path: Input PDF path
@@ -194,46 +245,50 @@ def rasterize_pdf_jbig2(
         (success, stats_dict)
     """
     if not check_jbig2_available():
-        logger.warning("jbig2 not available, falling back to CCITT G4")
-        return rasterize_pdf_ccitt(pdf_path, output_path, pages, dpi)
+        logger.warning("jbig2 not available")
+        return False, {}
 
     doc = fitz.open(pdf_path)
     page_indices = [p - 1 for p in pages] if pages else list(range(len(doc)))
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. Render each page to binary PBM
-        pbm_files = []
-        for i, page_idx in enumerate(page_indices):
+        jbig2_files = []
+
+        for i, page_idx in enumerate(tqdm(page_indices, desc=f"JBIG2 {dpi}dpi", unit="page")):
             page = doc[page_idx]
             mat = fitz.Matrix(dpi / 72, dpi / 72)
             pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
             img = Image.frombytes('L', [pix.width, pix.height], pix.samples)
-            img_bw = img.convert('1')
+            img_bw = _binarize_image(img)
+
+            # Save as PBM for jbig2 input
             pbm_path = f'{tmpdir}/page_{i:04d}.pbm'
             img_bw.save(pbm_path)
-            pbm_files.append(pbm_path)
+
+            # Compress single page with jbig2 per-page mode (no -s, no -b)
+            jbig2_path = f'{tmpdir}/page_{i:04d}.jbig2'
+            result = subprocess.run(
+                ['jbig2', '-p', pbm_path],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                logger.error(f"jbig2 failed on page {page_idx + 1}: {result.stderr.decode()}")
+                doc.close()
+                return False, {}
+
+            # jbig2 -p writes to stdout
+            with open(jbig2_path, 'wb') as f:
+                f.write(result.stdout)
+            jbig2_files.append(jbig2_path)
 
         doc.close()
 
-        # 2. Compress with jbig2
-        output_base = f'{tmpdir}/output'
-        result = subprocess.run(
-            ['jbig2', '-s', '-p', '-b', output_base] + pbm_files,
-            capture_output=True
-        )
-        if result.returncode != 0:
-            logger.error(f"jbig2 failed: {result.stderr.decode()}")
+        if not jbig2_files:
+            logger.error("No JBIG2 pages produced")
             return False, {}
 
-        # 3. Assemble PDF using built-in converter
-        sym_path = f'{output_base}.sym'
-        page_files = sorted(glob.glob(f'{output_base}.[0-9]*'))
-
-        if not page_files:
-            logger.error("jbig2 produced no output files")
-            return False, {}
-
-        pdf_bytes = _jbig2_to_pdf(sym_path, page_files)
+        # Assemble PDF (no symbol table in per-page mode)
+        pdf_bytes = _jbig2_to_pdf(sym_path=None, page_files=jbig2_files)
 
         with open(output_path, 'wb') as f:
             f.write(pdf_bytes)
@@ -247,54 +302,6 @@ def rasterize_pdf_jbig2(
     }
 
 
-def rasterize_pdf_ccitt(
-    pdf_path: Path,
-    output_path: Path,
-    pages: Optional[List[int]] = None,
-    dpi: int = 150
-) -> Tuple[bool, Dict]:
-    """
-    Fallback: Use CCITT G4 compression (pure Python, no external dependencies).
-    Note: Files will be ~8x larger than JBIG2.
-    """
-    try:
-        doc = fitz.open(pdf_path)
-        page_indices = [p - 1 for p in pages] if pages else list(range(len(doc)))
-
-        new_doc = fitz.open()
-        for page_idx in page_indices:
-            page = doc[page_idx]
-            mat = fitz.Matrix(dpi / 72, dpi / 72)
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-            img = Image.frombytes('L', [pix.width, pix.height], pix.samples)
-            img_bw = img.convert('1')
-
-            tiff_buffer = io.BytesIO()
-            img_bw.save(tiff_buffer, format='TIFF', compression='group4')
-            tiff_data = tiff_buffer.getvalue()
-
-            img_doc = fitz.open('tiff', tiff_data)
-            rect = img_doc[0].rect
-            new_page = new_doc.new_page(width=rect.width, height=rect.height)
-            new_page.insert_image(rect, stream=tiff_data)
-            img_doc.close()
-
-        new_doc.save(str(output_path))
-        new_doc.close()
-        doc.close()
-
-        output_size = output_path.stat().st_size
-        return True, {
-            'output_size_mb': output_size / 1024 / 1024,
-            'page_count': len(page_indices),
-            'dpi': dpi,
-            'method': 'ccitt_g4'
-        }
-    except Exception as e:
-        logger.error(f"CCITT rasterization failed: {e}")
-        return False, {}
-
-
 def rasterize_to_limit(
     pdf_path: Path,
     output_path: Path,
@@ -302,12 +309,14 @@ def rasterize_to_limit(
     target_mb: float = 30.0
 ) -> Tuple[bool, Dict]:
     """
-    Progressive degradation until file is below target size.
+    Try JBIG2 rasterization at decreasing DPI until file is below target size.
+
+    Returns (False, {}) if jbig2 is unavailable or all DPI levels exceed target.
     """
     for dpi in JBIG2_DPI_LEVELS:
         success, stats = rasterize_pdf_jbig2(pdf_path, output_path, pages, dpi)
         if not success:
-            continue
+            return False, {}
         if stats['output_size_mb'] <= target_mb:
             logger.info(f"Rasterized at {dpi} DPI: {stats['output_size_mb']:.1f} MB")
             return True, stats

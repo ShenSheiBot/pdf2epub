@@ -241,54 +241,42 @@ def preprocess_pdf(input_pdf, output_dir):
     if file_size_mb > 45:
         logger.warning(f"PDF file size ({file_size_mb:.2f}MB) exceeds 45MB. Compressing...")
 
-        # Create temporary file for compression output
         temp_output = output_dir / "compressed_temp.pdf"
 
-        # Start with moderate compression settings
-        compression_settings = [
-            # (dpi, quality, grayscale)
-            (100, 30, True),   # Aggressive compression with grayscale
-            (80, 25, True),    # Very aggressive
-            (72, 20, True),    # Ultra aggressive (minimum readable)
-            (60, 15, True)     # Extreme compression (last resort)
-        ]
+        # Step 1: Try JBIG2 rasterization (best compression for scanned books)
+        from ..refine.pdf_rasterizer import rasterize_to_limit
 
-        # Try compression with increasingly aggressive settings until size is under limit
-        for dpi, quality, grayscale in compression_settings:
+        logger.info("Attempting JBIG2 compression...")
+        success, stats = rasterize_to_limit(
+            processed_pdf, temp_output, pages=None, target_mb=45.0
+        )
+
+        if success:
+            shutil.move(str(temp_output), str(processed_pdf))
+            logger.info(
+                f"JBIG2 compressed: {stats['output_size_mb']:.2f}MB @ {stats['dpi']} DPI"
+            )
+        else:
+            # Step 2: Fallback to binarized PNG at 120 DPI
+            logger.warning("JBIG2 failed, falling back to binarized PNG at 120 DPI...")
             try:
-                logger.info(f"Trying compression with DPI={dpi}, quality={quality}, grayscale={grayscale}...")
                 success, stats = compress_pdf(
                     str(processed_pdf),
                     str(temp_output),
-                    dpi=dpi,
-                    quality=quality,
-                    grayscale=grayscale
+                    dpi=120,
                 )
 
-                if success:
-                    compressed_size_mb = stats["output_size_mb"]
-                    logger.info(
-                        f"Compression result: {compressed_size_mb:.2f}MB ({stats['saved_percentage']:.1f}% reduction)"
-                    )
-
-                    # If compression was successful and reduced size, use the compressed file
-                    if compressed_size_mb < file_size_mb:
-                        # Replace the processed file with our compressed version
-                        if temp_output.exists():
-                            shutil.move(str(temp_output), str(processed_pdf))
-                    else:
-                        logger.warning("Compression did not reduce file size. Keeping original.")
-
-                    # If we're under 45MB, we're done
-                    if compressed_size_mb <= 45:
-                        break
-
+                if success and stats["output_size_mb"] < file_size_mb:
+                    shutil.move(str(temp_output), str(processed_pdf))
+                    logger.info(f"Binarized PNG compressed: {stats['output_size_mb']:.2f}MB")
+                else:
+                    logger.warning("Binarized PNG compression did not help")
+                    if temp_output.exists():
+                        temp_output.unlink()
             except Exception as e:
                 logger.error(f"Compression attempt failed: {e}")
-
-            # Clean up temp file if it exists
-            if temp_output.exists():
-                temp_output.unlink()
+                if temp_output.exists():
+                    temp_output.unlink()
 
         # Check final file size
         final_size_mb = processed_pdf.stat().st_size / (1024 * 1024)

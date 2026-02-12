@@ -23,7 +23,6 @@ from .refiner_state import RefinerState
 from .pdf_batching import (
     PdfBatchContext,
     get_toc_detection_pages,
-    convert_toc_page_to_original,
     create_content_batches,
     deduplicate_chapters,
     merge_batch_chapters,
@@ -62,13 +61,13 @@ class StructureAnalyzer:
         self.analysis_client = analysis_client
         self.analysis_model = analysis_model
         self.config = config or {}
+        self._pdf_already_rasterized = False
 
     def _compress_pdf_to_limit(self, input_path: Path, output_path: Path, target_mb: float) -> bool:
         """
-        Iteratively compress PDF until it's below target size.
+        Compress PDF until it's below target size.
 
-        Tries progressively more aggressive compression settings until the PDF
-        is below the target size in MB.
+        Priority: JBIG2 (primary) -> binarized PNG (fallback)
 
         Args:
             input_path: Path to input PDF
@@ -78,59 +77,53 @@ class StructureAnalyzer:
         Returns:
             True if compression succeeded, False otherwise
         """
-        from ..pdf_compressor import compress_pdf
-
-        # Progressive compression strategies (from moderate to extreme)
-        strategies = [
-            {"dpi": 150, "quality": 60, "grayscale": False, "desc": "moderate (150dpi, q60)"},
-            {"dpi": 120, "quality": 50, "grayscale": False, "desc": "aggressive (120dpi, q50)"},
-            {"dpi": 100, "quality": 40, "grayscale": False, "desc": "very aggressive (100dpi, q40)"},
-            {"dpi": 80, "quality": 30, "grayscale": False, "desc": "extreme (80dpi, q30)"},
-            {"dpi": 72, "quality": 20, "grayscale": True, "desc": "maximum (72dpi, q20, grayscale)"},
-        ]
-
         input_size_mb = os.path.getsize(input_path) / 1024 / 1024
         logger.info(f"Input PDF size: {input_size_mb:.2f} MB, target: {target_mb:.2f} MB")
 
-        for i, strategy in enumerate(strategies, 1):
-            logger.info(f"Compression attempt {i}/{len(strategies)}: {strategy['desc']}")
+        # Step 1: Try JBIG2 rasterization (preserves text sharpness)
+        logger.info("Attempting JBIG2 compression...")
+        success, stats = rasterize_to_limit(input_path, output_path, pages=None, target_mb=target_mb)
 
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                tmp_path = Path(tmp.name)
+        if success:
+            logger.success(
+                f"Successfully compressed to {stats['output_size_mb']:.2f} MB "
+                f"using {stats['method']} @ {stats['dpi']} DPI"
+            )
+            return True
 
-            try:
-                success, stats = compress_pdf(
-                    str(input_path),
-                    str(tmp_path),
-                    dpi=strategy['dpi'],
-                    quality=strategy['quality'],
-                    grayscale=strategy['grayscale']
-                )
+        # Step 2: JBIG2 unavailable/failed, fall back to binarized PNG at 120 DPI
+        logger.warning("JBIG2 compression failed, falling back to binarized PNG at 120 DPI...")
+        from ..pdf_compressor import compress_pdf
 
-                if not success:
-                    logger.warning(f"Compression failed with {strategy['desc']}")
-                    tmp_path.unlink(missing_ok=True)
-                    continue
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp_path = Path(tmp.name)
 
-                output_size_mb = stats['output_size_mb']
-                logger.info(f"Compressed to {output_size_mb:.2f} MB")
+        try:
+            success, stats = compress_pdf(
+                str(input_path),
+                str(tmp_path),
+                dpi=120,
+            )
 
-                if output_size_mb <= target_mb:
-                    # Success! Move to final output path
-                    tmp_path.rename(output_path)
-                    logger.success(f"Successfully compressed to {output_size_mb:.2f} MB (under {target_mb:.2f} MB limit)")
-                    return True
-                else:
-                    logger.warning(f"Still too large ({output_size_mb:.2f} MB > {target_mb:.2f} MB), trying more aggressive compression...")
-                    tmp_path.unlink(missing_ok=True)
-
-            except Exception as e:
-                logger.error(f"Error during compression: {e}")
+            if not success:
+                logger.error("Binarized PNG compression failed")
                 tmp_path.unlink(missing_ok=True)
-                continue
+                return False
 
-        logger.error(f"Failed to compress PDF below {target_mb:.2f} MB after {len(strategies)} attempts")
-        return False
+            output_size_mb = stats['output_size_mb']
+            if output_size_mb <= target_mb:
+                tmp_path.rename(output_path)
+                logger.success(f"Successfully compressed to {output_size_mb:.2f} MB (binarized PNG)")
+                return True
+            else:
+                logger.error(f"Binarized PNG still too large ({output_size_mb:.2f} MB > {target_mb:.2f} MB)")
+                tmp_path.unlink(missing_ok=True)
+                return False
+
+        except Exception as e:
+            logger.error(f"Error during PNG compression: {e}")
+            tmp_path.unlink(missing_ok=True)
+            return False
 
     def _is_503_error(self, error: Exception) -> bool:
         """Check if an exception is a 503 UNAVAILABLE error."""
@@ -154,6 +147,10 @@ class StructureAnalyzer:
         Returns:
             PDF bytes, or None if rasterization fails
         """
+        if self._pdf_already_rasterized:
+            logger.warning("PDF was already rasterized in compression step, skipping redundant rasterization")
+            return None
+
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
@@ -245,15 +242,9 @@ If no TOC exists, return: {"has_toc": false, "toc_start": null, "toc_end": null}
                 return None
 
             if result.get('has_toc'):
-                # Convert page numbers from subset PDF to original PDF
-                if batch_ctx and batch_ctx.needs_batching:
-                    orig_start = convert_toc_page_to_original(result['toc_start'], batch_ctx)
-                    orig_end = convert_toc_page_to_original(result['toc_end'], batch_ctx)
-                    logger.info(f"TOC detected in subset: pages {result['toc_start']}-{result['toc_end']} -> original: {orig_start}-{orig_end}")
-                    result['toc_start'] = orig_start
-                    result['toc_end'] = orig_end
-                else:
-                    logger.info(f"TOC detected: pages {result['toc_start']}-{result['toc_end']}")
+                # LLM returns original PDF page numbers (from "PDF Page: X" patches)
+                # No conversion needed even for subset PDFs
+                logger.info(f"TOC detected: pages {result['toc_start']}-{result['toc_end']}")
             else:
                 logger.info("No TOC detected in PDF")
 
@@ -304,15 +295,7 @@ If no TOC exists, return: {"has_toc": false, "toc_start": null, "toc_end": null}
                 return None
 
             if result.get('has_toc'):
-                # Convert page numbers from rasterized PDF to original PDF
-                if batch_ctx and batch_ctx.needs_batching:
-                    orig_start = convert_toc_page_to_original(result['toc_start'], batch_ctx)
-                    orig_end = convert_toc_page_to_original(result['toc_end'], batch_ctx)
-                    logger.info(f"TOC detected (rasterized): pages {result['toc_start']}-{result['toc_end']} -> original: {orig_start}-{orig_end}")
-                    result['toc_start'] = orig_start
-                    result['toc_end'] = orig_end
-                else:
-                    logger.info(f"TOC detected (rasterized): pages {result['toc_start']}-{result['toc_end']}")
+                logger.info(f"TOC detected (rasterized): pages {result['toc_start']}-{result['toc_end']}")
             else:
                 logger.info("No TOC detected in rasterized PDF")
 
@@ -816,45 +799,58 @@ Return the complete structure as JSON:
 
                 if should_compress and file_size_mb > payload_limit_mb:
                     logger.warning(
-                        f"PDF size ({file_size_mb:.2f} MB) exceeds payload limit ({payload_limit_mb} MB). "
-                        f"Applying JPEG compression..."
+                        f"PDF subset ({file_size_mb:.2f} MB) exceeds payload limit ({payload_limit_mb} MB). "
+                        f"Compressing..."
                     )
-
-                    # Import compress_pdf
-                    from ..pdf_compressor import compress_pdf
 
                     # Create compressed output path
                     with tempfile.NamedTemporaryFile(suffix='_compressed.pdf', delete=False) as compressed_tmp:
-                        compressed_path = compressed_tmp.name
+                        compressed_path = Path(compressed_tmp.name)
 
-                    # Compress with config settings
-                    dpi = compression_config.get('dpi', 150)
-                    quality = compression_config.get('quality', 60)
-                    grayscale = compression_config.get('grayscale', False)
-
-                    success, stats = compress_pdf(
-                        tmp_path,
-                        compressed_path,
-                        dpi=dpi,
-                        quality=quality,
-                        grayscale=grayscale
-                    )
-
-                    if success:
-                        compressed_size_mb = os.path.getsize(compressed_path) / 1024 / 1024
-                        logger.info(
-                            f"Compressed PDF: {file_size_mb:.2f} MB → {compressed_size_mb:.2f} MB "
-                            f"({stats['compression_ratio']:.1f}x compression)"
+                    # Step 1: Try JBIG2 rasterization (preserves text sharpness)
+                    # Skip if PDF was already rasterized in Step 0
+                    if self._pdf_already_rasterized:
+                        success = False
+                        stats = {}
+                        logger.warning("PDF already rasterized, skipping redundant JBIG2")
+                    else:
+                        success, stats = rasterize_to_limit(
+                            Path(tmp_path), compressed_path, pages=None, target_mb=payload_limit_mb
                         )
 
-                        # Replace with compressed version
+                    if success:
+                        compressed_size_mb = stats['output_size_mb']
+                        logger.info(
+                            f"Compressed PDF: {file_size_mb:.2f} MB → {compressed_size_mb:.2f} MB "
+                            f"using {stats['method']} @ {stats['dpi']} DPI"
+                        )
                         os.unlink(tmp_path)
-                        tmp_path = compressed_path
+                        tmp_path = str(compressed_path)
                         file_size_mb = compressed_size_mb
                     else:
-                        logger.warning("Compression failed, using uncompressed version")
-                        if os.path.exists(compressed_path):
-                            os.unlink(compressed_path)
+                        # Step 2: JBIG2 failed, fall back to binarized PNG at 120 DPI
+                        logger.warning("JBIG2 compression failed, falling back to binarized PNG...")
+                        from ..pdf_compressor import compress_pdf
+
+                        png_success, png_stats = compress_pdf(
+                            tmp_path,
+                            str(compressed_path),
+                            dpi=120,
+                        )
+
+                        if png_success:
+                            compressed_size_mb = png_stats['output_size_mb']
+                            logger.info(
+                                f"Compressed PDF: {file_size_mb:.2f} MB → {compressed_size_mb:.2f} MB "
+                                f"using binarized PNG @ 120 DPI"
+                            )
+                            os.unlink(tmp_path)
+                            tmp_path = str(compressed_path)
+                            file_size_mb = compressed_size_mb
+                        else:
+                            logger.warning("All compression methods failed, using uncompressed version")
+                            if compressed_path.exists():
+                                compressed_path.unlink()
 
                 with open(tmp_path, 'rb') as f:
                     pdf_bytes = f.read()
@@ -956,6 +952,7 @@ Return the complete structure as JSON:
             if self._compress_pdf_to_limit(pdf_path, compressed_pdf_path, payload_limit_mb):
                 logger.success(f"Using compressed PDF: {compressed_pdf_path}")
                 working_pdf_path = compressed_pdf_path
+                self._pdf_already_rasterized = True
             else:
                 logger.error("PDF compression failed, attempting to use original PDF (may fail with 413 error)")
                 working_pdf_path = pdf_path

@@ -3,12 +3,12 @@
 pdf_compressor.py - Standalone PDF compression utility
 
 Compresses PDF files by:
-1. Converting each page to an image
-2. Applying JPEG compression with customizable quality
-3. Creating a new PDF from the compressed images
+1. Rendering each page at specified DPI
+2. Binarizing with Otsu's method (1-bit black/white)
+3. Saving as PNG and assembling into a new PDF with deflate compression
 
 Usage:
-  python pdf_compressor.py input.pdf output.pdf --dpi 150 --quality 60 --grayscale
+  python pdf_compressor.py input.pdf output.pdf --dpi 150
 """
 
 import os
@@ -19,22 +19,24 @@ from pathlib import Path
 from PIL import Image
 import fitz  # PyMuPDF
 from loguru import logger
+from tqdm import tqdm
 from .utils.logging_config import configure_logging
 
 # Configure logger
 logger = configure_logging()
 
 
-def compress_pdf(input_path, output_path, dpi=150, quality=60, grayscale=False):
+def compress_pdf(input_path, output_path, dpi=150):
     """
-    Compress a PDF by flattening each page to a JPEG image with specified quality.
+    Compress a PDF by rasterizing each page with Otsu binarization and PNG encoding.
+
+    Each page is rendered at the specified DPI, binarized to 1-bit black/white,
+    saved as PNG, and assembled into a new PDF with deflate compression.
 
     Args:
         input_path (str): Path to input PDF file
         output_path (str): Path to save compressed PDF
-        dpi (int): Resolution for rendering PDF pages (higher = better quality but larger size)
-        quality (int): JPEG compression quality (0-100, lower = smaller size but lower quality)
-        grayscale (bool): Whether to convert to grayscale for additional compression
+        dpi (int): Resolution for rendering PDF pages (default: 150)
 
     Returns:
         tuple: (bool success, dict stats)
@@ -56,30 +58,20 @@ def compress_pdf(input_path, output_path, dpi=150, quality=60, grayscale=False):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = Path(temp_dir)
 
-            logger.info(f"Processing {page_count} pages...")
+            from .refine.pdf_rasterizer import _binarize_image
 
-            # Process each page
-            for page_num, page in enumerate(pdf_document):
-                # Use logger.debug for progress updates
-                if (page_num + 1) % 10 == 0 or page_num == 0 or page_num == page_count - 1:
-                    logger.debug(f"Converting page {page_num + 1}/{page_count}")
-
+            for page_num, page in enumerate(tqdm(pdf_document, desc=f"Binarize {dpi}dpi", unit="page")):
                 # Get page dimensions
                 rect = page.rect
 
-                # Convert page to image
+                # Render grayscale -> Otsu binarize -> save as 1-bit PNG
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-
-                # Convert to PIL Image
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                img = img.convert("L")
+                img = _binarize_image(img)
 
-                # Optional grayscale conversion
-                if grayscale:
-                    img = img.convert("L")
-
-                # Save as JPEG with specified quality
-                img_path = temp_dir_path / f"page_{page_num + 1}.jpg"
-                img.save(img_path, "JPEG", quality=quality, optimize=True)
+                img_path = temp_dir_path / f"page_{page_num + 1}.png"
+                img.save(img_path, "PNG")
 
                 # Add image back to new PDF
                 new_page = output_pdf.new_page(width=rect.width, height=rect.height)
@@ -117,20 +109,12 @@ def compress_pdf(input_path, output_path, dpi=150, quality=60, grayscale=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compress PDF by flattening to images with JPEG compression"
+        description="Compress PDF by binarizing pages to 1-bit PNG"
     )
     parser.add_argument("input", help="Input PDF file path")
     parser.add_argument("output", help="Output PDF file path")
     parser.add_argument(
         "--dpi", type=int, default=150, help="DPI for rendering (default: 150)"
-    )
-    parser.add_argument(
-        "--quality", type=int, default=60, help="JPEG quality 0-100 (default: 60)"
-    )
-    parser.add_argument(
-        "--grayscale",
-        action="store_true",
-        help="Convert to grayscale for additional compression",
     )
 
     args = parser.parse_args()
@@ -140,19 +124,10 @@ def main():
         logger.error(f"Error: Input file '{args.input}' not found")
         return 1
 
-    # Validate quality range
-    if args.quality < 0 or args.quality > 100:
-        logger.error("Error: Quality must be between 0 and 100")
-        return 1
-
     logger.info(f"Compressing {args.input} to {args.output}")
-    logger.info(
-        f"Settings: DPI={args.dpi}, Quality={args.quality}, Grayscale={args.grayscale}"
-    )
+    logger.info(f"Settings: DPI={args.dpi}")
 
-    success, _ = compress_pdf(
-        args.input, args.output, args.dpi, args.quality, args.grayscale
-    )
+    success, _ = compress_pdf(args.input, args.output, args.dpi)
     return 0 if success else 1
 
 

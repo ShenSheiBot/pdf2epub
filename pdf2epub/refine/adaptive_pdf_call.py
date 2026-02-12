@@ -122,25 +122,28 @@ def split_pages_into_batches(
 
 def run_adaptive_batches(
     pages: List[int],
-    process_batch: Callable[[List[int], int, int], T],
+    process_batch: Callable[[List[int], int, int, bool], T],
     learner: PdfPageLimitLearner,
     is_503_fn: Callable[[Exception], bool],
     operation_name: str,
     overlap: int = 0,
+    can_rasterize: bool = False,
 ) -> List[T]:
     """
     Process pages in batches with adaptive 503 recovery.
 
-    On 503, the learner reduces the page limit and the failed batch
-    (plus all remaining batches) are re-split with the new limit.
+    On 503:
+    1. If rasterization available and not yet tried: rasterize and retry same batch
+    2. If already rasterized or no rasterization: reduce page limit and re-split
 
     Args:
         pages: All pages to process (1-indexed)
-        process_batch: Callable(batch_pages, batch_idx, total_batches) -> result
+        process_batch: Callable(batch_pages, batch_idx, total_batches, use_rasterized) -> result
         learner: Page limit learner (shared across calls in session)
         is_503_fn: Predicate to identify 503 errors
         operation_name: For logging
         overlap: Pages of overlap between consecutive batches
+        can_rasterize: Whether rasterization fallback is available
 
     Returns:
         List of results from each successful batch
@@ -157,6 +160,7 @@ def run_adaptive_batches(
     while batch_idx < len(batches):
         batch = batches[batch_idx]
         batch_start, batch_end = min(batch), max(batch)
+        tried_rasterize_this_batch = False  # Reset for each batch
 
         logger.info(
             f"[{operation_name}] Batch {batch_idx + 1}/{len(batches)}: "
@@ -164,10 +168,10 @@ def run_adaptive_batches(
         )
 
         try:
-            # Tell tenacity not to retry 503 — we handle it here by splitting
+            # Tell tenacity not to retry 503 — we handle it here
             _retry_context.skip_503 = True
             try:
-                result = process_batch(batch, batch_idx, len(batches))
+                result = process_batch(batch, batch_idx, len(batches), False)
             finally:
                 _retry_context.skip_503 = False
             learner.report_success(len(batch))
@@ -175,6 +179,35 @@ def run_adaptive_batches(
             batch_idx += 1
         except Exception as e:
             if is_503_fn(e):
+                # Strategy: try rasterization first (once per batch), then split
+                if can_rasterize and not tried_rasterize_this_batch:
+                    logger.warning(
+                        f"[{operation_name}] 503 error on {len(batch)} pages, "
+                        f"retrying batch {batch_idx+1} with JBIG2 rasterization..."
+                    )
+                    tried_rasterize_this_batch = True
+
+                    # Retry same batch with rasterized PDF
+                    try:
+                        _retry_context.skip_503 = True
+                        try:
+                            result = process_batch(batch, batch_idx, len(batches), True)
+                        finally:
+                            _retry_context.skip_503 = False
+                        learner.report_success(len(batch))
+                        results.append(result)
+                        batch_idx += 1
+                        continue
+                    except Exception as e2:
+                        if not is_503_fn(e2):
+                            raise
+                        logger.warning(
+                            f"[{operation_name}] 503 even after rasterization, "
+                            f"falling back to batch splitting..."
+                        )
+                        # Fall through to split logic
+
+                # Split: reduce limit and re-batch
                 learner.report_503(len(batch))
 
                 # Collect all remaining pages (current failed + future batches)
@@ -304,10 +337,12 @@ class AdaptivePdfCall:
         model: str,
         prepare_pdf: Callable,
         learner: PdfPageLimitLearner,
+        prepare_pdf_rasterized: Callable = None,
     ):
         self.client = client
         self.model = model
         self._prepare_pdf = prepare_pdf
+        self._prepare_pdf_rasterized = prepare_pdf_rasterized
         self._learner = learner
 
     def build_prompt(self, batch_pages: List[int], batch_idx: int, total_batches: int) -> str:
@@ -459,8 +494,19 @@ Look at the PDF pages carefully to verify page numbers are correct."""
         Returns:
             Parsed result (single batch) or merged result (multi-batch)
         """
-        def process_batch(batch_pages, batch_idx, total_batches):
-            pdf_data = self._prepare_pdf(pdf_path, include_pages=batch_pages)
+        def process_batch(batch_pages, batch_idx, total_batches, use_rasterized=False):
+            # Choose PDF preparation method
+            if use_rasterized and self._prepare_pdf_rasterized:
+                pdf_data = self._prepare_pdf_rasterized(pdf_path, include_pages=batch_pages)
+                if pdf_data is None:
+                    logger.warning(
+                        f"Rasterization failed for batch {batch_idx+1}, "
+                        f"falling back to normal PDF"
+                    )
+                    pdf_data = self._prepare_pdf(pdf_path, include_pages=batch_pages)
+            else:
+                pdf_data = self._prepare_pdf(pdf_path, include_pages=batch_pages)
+
             if pdf_data is None:
                 batch_start, batch_end = min(batch_pages), max(batch_pages)
                 raise RuntimeError(
@@ -477,16 +523,32 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                 config.response_mime_type = "application/json"
 
                 op_name = f"{self.operation_name} batch {batch_idx+1}/{total_batches}"
+                if use_rasterized:
+                    op_name += " (rasterized)"
                 if attempt > 0:
                     op_name += f" (fix {attempt})"
 
-                response_text = self.client.generate_content_stream(
-                    model=self.model,
-                    contents=parts,
-                    config=config,
-                    operation_name=op_name,
-                )
-                result = self.parse_result(response_text)
+                # Retry on truncated JSON (Gemini connection drops)
+                last_json_error = None
+                for json_retry in range(3):
+                    response_text = self.client.generate_content_stream(
+                        model=self.model,
+                        contents=parts,
+                        config=config,
+                        operation_name=op_name,
+                    )
+                    try:
+                        result = self.parse_result(response_text)
+                        break
+                    except json.JSONDecodeError as e:
+                        last_json_error = e
+                        logger.warning(
+                            f"[{self.operation_name}] JSON truncated "
+                            f"({len(response_text)} chars), "
+                            f"retrying ({json_retry+1}/3): {e}"
+                        )
+                else:
+                    raise last_json_error
 
                 # Run batch validation hook
                 all_issues = self.validate_batch_result(result, batch_idx, total_batches)
@@ -528,9 +590,13 @@ Look at the PDF pages carefully to verify page numbers are correct."""
 
             return result
 
+        # Check if rasterization is available
+        can_rasterize = self._prepare_pdf_rasterized is not None
+
         results = run_adaptive_batches(
             pages, process_batch, self._learner, is_503_error,
-            self.operation_name, overlap=self.overlap
+            self.operation_name, overlap=self.overlap,
+            can_rasterize=can_rasterize,
         )
 
         return self.merge_results(results)
@@ -597,8 +663,9 @@ class DirectAnalysisCall(AdaptivePdfCall):
     overlap = 50
     merge_max_retries = 2
 
-    def __init__(self, client, model, prepare_pdf, learner, book_title: str, toc_reference: str = None):
-        super().__init__(client, model, prepare_pdf, learner)
+    def __init__(self, client, model, prepare_pdf, learner, book_title: str,
+                 toc_reference: str = None, prepare_pdf_rasterized: Callable = None):
+        super().__init__(client, model, prepare_pdf, learner, prepare_pdf_rasterized)
         self.book_title = book_title
         self.toc_reference = toc_reference
 

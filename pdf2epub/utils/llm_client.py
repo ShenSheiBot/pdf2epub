@@ -27,7 +27,8 @@ class SafetyBlockError(Exception):
 class LLMGenerateConfig:
     """Universal generation config that works across all providers."""
 
-    def __init__(self, temperature: float = 0.1, max_tokens: int = 65536):
+    # 64000 is Haiku 4.5's limit; Gemini supports 65536 but we use the lower value
+    def __init__(self, temperature: float = 0.1, max_tokens: int = 64000):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.response_mime_type: Optional[str] = None  # "application/json" for JSON mode

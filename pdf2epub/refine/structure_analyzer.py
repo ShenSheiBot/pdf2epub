@@ -162,6 +162,7 @@ class StructureAnalyzer:
         call = TocDetectionCall(
             self.structure_client, self.toc_model,
             self._prepare_pdf, self._learner,
+            self._prepare_pdf_rasterized,
         )
         try:
             return call.run(pdf_path, pages)
@@ -204,6 +205,9 @@ Return ONLY the cleaned text, nothing else.
 
         try:
             config = self.analysis_client.get_default_config(temperature=0.1)
+            # TOC text typically ~500-1000 tokens. 4096 is conservative upper bound
+            # that reduces API costs. If truncated, returns None (handled by caller).
+            config.max_tokens = 4096
             response = self.analysis_client.generate_content_stream(
                 model=self.analysis_model,
                 contents=prompt,
@@ -516,6 +520,51 @@ Return ONLY the cleaned text, nothing else.
             logger.error(f"Failed to render pages to PDF: {e}")
             return None
 
+    def _prepare_pdf_rasterized(
+        self,
+        pdf_path: Path,
+        include_pages: Optional[List[int]] = None,
+        target_mb: float = 30.0
+    ) -> Optional[bytes]:
+        """
+        Prepare PDF using JBIG2 rasterization (for 503 fallback).
+
+        Rasterizes specified pages with binarization, producing a much smaller
+        PDF that Gemini can process even under load.
+
+        Args:
+            pdf_path: Path to the source PDF
+            include_pages: Pages to include (1-indexed), None for all
+            target_mb: Target file size limit in MB
+
+        Returns:
+            PDF bytes, or None if rasterization fails
+        """
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        try:
+            success, stats = rasterize_to_limit(
+                pdf_path, tmp_path, include_pages, target_mb
+            )
+            if not success:
+                logger.warning("JBIG2 rasterization failed")
+                return None
+
+            logger.info(
+                f"Rasterized PDF: {stats.get('page_count', '?')} pages, "
+                f"{stats['output_size_mb']:.1f} MB ({stats['method']} @ {stats['dpi']} DPI)"
+            )
+
+            try:
+                with open(tmp_path, 'rb') as f:
+                    return f.read()
+            except OSError as e:
+                logger.error(f"Failed to read rasterized PDF: {e}")
+                return None
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
     def analyze_pdf_structure(
         self,
         pdf_path: Path,
@@ -688,6 +737,7 @@ Return ONLY the cleaned text, nothing else.
             self.structure_client, self.structure_model,
             self._prepare_pdf, self._learner, book_title,
             toc_reference=toc_reference,
+            prepare_pdf_rasterized=self._prepare_pdf_rasterized,
         )
         return call.run(pdf_path, all_pages)
 

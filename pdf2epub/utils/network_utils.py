@@ -320,11 +320,13 @@ class GeminiClient:
         # Get final token count
         final_tokens = len(self.tokenizer.encode(aggregated_text))
 
-        # Warn if response seems abnormally short (< 500 tokens for structure analysis)
-        if final_tokens < 500 and "structure" in operation_name.lower():
-            logger.warning(f"Abnormally short response ({final_tokens} tokens) for {operation_name}")
-            if finish_reason:
-                logger.warning(f"Finish reason: {finish_reason}")
+        # Log truncation warning — actual retry is handled by caller
+        if finish_reason and 'MAX_TOKENS' in finish_reason.upper():
+            logger.warning(
+                f"Response truncated (MAX_TOKENS) for {operation_name}: "
+                f"{final_tokens} tokens generated before cutoff"
+            )
+
         logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) for {operation_name}")
         return aggregated_text
     

@@ -142,7 +142,7 @@ class TestRunAdaptiveBatches:
         learner = PdfPageLimitLearner(initial_limit=100)
         calls = []
 
-        def process(batch, idx, total):
+        def process(batch, idx, total, use_rasterized=False):
             calls.append((batch, idx, total))
             return f"result_{idx}"
 
@@ -158,7 +158,7 @@ class TestRunAdaptiveBatches:
         learner = PdfPageLimitLearner(initial_limit=5)
         results = run_adaptive_batches(
             list(range(1, 13)),
-            lambda batch, idx, total: len(batch),
+            lambda batch, idx, total, use_rasterized=False: len(batch),
             learner, is_503_error, "test"
         )
         assert results == [5, 5, 2]
@@ -168,7 +168,7 @@ class TestRunAdaptiveBatches:
         learner = PdfPageLimitLearner(initial_limit=10, min_limit=2)
         attempt_count = [0]
 
-        def process(batch, idx, total):
+        def process(batch, idx, total, use_rasterized=False):
             attempt_count[0] += 1
             if len(batch) > 5:
                 raise Exception("503 UNAVAILABLE")
@@ -192,7 +192,7 @@ class TestRunAdaptiveBatches:
         learner = PdfPageLimitLearner(initial_limit=5, min_limit=2)
         call_count = [0]
 
-        def process(batch, idx, total):
+        def process(batch, idx, total, use_rasterized=False):
             call_count[0] += 1
             # Second batch fails first time (call_count==2), succeeds after re-split
             if call_count[0] == 2 and len(batch) == 5:
@@ -212,7 +212,7 @@ class TestRunAdaptiveBatches:
         """Non-503 errors are re-raised, not caught."""
         learner = PdfPageLimitLearner(initial_limit=100)
 
-        def process(batch, idx, total):
+        def process(batch, idx, total, use_rasterized=False):
             raise ValueError("bad data")
 
         with pytest.raises(ValueError, match="bad data"):
@@ -224,7 +224,7 @@ class TestRunAdaptiveBatches:
         """Repeated 503s until below minimum → RuntimeError."""
         learner = PdfPageLimitLearner(initial_limit=100, min_limit=50)
 
-        def always_503(batch, idx, total):
+        def always_503(batch, idx, total, use_rasterized=False):
             raise Exception("503")
 
         with pytest.raises(RuntimeError, match="below minimum"):
@@ -237,7 +237,7 @@ class TestRunAdaptiveBatches:
         learner = PdfPageLimitLearner(initial_limit=10, min_limit=2)
         call_sizes = []
 
-        def process(batch, idx, total):
+        def process(batch, idx, total, use_rasterized=False):
             call_sizes.append(len(batch))
             if len(batch) > 5:
                 raise Exception("503 UNAVAILABLE")
@@ -258,7 +258,7 @@ class TestRunAdaptiveBatches:
         """Learner from one run_adaptive_batches carries to the next."""
         learner = PdfPageLimitLearner(initial_limit=100, min_limit=10)
 
-        def fail_big(batch, idx, total):
+        def fail_big(batch, idx, total, use_rasterized=False):
             if len(batch) > 25:
                 raise Exception("503")
             return "ok"
@@ -272,7 +272,7 @@ class TestRunAdaptiveBatches:
         # Second operation: starts with learned limit=25
         call_batches = []
 
-        def record(batch, idx, total):
+        def record(batch, idx, total, use_rasterized=False):
             call_batches.append(batch)
             return "ok"
 
@@ -281,6 +281,101 @@ class TestRunAdaptiveBatches:
         )
         # Should start with batches of 25, not 100
         assert all(len(b) <= 25 for b in call_batches)
+
+    def test_503_tries_rasterization_first(self):
+        """503 with can_rasterize=True tries rasterized version first."""
+        learner = PdfPageLimitLearner(initial_limit=100)
+        calls = []
+
+        def process(batch, idx, total, use_rasterized=False):
+            calls.append((len(batch), use_rasterized))
+            # First call (not rasterized) fails with 503
+            # Second call (rasterized) succeeds
+            if not use_rasterized:
+                raise Exception("503 UNAVAILABLE")
+            return "ok"
+
+        results = run_adaptive_batches(
+            list(range(1, 11)), process, learner, is_503_error, "test",
+            can_rasterize=True
+        )
+        # Should have tried normal first, then rasterized
+        assert calls == [(10, False), (10, True)]
+        assert results == ["ok"]
+        # Limit should NOT have been reduced (rasterization succeeded)
+        assert learner.limit == 100
+
+    def test_503_rasterization_per_batch(self):
+        """Each batch gets its own chance to try rasterization."""
+        learner = PdfPageLimitLearner(initial_limit=5)
+        calls = []
+
+        def process(batch, idx, total, use_rasterized=False):
+            calls.append((idx, use_rasterized))
+            # Both batches fail without rasterization, succeed with it
+            if not use_rasterized:
+                raise Exception("503 UNAVAILABLE")
+            return f"batch_{idx}"
+
+        results = run_adaptive_batches(
+            list(range(1, 11)), process, learner, is_503_error, "test",
+            can_rasterize=True
+        )
+        # Each batch should try normal first, then rasterized
+        assert (0, False) in calls
+        assert (0, True) in calls
+        assert (1, False) in calls
+        assert (1, True) in calls
+        assert results == ["batch_0", "batch_1"]
+        # Limit unchanged since rasterization succeeded
+        assert learner.limit == 5
+
+    def test_503_rasterization_fails_then_splits(self):
+        """503 with rasterization also failing → fall back to split."""
+        learner = PdfPageLimitLearner(initial_limit=10, min_limit=2)
+        calls = []
+
+        def process(batch, idx, total, use_rasterized=False):
+            calls.append((len(batch), use_rasterized))
+            # Always 503 for batches > 5 pages
+            if len(batch) > 5:
+                raise Exception("503 UNAVAILABLE")
+            return batch
+
+        results = run_adaptive_batches(
+            list(range(1, 11)), process, learner, is_503_error, "test",
+            can_rasterize=True
+        )
+        # First call: 10 pages, not rasterized → 503
+        # Second call: 10 pages, rasterized → 503
+        # Then split to 5+5
+        assert (10, False) in calls
+        assert (10, True) in calls
+        assert learner.limit == 5
+        # Final results from split batches
+        all_pages = []
+        for r in results:
+            all_pages.extend(r)
+        assert sorted(set(all_pages)) == list(range(1, 11))
+
+    def test_no_rasterization_when_disabled(self):
+        """503 without can_rasterize goes straight to split."""
+        learner = PdfPageLimitLearner(initial_limit=10, min_limit=2)
+        calls = []
+
+        def process(batch, idx, total, use_rasterized=False):
+            calls.append((len(batch), use_rasterized))
+            if len(batch) > 5:
+                raise Exception("503 UNAVAILABLE")
+            return batch
+
+        results = run_adaptive_batches(
+            list(range(1, 11)), process, learner, is_503_error, "test",
+            can_rasterize=False
+        )
+        # Should never call with use_rasterized=True
+        assert all(not r for _, r in calls)
+        assert learner.limit == 5
 
 
 # --- validate_chapter_structure ---

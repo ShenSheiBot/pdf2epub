@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.usage import UsageLimits
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
@@ -662,10 +663,12 @@ async def verify_node_boundaries(
 
 async def _run_agent_with_retries(agent, state: ChapterState, prompt: str, max_retries: int):
     """Run agent with retry logic for transient errors."""
+    config = load_config()
+    request_limit = config.get('refine', {}).get('agent_request_limit', 100)
     last_error = None
     for attempt in range(max_retries):
         try:
-            await agent.run(prompt, deps=state)
+            await agent.run(prompt, deps=state, usage_limits=UsageLimits(request_limit=request_limit))
             return
         except Exception as e:
             last_error = e

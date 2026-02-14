@@ -13,6 +13,7 @@ from typing import Dict, List, Tuple, Any, Optional
 from lxml import etree
 from lxml import html as lxml_html
 from loguru import logger
+from .display_resolver import resolve_display
 
 
 class HTMLCompressor:
@@ -37,22 +38,13 @@ class HTMLCompressor:
         """
         self.compactor = compactor
 
-    BLOCK_ELEMENTS = {
-        'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-        'blockquote', 'section', 'article', 'li', 'td', 'th',
-        'dt', 'dd', 'figcaption', 'caption', 'header', 'footer',
-        'pre', 'address', 'aside', 'main', 'nav', 'figure',
-        'ul', 'ol', 'dl', 'table', 'thead', 'tbody', 'tfoot', 'tr',
-        'form', 'fieldset', 'details', 'summary', 'dialog'
-    }
-
     VOID_ELEMENTS = {
         'img', 'br', 'hr', 'input', 'meta', 'link', 'area', 'base',
         'col', 'embed', 'source', 'track', 'wbr'
     }
 
     # Types that need translation (have content to translate)
-    TRANSLATABLE_TYPES = {'naked', 'block', 'inline'}
+    TRANSLATABLE_TYPES = {'naked', 'block', 'inline', 'inline_run'}
 
     def _parse_html(self, html: str):
         """Parse HTML string, handling XML declarations properly.
@@ -65,7 +57,7 @@ class HTMLCompressor:
             return lxml_html.fromstring(html.encode('utf-8'))
         return lxml_html.fromstring(html)
 
-    def compress(self, html: str) -> Tuple[str, Dict[str, Any]]:
+    def compress(self, html: str, author_css: str = "") -> Tuple[str, Dict[str, Any]]:
         """
         Compress HTML for translation.
 
@@ -86,6 +78,9 @@ class HTMLCompressor:
         # Encode to bytes if string contains XML declaration (lxml requirement)
         root = self._parse_html(html)
 
+        # Build CSS display map for block/inline detection
+        self._display_map = resolve_display(root, author_css)
+
         units: List[str] = []
         unit_mappings: List[Dict[str, Any]] = []
 
@@ -97,22 +92,8 @@ class HTMLCompressor:
         if body is None:
             body = root
 
-        # Process all top-level children
-        # In lxml, we need to handle text before first child and tail after each child
-        if body.text and body.text.strip():
-            text = self._normalize_whitespace(body.text)
-            if text:
-                units.append(text)
-                unit_mappings.append({'type': 'naked'})
-
-        for child in body:
-            self._process_element(child, units, unit_mappings)
-            # Handle tail text after element
-            if child.tail and child.tail.strip():
-                text = self._normalize_whitespace(child.tail)
-                if text:
-                    units.append(text)
-                    unit_mappings.append({'type': 'naked'})
+        # Process body children, grouping consecutive inline content
+        self._process_mixed_children(body, units, unit_mappings)
 
         mapping = {
             'wrapper': wrapper,
@@ -255,6 +236,20 @@ class HTMLCompressor:
 
                 body_parts.append(content)
 
+            elif unit_type == 'inline_run':
+                # Translatable inline run: consume a line only if has_content
+                if unit_map.get('has_content', True):
+                    content = lines[line_idx] if line_idx < len(lines) else ''
+                    line_idx += 1
+                else:
+                    content = ''
+
+                # Restore inner attrs if present
+                if unit_map.get('inner_tags') and unit_map.get('inner_attr_map'):
+                    content = self._restore_inner_attrs(content, unit_map['inner_attr_map'])
+
+                body_parts.append(content)
+
             else:
                 # Unknown type - skip (shouldn't happen)
                 pass
@@ -329,8 +324,8 @@ class HTMLCompressor:
             })
             return
 
-        # Handle block elements
-        if tag_name in self.BLOCK_ELEMENTS:
+        # Handle block elements (determined by CSS display)
+        if self._is_block(elem):
             # Check if contains nested block children
             if self._has_block_children(elem):
                 # Container block: add open marker, recurse, add close marker
@@ -341,21 +336,7 @@ class HTMLCompressor:
                     'attrs': dict(elem.attrib)
                 })
 
-                # Process text before first child
-                if elem.text and elem.text.strip():
-                    text = self._normalize_whitespace(elem.text)
-                    if text:
-                        units.append(text)
-                        mapping.append({'type': 'naked'})
-
-                for child in elem:
-                    self._process_element(child, units, mapping)
-                    # Handle tail text after element
-                    if child.tail and child.tail.strip():
-                        text = self._normalize_whitespace(child.tail)
-                        if text:
-                            units.append(text)
-                            mapping.append({'type': 'naked'})
+                self._process_mixed_children(elem, units, mapping)
 
                 units.append('')
                 mapping.append({
@@ -453,12 +434,142 @@ class HTMLCompressor:
             return self._is_single_chain(child)
         return False
 
+    def _is_inline(self, elem) -> bool:
+        """Check if element has inline-level display based on CSS cascade."""
+        if not isinstance(elem, etree._Element) or not isinstance(elem.tag, str):
+            return False
+        display = self._display_map.get(elem, 'inline')
+        return display.startswith('inline') or display in ('contents', 'none')
+
+    def _is_block(self, elem) -> bool:
+        """Check if element has block-level display based on CSS cascade."""
+        if not isinstance(elem, etree._Element) or not isinstance(elem.tag, str):
+            return False
+        return not self._is_inline(elem)
+
     def _has_block_children(self, elem) -> bool:
         """Check if element contains any block-level children."""
         for child in elem:
-            if child.tag in self.BLOCK_ELEMENTS:
+            if isinstance(child, etree._Element) and self._is_block(child):
                 return True
         return False
+
+    def _group_children(self, elem):
+        """Group element's children into block elements and inline runs.
+
+        Returns:
+            List of tuples:
+            - ('block', element) for block-level children
+            - ('inline_run', [(type, data), ...]) for consecutive inline content
+            - ('void', element) for void elements
+            - ('comment', element) for comment nodes
+        """
+        groups = []
+        current_run = []
+
+        # elem.text (text before first child)
+        if elem.text:
+            current_run.append(('text', elem.text))
+
+        for child in elem:
+            if isinstance(child, etree._Comment):
+                if current_run:
+                    groups.append(('inline_run', current_run))
+                    current_run = []
+                groups.append(('comment', child))
+                if child.tail:
+                    current_run.append(('text', child.tail))
+            elif isinstance(child, etree._Element) and child.tag in self.VOID_ELEMENTS:
+                if current_run:
+                    groups.append(('inline_run', current_run))
+                    current_run = []
+                groups.append(('void', child))
+                if child.tail:
+                    current_run.append(('text', child.tail))
+            elif isinstance(child, etree._Element) and self._is_block(child):
+                if current_run:
+                    groups.append(('inline_run', current_run))
+                    current_run = []
+                groups.append(('block', child))
+                if child.tail:
+                    current_run.append(('text', child.tail))
+            elif isinstance(child, etree._Element):
+                # Inline element
+                current_run.append(('element', child))
+                if child.tail:
+                    current_run.append(('text', child.tail))
+            # Skip non-element, non-comment nodes
+
+        if current_run:
+            groups.append(('inline_run', current_run))
+
+        return groups
+
+    def _process_mixed_children(self, elem, units, mapping):
+        """Process a container's children, grouping consecutive inline content.
+
+        Used for both body-level and container block processing.
+        """
+        groups = self._group_children(elem)
+        for group_type, group_data in groups:
+            if group_type == 'block':
+                self._process_element(group_data, units, mapping)
+            elif group_type == 'inline_run':
+                self._process_inline_run(group_data, units, mapping)
+            elif group_type == 'void':
+                units.append('')
+                mapping.append({
+                    'type': 'void',
+                    'tag': group_data.tag,
+                    'attrs': dict(group_data.attrib)
+                })
+            elif group_type == 'comment':
+                units.append('')
+                mapping.append({
+                    'type': 'comment',
+                    'content': str(group_data.text) if group_data.text else ''
+                })
+
+    def _process_inline_run(self, run_items, units, mapping):
+        """Process a group of consecutive inline content as a single unit.
+
+        Serializes text nodes and inline elements into one HTML string,
+        strips inner attributes for translation, and records mapping.
+        """
+        parts = []
+        for item_type, item_data in run_items:
+            if item_type == 'text':
+                parts.append(escape(item_data, quote=False))
+            elif item_type == 'element':
+                parts.append(etree.tostring(
+                    item_data, encoding='unicode', method='xml', with_tail=False
+                ))
+
+        inner_html = ''.join(parts)
+        normalized = self._normalize_whitespace(inner_html)
+
+        if not normalized.strip():
+            return  # Empty run, skip
+
+        has_elements = any(t == 'element' for t, _ in run_items)
+
+        if not has_elements:
+            # Pure text run - use naked type (compatible with existing behavior)
+            units.append(normalized)
+            mapping.append({'type': 'naked'})
+        else:
+            # Contains inline elements - strip attrs and save mapping
+            stripped, attr_map = self._strip_inner_attrs(inner_html)
+            stripped = self._normalize_whitespace(stripped)
+            if not stripped.strip():
+                return
+            units.append(stripped)
+            mapping.append({
+                'type': 'inline_run',
+                'has_content': bool(stripped.strip()),
+                'inner_tags': bool(attr_map),
+                'inner_attr_map': attr_map
+            })
 
     def _extract_chain(self, elem) -> Tuple[str, List[Tuple[str, Dict]]]:
         """Extract text and full tag path from single-chain element."""

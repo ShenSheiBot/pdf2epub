@@ -792,7 +792,7 @@ class HTMLEpubPipeline:
                     content = content.decode('utf-8')
 
                 # Compress HTML
-                compressed, mapping = compressor.compress(content)
+                compressed, mapping = compressor.compress(content, author_css=css_content)
 
                 # Save compressed content (.md - one translation unit per line)
                 href_path = Path(href)

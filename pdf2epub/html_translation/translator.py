@@ -274,9 +274,8 @@ class HTMLTranslateProcessor:
 
         # Check if already completed
         if self.resume and output_file.exists():
-            if self.processing_tracker.is_file_completed(file_name):
-                logger.debug(f"Skipping completed file: {file_name}")
-                return {"file": file_name, "status": "skipped", "reason": "already completed"}
+            logger.debug(f"Skipping completed file: {file_name}")
+            return {"file": file_name, "status": "skipped", "reason": "already completed"}
 
         # Read input content
         if not input_file.exists():
@@ -291,68 +290,30 @@ class HTMLTranslateProcessor:
         if not content.strip():
             # Empty file, just copy
             output_file.write_text("")
-            self.processing_tracker.mark_file_completed(file_name)
             return {"file": file_name, "status": "success", "reason": "empty file"}
 
-        # Process with retry logic
+        # Single-pass translation: call LLM once, save result directly
         model_configs = self.get_model_configs()
-        last_error = None
-        longest_response = None
-        longest_length = 0
 
-        for model_config in model_configs:
-            provider = model_config.get('provider', 'gemini')
-            model = model_config.get('model', 'gemini-2.5-pro')
-            api_retries = model_config.get('api_retries', 2)
-            validation_retries = model_config.get('validation_retries', 2)
+        try:
+            prompt = self.build_prompt(content, file_name)
+            response = self.llm_client.generate(
+                prompt=prompt,
+                model_configs=model_configs,
+                operation_name=f"Translate {file_name}"
+            )
+            cleaned = self.clean_response(response)
 
-            for attempt in range(api_retries + validation_retries):
-                try:
-                    # Build prompt
-                    prompt = self.build_prompt(content, file_name)
-
-                    # Call LLM
-                    response = self.llm_client.generate(
-                        provider=provider,
-                        model=model,
-                        prompt=prompt
-                    )
-
-                    # Clean response
-                    cleaned = self.clean_response(response)
-
-                    # Track longest response for fallback
-                    if len(cleaned) > longest_length:
-                        longest_response = cleaned
-                        longest_length = len(cleaned)
-
-                    # Validate
-                    is_valid, reason = self.validate_output(content, cleaned, file_name)
-
-                    if is_valid:
-                        # Save output
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            f.write(cleaned)
-                        self.processing_tracker.mark_file_completed(file_name)
-                        return {"file": file_name, "status": "success", "model": f"{provider}/{model}"}
-
-                    last_error = reason
-                    logger.warning(f"Validation failed for {file_name}: {reason}")
-
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning(f"Error processing {file_name} with {provider}/{model}: {e}")
-                    time.sleep(1)  # Brief pause before retry
-
-        # All attempts failed
-        if self.use_longest_on_failure and longest_response:
-            logger.warning(f"Using longest response for {file_name} after all attempts failed")
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(longest_response)
-            self.processing_tracker.mark_file_completed(file_name)
-            return {"file": file_name, "status": "fallback", "reason": last_error}
+                f.write(cleaned)
 
-        return {"file": file_name, "status": "error", "reason": last_error}
+            provider = model_configs[0].get('provider', 'unknown')
+            model = model_configs[0].get('model', 'unknown')
+            return {"file": file_name, "status": "success", "model": f"{provider}/{model}"}
+
+        except Exception as e:
+            logger.error(f"Failed to translate {file_name}: {e}")
+            return {"file": file_name, "status": "error", "reason": str(e)}
 
     def process_all_files(self) -> Dict:
         """

@@ -24,6 +24,11 @@ output/{title}/
 │   └── processing_tracker.json
 ├── translated/               # PDF 翻译后内容
 │   └── processing_tracker.json
+├── logs/                     # 各阶段日志（重要！查进度用这里）
+│   ├── refine.log
+│   ├── polish_v2.log
+│   ├── translate_v2.log
+│   └── build-epub.log
 ├── toc_tree.json            # 目录结构（新版）
 ├── book_structure.json      # 目录结构（旧版）
 ├── refine_state.json        # Refine 阶段状态
@@ -215,6 +220,11 @@ translation:
 ```bash
 # 查看输出目录内容
 ls -la "output/{title}/"
+
+# 查看各阶段日志（最重要！）
+tail -50 "output/{title}/logs/polish_v2.log"
+tail -50 "output/{title}/logs/translate_v2.log"
+tail -50 "output/{title}/logs/refine.log"
 
 # 查看翻译进度（文件数量）
 ls "output/{title}/translated_compressed/" | wc -l

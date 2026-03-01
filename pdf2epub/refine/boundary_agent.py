@@ -86,6 +86,7 @@ class Section(BaseModel):
     children_count: int = 0
     estimated_tokens: int = 0
     original_index: Optional[int] = None  # Index in original children, None if inserted
+    original_start_page: Optional[int] = None  # Original start page, for cumulative drift cap
 
 
 # Hard cap on page adjustments to prevent catastrophic boundary moves
@@ -209,18 +210,19 @@ If issues remain, fix them or confirm they are intentional before finishing.
             section = sections[section_index]
             old_start = section.start_page
 
-            # Hard cap: reject adjustments larger than ±10 pages
-
-            delta = abs(new_start_page - old_start)
+            # Hard cap: reject adjustments larger than ±10 pages from ORIGINAL position
+            # This prevents cumulative drift via chained adjustments
+            reference = old_start if section.original_start_page is None else section.original_start_page
+            delta = abs(new_start_page - reference)
             if delta > MAX_ADJUSTMENT_PAGES:
                 logger.warning(
                     f"Rejected adjustment for '{section.title}': "
-                    f"p{old_start} -> p{new_start_page} (delta={delta})"
+                    f"p{reference} (original) -> p{new_start_page} (delta={delta})"
                 )
                 return (
-                    f"Error: Adjustment of {delta} pages is too large "
-                    f"(max ±{MAX_ADJUSTMENT_PAGES}). "
-                    f"Original: p{old_start}, proposed: p{new_start_page}. "
+                    f"Error: Cumulative adjustment of {delta} pages from original "
+                    f"position p{reference} is too large (max ±{MAX_ADJUSTMENT_PAGES}). "
+                    f"Proposed: p{new_start_page}. "
                     f"Keep original start page if uncertain."
                 )
 
@@ -262,17 +264,18 @@ If issues remain, fix them or confirm they are intentional before finishing.
             section = sections[section_index]
             prev_section = sections[section_index - 1]
 
-            # Hard cap: reject splits too far from section's current start page
-
-            delta = abs(page_num - section.start_page)
+            # Hard cap: reject splits too far from section's ORIGINAL start page
+            # This prevents cumulative drift via chained adjustments
+            reference = section.start_page if section.original_start_page is None else section.original_start_page
+            delta = abs(page_num - reference)
             if delta > MAX_ADJUSTMENT_PAGES:
                 logger.warning(
                     f"Rejected split for '{section.title}': "
-                    f"page {page_num} vs current start p{section.start_page} (delta={delta})"
+                    f"page {page_num} vs original start p{reference} (delta={delta})"
                 )
                 return (
-                    f"Error: Split page {page_num} is too far from section's current "
-                    f"start page {section.start_page} (delta={delta} pages, "
+                    f"Error: Split page {page_num} is too far from section's original "
+                    f"start page {reference} (delta={delta} pages, "
                     f"max ±{MAX_ADJUSTMENT_PAGES}). "
                     f"Use adjust_start first if the section start needs correction."
                 )
@@ -370,12 +373,13 @@ If issues remain, fix them or confirm they are intentional before finishing.
             # Success — reset rejection counter
             ctx.deps.insert_rejections = 0
 
-            # Create new section
+            # Create new section (with drift anchor so cumulative cap applies)
             new_section = Section(
                 title=title,
                 start_page=start_page,
                 end_page=end_page,
                 verified=False,
+                original_start_page=start_page,
             )
 
             # Tighten adjacent boundaries to abut the new section
@@ -446,6 +450,14 @@ def detect_boundary_issues(sections: list[Section], pages_dir: Path = None) -> l
         List of issue descriptions, empty if no issues found.
     """
     issues = []
+
+    # Check for invalid ranges (end_page < start_page)
+    for i, s in enumerate(sections):
+        if s.end_page < s.start_page:
+            issues.append(
+                f"INVALID RANGE: [{i}] '{s.title[:30]}' has end_page={s.end_page} < "
+                f"start_page={s.start_page}. Use adjust_start to fix."
+            )
 
     for i in range(len(sections) - 1):
         curr = sections[i]
@@ -542,6 +554,7 @@ def toc_node_to_sections(node: TOCNode) -> list[Section]:
             children_count=len(child.children),
             estimated_tokens=child.estimated_tokens,
             original_index=i,
+            original_start_page=start_page,
         ))
     return sections
 
@@ -589,6 +602,89 @@ def sections_to_toc_children(sections: list[Section], original_children: list[TO
             new_children.append(new_node)
 
     return new_children
+
+
+def _enforce_boundary_invariants(
+    sections: list[Section],
+    parent_start: int,
+    parent_end: int,
+) -> None:
+    """Enforce structural invariants after agent verification.
+
+    The boundary agent makes best-effort adjustments, but can leave structural
+    issues: children outside parent bounds, end_page < start_page, last child
+    not extending to parent's end, gaps between siblings. This function fixes
+    them deterministically.
+
+    Fixes:
+    0. Clamp all children to parent bounds (no child outside parent range)
+    1. end_page < start_page (logically impossible)
+    2. First child's start_page should match parent's start_page
+    3. Last child's end_page should match parent's end_page
+    4. Gaps between consecutive sections (extend previous section)
+    """
+    if not sections:
+        return
+
+    # Fix 0: Clamp all children to parent bounds [parent_start, parent_end]
+    for s in sections:
+        clamped_start = max(parent_start, min(s.start_page, parent_end))
+        clamped_end = max(parent_start, min(s.end_page, parent_end))
+        if s.start_page != clamped_start:
+            logger.warning(
+                f"Boundary invariant: '{s.title}' start_page={s.start_page} "
+                f"outside parent [{parent_start}, {parent_end}], clamping to {clamped_start}"
+            )
+            s.start_page = clamped_start
+            s.start_line = None
+        if s.end_page != clamped_end:
+            logger.warning(
+                f"Boundary invariant: '{s.title}' end_page={s.end_page} "
+                f"outside parent [{parent_start}, {parent_end}], clamping to {clamped_end}"
+            )
+            s.end_page = clamped_end
+            s.end_line = None
+
+    # Fix 1: end_page >= start_page (may happen after clamping)
+    for s in sections:
+        if s.end_page < s.start_page:
+            logger.warning(
+                f"Boundary invariant: '{s.title}' end_page={s.end_page} < "
+                f"start_page={s.start_page}, setting end_page={s.start_page}"
+            )
+            s.end_page = s.start_page
+            s.end_line = None
+
+    # Fix 2: First child should start at parent's start_page
+    if sections[0].start_page > parent_start:
+        logger.info(
+            f"Boundary invariant: first child '{sections[0].title}' start_page "
+            f"{sections[0].start_page} -> {parent_start} (parent start)"
+        )
+        sections[0].start_page = parent_start
+        sections[0].start_line = None
+
+    # Fix 3: Last child should end at parent's end_page
+    if sections[-1].end_page < parent_end:
+        logger.info(
+            f"Boundary invariant: last child '{sections[-1].title}' end_page "
+            f"{sections[-1].end_page} -> {parent_end} (parent end)"
+        )
+        sections[-1].end_page = parent_end
+        sections[-1].end_line = None
+
+    # Fix 4: Close gaps between consecutive sections
+    for i in range(len(sections) - 1):
+        curr = sections[i]
+        next_sec = sections[i + 1]
+        if curr.end_page + 1 < next_sec.start_page:
+            old_end = curr.end_page
+            curr.end_page = next_sec.start_page - 1
+            curr.end_line = None
+            logger.info(
+                f"Boundary invariant: closed gap after '{curr.title}' "
+                f"end_page {old_end} -> {curr.end_page}"
+            )
 
 
 async def verify_node_boundaries(
@@ -656,8 +752,11 @@ async def verify_node_boundaries(
         if final_issues:
             logger.info(f"After second round, {len(final_issues)} issues remain (may be intentional)")
 
-    # Sort by page and update the node's children
+    # Sort by page, enforce invariants, then update the node's children
     _sort_sections_by_page(state.sections)
+    parent_start = getattr(node, 'start_page', 1)
+    parent_end = getattr(node, 'end_page', total_pages)
+    _enforce_boundary_invariants(state.sections, parent_start, parent_end)
     node.children = sections_to_toc_children(state.sections, node.children)
 
 

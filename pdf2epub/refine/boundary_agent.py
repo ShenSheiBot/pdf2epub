@@ -837,6 +837,14 @@ async def verify_toc_recursive(
     # Step 1: Verify top-level chapters
     logger.info("=== Verifying top-level chapters ===")
     await verify_node_boundaries(root, pages_dir, total_pages, max_retries)
+    # verify_node_boundaries replaces node.children with a new list (via
+    # sections_to_toc_children), so root.children may differ from toc_tree
+    # if sections were inserted. Capture the updated reference.
+    toc_tree = root.children
+    # Re-estimate tokens for any newly inserted chapters (gap_filled=True)
+    for node in toc_tree:
+        if not node.estimated_tokens:
+            node.estimated_tokens = estimate_tokens(pages_dir, node.start_page, node.end_page)
 
     # Step 2: Process each chapter recursively
     async def process_node(node: TOCNode, depth: int = 1):

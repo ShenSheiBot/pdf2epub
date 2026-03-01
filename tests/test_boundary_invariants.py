@@ -6,7 +6,9 @@ from pdf2epub.refine.boundary_agent import (
     Section,
     _enforce_boundary_invariants,
     detect_boundary_issues,
+    sections_to_toc_children,
 )
+from pdf2epub.refine.structure_analyzer import TOCNode
 
 
 class TestEnforceBoundaryInvariants:
@@ -197,3 +199,46 @@ class TestDetectBoundaryIssues:
         ]
         issues = detect_boundary_issues(sections)
         assert any("OVERLAP" in i for i in issues)
+
+
+class TestSectionsToTocChildren:
+    """Tests for sections_to_toc_children."""
+
+    def test_inserted_section_preserved(self):
+        """Inserted sections (original_index=None) create new TOCNodes."""
+        original_children = [
+            TOCNode(title="Ch 1", level=1, start_page=1, end_page=49),
+            TOCNode(title="Ch 3", level=1, start_page=70, end_page=100),
+        ]
+        sections = [
+            Section(title="Ch 1", start_page=1, end_page=49, original_index=0),
+            Section(title="Ch 2 (inserted)", start_page=50, end_page=69, original_index=None),
+            Section(title="Ch 3", start_page=70, end_page=100, original_index=1),
+        ]
+        result = sections_to_toc_children(sections, original_children)
+        assert len(result) == 3
+        assert result[1].title == "Ch 2 (inserted)"
+        assert result[1].start_page == 50
+        assert result[1].end_page == 69
+        assert result[1].gap_filled is True
+
+    def test_inserted_section_not_lost_via_reference(self):
+        """Simulate the VirtualRoot pattern: assignment replaces reference."""
+        original_children = [
+            TOCNode(title="Ch 1", level=1, start_page=1, end_page=49),
+            TOCNode(title="Ch 3", level=1, start_page=70, end_page=100),
+        ]
+        toc_tree = list(original_children)  # copy
+
+        # Simulate what verify_node_boundaries does
+        sections = [
+            Section(title="Ch 1", start_page=1, end_page=49, original_index=0),
+            Section(title="Ch 2 (inserted)", start_page=50, end_page=69, original_index=None),
+            Section(title="Ch 3", start_page=70, end_page=100, original_index=1),
+        ]
+        new_children = sections_to_toc_children(sections, original_children)
+
+        # This is the fix: capture updated reference
+        toc_tree = new_children
+        assert len(toc_tree) == 3
+        assert toc_tree[1].title == "Ch 2 (inserted)"

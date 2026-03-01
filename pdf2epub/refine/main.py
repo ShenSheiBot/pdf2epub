@@ -170,10 +170,12 @@ class RefinedBreakdown:
 
             # Analyze structure (with resume support)
             logger.info("Analyzing PDF structure...")
+            agent_artifacts = output_dir / "logs" / "agent_artifacts"
             toc_tree, book_metadata = self.structure_analyzer.analyze_pdf_structure(
                 processed_pdf, book_title,
                 state=self.state, state_path=state_file,
-                pages_dir=pages_dir
+                pages_dir=pages_dir,
+                artifacts_dir=agent_artifacts,
             )
 
             # Insert table_of_contents as a chapter if it exists

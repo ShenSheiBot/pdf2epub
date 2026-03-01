@@ -12,14 +12,17 @@ Provides:
 
 import json
 from pathlib import Path
-from typing import Any, Callable, List, TypeVar
+from typing import Any, Callable, List, Optional, TypeVar
 
-from google.genai.types import Part
+from google.genai.types import Content, Part
 from loguru import logger
 
-from ..utils.common import parse_llm_json
+from ..utils.common import parse_llm_json, load_config
 from ..utils.network_utils import _retry_context
 from ..utils.llm_client import BoundLLMClient
+from ..core.whole import run_agent_loop, AgentLoopExhausted
+from ..core.whole.runner import run_agent_loop_sync
+from ..core.whole.prompts.json_refine import JSON_REFINE_PROMPT
 
 T = TypeVar('T')
 
@@ -107,15 +110,18 @@ def split_pages_into_batches(
     """
     if not pages:
         return []
+    batch_size = max(1, batch_size)
     if len(pages) <= batch_size:
         return [pages]
 
+    # Clamp overlap to ensure forward progress (overlap must be < batch_size)
+    effective_overlap = min(overlap, batch_size - 1)
     batches = []
     start = 0
     while start < len(pages):
         end = min(start + batch_size, len(pages))
         batches.append(pages[start:end])
-        start = end - overlap if end < len(pages) else end
+        start = end - effective_overlap if end < len(pages) else end
 
     return batches
 
@@ -430,6 +436,111 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             filtered.append(issue)
         return filtered
 
+    @staticmethod
+    def _get_agent_model():
+        """
+        Get a pydantic-ai Model for the JSON repair agent.
+
+        Priority: Anthropic Haiku (best at tool use) > config refine.agent > Poe fallback.
+        Mirrors boundary_agent.get_model_and_limits() pattern.
+        """
+        config = load_config()
+        providers = config.get('credentials', {}).get('providers', {})
+
+        # Priority 1: Anthropic (Haiku — fast, good at tool use)
+        if 'anthropic' in providers:
+            from pydantic_ai.models.anthropic import AnthropicModel
+            from pydantic_ai.providers.anthropic import AnthropicProvider
+            p = providers['anthropic']
+            provider = AnthropicProvider(
+                api_key=p.get('api_key'),
+                base_url=p.get('base_url'),
+            )
+            model_name = 'claude-haiku-4-5-20251001'
+            logger.info(f"[agent-model] Using Anthropic {model_name}")
+            return AnthropicModel(model_name, provider=provider)
+
+        # Priority 2: Explicit refine.agent config
+        agent_cfg = config.get('refine', {}).get('agent', {})
+        if agent_cfg.get('provider') and agent_cfg.get('model'):
+            provider_name = agent_cfg['provider']
+            model_name = agent_cfg['model']
+            if provider_name in providers:
+                p = providers[provider_name]
+                provider_type = p.get('type', 'openai')
+                if provider_type == 'openai':
+                    from pydantic_ai.models.openai import OpenAIChatModel
+                    from pydantic_ai.providers.openai import OpenAIProvider
+                    provider = OpenAIProvider(
+                        api_key=p.get('api_key'),
+                        base_url=p.get('base_url'),
+                    )
+                    logger.info(f"[agent-model] Using OpenAI-compat {model_name}")
+                    return OpenAIChatModel(model_name, provider=provider)
+                elif provider_type == 'google':
+                    from pydantic_ai.models.google import GoogleModel, GoogleProvider
+                    from google.genai import Client
+                    from google.genai.types import HttpOptions
+                    client = Client(
+                        api_key=p.get('api_key'),
+                        http_options=HttpOptions(base_url=p.get('base_url')),
+                    )
+                    gp = GoogleProvider(client=client)
+                    logger.info(f"[agent-model] Using Google {model_name}")
+                    return GoogleModel(model_name, provider=gp)
+
+        # Priority 3: Poe fallback (Gemini-2.5-Flash)
+        if 'poe' in providers:
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+            p = providers['poe']
+            provider = OpenAIProvider(
+                api_key=p.get('api_key'),
+                base_url=p.get('base_url'),
+            )
+            model_name = 'Gemini-2.5-Flash'
+            logger.info(f"[agent-model] Fallback to Poe {model_name}")
+            return OpenAIChatModel(model_name, provider=provider)
+
+        raise ValueError(
+            "No suitable provider found for agent model. "
+            "Need 'anthropic' or 'poe' in credentials.providers."
+        )
+
+    def _build_generate_fn(self, parts, config, op_name):
+        """
+        Build a generate_fn closure for the agent loop.
+
+        The returned function follows the contract:
+            generate_fn(prefix=None) -> str
+
+        When prefix is None: single-turn call with original parts.
+        When prefix is provided: multi-turn continuation (user → model → user).
+        """
+        def generate_fn(prefix=None):
+            if prefix is None:
+                contents = parts
+            else:
+                # Multi-turn continuation for Gemini cache optimization:
+                # Message 1 [User]: original prompt + PDF (unchanged → cache hit)
+                # Message 2 [Model]: cleaned prefix (prefix unchanged → partial cache hit)
+                # Message 3 [User]: continuation instruction
+                contents = [
+                    Content(role="user", parts=[
+                        Part(text=p) if isinstance(p, str) else p
+                        for p in parts
+                    ]),
+                    Content(role="model", parts=[Part(text=prefix)]),
+                    Content(role="user", parts=[Part(text="Continue from where you left off. Output only the remaining JSON content, no preamble.")]),
+                ]
+            return self.client.generate_content_stream(
+                model=self.model,
+                contents=contents,
+                config=config,
+                operation_name=op_name,
+            )
+        return generate_fn
+
     def validate_merge(self, merged: Any, original_results: List) -> bool:
         """Validate merged result. Return True if acceptable."""
         return True
@@ -438,33 +549,85 @@ Look at the PDF pages carefully to verify page numbers are correct."""
         """Parse LLM response. Default: parse as JSON."""
         return parse_llm_json(response_text, operation_name=self.operation_name)
 
-    def merge_results(self, results: List) -> Any:
+    def _build_merge_generate_fn(self, prompt, config, op_name):
+        """Build a generate_fn for merge (text-only, no PDF)."""
+        def generate_fn(prefix=None):
+            if prefix is None:
+                contents = [prompt]
+            else:
+                contents = [
+                    Content(role="user", parts=[Part(text=prompt)]),
+                    Content(role="model", parts=[Part(text=prefix)]),
+                    Content(role="user", parts=[Part(text="Continue from where you left off. Output only the remaining JSON content, no preamble.")]),
+                ]
+            return self.client.generate_content_stream(
+                model=self.model,
+                contents=contents,
+                config=config,
+                operation_name=op_name,
+            )
+        return generate_fn
+
+    def merge_results(self, results: List, artifacts_dir: Optional[Path] = None) -> Any:
         """
         Merge results from multiple batches.
 
         Default: LLM-based merge using build_merge_prompt(), with retry.
+        Uses agent loop for JSON validation and truncation recovery.
         Override entirely for rule-based merge (e.g. TocDetectionCall).
         """
         if len(results) == 1:
             return results[0]
 
+        # Load agent config
+        agent_config = load_config().get('refine', {})
+        request_limit = agent_config.get('agent_request_limit', 100)
+        max_continuations = agent_config.get('max_continuations', 5)
+
         merged = None
         for attempt in range(1 + self.merge_max_retries):
             prompt = self.build_merge_prompt(results)
             config = self.client.get_default_config(temperature=0.1)
-            config.response_mime_type = "application/json"
+            # NOTE: No response_mime_type="application/json" — agent loop
+            # handles JSON validation. Continuation fragments are not valid JSON.
 
             op_name = f"{self.operation_name} merge"
             if attempt > 0:
                 op_name += f" (retry {attempt})"
 
-            response_text = self.client.generate_content_stream(
-                model=self.model,
-                contents=[prompt],
-                config=config,
-                operation_name=op_name,
-            )
-            merged = self.parse_result(response_text)
+            generate_fn = self._build_merge_generate_fn(prompt, config, op_name)
+            merge_attempt_artifacts = None
+            if artifacts_dir:
+                merge_attempt_artifacts = artifacts_dir / f"attempt_{attempt+1}"
+            try:
+                response_text = run_agent_loop_sync(
+                    generate_fn=generate_fn,
+                    system_prompt=JSON_REFINE_PROMPT,
+                    agent_model=self._get_agent_model(),
+                    max_continuations=max_continuations,
+                    request_limit=request_limit,
+                    artifacts_dir=merge_attempt_artifacts,
+                )
+            except AgentLoopExhausted:
+                logger.warning(
+                    f"[{self.operation_name}] Agent loop exhausted during merge "
+                    f"(attempt {attempt+1}/{1 + self.merge_max_retries})"
+                )
+                if attempt < self.merge_max_retries:
+                    continue
+                raise
+
+            # Parse with retry on JSON errors (defense-in-depth)
+            try:
+                merged = self.parse_result(response_text)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    f"[{self.operation_name}] JSON parse failed after merge agent loop "
+                    f"(attempt {attempt+1}): {e}"
+                )
+                if attempt < self.merge_max_retries:
+                    continue
+                raise
 
             if self.validate_merge(merged, results):
                 logger.info(
@@ -483,13 +646,14 @@ Look at the PDF pages carefully to verify page numbers are correct."""
         )
         return merged
 
-    def run(self, pdf_path: Path, pages: List[int]) -> Any:
+    def run(self, pdf_path: Path, pages: List[int], artifacts_dir: Optional[Path] = None) -> Any:
         """
         Execute the adaptive PDF→LLM call.
 
         Args:
             pdf_path: Path to PDF file
             pages: List of 1-indexed page numbers to process
+            artifacts_dir: If provided, save agent loop artifacts here for debugging
 
         Returns:
             Parsed result (single batch) or merged result (multi-batch)
@@ -517,10 +681,17 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             prompt = original_prompt
             result = None
 
+            # Load agent config
+            agent_config = load_config().get('refine', {})
+            request_limit = agent_config.get('agent_request_limit', 100)
+            max_continuations = agent_config.get('max_continuations', 5)
+
             for attempt in range(1 + self.batch_validation_retries):
                 parts = [prompt, Part.from_bytes(data=pdf_data, mime_type="application/pdf")]
                 config = self.client.get_default_config(temperature=0.1)
-                config.response_mime_type = "application/json"
+                # NOTE: No response_mime_type="application/json" — the agent loop
+                # handles JSON validation. Continuation fragments are not valid JSON,
+                # so JSON mode would break the Gemini API for continuation calls.
 
                 op_name = f"{self.operation_name} batch {batch_idx+1}/{total_batches}"
                 if use_rasterized:
@@ -528,27 +699,42 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                 if attempt > 0:
                     op_name += f" (fix {attempt})"
 
-                # Retry on truncated JSON (Gemini connection drops)
-                last_json_error = None
-                for json_retry in range(3):
-                    response_text = self.client.generate_content_stream(
-                        model=self.model,
-                        contents=parts,
-                        config=config,
-                        operation_name=op_name,
+                # Agent loop: generate → agent inspects → continue/complete
+                generate_fn = self._build_generate_fn(parts, config, op_name)
+                batch_artifacts = None
+                if artifacts_dir:
+                    batch_artifacts = artifacts_dir / f"batch_{batch_idx+1}_attempt_{attempt+1}"
+                try:
+                    response_text = run_agent_loop_sync(
+                        generate_fn=generate_fn,
+                        system_prompt=JSON_REFINE_PROMPT,
+                        agent_model=self._get_agent_model(),
+                        max_continuations=max_continuations,
+                        request_limit=request_limit,
+                        artifacts_dir=batch_artifacts,
                     )
-                    try:
-                        result = self.parse_result(response_text)
-                        break
-                    except json.JSONDecodeError as e:
-                        last_json_error = e
-                        logger.warning(
-                            f"[{self.operation_name}] JSON truncated "
-                            f"({len(response_text)} chars), "
-                            f"retrying ({json_retry+1}/3): {e}"
-                        )
-                else:
-                    raise last_json_error
+                except AgentLoopExhausted:
+                    logger.warning(
+                        f"[{self.operation_name}] Agent loop exhausted for "
+                        f"batch {batch_idx+1}/{total_batches} "
+                        f"(attempt {attempt+1}/{1 + self.batch_validation_retries})"
+                    )
+                    if attempt < self.batch_validation_retries:
+                        continue
+                    raise
+
+                # Parse with retry on JSON errors (defense-in-depth)
+                try:
+                    result = self.parse_result(response_text)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(
+                        f"[{self.operation_name}] JSON parse failed after agent loop "
+                        f"for batch {batch_idx+1}/{total_batches} "
+                        f"(attempt {attempt+1}): {e}"
+                    )
+                    if attempt < self.batch_validation_retries:
+                        continue
+                    raise
 
                 # Run batch validation hook
                 all_issues = self.validate_batch_result(result, batch_idx, total_batches)
@@ -599,7 +785,8 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             can_rasterize=can_rasterize,
         )
 
-        return self.merge_results(results)
+        merge_artifacts = artifacts_dir / "merge" if artifacts_dir else None
+        return self.merge_results(results, artifacts_dir=merge_artifacts)
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +826,7 @@ If no TOC exists, return: {"has_toc": false, "toc_start": null, "toc_end": null}
             return {'has_toc': False, 'toc_start': None, 'toc_end': None}
         return result
 
-    def merge_results(self, results):
+    def merge_results(self, results, artifacts_dir=None):
         """Rule-based: pick first result with has_toc=True."""
         if len(results) == 1:
             return results[0]
@@ -735,9 +922,99 @@ Return JSON:
     ]
 }}
 
+## Complete Example Output
+
+Below is a complete example for a 353-page academic book ("{self.book_title}" has \
+{batch_end - batch_start + 1} pages — scale your output accordingly). \
+The key point: your output MUST include metadata AND a complete "chapters" array. \
+A short book may have fewer chapters, but every chapter must be listed.
+
+```json
+{{
+    "author": "Alex Callinicos",
+    "language": "chinese",
+    "is_vertical_text": false,
+    "has_footnotes": true,
+    "cover_page": {{"page_number": 1}},
+    "table_of_contents": {{"start_page": 10, "end_page": 11}},
+    "back_cover": {{"page_number": 2}},
+    "chapters": [
+        {{"title": "前言與致謝", "level": 1, "start_page": 6, "end_page": 8}},
+        {{"title": "導言", "level": 1, "start_page": 12, "end_page": 25}},
+        {{
+            "title": "第一部分 四條死路", "level": 1, "start_page": 26, "end_page": 203,
+            "children": [
+                {{
+                    "title": "第一章 現代性及其承諾", "level": 2, "start_page": 27, "end_page": 71,
+                    "children": [
+                        {{"title": "第一節 在社會學式的懷疑與法治之間", "level": 3, "start_page": 27, "end_page": 52}},
+                        {{"title": "第二節 對馬克思和羅爾斯的支持與反對", "level": 3, "start_page": 53, "end_page": 71}}
+                    ]
+                }},
+                {{
+                    "title": "第二章 在相對主義與普遍主義之間", "level": 2, "start_page": 72, "end_page": 112,
+                    "children": [
+                        {{"title": "第一節 資本主義與對資本主義的批判", "level": 3, "start_page": 72, "end_page": 97}},
+                        {{"title": "第二節 普遍與特殊的辯證法", "level": 3, "start_page": 98, "end_page": 112}}
+                    ]
+                }},
+                {{
+                    "title": "第三章 觸摸虛空", "level": 2, "start_page": 113, "end_page": 162,
+                    "children": [
+                        {{"title": "第一節 例外即規範", "level": 3, "start_page": 113, "end_page": 120}},
+                        {{"title": "第二節 巴迪烏的本體論", "level": 3, "start_page": 121, "end_page": 150}},
+                        {{"title": "第三節 紀傑克與無產階級", "level": 3, "start_page": 151, "end_page": 162}}
+                    ]
+                }},
+                {{
+                    "title": "第四章 存有的慷慨", "level": 2, "start_page": 163, "end_page": 203,
+                    "children": [
+                        {{"title": "第一節 一切都是神恩", "level": 3, "start_page": 163, "end_page": 165}},
+                        {{"title": "第二節 革命主體對陣馬克思主義的客觀主義", "level": 3, "start_page": 166, "end_page": 188}},
+                        {{"title": "第三節 拒斥超越", "level": 3, "start_page": 189, "end_page": 203}}
+                    ]
+                }}
+            ]
+        }},
+        {{
+            "title": "第二部分 進步的三個維度", "level": 1, "start_page": 204, "end_page": 336,
+            "children": [
+                {{
+                    "title": "第五章 批判實在論意義上的本體論", "level": 2, "start_page": 205, "end_page": 239,
+                    "children": [
+                        {{"title": "第一節 迄今為止的故事", "level": 3, "start_page": 205, "end_page": 211}},
+                        {{"title": "第二節 實在論的諸維度", "level": 3, "start_page": 212, "end_page": 239}}
+                    ]
+                }},
+                {{
+                    "title": "第六章 結構與矛盾", "level": 2, "start_page": 240, "end_page": 283,
+                    "children": [
+                        {{"title": "第一節 關於結構的實在論", "level": 3, "start_page": 240, "end_page": 249}},
+                        {{"title": "第二節 矛盾的首要性", "level": 3, "start_page": 250, "end_page": 273}},
+                        {{"title": "第三節 一種自然辯證法?", "level": 3, "start_page": 274, "end_page": 283}}
+                    ]
+                }},
+                {{
+                    "title": "第七章 正義與普遍性", "level": 2, "start_page": 284, "end_page": 317,
+                    "children": [
+                        {{"title": "第一節 從事實到價值", "level": 3, "start_page": 284, "end_page": 291}},
+                        {{"title": "第二節 平等與幸福", "level": 3, "start_page": 292, "end_page": 306}},
+                        {{"title": "第三節 為何平等重要", "level": 3, "start_page": 307, "end_page": 317}}
+                    ]
+                }},
+                {{"title": "第八章 結論", "level": 2, "start_page": 318, "end_page": 336}}
+            ]
+        }},
+        {{"title": "徵引文獻", "level": 1, "start_page": 337, "end_page": 352, "type": "bibliography"}},
+        {{"title": "索引", "level": 1, "start_page": 353, "end_page": 353, "type": "index"}}
+    ]
+}}
+```
+
 **IMPORTANT**:
 - Use PDF page numbers from "PDF Page: X" labels, NOT printed page numbers
 - Preserve the original language for all titles and author names
+- Your output must contain ALL chapters — do not stop after metadata
 """
 
     def build_merge_prompt(self, results):
@@ -789,6 +1066,8 @@ Return a single JSON object:
             chapters = result
         else:
             chapters = result.get('chapters', [])
+        if not chapters:
+            return ["No chapters extracted — output appears truncated or incomplete"]
         return validate_chapter_structure(chapters)
 
     def validate_merge(self, merged, original_results):
@@ -825,13 +1104,16 @@ Return a single JSON object:
 
         return True
 
-    def merge_results(self, results):
+    def merge_results(self, results, artifacts_dir=None):
         if len(results) == 1:
             return results[0]
 
         # Extract metadata from first/last batch (rule-based, no LLM needed)
+        # Handle bare list results (LLM may omit the wrapper object)
         metadata = {}
         for i, result in enumerate(results):
+            if not isinstance(result, dict):
+                continue
             if i == 0:
                 metadata = {
                     'author': result.get('author'),
@@ -845,7 +1127,7 @@ Return a single JSON object:
                 metadata['back_cover'] = result.get('back_cover')
 
         # LLM merge for chapters (via base class)
-        merged = super().merge_results(results)
+        merged = super().merge_results(results, artifacts_dir=artifacts_dir)
 
         # LLM may return a bare list instead of {"chapters": [...]}
         if isinstance(merged, list):

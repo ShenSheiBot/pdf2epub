@@ -145,7 +145,8 @@ class StructureAnalyzer:
             return False
 
     def detect_toc_location(
-        self, pdf_path: Path, batch_ctx: Optional[PdfBatchContext] = None
+        self, pdf_path: Path, batch_ctx: Optional[PdfBatchContext] = None,
+        artifacts_dir: Optional[Path] = None,
     ) -> Optional[Dict]:
         """
         Detect the location of table of contents in the PDF.
@@ -166,8 +167,9 @@ class StructureAnalyzer:
             self._prepare_pdf, self._learner,
             self._prepare_pdf_rasterized,
         )
+        toc_artifacts = artifacts_dir / "toc_detection" if artifacts_dir else None
         try:
-            return call.run(pdf_path, pages)
+            return call.run(pdf_path, pages, artifacts_dir=toc_artifacts)
         except Exception as e:
             logger.error(f"TOC detection failed: {e}")
             return None
@@ -618,7 +620,8 @@ Return ONLY the cleaned text, nothing else.
         book_title: str,
         state: Optional[RefinerState] = None,
         state_path: Optional[Path] = None,
-        pages_dir: Optional[Path] = None
+        pages_dir: Optional[Path] = None,
+        artifacts_dir: Optional[Path] = None,
     ) -> Tuple[List[TOCNode], Dict]:
         """
         Analyze PDF structure and extract recursive TOC tree.
@@ -682,7 +685,7 @@ Return ONLY the cleaned text, nothing else.
             toc_location = state.toc_location
         else:
             logger.info("Step 1: Detecting TOC location...")
-            toc_location = self.detect_toc_location(working_pdf_path, batch_ctx)
+            toc_location = self.detect_toc_location(working_pdf_path, batch_ctx, artifacts_dir=artifacts_dir)
             if state and toc_location:
                 state.toc_location = toc_location
                 save_state()
@@ -724,7 +727,8 @@ Return ONLY the cleaned text, nothing else.
         result = self._analyze_pdf_directly(
             working_pdf_path, book_title, batch_ctx,
             exclude_pages=exclude_toc if exclude_toc else None,
-            toc_reference=toc_reference
+            toc_reference=toc_reference,
+            artifacts_dir=artifacts_dir,
         )
 
         # Mark structure analysis complete
@@ -768,7 +772,8 @@ Return ONLY the cleaned text, nothing else.
         self, pdf_path: Path, book_title: str,
         batch_ctx: Optional[PdfBatchContext] = None,
         exclude_pages: Optional[set] = None,
-        toc_reference: Optional[str] = None
+        toc_reference: Optional[str] = None,
+        artifacts_dir: Optional[Path] = None,
     ) -> Dict:
         """
         Analyze PDF directly using DirectAnalysisCall.
@@ -786,7 +791,8 @@ Return ONLY the cleaned text, nothing else.
             toc_reference=toc_reference,
             prepare_pdf_rasterized=self._prepare_pdf_rasterized,
         )
-        return call.run(pdf_path, all_pages)
+        analysis_artifacts = artifacts_dir / "direct_analysis" if artifacts_dir else None
+        return call.run(pdf_path, all_pages, artifacts_dir=analysis_artifacts)
 
     def _fix_invalid_notes_type(self, chapters: List[Dict]):
         """

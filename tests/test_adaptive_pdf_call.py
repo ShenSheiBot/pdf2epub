@@ -586,7 +586,7 @@ def _make_test_call_cls(validate_fn=None):
                 return validate_fn(result, batch_idx, total_batches)
             return []
 
-        def merge_results(self, results):
+        def merge_results(self, results, artifacts_dir=None):
             if len(results) == 1:
                 return results[0]
             return {'merged': True, 'chapters': []}
@@ -594,11 +594,17 @@ def _make_test_call_cls(validate_fn=None):
     return TestCall
 
 
+def _mock_agent_loop(generate_fn, system_prompt, agent_model, **kwargs):
+    """Mock run_agent_loop_sync: just call generate_fn() once and return."""
+    return generate_fn()
+
+
 class TestBatchValidationRetry:
     """Test batch validation triggers retry with PDF context."""
 
+    @patch('pdf2epub.refine.adaptive_pdf_call.run_agent_loop_sync', side_effect=_mock_agent_loop)
     @patch('pdf2epub.refine.adaptive_pdf_call.Part')
-    def test_no_issues_no_retry(self, mock_part):
+    def test_no_issues_no_retry(self, mock_part, mock_agent_loop):
         """Clean result → 1 LLM call, no retry."""
         TestCall = _make_test_call_cls()
         client = MagicMock()
@@ -612,8 +618,9 @@ class TestBatchValidationRetry:
         call.run(Path("/f.pdf"), [1, 2, 3])
         assert client.generate_content_stream.call_count == 1
 
+    @patch('pdf2epub.refine.adaptive_pdf_call.run_agent_loop_sync', side_effect=_mock_agent_loop)
     @patch('pdf2epub.refine.adaptive_pdf_call.Part')
-    def test_issues_trigger_retry_with_repair_prompt(self, mock_part):
+    def test_issues_trigger_retry_with_repair_prompt(self, mock_part, mock_agent_loop):
         """Validation issues → retry, repair prompt contains error text."""
         call_num = [0]
 
@@ -643,8 +650,9 @@ class TestBatchValidationRetry:
         second_prompt = str(second_kwargs['contents'][0])
         assert "STRUCTURAL ERRORS" in second_prompt
 
+    @patch('pdf2epub.refine.adaptive_pdf_call.run_agent_loop_sync', side_effect=_mock_agent_loop)
     @patch('pdf2epub.refine.adaptive_pdf_call.Part')
-    def test_max_retries_exhausted(self, mock_part):
+    def test_max_retries_exhausted(self, mock_part, mock_agent_loop):
         """Persistent issues → exhausts retries, returns last result."""
         def always_fail(result, batch_idx, total_batches):
             return ["Persistent issue"]
@@ -666,8 +674,9 @@ class TestBatchValidationRetry:
         assert client.generate_content_stream.call_count == 3
         assert result is not None
 
+    @patch('pdf2epub.refine.adaptive_pdf_call.run_agent_loop_sync', side_effect=_mock_agent_loop)
     @patch('pdf2epub.refine.adaptive_pdf_call.Part')
-    def test_edge_issues_tolerated_no_retry(self, mock_part):
+    def test_edge_issues_tolerated_no_retry(self, mock_part, mock_agent_loop):
         """Edge-only issues in multi-batch don't trigger retry."""
         def validate(result, batch_idx, total_batches):
             # First batch: issue on last chapter (edge)
@@ -692,8 +701,9 @@ class TestBatchValidationRetry:
         # 2 batches, each called once (edge issue tolerated, no retry)
         assert client.generate_content_stream.call_count == 2
 
+    @patch('pdf2epub.refine.adaptive_pdf_call.run_agent_loop_sync', side_effect=_mock_agent_loop)
     @patch('pdf2epub.refine.adaptive_pdf_call.Part')
-    def test_non_edge_issues_retry_in_multi_batch(self, mock_part):
+    def test_non_edge_issues_retry_in_multi_batch(self, mock_part, mock_agent_loop):
         """Non-edge issues in multi-batch DO trigger retry."""
         call_num = [0]
 

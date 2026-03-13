@@ -43,7 +43,7 @@ def run(args: argparse.Namespace) -> int:
     batch_states_dirs = list(output_dir.glob("*/batch_states"))
 
     # Get batch client from config
-    from ..utils.batch_utils import GeminiBatchClient
+    from ..utils.batch_utils import GeminiBatchClient, VertexBatchClient
 
     # Find batch provider in config
     batch_provider = None
@@ -66,11 +66,22 @@ def run(args: argparse.Namespace) -> int:
         logger.error(f"No credentials found for provider: {batch_provider}")
         return 1
 
-    batch_client = GeminiBatchClient(
-        api_key=creds.get('api_key', ''),
-        base_url=creds.get('base_url'),
-        model='any',  # Not used for cancel/list
-    )
+    if batch_provider == "vertex":
+        project = creds.get('project')
+        if not project:
+            logger.error("No 'project' found for vertex provider")
+            return 1
+        batch_client = VertexBatchClient(
+            project=project,
+            location=creds.get('location', 'us-central1'),
+            model='any',
+        )
+    else:
+        batch_client = GeminiBatchClient(
+            api_key=creds.get('api_key', ''),
+            base_url=creds.get('base_url'),
+            model='any',  # Not used for cancel/list
+        )
 
     cancelled_count = 0
 
@@ -80,7 +91,8 @@ def run(args: argparse.Namespace) -> int:
             from ..utils.batch_utils import BatchJobState
             jobs = batch_client.list_jobs(limit=50)
             for job in jobs:
-                if job.state in (BatchJobState.PENDING, BatchJobState.RUNNING):
+                if job.state in (BatchJobState.PENDING, BatchJobState.RUNNING,
+                                BatchJobState.QUEUED, BatchJobState.CANCELLING):
                     try:
                         batch_client.cancel(job.name)
                         logger.info(f"Cancelled: {job.name}")

@@ -631,6 +631,11 @@ class Executor:
                     # Still running, continue waiting
                     logger.info(f"Resuming mega unit {mega_id}: {existing_state.job_name}")
                     job_name = existing_state.job_name
+                # Restore key order for Vertex line-order correlation
+                if job_name and existing_state.processing_keys:
+                    if hasattr(self._batch_client, '_job_keys'):
+                        self._batch_client._job_keys[job_name] = existing_state.processing_keys
+                        logger.debug(f"Restored {len(existing_state.processing_keys)} processing keys for {job_name}")
 
         # Build requests if not resuming
         batch_requests: List[BatchRequest] = []
@@ -694,9 +699,14 @@ class Executor:
                 else:
                     logger.info(f"Submitted mega unit {mega_id}: {job_name} ({len(batch_requests)} units)")
 
-                # Save state
+                # Save state (include key order for Vertex line-order correlation on resume)
                 if state_file:
-                    state = MegaUnitState(job_name=job_name, job_state="RUNNING")
+                    processing_keys = [req.key for req in batch_requests]
+                    state = MegaUnitState(
+                        job_name=job_name,
+                        job_state="RUNNING",
+                        processing_keys=processing_keys,
+                    )
                     state.save(state_file)
             else:
                 # All units were skipped
@@ -741,13 +751,21 @@ class Executor:
                 if poll_count % 5 == 1:  # Every 5 polls (~5 min with 60s interval)
                     logger.info(f"Batch job {job_name}: {job_info.state.name} (poll #{poll_count})")
 
-                if job_info.state == BatchJobState.SUCCEEDED:
+                # Use client's COMPLETED_STATES to handle both Gemini and Vertex terminal states
+                completed_states = getattr(self._batch_client, 'COMPLETED_STATES', {
+                    BatchJobState.SUCCEEDED, BatchJobState.FAILED,
+                    BatchJobState.CANCELLED, BatchJobState.EXPIRED,
+                })
+
+                if job_info.state in completed_states and job_info.state in (
+                    BatchJobState.SUCCEEDED, BatchJobState.PARTIALLY_SUCCEEDED,
+                ):
                     if state_file:
                         state = MegaUnitState(job_name=job_name, job_state="SUCCEEDED")
                         state.save(state_file)
                     break
 
-                elif job_info.state in (BatchJobState.FAILED, BatchJobState.CANCELLED, BatchJobState.EXPIRED):
+                elif job_info.state in completed_states:
                     logger.error(f"Batch job {job_info.state.name}: {job_info.error}")
 
                     # Classify job-level error

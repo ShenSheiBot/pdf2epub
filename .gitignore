@@ -33,3 +33,4 @@ secrets.yaml
 .claude/test_*.py
 test_*.md
 temp_test/
+docs/plans/

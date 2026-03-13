@@ -41,16 +41,21 @@ class MegaUnitState:
     Only stores what's needed for resume:
     - job_name: The batch API job name
     - job_state: Current job state (PENDING, RUNNING, SUCCEEDED, etc.)
+    - processing_keys: Ordered list of unit keys (for Vertex line-order correlation)
     """
     job_name: str
     job_state: str = "RUNNING"
+    processing_keys: Optional[List[str]] = None
 
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict."""
-        return {
+        d = {
             "job_name": self.job_name,
             "job_state": self.job_state,
         }
+        if self.processing_keys is not None:
+            d["processing_keys"] = self.processing_keys
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> 'MegaUnitState':
@@ -58,6 +63,7 @@ class MegaUnitState:
         return cls(
             job_name=data["job_name"],
             job_state=data.get("job_state", "RUNNING"),
+            processing_keys=data.get("processing_keys"),
         )
 
     def save(self, path: Path) -> None:

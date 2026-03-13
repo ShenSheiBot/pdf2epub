@@ -397,21 +397,42 @@ def _create_batch_client_from_config(
     api_key = provider_config.get('api_key')
     base_url = provider_config.get('base_url')
 
-    if not api_key:
-        from loguru import logger
-        logger.warning(f"No api_key found for batch provider '{batch_entry.provider}'")
-        return None
-
     # Get batch config
     batch_config = config.get('batch', {})
     poll_interval = batch_config.get('poll_interval', 60)
 
-    # Create batch client
-    from ..utils.batch_utils import GeminiBatchClient
     from loguru import logger
 
-    logger.info(f"Creating batch client for {batch_entry.provider}/{batch_entry.model}")
+    # Route to Vertex or Gemini batch client
+    if batch_entry.provider == "vertex":
+        project = provider_config.get('project')
+        if not project:
+            logger.warning("No 'project' found for vertex batch provider. "
+                          "Set credentials.providers.vertex.project in config.yaml")
+            return None
+        location = provider_config.get('location', 'us-central1')
+        bucket = provider_config.get('bucket')
 
+        from ..utils.batch_utils import VertexBatchClient
+        logger.info(f"Creating Vertex batch client for {batch_entry.model} "
+                    f"(project={project}, location={location})")
+        return VertexBatchClient(
+            project=project,
+            location=location,
+            model=batch_entry.model,
+            poll_interval=poll_interval,
+            bucket_name=bucket,
+        )
+
+    # Gemini batch (default)
+    api_key = provider_config.get('api_key')
+    base_url = provider_config.get('base_url')
+    if not api_key:
+        logger.warning(f"No api_key found for batch provider '{batch_entry.provider}'")
+        return None
+
+    from ..utils.batch_utils import GeminiBatchClient
+    logger.info(f"Creating Gemini batch client for {batch_entry.provider}/{batch_entry.model}")
     return GeminiBatchClient(
         api_key=api_key,
         model=batch_entry.model,

@@ -307,7 +307,16 @@ class LLMClient:
         last_error = None
         attempts_summary = []
         
-        for model_config in model_configs:
+        # Filter out batch-only models (online calls can't use them)
+        online_configs = [m for m in model_configs if m.get("mode") != "batch"]
+        if not online_configs:
+            raise Exception(
+                f"No online models available for {operation_name}. "
+                f"All {len(model_configs)} model(s) are configured as batch-only. "
+                f"Add a model without 'mode: batch' for online operations like TOC translation."
+            )
+
+        for model_config in online_configs:
             provider = model_config["provider"]
             model = model_config["model"]
             max_retries = model_config.get("max_retries", 1)
@@ -449,7 +458,16 @@ class LLMClient:
         validation_strategy.clear_attempts()
         last_error = None
 
-        for model_idx, model_config in enumerate(model_configs):
+        # Filter out batch-only models (online calls can't use them)
+        online_configs = [m for m in model_configs if m.get("mode") != "batch"]
+        if not online_configs:
+            raise Exception(
+                f"No online models available for {operation_name}. "
+                f"All {len(model_configs)} model(s) are configured as batch-only. "
+                f"Add a model without 'mode: batch' for online operations."
+            )
+
+        for model_idx, model_config in enumerate(online_configs):
             provider = model_config["provider"]
             model = model_config["model"]
 

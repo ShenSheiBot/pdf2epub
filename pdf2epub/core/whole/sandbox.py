@@ -19,7 +19,7 @@ STDOUT_MAX_BYTES = 32 * 1024  # 32KB
 # Reject commands containing absolute paths, path traversal, or home expansion.
 # These patterns catch paths at token boundaries (after whitespace, redirects, or
 # at command start) while avoiding false positives on relative paths and sed patterns.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s;|&()<>])/[a-zA-Z0-9_.]')
+_ABS_PATH_RE = re.compile(r'(?:^|[\s;|&()<>])(?<!<)/[a-zA-Z0-9_.]')
 _TRAVERSAL_RE = re.compile(r'(?:^|[\s/])\.\.(?:[\s/]|$)')
 _HOME_RE = re.compile(r'(?:^|[\s;|&()<>])~/')
 

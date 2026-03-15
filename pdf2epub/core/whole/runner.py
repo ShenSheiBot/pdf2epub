@@ -5,10 +5,12 @@ The core primitive: generate → agent inspects → Decision(continue/complete).
 """
 
 import asyncio
+import hashlib
 import json
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -47,14 +49,142 @@ class Decision(BaseModel):
     file_path: str
 
 
+def _save_agent_trace(result, round_num: int, workspace_dir: Path) -> None:
+    """Save the full agent message history as JSON for debugging."""
+    try:
+        trace_bytes = result.all_messages_json()
+        trace_path = workspace_dir / f"agent_trace_round_{round_num:03d}.json"
+        trace_path.write_bytes(trace_bytes)
+        logger.debug(f"[agent-loop] Saved agent trace: {trace_path.name} ({len(trace_bytes)} bytes)")
+    except Exception as e:
+        logger.warning(f"[agent-loop] Failed to save agent trace: {e}")
+
+
+def _extract_tool_stats(result) -> dict:
+    """Extract tool call statistics from an agent run result. Returns structured dict."""
+    from collections import Counter
+
+    tool_calls = Counter()
+    tool_errors = Counter()
+
+    for msg in result.all_messages():
+        for part in getattr(msg, "parts", []):
+            if hasattr(part, "part_kind"):
+                if part.part_kind == "tool-call":
+                    tool_calls[part.tool_name] += 1
+                elif part.part_kind == "tool-return":
+                    content = str(getattr(part, "content", ""))
+                    if content.startswith("ERROR:"):
+                        tool_errors[part.tool_name] += 1
+
+    usage = result.usage()
+    return {
+        "tool_calls": dict(tool_calls),
+        "tool_errors": dict(tool_errors),
+        "total_calls": sum(tool_calls.values()),
+        "total_errors": sum(tool_errors.values()),
+        "request_tokens": getattr(usage, "request_tokens", 0) or 0,
+        "response_tokens": getattr(usage, "response_tokens", 0) or 0,
+    }
+
+
+def _log_tool_usage(stats: dict, round_num: int) -> None:
+    """Log tool call statistics from extracted stats dict."""
+    total = stats["total_calls"]
+    errors = stats["total_errors"]
+    breakdown = ", ".join(
+        f"{name}={count}" for name, count in
+        sorted(stats["tool_calls"].items(), key=lambda x: -x[1])
+    )
+    error_detail = ""
+    if errors:
+        error_detail = " | errors: " + ", ".join(
+            f"{name}={count}" for name, count in stats["tool_errors"].items()
+        )
+    tokens_info = (
+        f" | tokens: {stats['request_tokens']} in, "
+        f"{stats['response_tokens']} out"
+    )
+
+    logger.info(
+        f"[agent-loop] Round {round_num} tools: {total} calls ({breakdown}){error_detail}{tokens_info}"
+    )
+
+
+def _save_round_metrics(
+    workspace_dir: Path,
+    round_num: int,
+    duration_sec: float,
+    status: str,
+    decision_action: str | None,
+    decision_file: str | None,
+    stats: dict | None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Append structured round metrics to agent_round_metrics.jsonl."""
+    entry = {
+        "round": round_num,
+        "ts": round(time.time(), 3),
+        "duration_sec": round(duration_sec, 2),
+        "status": status,
+        "decision_action": decision_action,
+        "decision_file": decision_file,
+        "error_type": error_type,
+        "error_message": error_message,
+    }
+    if stats:
+        entry.update({
+            "tool_calls": stats["tool_calls"],
+            "tool_errors": stats["tool_errors"],
+            "total_calls": stats["total_calls"],
+            "total_errors": stats["total_errors"],
+            "request_tokens": stats["request_tokens"],
+            "response_tokens": stats["response_tokens"],
+        })
+    try:
+        metrics_path = workspace_dir / "_agent_round_metrics.jsonl"
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 class AgentLoopExhausted(Exception):
     """Raised when max_continuations is exceeded without completion."""
 
     pass
 
 
-def _create_agent(system_prompt: str, model: Model, sandbox: Sandbox) -> Agent:
-    """Create a pydantic-ai agent with the Decision output type and validators."""
+def _validate_json_content(content: str) -> Optional[str]:
+    """Default content validator: checks for valid JSON. Returns error message or None."""
+    try:
+        json.loads(content, strict=False)
+    except json.JSONDecodeError as e:
+        hint = ""
+        if "```" in content:
+            hint = " Remove markdown fences (```...```) and any preamble."
+        return f"Cannot complete: file is not valid JSON: {e}.{hint} Fix the file and try again."
+    return None
+
+
+# Type alias for content validators: takes file content, returns error message or None.
+ContentValidator = Callable[[str], Optional[str]]
+
+
+def _create_agent(
+    system_prompt: str,
+    model: Model,
+    sandbox: Sandbox,
+    content_validator: Optional[ContentValidator] = _validate_json_content,
+) -> Agent:
+    """Create a pydantic-ai agent with the Decision output type and validators.
+
+    Args:
+        content_validator: Optional callable that validates completed file content.
+            Takes file content string, returns error message string or None if valid.
+            Default: JSON validation. Pass None to skip content validation.
+    """
     agent = Agent(
         model,
         output_type=Decision,
@@ -65,7 +195,7 @@ def _create_agent(system_prompt: str, model: Model, sandbox: Sandbox) -> Agent:
 
     @agent.output_validator
     def _validate_decision(ctx, decision: Decision) -> Decision:
-        """Enforce workspace path and JSON validity before accepting a decision."""
+        """Enforce workspace path and content validity before accepting a decision."""
         work_dir = sandbox.work_dir
         # Resolve path
         p = Path(decision.file_path)
@@ -78,7 +208,7 @@ def _create_agent(system_prompt: str, model: Model, sandbox: Sandbox) -> Agent:
             raise ModelRetry(
                 f"file_path must be inside the work directory. "
                 f"You returned: {decision.file_path}. "
-                f"Use relative paths like workspace/output.json."
+                f"Use relative paths like workspace/output.txt."
             )
 
         # Must exist and be a file (not a directory)
@@ -90,10 +220,10 @@ def _create_agent(system_prompt: str, model: Model, sandbox: Sandbox) -> Agent:
         if not resolved.is_file():
             raise ModelRetry(
                 f"Path is a directory, not a file: {decision.file_path}. "
-                f"Specify the actual file path (e.g., workspace/output.json)."
+                f"Specify the actual file path."
             )
 
-        # For 'complete', must be in workspace/ and valid JSON
+        # For 'complete', must be in workspace/ and pass content validation
         if decision.action == "complete":
             if not sandbox.is_writable_path(resolved):
                 raise ModelRetry(
@@ -104,18 +234,12 @@ def _create_agent(system_prompt: str, model: Model, sandbox: Sandbox) -> Agent:
             content = resolved.read_text(encoding="utf-8", errors="replace").strip()
             if not content:
                 raise ModelRetry(
-                    "Selected file is empty. Write repaired JSON to workspace/ first."
+                    "Selected file is empty. Write content to workspace/ first."
                 )
-            try:
-                json.loads(content, strict=False)
-            except json.JSONDecodeError as e:
-                hint = ""
-                if "```" in content:
-                    hint = " Remove markdown fences (```...```) and any preamble."
-                raise ModelRetry(
-                    f"Cannot complete: file is not valid JSON: {e}.{hint} "
-                    f"Fix the file and try again."
-                )
+            if content_validator:
+                error = content_validator(content)
+                if error:
+                    raise ModelRetry(error)
 
         return decision
 
@@ -130,6 +254,8 @@ async def run_agent_loop(
     request_limit: int = 100,
     work_dir: Optional[Path] = None,
     artifacts_dir: Optional[Path] = None,
+    content_validator: Optional[ContentValidator] = _validate_json_content,
+    extra_originals: Optional[dict[str, str]] = None,
 ) -> str:
     """
     Universal agent-assisted generation loop.
@@ -152,6 +278,10 @@ async def run_agent_loop(
         request_limit: Max tool calls per agent round.
         work_dir: Work directory (default: auto-create temp directory).
         artifacts_dir: If provided, copy originals/ and workspace/ here before cleanup.
+        content_validator: Optional callable that validates completed file content.
+            Default: JSON validation. Pass None to skip content validation.
+        extra_originals: Optional dict of {filename: content} to write into originals/.
+            Use this to provide reference files the agent needs (e.g., source text, mapping).
 
     Returns:
         Final content (from the file the agent marked as complete).
@@ -159,6 +289,7 @@ async def run_agent_loop(
     Raises:
         AgentLoopExhausted: max_continuations exceeded without completion.
     """
+    loop_start = time.perf_counter()
     own_work_dir = work_dir is None
     if own_work_dir:
         work_dir = Path(tempfile.mkdtemp(prefix="agent_work_"))
@@ -169,6 +300,12 @@ async def run_agent_loop(
     try:
         originals_dir.mkdir(parents=True, exist_ok=True)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write extra reference files into originals/
+        if extra_originals:
+            for fname, fcontent in extra_originals.items():
+                (originals_dir / fname).write_text(fcontent, encoding="utf-8")
+                logger.debug(f"[agent-loop] Wrote extra original: {fname}")
 
         # Step 1: Generate initial output
         logger.info("[agent-loop] Calling generate_fn for initial output...")
@@ -190,7 +327,7 @@ async def run_agent_loop(
 
         while True:
             # Create a fresh agent each round (with output validator)
-            agent = _create_agent(system_prompt, agent_model, sandbox)
+            agent = _create_agent(system_prompt, agent_model, sandbox, content_validator)
             register_tools(agent, sandbox)
 
             # Build user prompt describing current state
@@ -203,35 +340,74 @@ async def run_agent_loop(
                 f"Inspect the files and produce your decision."
             )
 
+            round_num = continuation_count + 1
             logger.info(
-                f"[agent-loop] Running agent (round {continuation_count + 1}, "
+                f"[agent-loop] Running agent (round {round_num}, "
                 f"request_limit={request_limit})..."
             )
 
-            result = await agent.run(
-                user_prompt,
-                usage_limits=UsageLimits(
-                    request_limit=request_limit,
-                ),
-            )
+            round_start = time.perf_counter()
+            result = None
+            stats = None
+            try:
+                result = await agent.run(
+                    user_prompt,
+                    usage_limits=UsageLimits(
+                        request_limit=request_limit,
+                    ),
+                )
+            except Exception as agent_err:
+                round_dur = time.perf_counter() - round_start
+                # Save whatever trace we can
+                if result is not None:
+                    _save_agent_trace(result, round_num, workspace_dir)
+                _save_round_metrics(
+                    workspace_dir, round_num, round_dur,
+                    status="error", decision_action=None, decision_file=None,
+                    stats=None,
+                    error_type=type(agent_err).__name__,
+                    error_message=str(agent_err)[:500],
+                )
+                logger.error(f"[agent-loop] Agent crashed in round {round_num}: {agent_err}")
+                raise
+
+            round_dur = time.perf_counter() - round_start
             decision = result.output
+
+            # Extract stats, log, save trace and metrics
+            stats = _extract_tool_stats(result)
+            _log_tool_usage(stats, round_num)
+            _save_agent_trace(result, round_num, workspace_dir)
+            _save_round_metrics(
+                workspace_dir, round_num, round_dur,
+                status="ok", decision_action=decision.action,
+                decision_file=decision.file_path, stats=stats,
+            )
 
             logger.info(
                 f"[agent-loop] Agent decision: action={decision.action}, "
-                f"file_path={decision.file_path}"
+                f"file_path={decision.file_path} ({round_dur:.1f}s)"
             )
 
             try:
                 resolved_path = _resolve_decision_path(decision.file_path, work_dir)
             except (ValueError, FileNotFoundError) as e:
+                _save_round_metrics(
+                    workspace_dir, round_num, round_dur,
+                    status="error", decision_action=decision.action,
+                    decision_file=decision.file_path, stats=stats,
+                    error_type="invalid_path", error_message=str(e)[:500],
+                )
                 logger.warning(f"[agent-loop] Invalid decision path: {e}")
                 raise
 
             if decision.action == "complete":
                 # Read the completed file and return
                 content = resolved_path.read_text(encoding="utf-8")
+                loop_dur = time.perf_counter() - loop_start
                 logger.info(
-                    f"[agent-loop] Complete. Final output: {len(content)} chars"
+                    f"[agent-loop] Complete. Final output: {len(content)} chars, "
+                    f"total duration: {loop_dur:.1f}s, rounds: {round_num}"
                 )
                 return content
 
@@ -284,6 +460,7 @@ async def run_agent_loop(
 
     finally:
         # Preserve artifacts for observability
+        artifacts_saved = False
         if artifacts_dir and work_dir.exists():
             try:
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -294,16 +471,27 @@ async def run_agent_loop(
                         if dst.exists():
                             shutil.rmtree(dst)
                         shutil.copytree(src, dst)
+                artifacts_saved = True
                 logger.debug(f"[agent-loop] Saved artifacts to {artifacts_dir}")
             except OSError as e:
                 logger.warning(f"[agent-loop] Failed to save artifacts: {e}")
 
+        # Clean up temp dir policy:
+        # - artifacts_dir provided and saved OK → clean up
+        # - artifacts_dir provided but save failed → keep for diagnosis
+        # - no artifacts_dir → clean up (caller chose not to save artifacts)
         if own_work_dir and work_dir.exists():
-            try:
-                shutil.rmtree(work_dir)
-                logger.debug(f"[agent-loop] Cleaned up work dir: {work_dir}")
-            except OSError as e:
-                logger.warning(f"[agent-loop] Failed to clean up work dir: {e}")
+            should_keep = artifacts_dir and not artifacts_saved
+            if should_keep:
+                logger.warning(
+                    f"[agent-loop] Keeping work dir for diagnosis: {work_dir}"
+                )
+            else:
+                try:
+                    shutil.rmtree(work_dir)
+                    logger.debug(f"[agent-loop] Cleaned up work dir: {work_dir}")
+                except OSError as e:
+                    logger.warning(f"[agent-loop] Failed to clean up work dir: {e}")
 
 
 def _resolve_decision_path(file_path: str, work_dir: Path) -> Path:
@@ -345,6 +533,8 @@ def run_agent_loop_sync(
     request_limit: int = 100,
     work_dir: Optional[Path] = None,
     artifacts_dir: Optional[Path] = None,
+    content_validator: Optional[ContentValidator] = _validate_json_content,
+    extra_originals: Optional[dict[str, str]] = None,
 ) -> str:
     """Synchronous wrapper for run_agent_loop."""
     try:
@@ -352,32 +542,23 @@ def run_agent_loop_sync(
     except RuntimeError:
         loop = None
 
+    kwargs = dict(
+        generate_fn=generate_fn,
+        system_prompt=system_prompt,
+        agent_model=agent_model,
+        max_continuations=max_continuations,
+        request_limit=request_limit,
+        work_dir=work_dir,
+        artifacts_dir=artifacts_dir,
+        content_validator=content_validator,
+        extra_originals=extra_originals,
+    )
+
     if loop and loop.is_running():
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                asyncio.run,
-                run_agent_loop(
-                    generate_fn=generate_fn,
-                    system_prompt=system_prompt,
-                    agent_model=agent_model,
-                    max_continuations=max_continuations,
-                    request_limit=request_limit,
-                    work_dir=work_dir,
-                    artifacts_dir=artifacts_dir,
-                ),
-            )
+            future = executor.submit(asyncio.run, run_agent_loop(**kwargs))
             return future.result()
     else:
-        return asyncio.run(
-            run_agent_loop(
-                generate_fn=generate_fn,
-                system_prompt=system_prompt,
-                agent_model=agent_model,
-                max_continuations=max_continuations,
-                request_limit=request_limit,
-                work_dir=work_dir,
-                artifacts_dir=artifacts_dir,
-            )
-        )
+        return asyncio.run(run_agent_loop(**kwargs))

@@ -3,6 +3,10 @@ HTML Translation Processor.
 
 Translates compressed HTML content line-by-line while preserving structure.
 This is a standalone processor that does NOT use the V2 executor architecture.
+
+Supports two modes:
+- Single-pass: call LLM once, save result (legacy, for small files)
+- Whole mode: agent-assisted loop with continuation for large files
 """
 
 import re
@@ -102,6 +106,12 @@ class HTMLTranslateProcessor:
 
         # Track retry context for enhanced prompts
         self._retry_context: Dict[str, str] = {}
+
+        # Agent model for whole mode (lazy-initialized)
+        self._agent_model = None
+        self._agent_model_name = config.get('html_translation', {}).get(
+            'agent_model', 'gemini-3-flash-preview'
+        )
 
     def _wrap_lines_with_div(self, content: str) -> str:
         """Wrap each line with <div> tags for line preservation."""
@@ -259,9 +269,51 @@ class HTMLTranslateProcessor:
         matches = chinese_pattern.findall(sample)
         return len(matches) >= 5  # At least 5 Chinese chars in sample
 
+    def _get_agent_model(self):
+        """Get or create pydantic-ai Model for the verification agent."""
+        if self._agent_model is not None:
+            return self._agent_model
+
+        from pdf2epub.utils.common import load_config
+        config = load_config()
+        providers = config.get('credentials', {}).get('providers', {})
+
+        model_name = self._agent_model_name
+
+        # Try google providers first (gemini-direct, gemini, etc.)
+        for provider_name in ('gemini-direct', 'gemini', 'gemini-cf'):
+            if provider_name in providers:
+                p = providers[provider_name]
+                if p.get('type') == 'google':
+                    from pydantic_ai.models.google import GoogleModel, GoogleProvider
+                    from google.genai import Client
+                    from google.genai.types import HttpOptions
+                    client = Client(
+                        api_key=p.get('api_key'),
+                        http_options=HttpOptions(base_url=p.get('base_url')),
+                    )
+                    gp = GoogleProvider(client=client)
+                    logger.info(f"[html-translate] Agent model: {model_name} via {provider_name}")
+                    self._agent_model = GoogleModel(model_name, provider=gp)
+                    return self._agent_model
+
+        # Fallback: poe
+        if 'poe' in providers:
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+            p = providers['poe']
+            provider = OpenAIProvider(api_key=p.get('api_key'), base_url=p.get('base_url'))
+            logger.info(f"[html-translate] Agent model: {model_name} via poe")
+            self._agent_model = OpenAIChatModel(model_name, provider=provider)
+            return self._agent_model
+
+        raise RuntimeError("No suitable provider found for HTML translation agent model")
+
     def _process_single_file(self, file_name: str) -> Dict:
         """
-        Process a single file with retry logic.
+        Process a single file using agent-assisted whole mode.
+
+        Uses run_agent_loop to handle truncation, continuation, and tag repair.
 
         Args:
             file_name: Name of the file (without extension)
@@ -292,20 +344,18 @@ class HTMLTranslateProcessor:
             output_file.write_text("")
             return {"file": file_name, "status": "success", "reason": "empty file"}
 
-        # Single-pass translation: call LLM once, save result directly
+        # Load mapping for agent reference
+        mapping_file = self.input_dir / f"{file_name}.mapping.json"
+        mapping_json = ""
+        if mapping_file.exists():
+            mapping_json = mapping_file.read_text(encoding="utf-8")
+
         model_configs = self.get_model_configs()
 
         try:
-            prompt = self.build_prompt(content, file_name)
-            response = self.llm_client.generate(
-                prompt=prompt,
-                model_configs=model_configs,
-                operation_name=f"Translate {file_name}"
-            )
-            cleaned = self.clean_response(response)
+            result = self._translate_with_agent_loop(content, mapping_json, file_name, model_configs)
 
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(cleaned)
+            output_file.write_text(result, encoding="utf-8")
 
             provider = model_configs[0].get('provider', 'unknown')
             model = model_configs[0].get('model', 'unknown')
@@ -314,6 +364,59 @@ class HTMLTranslateProcessor:
         except Exception as e:
             logger.error(f"Failed to translate {file_name}: {e}")
             return {"file": file_name, "status": "error", "reason": str(e)}
+
+    def _translate_with_agent_loop(
+        self, content: str, mapping_json: str, file_name: str, model_configs: list
+    ) -> str:
+        """Translate compressed HTML content using agent-assisted whole mode."""
+        from pdf2epub.core.whole.runner import run_agent_loop_sync
+        from pdf2epub.core.whole.prompts.html_translate import HTML_TRANSLATE_PROMPT
+
+        prompt_template = create_compressed_translation_prompt(
+            source_language=self.source_language,
+            target_language=self.target_language,
+            entities=self.entities,
+        )
+
+        def generate_fn(prefix=None):
+            if prefix is None:
+                # Initial translation
+                marked = self._wrap_lines_with_div(content)
+                full_prompt = f"{prompt_template}\n\n{marked}"
+            else:
+                # Continuation with prefix
+                marked = self._wrap_lines_with_div(content)
+                prefix_wrapped = self._wrap_lines_with_div(prefix)
+                full_prompt = [
+                    {"role": "user", "content": f"{prompt_template}\n\n{marked}"},
+                    {"role": "assistant", "content": prefix_wrapped},
+                    {"role": "user", "content": "继续翻译，从上次停止的地方接着。保持相同的 <div> 格式。"},
+                ]
+
+            return self.llm_client.generate(
+                prompt=full_prompt,
+                model_configs=model_configs,
+                operation_name=f"Translate {file_name}",
+            )
+
+        # Prepare extra originals for agent reference
+        extra_originals = {"source.txt": content}
+        if mapping_json:
+            extra_originals["mapping.json"] = mapping_json
+
+        # Artifacts for debugging
+        artifacts_dir = self.output_dir.parent / "logs" / "agent_artifacts" / file_name
+
+        return run_agent_loop_sync(
+            generate_fn=generate_fn,
+            system_prompt=HTML_TRANSLATE_PROMPT,
+            agent_model=self._get_agent_model(),
+            max_continuations=10,
+            request_limit=100,
+            artifacts_dir=artifacts_dir,
+            content_validator=None,  # Agent handles validation internally
+            extra_originals=extra_originals,
+        )
 
     def process_all_files(self) -> Dict:
         """

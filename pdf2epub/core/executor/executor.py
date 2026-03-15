@@ -474,12 +474,19 @@ class Executor:
 
                         except Exception as e:
                             logger.error(f"Batch future error: {e}")
-                            # Record failure for each unit via saver
+                            # Route through _handle_failure so units can
+                            # fallback to online models via the normal chain
                             for uid in batch_unit_ids:
-                                if self._saver:
-                                    with self._saver.attempt(uid, "batch") as attempt:
-                                        attempt.failure("unknown", str(e)[:500])
-                            failed.update(batch_unit_ids)
+                                total_attempts += 1
+                                state = unit_states[uid]
+                                result = ProcessResult(success=False, error=e)
+                                current_entry = state.get_current_entry()
+                                model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "batch"
+                                requeued, split_depth = self._handle_failure(
+                                    uid, result, state, unit_states,
+                                    pending, completed, failed, safety_blocked, validation_failed,
+                                    results, fallback_used, model_str
+                                )
 
                     else:
                         # Online unit completed
@@ -743,8 +750,21 @@ class Executor:
         # Poll for completion
         if job_name:
             poll_count = 0
+            poll_errors = 0
+            max_poll_errors = 5  # Give up after 5 consecutive poll failures
             while True:
-                job_info = self._batch_client.get_status(job_name)
+                try:
+                    job_info = self._batch_client.get_status(job_name)
+                    poll_errors = 0  # Reset on success
+                except Exception as poll_exc:
+                    poll_errors += 1
+                    logger.warning(
+                        f"Batch poll error ({poll_errors}/{max_poll_errors}): {poll_exc}"
+                    )
+                    if poll_errors >= max_poll_errors:
+                        raise  # Propagate to batch future error handler
+                    time.sleep(self._batch_poll_interval)
+                    continue
                 poll_count += 1
 
                 # Log polling status periodically

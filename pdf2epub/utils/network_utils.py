@@ -118,46 +118,52 @@ def is_transient_gemini_error(exception: Exception) -> bool:
 def is_transient_anthropic_error(exception: Exception) -> bool:
     """Check if an Anthropic API error is transient and should be retried."""
     error_str = str(exception).lower()
-    
+
     # Don't retry content blocks
     if any(term in error_str for term in ['content_policy', 'unsafe', 'violation']):
         return False
-    
+
     # Retry rate limits and server errors
     if '429' in error_str or 'rate' in error_str:
         return True
-    
+
     if any(code in error_str for code in ['500', '502', '503', '504']):
         return True
-    
+
     if isinstance(exception, (TimeoutError, ConnectionError, httpx.TimeoutException)):
         return True
-    
+
+    # Network disruption keywords
+    if any(kw in error_str for kw in ['disconnect', 'broken pipe', 'reset by peer',
+                                       'connection', 'timeout', 'remote protocol']):
+        return True
+
     return False
 
 
 def is_transient_openai_error(exception: Exception) -> bool:
     """Check if an OpenAI API error is transient and should be retried."""
     error_str = str(exception).lower()
-    
+
     # Don't retry content policy violations
     if any(term in error_str for term in ['content_policy', 'violation', 'refused']):
         return False
-    
+
     # Retry rate limits and server errors
     if '429' in error_str or 'rate' in error_str:
         return True
-    
+
     if any(code in error_str for code in ['500', '502', '503', '504']):
         return True
-    
+
     if isinstance(exception, (TimeoutError, ConnectionError, httpx.TimeoutException)):
         return True
-    
-    # OpenAI specific errors
-    if 'timeout' in error_str or 'connection' in error_str:
+
+    # Network disruption keywords
+    if any(kw in error_str for kw in ['disconnect', 'broken pipe', 'reset by peer',
+                                       'connection', 'timeout', 'remote protocol']):
         return True
-        
+
     return False
 
 

@@ -47,8 +47,21 @@ def parse_llm_json(
 
     try:
         return json.loads(text, strict=False)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON from {operation_name}: {e}")
+    except json.JSONDecodeError as original_error:
+        # Try heuristic repair before giving up
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(text, return_objects=True)
+            if repaired is not None:
+                logger.warning(
+                    f"json_repair fixed invalid JSON from {operation_name} "
+                    f"(original error: {original_error})"
+                )
+                return repaired
+        except Exception:
+            pass  # repair also failed, fall through to original error
+
+        logger.error(f"Failed to parse JSON from {operation_name}: {original_error}")
         # Log the actual response for debugging
         logger.error(f"Response length: {len(text)} chars")
         logger.error(f"Response preview: {text[:500]}...")
@@ -60,7 +73,7 @@ def parse_llm_json(
             error_file.write_text(text, encoding='utf-8')
             logger.error(f"Raw response saved to: {error_file}")
 
-        raise
+        raise original_error
 
 # Re-export for backward compatibility
 def load_config(config_path: str = "config.yaml") -> Dict:

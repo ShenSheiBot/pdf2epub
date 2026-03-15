@@ -417,7 +417,8 @@ class LLMClient:
         model_configs: Optional[List[Dict]] = None,
         validator: Optional[Callable[[str], Tuple[bool, str]]] = None,
         validation_strategy: Optional['ValidationStrategy'] = None,
-        operation_name: str = "LLM generation"
+        operation_name: str = "LLM generation",
+        repair_prompt_builder: Optional[Callable[[str, str, str], Union[str, List[Dict]]]] = None,
     ) -> str:
         """
         Generate content with validation and retry logic.
@@ -434,6 +435,9 @@ class LLMClient:
             validator: Optional validation function that returns (is_valid, reason)
             validation_strategy: Strategy for handling validation failures
             operation_name: Name for logging
+            repair_prompt_builder: Optional function (original_prompt, response, error_reason) -> repair_prompt.
+                When provided and validation fails, the retry uses this to build a multi-turn
+                prompt that includes the failed response and error, so the LLM can fix its own output.
 
         Returns:
             Generated and validated text
@@ -481,6 +485,7 @@ class LLMClient:
                     continue
 
             # Try validation retries for this specific model
+            current_prompt = prompt  # May be replaced by repair prompt on retry
             for val_attempt in range(validation_retries + 1):
                 try:
                     logger.info(
@@ -499,7 +504,7 @@ class LLMClient:
 
                     if provider_type == "google":
                         response = self._generate_with_gemini(
-                            prompt=prompt,
+                            prompt=current_prompt,
                             model=model,
                             max_retries=api_retries,
                             operation_name=operation_name,
@@ -507,7 +512,7 @@ class LLMClient:
                         )
                     elif provider_type == "anthropic":
                         response = self._generate_with_anthropic(
-                            prompt=prompt,
+                            prompt=current_prompt,
                             model=model,
                             max_retries=api_retries,
                             operation_name=operation_name,
@@ -515,7 +520,7 @@ class LLMClient:
                         )
                     elif provider_type == "openai":
                         response = self._generate_with_openai(
-                            prompt=prompt,
+                            prompt=current_prompt,
                             model=model,
                             max_retries=api_retries,
                             operation_name=operation_name,
@@ -559,6 +564,15 @@ class LLMClient:
                         if validation_strategy.should_retry_validation(
                             model_idx, val_attempt, validation_retries, is_valid, reason
                         ):
+                            # Build repair prompt for next attempt if builder provided
+                            if repair_prompt_builder:
+                                current_prompt = repair_prompt_builder(
+                                    prompt, response, reason
+                                )
+                                logger.info(
+                                    f"Using repair prompt for {operation_name} "
+                                    f"(error: {reason[:100]})"
+                                )
                             continue  # Retry with same model
                         else:
                             break  # Move to next model
@@ -883,11 +897,26 @@ class BoundLLMClient:
         config: Optional[LLMGenerateConfig] = None,
         operation_name: str = "LLM generation"
     ) -> str:
-        """Generate content with streaming."""
-        return self.llm_client.generate_content_stream(
-            provider=self.provider,
-            model=model or self.default_model,
-            contents=contents,
-            config=config,
-            operation_name=operation_name
+        """Generate content with streaming and retry on transient errors."""
+        from .retry_utils import is_transient_error
+        from .network_utils import is_transient_gemini_error
+
+        max_wait = self.llm_client.config.get('retry', {}).get('max_wait_seconds', 10)
+        max_retries = self.llm_client.config.get('retry', {}).get('max_retries', 2)
+
+        @retry_with_logging(
+            operation_name=operation_name,
+            retry_condition=is_transient_error,
+            wait_strategy=wait_random_exponential(multiplier=2, max=max_wait),
+            stop_strategy=stop_after_attempt(max_retries),
         )
+        def _call():
+            return self.llm_client.generate_content_stream(
+                provider=self.provider,
+                model=model or self.default_model,
+                contents=contents,
+                config=config,
+                operation_name=operation_name
+            )
+
+        return _call()

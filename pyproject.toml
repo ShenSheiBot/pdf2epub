@@ -37,6 +37,7 @@ dependencies = [
     "pikepdf>=10.3.0",
     "rapidfuzz>=3.14.3",
     "google-cloud-storage>=3.4.1",
+    "json-repair>=0.39.0",
 ]
 
 [project.scripts]

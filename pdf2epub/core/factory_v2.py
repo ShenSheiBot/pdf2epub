@@ -412,6 +412,7 @@ def _create_batch_client_from_config(
             return None
         location = provider_config.get('location', 'us-central1')
         bucket = provider_config.get('bucket')
+        proxy = provider_config.get('proxy')
 
         from ..utils.batch_utils import VertexBatchClient
         logger.info(f"Creating Vertex batch client for {batch_entry.model} "
@@ -422,6 +423,7 @@ def _create_batch_client_from_config(
             model=batch_entry.model,
             poll_interval=poll_interval,
             bucket_name=bucket,
+            proxy=proxy,
         )
 
     # Gemini batch (default)

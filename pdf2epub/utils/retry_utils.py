@@ -49,9 +49,10 @@ def is_transient_error(exception: Exception) -> bool:
     transient_keywords = [
         'rate_limit', 'rate limit', 'quota',
         'timeout', 'timed out',
-        'connection', 'network',
+        'connection', 'network', 'disconnect',
         'unavailable', 'internal',
         'resource_exhausted', 'overloaded',
+        'remote protocol', 'broken pipe', 'reset by peer',
         '429', '500', '502', '503', '504'
     ]
     

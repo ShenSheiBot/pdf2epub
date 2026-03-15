@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
+from .retry_utils import default_retry, aggressive_retry
 
 
 # Default batch configuration
@@ -161,6 +162,7 @@ class GeminiBatchClient:
 
         return self._client
 
+    @default_retry
     def submit(
         self,
         requests: List[BatchRequest],
@@ -241,19 +243,31 @@ class GeminiBatchClient:
         Returns:
             Job name (ID) for tracking
         """
-        client = self._get_client()
-        from google.genai import types
         import tempfile
 
-        # Write to temp JSONL file
+        # Write to temp JSONL file (local, no retry needed)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             for req in requests:
                 f.write(json.dumps(req.to_dict()) + "\n")
             temp_path = f.name
 
-        logger.info(f"Uploading batch file with {len(requests)} requests...")
+        try:
+            job_name = self._upload_and_create_batch(temp_path, display_name)
+        finally:
+            # Clean up temp file regardless of success/failure
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
-        # Upload the file
+        return job_name
+
+    @default_retry
+    def _upload_and_create_batch(self, temp_path: str, display_name: Optional[str] = None) -> str:
+        """Upload file and create batch job (with retry)."""
+        client = self._get_client()
+        from google.genai import types
+
+        logger.info(f"Uploading batch file...")
+
         uploaded_file = client.files.upload(
             file=temp_path,
             config=types.UploadFileConfig(
@@ -262,12 +276,8 @@ class GeminiBatchClient:
             )
         )
 
-        # Clean up temp file
-        Path(temp_path).unlink()
-
         logger.info(f"Uploaded file: {uploaded_file.name}")
 
-        # Create batch job from file
         config = {}
         if display_name:
             config["display_name"] = display_name
@@ -281,6 +291,7 @@ class GeminiBatchClient:
         logger.info(f"Created batch job: {job.name}")
         return job.name
 
+    @default_retry
     def get_status(self, job_name: str) -> BatchJobInfo:
         """
         Get the current status of a batch job.
@@ -358,6 +369,7 @@ class GeminiBatchClient:
             logger.info(f"Job state: {info.state.name}, waiting {interval}s...")
             time.sleep(interval)
 
+    @aggressive_retry
     def get_results(self, job_name: str) -> List[BatchResponse]:
         """
         Get results from a completed batch job.
@@ -433,6 +445,7 @@ class GeminiBatchClient:
 
         return results
 
+    @default_retry
     def cancel(self, job_name: str) -> bool:
         """
         Cancel a running batch job.
@@ -444,14 +457,11 @@ class GeminiBatchClient:
             True if cancellation was successful
         """
         client = self._get_client()
-        try:
-            client.batches.cancel(name=job_name)
-            logger.info(f"Cancelled batch job: {job_name}")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to cancel batch job {job_name}: {e}")
-            return False
+        client.batches.cancel(name=job_name)
+        logger.info(f"Cancelled batch job: {job_name}")
+        return True
 
+    @default_retry
     def list_jobs(self, limit: int = 10) -> List[BatchJobInfo]:
         """
         List recent batch jobs.
@@ -500,16 +510,26 @@ class VertexBatchClient:
         model: str = "gemini-2.5-flash",
         poll_interval: int = 60,
         bucket_name: Optional[str] = None,
+        proxy: Optional[str] = None,
     ):
         self.project = project
         self.location = location
         self.model = model
         self.poll_interval = poll_interval
         self._bucket_name = bucket_name
+        self._proxy = proxy
         self._client = None
         self._storage_client = None
         # Track submitted key orders for line-order correlation
         self._job_keys: Dict[str, List[str]] = {}
+
+        # Set proxy env vars for httpx (google-genai SDK uses trust_env=True)
+        # and for google-cloud-storage / google-auth (ADC token refresh)
+        if proxy:
+            import os
+            os.environ.setdefault("HTTPS_PROXY", proxy)
+            os.environ.setdefault("HTTP_PROXY", proxy)
+            logger.info(f"Vertex batch client using proxy: {proxy}")
 
     def _get_client(self):
         """Get or create the genai client with Vertex AI backend."""
@@ -555,6 +575,7 @@ class VertexBatchClient:
         self._bucket_name = f"pdf2epub-batch-{project_hash}"
         return self._bucket_name
 
+    @default_retry
     def _ensure_bucket(self):
         """Ensure the GCS bucket exists, creating it if necessary."""
         storage_client = self._get_storage_client()
@@ -589,6 +610,7 @@ class VertexBatchClient:
 
         return bucket_name
 
+    @default_retry
     def submit(
         self,
         requests: List[BatchRequest],
@@ -652,6 +674,7 @@ class VertexBatchClient:
         logger.info(f"Created Vertex batch job: {job.name}")
         return job.name
 
+    @default_retry
     def get_status(self, job_name: str) -> BatchJobInfo:
         """Get the current status of a batch job."""
         client = self._get_client()
@@ -695,6 +718,7 @@ class VertexBatchClient:
             logger.info(f"Job state: {info.state.name}, waiting {interval}s...")
             time.sleep(interval)
 
+    @aggressive_retry
     def get_results(self, job_name: str) -> List[BatchResponse]:
         """Get results from a completed Vertex batch job via GCS."""
         client = self._get_client()
@@ -810,6 +834,7 @@ class VertexBatchClient:
 
         return results
 
+    @default_retry
     def _cleanup_gcs(self, bucket_name: str, prefix: str, blobs: list):
         """Clean up GCS input/output files after results are retrieved."""
         try:
@@ -829,17 +854,15 @@ class VertexBatchClient:
         except Exception as e:
             logger.warning(f"Failed to clean up GCS artifacts: {e}")
 
+    @default_retry
     def cancel(self, job_name: str) -> bool:
         """Cancel a running batch job."""
         client = self._get_client()
-        try:
-            client.batches.cancel(name=job_name)
-            logger.info(f"Cancelled Vertex batch job: {job_name}")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to cancel Vertex batch job {job_name}: {e}")
-            return False
+        client.batches.cancel(name=job_name)
+        logger.info(f"Cancelled Vertex batch job: {job_name}")
+        return True
 
+    @default_retry
     def list_jobs(self, limit: int = 10) -> List[BatchJobInfo]:
         """List recent batch jobs."""
         client = self._get_client()

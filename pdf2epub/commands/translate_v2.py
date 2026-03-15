@@ -14,7 +14,7 @@ Key features:
 import json
 import re
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple, Union
 from loguru import logger
 
 from ..utils.common import load_config, parse_llm_json
@@ -377,44 +377,67 @@ def _translate_toc_batch(
 ```
 """
 
-    try:
-        # Call LLM
-        response = llm_client.generate(
-            prompt=prompt,
-            model_configs=translation_models,
-            operation_name="TOC batch translation"
-        )
+    expected_count = len(reference_json)
 
-        # Parse response - extract JSON from possible markdown code block
-        response = response.strip()
-        if response.startswith("```"):
-            # Remove markdown code block
-            lines = response.split('\n')
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.startswith("```"):
-                    in_block = not in_block
-                    continue
-                if in_block:
-                    json_lines.append(line)
-            response = '\n'.join(json_lines)
+    def _validate_toc_json(response: str) -> Tuple[bool, str]:
+        """Validate TOC translation response is valid JSON with correct structure."""
+        try:
+            translations = parse_llm_json(response, operation_name="TOC translation")
+        except json.JSONDecodeError as e:
+            return False, f"Invalid JSON: {e}"
 
-        translations = parse_llm_json(response, operation_name="TOC translation")
+        if not isinstance(translations, list):
+            return False, f"Expected JSON array, got {type(translations).__name__}"
 
-        # Validate count
-        if len(translations) != len(reference_json):
-            logger.warning(
-                f"Translation count mismatch: expected {len(reference_json)}, "
+        if len(translations) != expected_count:
+            return False, (
+                f"Translation count mismatch: expected {expected_count}, "
                 f"got {len(translations)}"
             )
 
+        # Check each entry has required fields
+        for i, entry in enumerate(translations):
+            if not isinstance(entry, dict):
+                return False, f"Entry {i} is not an object"
+            if "id" not in entry or "translated" not in entry:
+                return False, f"Entry {i} missing 'id' or 'translated' field"
+
+        return True, ""
+
+    def _build_repair_prompt(
+        original_prompt: str,
+        failed_response: str,
+        error_reason: str,
+    ) -> List[Dict]:
+        """Build multi-turn repair prompt for TOC JSON."""
+        return [
+            {"role": "user", "content": original_prompt},
+            {"role": "assistant", "content": failed_response},
+            {"role": "user", "content": (
+                f"你返回的JSON有错误：{error_reason}\n\n"
+                f"请修复并重新返回完整的、语法正确的JSON数组。"
+                f"只返回JSON，不要其他内容。"
+            )},
+        ]
+
+    # Ensure validation retries for TOC translation (repair prompt needs ≥1)
+    toc_models = [
+        {**m, "validation_retries": max(m.get("validation_retries", 0), 2)}
+        for m in translation_models
+    ]
+
+    try:
+        response = llm_client.generate_with_validation(
+            prompt=prompt,
+            model_configs=toc_models,
+            validator=_validate_toc_json,
+            operation_name="TOC batch translation",
+            repair_prompt_builder=_build_repair_prompt,
+        )
+
+        translations = parse_llm_json(response, operation_name="TOC translation")
         return translations
 
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse TOC translation response: {e}")
-        logger.error(f"Response was: {response[:500]}...")
-        return []
     except Exception as e:
         logger.error(f"TOC batch translation failed: {e}")
         return []

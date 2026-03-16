@@ -393,6 +393,13 @@ async def run_agent_loop(
                         usage_limits=UsageLimits(
                             request_limit=request_limit,
                         ),
+                        model_settings={
+                            # Anthropic prompt caching: system prompt + tools + messages
+                            # are mostly identical across tool calls within a run
+                            "anthropic_cache_instructions": True,
+                            "anthropic_cache_tool_definitions": True,
+                            "anthropic_cache_messages": True,
+                        },
                     )
                     last_agent_err = None
                     break

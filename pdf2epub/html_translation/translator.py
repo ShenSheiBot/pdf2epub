@@ -303,15 +303,12 @@ class HTMLTranslateProcessor:
 
         # Priority 1: Anthropic (default model is Haiku — different provider from translation)
         if 'anthropic' in providers and model_name.startswith('claude'):
-            from pydantic_ai.models.anthropic import AnthropicModel
-            from pydantic_ai.providers.anthropic import AnthropicProvider
+            from pdf2epub.core.whole.model_factory import create_anthropic_model
             p = providers['anthropic']
-            provider = AnthropicProvider(
-                api_key=p.get('api_key'),
-                base_url=p.get('base_url'),
+            logger.info(f"[html-translate] Agent model: {model_name} via anthropic (cached)")
+            self._agent_model = create_anthropic_model(
+                model_name, api_key=p['api_key'], base_url=p.get('base_url'),
             )
-            logger.info(f"[html-translate] Agent model: {model_name} via anthropic")
-            self._agent_model = AnthropicModel(model_name, provider=provider)
             return self._agent_model
 
         # Priority 2: Google providers

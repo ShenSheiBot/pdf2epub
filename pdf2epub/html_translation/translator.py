@@ -203,6 +203,11 @@ class HTMLTranslateProcessor:
         # Cannot parse, return as-is
         return cleaned
 
+    @staticmethod
+    def _get_tag_seq(text: str) -> list:
+        """Extract tag name sequence from HTML text."""
+        return [t.lower() for t in re.findall(r'<(/?[a-zA-Z0-9]+)', text)]
+
     def validate_output(
         self,
         original: str,
@@ -213,8 +218,9 @@ class HTMLTranslateProcessor:
         Validate translated compressed output.
 
         Checks:
-        1. Line count matches (each <div> represents one line)
-        2. Target language content present (if configured)
+        1. Line count matches
+        2. Tag structure preserved for each line
+        3. Target language content present (if configured)
 
         Args:
             original: Original compressed content (with \\n line breaks)
@@ -224,16 +230,26 @@ class HTMLTranslateProcessor:
         Returns:
             Tuple of (is_valid, reason)
         """
-        # Count lines - original has \n separators, processed has \n restored from <div> extraction
-        original_line_count = original.count('\n') + 1
-        processed_line_count = processed.count('\n') + 1
+        src_lines = [l for l in original.split('\n') if l.strip()]
+        tgt_lines = [l for l in processed.split('\n') if l.strip()]
 
         # 1. Line count validation
-        if original_line_count != processed_line_count:
+        if len(src_lines) != len(tgt_lines):
             self._retry_context[file_name] = "div_count_mismatch"
-            return False, f"Line count mismatch: expected {original_line_count}, got {processed_line_count}"
+            return False, f"Line count mismatch: expected {len(src_lines)}, got {len(tgt_lines)}"
 
-        # 2. Target language validation
+        # 2. Tag structure validation
+        mismatches = []
+        for i, (src, tgt) in enumerate(zip(src_lines, tgt_lines)):
+            st, tt = self._get_tag_seq(src), self._get_tag_seq(tgt)
+            if st != tt:
+                mismatches.append(f"Line {i}: expected {st}, got {tt}")
+        if mismatches:
+            self._retry_context[file_name] = "tag_mismatch"
+            detail = "; ".join(mismatches[:5])
+            return False, f"{len(mismatches)} tag mismatch(es): {detail}"
+
+        # 3. Target language validation
         if self.validate_target_language:
             target_lower = self.target_language.lower()
             if target_lower in ["chinese", "中文", "chinese simplified", "zh", "zh-cn"]:
@@ -422,30 +438,10 @@ class HTMLTranslateProcessor:
         if mapping_json:
             extra_originals["mapping.json"] = mapping_json
 
-        # Content validator: checks line count + tag structure against source
-        source_lines = [l for l in content.split("\n") if l.strip()]
-
+        # Content validator: reuse validate_output, return error string or None
         def validate_html_content(result_text: str) -> str | None:
-            import re
-            result_lines = [l for l in result_text.split("\n") if l.strip()]
-            if len(result_lines) != len(source_lines):
-                return (
-                    f"Line count mismatch: expected {len(source_lines)}, "
-                    f"got {len(result_lines)}. Fix the output."
-                )
-            get_tags = lambda t: [x.lower() for x in re.findall(r'<(/?[a-zA-Z0-9]+)', t)]
-            mismatches = []
-            for i, (src, tgt) in enumerate(zip(source_lines, result_lines)):
-                st, tt = get_tags(src), get_tags(tgt)
-                if st != tt:
-                    mismatches.append(f"Line {i}: expected tags {st}, got {tt}")
-            if mismatches:
-                detail = "; ".join(mismatches[:5])
-                return (
-                    f"{len(mismatches)} tag structure mismatch(es): {detail}. "
-                    f"Fix the tags to match source structure exactly."
-                )
-            return None
+            valid, reason = self.validate_output(content, result_text, file_name)
+            return None if valid else reason
 
         # Artifacts for debugging
         artifacts_dir = self.output_dir.parent / "logs" / "agent_artifacts" / file_name

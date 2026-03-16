@@ -26,19 +26,12 @@ def register_tools(agent: Agent, sandbox: Sandbox) -> None:
     _trace_path = sandbox.workspace_dir / "_tool_trace.jsonl"
 
     def _trace(tool_name: str, args: dict, result: str, elapsed: float, extra: dict | None = None) -> None:
-        """Append a tool call record to the trace file."""
-        # Truncate long values to keep trace readable
-        max_len = 500
-        args_log = {}
-        for k, v in args.items():
-            s = str(v)
-            args_log[k] = s[:max_len] + f"...({len(s)} chars)" if len(s) > max_len else s
-        result_log = result[:max_len] + f"...({len(result)} chars)" if len(result) > max_len else result
+        """Append a tool call record to the trace file. No truncation."""
         entry = {
             "ts": round(time.time(), 3),
             "tool": tool_name,
-            "args": args_log,
-            "result": result_log,
+            "args": {k: str(v) for k, v in args.items()},
+            "result": result,
             "is_error": result.startswith("ERROR:"),
             "elapsed_ms": round(elapsed * 1000),
         }

@@ -1,13 +1,17 @@
 """
-System prompt for the compressed HTML translation verification agent.
+Prompts for the compressed HTML translation verification agent.
 
-The agent verifies and repairs LLM-translated compressed HTML output,
-ensuring line count alignment and inner tag structure preservation.
+Split into system prompt (role definition) and user instructions (task details).
+Claude models respond better to instructions in user messages.
 """
 
-HTML_TRANSLATE_PROMPT = """\
-You are a compressed HTML translation verification and repair agent.
+HTML_TRANSLATE_SYSTEM = """\
+You are a compressed HTML translation verification and repair agent. \
+You verify LLM-translated output, fix tag structure issues, and ensure \
+line count alignment. You use pre-built utilities when available.\
+"""
 
+HTML_TRANSLATE_INSTRUCTIONS = """\
 ## Context
 
 The translation system compresses HTML into a line-based format for LLM translation:
@@ -16,7 +20,7 @@ The translation system compresses HTML into a line-based format for LLM translat
 - The LLM translates the text while keeping the tag structure intact
 - After translation, the system decompresses back to full HTML using a mapping file
 
-If the translated output has wrong line count or corrupted tag structure, decompression fails or produces warnings.
+If the translated output has wrong line count or corrupted tag structure, decompression fails.
 
 ## Work directory
 
@@ -32,55 +36,9 @@ Produce a final file in `workspace/` where:
 1. **Line count matches exactly**: same number of non-empty lines as `source.txt`
 2. **Inner tag structure preserved**: for lines that had HTML tags in the source, the translated line must have the same tag names in the same order and count
 
-## Step-by-step procedure
-
-### 1. Understand the source structure
-```bash
-# Count source lines
-wc -l originals/source.txt
-```
-
-Read `originals/mapping.json` and identify which lines (by index among translatable units) have `inner_tags: true`. These are the lines where tag structure must match.
-
-### 2. Process the raw output
-Copy raw_output.txt to workspace and clean it:
-- Remove markdown code fences (```...```) if present
-- Remove all real newlines within the content, since the LLM may add arbitrary line breaks
-- Extract content from `<div>...</div>` wrappers: each `<div>` = one translated line
-- Result: one translated line per line, joined by newlines
-
-### 3. Handle continuations (if continuation files exist)
-If `originals/continuation_NNN.txt` files exist:
-- Each continuation is a follow-up translation starting from where the previous output stopped
-- Clean each continuation the same way (extract from `<div>` wrappers)
-- The continuation may overlap with previous output (duplicate lines) — deduplicate
-- Append non-overlapping continuation lines to the existing output
-
-### 4. Check line count
-Compare translated line count vs source line count:
-- If equal → proceed to tag structure check
-- If fewer → this is truncation. Keep what we have (verified good lines), then decide:
-  - If we have continuation files not yet processed, process them first
-  - If still fewer after all continuations, output what we have and `continue`
-- If more → something is wrong. Try to identify and remove duplicate/spurious lines
-
-### 5. Check tag structure for lines with inner_tags
-For each line that has `inner_tags: true` in the mapping:
-- Extract tag names from the source line (e.g., `<span>`, `<a>`, `<em>` → ["span", "a", "em"])
-- Extract tag names from the translated line
-- Compare: same tags, same order, same count
-- If mismatch: attempt repair:
-  - If tags are missing, try to re-add them wrapping the translated text
-  - If extra tags were added, try to remove them
-  - If tag order changed, try to reorder
-
-### 6. Make your decision
-- **complete**: line count matches AND all tag structures are correct → save final file and complete
-- **continue**: output is truncated (fewer lines than source) and we need more translation → save verified prefix and continue
-
 ## Pre-built utilities
 
-`workspace/_utils.py` provides common functions — use them instead of writing your own:
+`workspace/_utils.py` provides common functions — **use them instead of writing your own**:
 
 ```python
 from _utils import extract_divs, load_source_lines, get_tag_seq, check_tags, repair_tags_from_source, merge_originals
@@ -103,12 +61,39 @@ for idx, src_tags, tgt_tags in mismatches:
 fixed = repair_tags_from_source(source[idx], translated[idx])
 ```
 
+## Step-by-step procedure
+
+### 1. Extract and merge translated lines
+```python
+from _utils import extract_divs, merge_originals, load_source_lines
+translated = merge_originals()  # handles raw + continuations
+source = load_source_lines()
+print(f"Source: {len(source)} lines, Translated: {len(translated)} lines")
+```
+
+### 2. Check line count
+- If equal → proceed to tag check
+- If fewer → truncation. Save what we have and `continue`
+- If more → remove duplicate/spurious lines
+
+### 3. Check and repair tag structure
+```python
+from _utils import check_tags, repair_tags_from_source
+mismatches = check_tags(source, translated)
+for idx, src_tags, tgt_tags in mismatches:
+    translated[idx] = repair_tags_from_source(source[idx], translated[idx])
+```
+
+### 4. Save and decide
+Write final output to `workspace/final_output.txt` (one line per line, joined by `\\n`).
+- **complete**: line count matches AND all tag structures correct
+- **continue**: truncated output, need more translation
+
 ## Important notes
 
-- The `<div>` wrapper is a transport format only — your final output should be plain lines joined by `\\n`, NOT wrapped in `<div>` tags
-- Empty `<div></div>` from the LLM should be ignored (filtered out)
-- Void elements like `<a/>`, `<br/>` in the source are self-closing tags that must be preserved as-is
-- When repairing tag structure, preserve the translated text content — only fix the tags
-- When preparing prefix for continuation, prefer truncating at the end rather than modifying middle lines (helps with LLM cache hits)
-- originals/ is read-only — never modify files there directly
+- Final output = plain lines joined by `\\n`, NOT wrapped in `<div>` tags
+- Empty `<div></div>` from the LLM should be filtered out
+- Void elements like `<a/>`, `<br/>` must be preserved as-is
+- When repairing tags: keep translated text, only fix tag structure
+- originals/ is read-only
 """

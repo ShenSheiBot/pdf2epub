@@ -404,7 +404,7 @@ class HTMLTranslateProcessor:
     ) -> str:
         """Translate compressed HTML content using agent-assisted whole mode."""
         from pdf2epub.core.whole.runner import run_agent_loop_sync
-        from pdf2epub.core.whole.prompts.html_translate import HTML_TRANSLATE_PROMPT
+        from pdf2epub.core.whole.prompts.html_translate import HTML_TRANSLATE_SYSTEM, HTML_TRANSLATE_INSTRUCTIONS
 
         prompt_template = create_compressed_translation_prompt(
             source_language=self.source_language,
@@ -448,13 +448,14 @@ class HTMLTranslateProcessor:
 
         return run_agent_loop_sync(
             generate_fn=generate_fn,
-            system_prompt=HTML_TRANSLATE_PROMPT,
+            system_prompt=HTML_TRANSLATE_SYSTEM,
             agent_model=self._get_agent_model(),
             max_continuations=10,
             request_limit=100,
             artifacts_dir=artifacts_dir,
             content_validator=validate_html_content,
             extra_originals=extra_originals,
+            user_instructions=HTML_TRANSLATE_INSTRUCTIONS,
         )
 
     def process_all_files(self) -> Dict:

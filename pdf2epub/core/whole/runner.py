@@ -288,6 +288,7 @@ async def run_agent_loop(
     artifacts_dir: Optional[Path] = None,
     content_validator: Optional[ContentValidator] = _validate_json_content,
     extra_originals: Optional[dict[str, str]] = None,
+    user_instructions: Optional[str] = None,
 ) -> str:
     """
     Universal agent-assisted generation loop.
@@ -366,17 +367,21 @@ async def run_agent_loop(
             agent = _create_agent(system_prompt, agent_model, sandbox, content_validator)
             register_tools(agent, sandbox)
 
-            # Build user prompt describing current state
+            # Build user prompt: instructions (if any) + directory listing
             originals_files = sorted(originals_dir.iterdir())
             orig_list = "\n".join(f"  - {f.name}" for f in originals_files)
             workspace_files = sorted(f for f in workspace_dir.iterdir() if not f.name.startswith("_agent"))
             ws_list = "\n".join(f"  - {f.name}" for f in workspace_files) if workspace_files else "  (empty)"
-            user_prompt = (
+            dir_listing = (
                 f"Work directory contents:\n"
                 f"originals/:\n{orig_list}\n"
                 f"workspace/:\n{ws_list}\n\n"
                 f"Inspect the files and produce your decision."
             )
+            if user_instructions:
+                user_prompt = f"{user_instructions}\n\n---\n\n{dir_listing}"
+            else:
+                user_prompt = dir_listing
 
             round_num = continuation_count + 1
             logger.info(
@@ -598,6 +603,7 @@ def run_agent_loop_sync(
     artifacts_dir: Optional[Path] = None,
     content_validator: Optional[ContentValidator] = _validate_json_content,
     extra_originals: Optional[dict[str, str]] = None,
+    user_instructions: Optional[str] = None,
 ) -> str:
     """Synchronous wrapper for run_agent_loop."""
     try:
@@ -615,6 +621,7 @@ def run_agent_loop_sync(
         artifacts_dir=artifacts_dir,
         content_validator=content_validator,
         extra_originals=extra_originals,
+        user_instructions=user_instructions,
     )
 
     if loop and loop.is_running():

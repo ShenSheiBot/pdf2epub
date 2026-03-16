@@ -414,11 +414,11 @@ async def run_agent_loop(
                             request_limit=request_limit,
                         ),
                         model_settings={
-                            # Anthropic prompt caching: system prompt + tools + messages
-                            # are mostly identical across tool calls within a run
-                            "anthropic_cache_instructions": True,
-                            "anthropic_cache_tool_definitions": True,
-                            "anthropic_cache_messages": True,
+                            # Anthropic prompt caching — use 1h TTL to match
+                            # CachedAnthropicModel's intermediate breakpoints
+                            "anthropic_cache_instructions": "1h",
+                            "anthropic_cache_tool_definitions": "1h",
+                            "anthropic_cache_messages": "1h",
                         },
                     )
                     last_agent_err = None

@@ -368,11 +368,13 @@ async def run_agent_loop(
 
             # Build user prompt describing current state
             originals_files = sorted(originals_dir.iterdir())
-            file_list = "\n".join(f"  - {f.name}" for f in originals_files)
+            orig_list = "\n".join(f"  - {f.name}" for f in originals_files)
+            workspace_files = sorted(f for f in workspace_dir.iterdir() if not f.name.startswith("_agent"))
+            ws_list = "\n".join(f"  - {f.name}" for f in workspace_files) if workspace_files else "  (empty)"
             user_prompt = (
                 f"Work directory contents:\n"
-                f"originals/:\n{file_list}\n"
-                f"workspace/: (your writable area)\n\n"
+                f"originals/:\n{orig_list}\n"
+                f"workspace/:\n{ws_list}\n\n"
                 f"Inspect the files and produce your decision."
             )
 

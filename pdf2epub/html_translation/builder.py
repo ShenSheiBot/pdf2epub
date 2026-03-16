@@ -360,7 +360,6 @@ class HTMLEpubBuilder:
             if target_lang_code:
                 lang_elem = root.find('.//dc:language', namespaces)
                 if lang_elem is None:
-                    # Try without namespace
                     for elem in root.iter():
                         if elem.tag.endswith('}language') or elem.tag == 'language':
                             lang_elem = elem
@@ -372,6 +371,71 @@ class HTMLEpubBuilder:
                     logger.debug(f"Updated content.opf language: {old_lang} -> {target_lang_code}")
                 else:
                     logger.warning("dc:language element not found in content.opf")
+
+            # Update dc:creator (author)
+            if metadata.get('translated_author'):
+                def _find_dc(tag_suffix):
+                    el = root.find(f'.//dc:{tag_suffix}', namespaces)
+                    if el is None:
+                        for e in root.iter():
+                            if e.tag.endswith(f'}}{tag_suffix}') or e.tag == tag_suffix:
+                                return e
+                    return el
+
+                creator_elem = _find_dc('creator')
+                if creator_elem is not None:
+                    creator_elem.text = metadata['translated_author']
+                    # Update file-as attribute
+                    opf_ns = 'http://www.idpf.org/2007/opf'
+                    file_as_key = f'{{{opf_ns}}}file-as'
+                    if file_as_key in creator_elem.attrib and metadata.get('translated_author_file_as'):
+                        creator_elem.attrib[file_as_key] = metadata['translated_author_file_as']
+                    logger.debug(f"Updated creator: {metadata['translated_author']}")
+
+            # Update dc:description
+            if metadata.get('translated_description'):
+                desc_elem = root.find('.//dc:description', namespaces)
+                if desc_elem is None:
+                    for e in root.iter():
+                        if e.tag.endswith('}description') or e.tag == 'description':
+                            desc_elem = e
+                            break
+                if desc_elem is not None:
+                    desc_elem.text = metadata['translated_description']
+                    logger.debug("Updated description")
+
+            # Update dc:publisher
+            if metadata.get('translated_publisher'):
+                pub_elem = root.find('.//dc:publisher', namespaces)
+                if pub_elem is None:
+                    for e in root.iter():
+                        if e.tag.endswith('}publisher') or e.tag == 'publisher':
+                            pub_elem = e
+                            break
+                if pub_elem is not None:
+                    pub_elem.text = metadata['translated_publisher']
+                    logger.debug(f"Updated publisher: {metadata['translated_publisher']}")
+
+            # Update dc:rights
+            if metadata.get('translated_rights'):
+                rights_elem = root.find('.//dc:rights', namespaces)
+                if rights_elem is None:
+                    for e in root.iter():
+                        if e.tag.endswith('}rights') or e.tag == 'rights':
+                            rights_elem = e
+                            break
+                if rights_elem is not None:
+                    rights_elem.text = metadata['translated_rights']
+                    logger.debug("Updated rights")
+
+            # Update calibre:title_sort
+            if metadata.get('translated_title_sort'):
+                for elem in root.iter():
+                    if elem.tag == 'meta' or ('}' in elem.tag and elem.tag.endswith('}meta')):
+                        if elem.get('name') == 'calibre:title_sort':
+                            elem.set('content', metadata['translated_title_sort'])
+                            logger.debug(f"Updated title_sort: {metadata['translated_title_sort']}")
+                            break
 
             tree.write(opf_path, encoding='utf-8', xml_declaration=True)
 
@@ -1019,8 +1083,17 @@ class HTMLEpubPipeline:
             flat_toc, self.source_language, target_language, llm_client, batch_size
         )
 
+        # Translate other metadata fields (author, description, publisher, etc.)
+        extra_metadata = self._translate_extra_metadata(
+            self.source_language, target_language, llm_client
+        )
+
         # Map target language to ISO 639-1 code for EPUB metadata
         target_lang_code = self._get_language_code(target_language)
+
+        # Set title_sort to translated title
+        if 'translated_title_sort' in extra_metadata:
+            extra_metadata['translated_title_sort'] = translated_title
 
         # Build result
         result = {
@@ -1028,7 +1101,8 @@ class HTMLEpubPipeline:
             'translated_title': translated_title,
             'target_language': target_language,
             'target_language_code': target_lang_code,
-            'toc': translated_toc
+            'toc': translated_toc,
+            **extra_metadata,
         }
 
         # Save to file
@@ -1039,6 +1113,80 @@ class HTMLEpubPipeline:
         logger.info(f"Translated {len(result['toc'])} TOC entries")
 
         return result
+
+    def _translate_extra_metadata(
+        self,
+        source_lang: str,
+        target_lang: str,
+        llm_client
+    ) -> Dict:
+        """Translate author, description, publisher and other metadata fields."""
+        import json as _json
+
+        meta = self.metadata
+        fields = {}
+        if meta.get('author') and meta['author'] != 'Unknown':
+            fields['author'] = meta['author']
+        if meta.get('description'):
+            # Strip HTML tags from description for cleaner translation
+            import re
+            desc = re.sub(r'<[^>]+>', '', meta['description'])
+            if len(desc.strip()) > 10:
+                fields['description'] = desc.strip()
+        if meta.get('publisher'):
+            fields['publisher'] = meta['publisher']
+        if meta.get('rights'):
+            fields['rights'] = meta['rights']
+
+        if not fields:
+            return {}
+
+        prompt = (
+            f"Translate the following book metadata from {source_lang} to {target_lang}.\n"
+            f"For author names, transliterate to the target language "
+            f"(e.g., 'Adam Hanieh' → '亚当·哈尼耶').\n"
+            f"For publisher names, transliterate if well-known, otherwise keep original.\n"
+            f"Return ONLY valid JSON with the same keys.\n\n"
+            f"```json\n{_json.dumps(fields, ensure_ascii=False, indent=2)}\n```"
+        )
+
+        try:
+            response = llm_client.generate(
+                prompt=prompt,
+                model_configs=self.config.get('translation_models', [
+                    {"provider": "gemini", "model": "gemini-2.5-pro"}
+                ]),
+                operation_name="Translate metadata fields"
+            )
+            # Parse JSON response
+            cleaned = response.strip()
+            # Strip markdown fences
+            if cleaned.startswith("```"):
+                cleaned = "\n".join(cleaned.split("\n")[1:])
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            translated = _json.loads(cleaned.strip())
+
+            result = {}
+            if 'author' in translated:
+                result['translated_author'] = translated['author']
+                # Generate file-as (sort) form
+                result['translated_author_file_as'] = translated['author']
+            if 'description' in translated:
+                result['translated_description'] = translated['description']
+            if 'publisher' in translated:
+                result['translated_publisher'] = translated['publisher']
+            if 'rights' in translated:
+                result['translated_rights'] = translated['rights']
+            # Title sort = translated title (will be set by caller)
+            result['translated_title_sort'] = None  # Placeholder, set after title is known
+
+            logger.info(f"Translated metadata: {list(result.keys())}")
+            return result
+
+        except Exception as e:
+            logger.warning(f"Failed to translate extra metadata: {e}")
+            return {}
 
     def _translate_title(
         self,

@@ -422,6 +422,31 @@ class HTMLTranslateProcessor:
         if mapping_json:
             extra_originals["mapping.json"] = mapping_json
 
+        # Content validator: checks line count + tag structure against source
+        source_lines = [l for l in content.split("\n") if l.strip()]
+
+        def validate_html_content(result_text: str) -> str | None:
+            import re
+            result_lines = [l for l in result_text.split("\n") if l.strip()]
+            if len(result_lines) != len(source_lines):
+                return (
+                    f"Line count mismatch: expected {len(source_lines)}, "
+                    f"got {len(result_lines)}. Fix the output."
+                )
+            get_tags = lambda t: [x.lower() for x in re.findall(r'<(/?[a-zA-Z0-9]+)', t)]
+            mismatches = []
+            for i, (src, tgt) in enumerate(zip(source_lines, result_lines)):
+                st, tt = get_tags(src), get_tags(tgt)
+                if st != tt:
+                    mismatches.append(f"Line {i}: expected tags {st}, got {tt}")
+            if mismatches:
+                detail = "; ".join(mismatches[:5])
+                return (
+                    f"{len(mismatches)} tag structure mismatch(es): {detail}. "
+                    f"Fix the tags to match source structure exactly."
+                )
+            return None
+
         # Artifacts for debugging
         artifacts_dir = self.output_dir.parent / "logs" / "agent_artifacts" / file_name
 
@@ -432,7 +457,7 @@ class HTMLTranslateProcessor:
             max_continuations=10,
             request_limit=100,
             artifacts_dir=artifacts_dir,
-            content_validator=None,  # Agent handles validation internally
+            content_validator=validate_html_content,
             extra_originals=extra_originals,
         )
 

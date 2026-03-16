@@ -42,6 +42,28 @@ def _strip_fences_and_bom(text: str) -> str:
     return text
 
 
+_AGENT_RUN_MAX_RETRIES = 3
+
+_TRANSIENT_KEYWORDS = frozenset([
+    'timeout', 'timed out', 'connection', 'disconnected', 'payload',
+    'content_length', 'contentlength', 'incomplete',
+    '500', '502', '503', '504', '429',
+    'unavailable', 'overloaded', 'rate_limit',
+])
+
+_NON_TRANSIENT_KEYWORDS = frozenset([
+    'safety', 'blocked', 'prohibited', 'harmful', 'permission',
+])
+
+
+def _is_transient_agent_error(exc: Exception) -> bool:
+    """Check if an agent error is transient (network/server) and worth retrying."""
+    err = str(exc).lower()
+    if any(k in err for k in _NON_TRANSIENT_KEYWORDS):
+        return False
+    return any(k in err for k in _TRANSIENT_KEYWORDS)
+
+
 class Decision(BaseModel):
     """Agent's decision after inspecting the work directory."""
 
@@ -301,6 +323,10 @@ async def run_agent_loop(
         originals_dir.mkdir(parents=True, exist_ok=True)
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
+        # Write pre-built utilities to workspace
+        from .workspace_utils import WORKSPACE_UTILS_CODE
+        (workspace_dir / "_utils.py").write_text(WORKSPACE_UTILS_CODE, encoding="utf-8")
+
         # Write extra reference files into originals/
         if extra_originals:
             for fname, fcontent in extra_originals.items():
@@ -349,27 +375,45 @@ async def run_agent_loop(
             round_start = time.perf_counter()
             result = None
             stats = None
-            try:
-                result = await agent.run(
-                    user_prompt,
-                    usage_limits=UsageLimits(
-                        request_limit=request_limit,
-                    ),
-                )
-            except Exception as agent_err:
-                round_dur = time.perf_counter() - round_start
-                # Save whatever trace we can
-                if result is not None:
-                    _save_agent_trace(result, round_num, workspace_dir)
-                _save_round_metrics(
-                    workspace_dir, round_num, round_dur,
-                    status="error", decision_action=None, decision_file=None,
-                    stats=None,
-                    error_type=type(agent_err).__name__,
-                    error_message=str(agent_err)[:500],
-                )
-                logger.error(f"[agent-loop] Agent crashed in round {round_num}: {agent_err}")
-                raise
+            last_agent_err = None
+            for attempt in range(_AGENT_RUN_MAX_RETRIES):
+                try:
+                    result = await agent.run(
+                        user_prompt,
+                        usage_limits=UsageLimits(
+                            request_limit=request_limit,
+                        ),
+                    )
+                    last_agent_err = None
+                    break
+                except Exception as agent_err:
+                    last_agent_err = agent_err
+                    if _is_transient_agent_error(agent_err) and attempt < _AGENT_RUN_MAX_RETRIES - 1:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            f"[agent-loop] Agent transient error in round {round_num} "
+                            f"(attempt {attempt + 1}/{_AGENT_RUN_MAX_RETRIES}): "
+                            f"{type(agent_err).__name__}: {str(agent_err)[:200]}. "
+                            f"Retrying in {wait}s..."
+                        )
+                        await asyncio.sleep(wait)
+                        # Recreate agent (fresh state) for retry
+                        agent = _create_agent(system_prompt, agent_model, sandbox, content_validator)
+                        register_tools(agent, sandbox)
+                        continue
+                    else:
+                        round_dur = time.perf_counter() - round_start
+                        if result is not None:
+                            _save_agent_trace(result, round_num, workspace_dir)
+                        _save_round_metrics(
+                            workspace_dir, round_num, round_dur,
+                            status="error", decision_action=None, decision_file=None,
+                            stats=None,
+                            error_type=type(agent_err).__name__,
+                            error_message=str(agent_err)[:500],
+                        )
+                        logger.error(f"[agent-loop] Agent crashed in round {round_num}: {agent_err}")
+                        raise
 
             round_dur = time.perf_counter() - round_start
             decision = result.output

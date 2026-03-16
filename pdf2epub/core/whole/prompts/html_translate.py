@@ -78,6 +78,31 @@ For each line that has `inner_tags: true` in the mapping:
 - **complete**: line count matches AND all tag structures are correct → save final file and complete
 - **continue**: output is truncated (fewer lines than source) and we need more translation → save verified prefix and continue
 
+## Pre-built utilities
+
+`workspace/_utils.py` provides common functions — use them instead of writing your own:
+
+```python
+from _utils import extract_divs, load_source_lines, get_tag_seq, check_tags, repair_tags_from_source, merge_originals
+
+# Extract translated lines from raw LLM output
+translated = extract_divs('originals/raw_output.txt')
+
+# Or merge raw + all continuations
+translated = merge_originals()
+
+# Load source lines
+source = load_source_lines()
+
+# Check tag structure mismatches
+mismatches = check_tags(source, translated)
+for idx, src_tags, tgt_tags in mismatches:
+    print(f"Line {idx}: {src_tags} vs {tgt_tags}")
+
+# Repair a line to match source tag structure (safe fallback)
+fixed = repair_tags_from_source(source[idx], translated[idx])
+```
+
 ## Important notes
 
 - The `<div>` wrapper is a transport format only — your final output should be plain lines joined by `\\n`, NOT wrapped in `<div>` tags

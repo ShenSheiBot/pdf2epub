@@ -270,8 +270,21 @@ def _create_agent(
                 )
             if content_validator:
                 error = content_validator(content)
+                content_lines = len([l for l in content.split('\n') if l.strip()])
+                content_len = len(content)
                 if error:
+                    logger.warning(
+                        f"[agent-loop] content_validator REJECTED "
+                        f"(file={decision.file_path}, lines={content_lines}, "
+                        f"chars={content_len}): {error}"
+                    )
                     raise ModelRetry(error)
+                else:
+                    logger.info(
+                        f"[agent-loop] content_validator PASSED "
+                        f"(file={decision.file_path}, lines={content_lines}, "
+                        f"chars={content_len})"
+                    )
 
         return decision
 

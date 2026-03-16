@@ -105,8 +105,11 @@ def _extract_tool_stats(result) -> dict:
         "tool_errors": dict(tool_errors),
         "total_calls": sum(tool_calls.values()),
         "total_errors": sum(tool_errors.values()),
-        "request_tokens": getattr(usage, "request_tokens", 0) or 0,
-        "response_tokens": getattr(usage, "response_tokens", 0) or 0,
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read_tokens": getattr(usage, "cache_read_tokens", 0) or 0,
+        "cache_write_tokens": getattr(usage, "cache_write_tokens", 0) or 0,
+        "requests": getattr(usage, "requests", 0) or 0,
     }
 
 
@@ -123,9 +126,14 @@ def _log_tool_usage(stats: dict, round_num: int) -> None:
         error_detail = " | errors: " + ", ".join(
             f"{name}={count}" for name, count in stats["tool_errors"].items()
         )
+    cache_info = ""
+    if stats.get("cache_read_tokens"):
+        cache_pct = round(stats["cache_read_tokens"] / max(stats["input_tokens"], 1) * 100)
+        cache_info = f", cache={cache_pct}%"
     tokens_info = (
-        f" | tokens: {stats['request_tokens']} in, "
-        f"{stats['response_tokens']} out"
+        f" | tokens: {stats['input_tokens']} in, "
+        f"{stats['output_tokens']} out{cache_info} "
+        f"({stats.get('requests', '?')} reqs)"
     )
 
     logger.info(
@@ -161,8 +169,10 @@ def _save_round_metrics(
             "tool_errors": stats["tool_errors"],
             "total_calls": stats["total_calls"],
             "total_errors": stats["total_errors"],
-            "request_tokens": stats["request_tokens"],
-            "response_tokens": stats["response_tokens"],
+            "input_tokens": stats["input_tokens"],
+            "output_tokens": stats["output_tokens"],
+            "cache_read_tokens": stats.get("cache_read_tokens", 0),
+            "requests": stats.get("requests", 0),
         })
     try:
         metrics_path = workspace_dir / "_agent_round_metrics.jsonl"

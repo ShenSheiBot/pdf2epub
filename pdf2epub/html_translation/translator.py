@@ -108,9 +108,10 @@ class HTMLTranslateProcessor:
         self._retry_context: Dict[str, str] = {}
 
         # Agent model for whole mode (lazy-initialized)
+        # Default to Haiku via Anthropic — avoids competing with translation model for Gemini quota
         self._agent_model = None
         self._agent_model_name = config.get('html_translation', {}).get(
-            'agent_model', 'gemini-3-flash-preview'
+            'agent_model', 'claude-haiku-4-5-20251001'
         )
 
     def _wrap_lines_with_div(self, content: str) -> str:
@@ -270,7 +271,11 @@ class HTMLTranslateProcessor:
         return len(matches) >= 5  # At least 5 Chinese chars in sample
 
     def _get_agent_model(self):
-        """Get or create pydantic-ai Model for the verification agent."""
+        """Get or create pydantic-ai Model for the verification agent.
+
+        Priority: Anthropic (Haiku) > Google > Poe.
+        Anthropic is preferred to avoid competing with translation model for Gemini quota.
+        """
         if self._agent_model is not None:
             return self._agent_model
 
@@ -280,7 +285,20 @@ class HTMLTranslateProcessor:
 
         model_name = self._agent_model_name
 
-        # Try google providers first (gemini-direct, gemini, etc.)
+        # Priority 1: Anthropic (default model is Haiku — different provider from translation)
+        if 'anthropic' in providers and model_name.startswith('claude'):
+            from pydantic_ai.models.anthropic import AnthropicModel
+            from pydantic_ai.providers.anthropic import AnthropicProvider
+            p = providers['anthropic']
+            provider = AnthropicProvider(
+                api_key=p.get('api_key'),
+                base_url=p.get('base_url'),
+            )
+            logger.info(f"[html-translate] Agent model: {model_name} via anthropic")
+            self._agent_model = AnthropicModel(model_name, provider=provider)
+            return self._agent_model
+
+        # Priority 2: Google providers
         for provider_name in ('gemini-direct', 'gemini', 'gemini-cf'):
             if provider_name in providers:
                 p = providers[provider_name]
@@ -297,7 +315,7 @@ class HTMLTranslateProcessor:
                     self._agent_model = GoogleModel(model_name, provider=gp)
                     return self._agent_model
 
-        # Fallback: poe
+        # Priority 3: Poe
         if 'poe' in providers:
             from pydantic_ai.models.openai import OpenAIChatModel
             from pydantic_ai.providers.openai import OpenAIProvider

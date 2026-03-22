@@ -696,8 +696,13 @@ def build_epub(config: BuildEpubConfig) -> Path:
 
     # Extract cover image from PDF if not provided
     if not config.cover_image:
-        cover_page_info = toc_tree.get('cover_page', {})
+        cover_page_info = toc_tree.get('cover_page') or {}
         cover_page_num = cover_page_info.get('page_number')
+
+        # Fallback: use page 1 as cover if no cover page specified
+        if not cover_page_num:
+            cover_page_num = 1
+            logger.info("No cover page in TOC, using page 1 as cover")
 
         if cover_page_num:
             # Look for original PDF (without page number patches) for clean cover

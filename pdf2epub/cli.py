@@ -228,6 +228,10 @@ def ocr_pages_command(args):
         logger.info("Specify --input with the path to your PDF file")
         return 1
 
+    # Preprocess PDF: copy to output dir + add page stamps + compress
+    from pdf2epub.utils.pdf_utils import preprocess_pdf
+    pdf_path = preprocess_pdf(pdf_path, output_dir)
+
     logger.info(f"Starting page-level OCR for: {book_title}")
 
     # Get OCR settings from config

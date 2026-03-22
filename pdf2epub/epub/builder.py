@@ -444,13 +444,13 @@ a { text-decoration: none; }
         <dc:identifier id="BookId" opf:scheme="UUID">{uid}</dc:identifier>
         <dc:date>{date}</dc:date>
         <meta name="generator" content="PDF2EPUB v3"/>
-        <meta name="cover" content="cover-image"/>
+        {f'<meta name="cover" content="cover-image"/>' if cover_image else ''}
     </metadata>
-    
+
     <manifest>
         <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
         <item id="stylesheet" href="stylesheet.css" media-type="text/css"/>
-        <item id="cover" href="text/cover.html" media-type="application/xhtml+xml"/>
+        {f'<item id="cover" href="text/cover.html" media-type="application/xhtml+xml"/>' if cover_image else ''}
         <item id="toc" href="text/toc.html" media-type="application/xhtml+xml"/>
 """
             
@@ -499,10 +499,13 @@ a { text-decoration: none; }
 """
             
             opf += """    </manifest>
-    
+
     <spine toc="ncx">
-        <itemref idref="cover" linear="no"/>
-        <itemref idref="toc"/>
+"""
+            if cover_image:
+                opf += """        <itemref idref="cover" linear="no"/>
+"""
+            opf += """        <itemref idref="toc"/>
 """
             
             # Build spine based on all_html_files if provided

@@ -32,12 +32,13 @@ dependencies = [
     "tinycss2>=1.2.1",
     "cssselect2>=0.7.0",
     "mobi>=0.4.1",
-    "pydantic-ai>=1.0.8",
+    "pydantic-ai>=1.61.0",
     "sentence-transformers>=2.2.0",
     "pikepdf>=10.3.0",
     "rapidfuzz>=3.14.3",
     "google-cloud-storage>=3.4.1",
     "json-repair>=0.39.0",
+    "griffe<2.0",
 ]
 
 [project.scripts]

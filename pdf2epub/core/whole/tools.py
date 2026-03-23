@@ -119,10 +119,25 @@ def register_tools(agent: Agent, sandbox: Sandbox) -> None:
                 _trace("read", {"path": path, "offset": offset, "limit": limit}, result, time.time() - t0)
                 return result
             numbered = []
+            char_count = 0
+            lines_included = 0
+            char_limit = 32 * 1024  # Same as bash tool
             for i, line in enumerate(selected, start=offset + 1):
-                numbered.append(f"{i:6d}\t{line.rstrip()}")
+                formatted = f"{i:6d}\t{line.rstrip()}"
+                if char_count + len(formatted) > char_limit and lines_included > 0:
+                    remaining = len(selected) - lines_included
+                    if offset + limit < len(lines):
+                        remaining += len(lines) - offset - limit
+                    numbered.append(
+                        f"\n[output truncated at {char_limit // 1024}KB — "
+                        f"{remaining} more lines, use offset/limit to read in chunks]"
+                    )
+                    break
+                numbered.append(formatted)
+                char_count += len(formatted) + 1  # +1 for newline
+                lines_included += 1
             result = "\n".join(numbered)
-            if offset + limit < len(lines):
+            if lines_included == len(selected) and offset + limit < len(lines):
                 result += f"\n\n... ({len(lines) - offset - limit} more lines)"
             _trace("read", {"path": path, "offset": offset, "limit": limit}, result, time.time() - t0)
             return result

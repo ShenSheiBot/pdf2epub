@@ -167,6 +167,35 @@ def is_transient_openai_error(exception: Exception) -> bool:
     return False
 
 
+# --- Streaming hallucination detection ---
+# Detect repetition loops and abnormally long lines during streaming.
+
+_HALLUCINATION_LINE_MAX = 1000       # Max chars per line in structured output
+_HALLUCINATION_WINDOW = 500          # Window size for repetition comparison
+
+
+def _detect_streaming_hallucination(text: str) -> Optional[str]:
+    """Check if streaming output shows hallucination patterns.
+
+    Returns a reason string if hallucination detected, None otherwise.
+    """
+    # 1. Long line check: any single line > threshold is almost certainly
+    #    a repetition loop (normal TOC titles max ~450 chars across all books)
+    last_nl = text.rfind('\n')
+    current_line_len = len(text) - last_nl - 1 if last_nl >= 0 else len(text)
+    if current_line_len > _HALLUCINATION_LINE_MAX:
+        return f"line length {current_line_len} > {_HALLUCINATION_LINE_MAX}"
+
+    # 2. Repetition loop: compare two adjacent windows at the tail.
+    #    If they're identical, output is stuck in a cycle of period ≤ W.
+    w = _HALLUCINATION_WINDOW
+    if len(text) >= 2 * w:
+        if text[-2 * w:-w] == text[-w:]:
+            return f"repetition loop detected (window={w})"
+
+    return None
+
+
 class GeminiClient:
     """Wrapper for Gemini API with smart retry logic."""
 
@@ -278,6 +307,7 @@ class GeminiClient:
         aggregated_text = ""
         chunk_count = 0
         last_log_length = 0
+        halted_early = False
 
         for chunk in stream_response:
             chunk_count += 1
@@ -303,6 +333,18 @@ class GeminiClient:
                 # Fallback for simpler response format
                 aggregated_text += chunk.text
 
+            # --- Hallucination guard: detect repetition loops ---
+            # Check every 200 chunks to avoid overhead
+            if chunk_count % 200 == 0:
+                halt_reason = _detect_streaming_hallucination(aggregated_text)
+                if halt_reason:
+                    logger.warning(
+                        f"Hallucination detected for {operation_name}: {halt_reason}. "
+                        f"Halting stream at {len(aggregated_text)} chars."
+                    )
+                    halted_early = True
+                    break
+
             # Log progress periodically - every 500 tokens
             current_tokens = len(self.tokenizer.encode(aggregated_text))
             if current_tokens - last_log_length >= 500:
@@ -311,7 +353,17 @@ class GeminiClient:
         
         # Log finish reason from last chunk
         finish_reason = None
-        if chunk_count > 0 and hasattr(chunk, 'candidates') and chunk.candidates:
+        if halted_early:
+            finish_reason = "HALLUCINATION_HALT"
+            # Truncate to last newline to avoid partial lines
+            last_nl = aggregated_text.rfind('\n')
+            if last_nl > 0:
+                aggregated_text = aggregated_text[:last_nl]
+            logger.warning(
+                f"Stream halted early (hallucination) for {operation_name}: "
+                f"truncated to {len(aggregated_text)} chars"
+            )
+        elif chunk_count > 0 and hasattr(chunk, 'candidates') and chunk.candidates:
             for candidate in chunk.candidates:
                 if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
                     finish_reason = str(candidate.finish_reason)
@@ -547,27 +599,40 @@ class OpenAIClient:
         max_tokens: int = 8192,
         temperature: float = 0.1,
         operation_name: str = "OpenAI API call",
-        json_mode: bool = False
+        json_mode: bool = False,
+        extra_body: Optional[Dict] = None,
+        messages: Optional[List[Dict]] = None,
     ) -> str:
-        """Generate content with automatic retry for transient errors."""
+        """Generate content with automatic retry for transient errors.
+
+        Args:
+            prompt: Text or multi-part content (ignored if messages is provided)
+            messages: Pre-formatted messages list (overrides prompt if provided)
+            extra_body: Extra parameters to pass to the API (e.g. chat_template_kwargs)
+        """
         logger.info(f"Calling OpenAI API for {operation_name}")
 
         # Use provided model or default
         model_to_use = model or self.default_model
 
         # Process content for messages format
-        messages = self._format_messages(prompt)
+        if messages is not None:
+            formatted_messages = messages
+        else:
+            formatted_messages = self._format_messages(prompt)
 
         # Build request kwargs
         request_kwargs = {
             "model": model_to_use,
-            "messages": messages,
+            "messages": formatted_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True
         }
         if json_mode:
             request_kwargs["response_format"] = {"type": "json_object"}
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
 
         # Create chat completion with streaming
         try:
@@ -575,28 +640,35 @@ class OpenAIClient:
         except Exception as e:
             logger.error(f"Failed to create OpenAI stream for {operation_name}: {e}")
             raise
-        
+
         # Aggregate streamed response
         response_text = ""
         chunk_count = 0
+        finish_reason = None
         last_log_tokens = 0
         for chunk in stream:
             if chunk.choices[0].delta.content:
                 response_text += chunk.choices[0].delta.content
                 chunk_count += 1
-                
+
                 # Log progress periodically - every 500 tokens
                 current_tokens = len(self.tokenizer.encode(response_text))
                 if current_tokens - last_log_tokens >= 500:
                     logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
                     last_log_tokens = current_tokens
-        
+
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
         if not response_text:
             raise ValueError(f"Empty response from OpenAI for {operation_name}")
-        
+
+        # Store finish_reason for caller inspection
+        self._last_finish_reason = finish_reason
+
         # Get final token count
         final_tokens = len(self.tokenizer.encode(response_text))
-        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from OpenAI for {operation_name}")
+        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from OpenAI for {operation_name} [finish={finish_reason}]")
         return response_text
 
     def _format_messages(self, prompt: Union[str, List[Dict]]) -> List[Dict]:

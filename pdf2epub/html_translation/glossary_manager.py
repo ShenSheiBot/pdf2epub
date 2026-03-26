@@ -495,6 +495,7 @@ class GlossaryManager:
                     prompt=messages,
                     model_configs=self.model_configs,
                     operation_name=f"Glossary dedup {chapter_id} (attempt {attempt + 1})",
+                    enable_cache=True,
                 )
                 dedup_result = parse_llm_json(
                     dedup_response,
@@ -737,11 +738,17 @@ class GlossaryManager:
                 logger.warning(f"Description compression failed for '{key}': {e}")
 
     def extract_and_update(
-        self, source_text: str, translated_text: str, chapter_id: str
+        self, source_text: str, translated_text: str, chapter_id: str,
+        translation_system_prompt: str = None,
     ) -> str:
         """Generate glossary from completed translation, update store.
 
-        Uses cache hit: same source_text prefix as the translation call.
+        If translation_system_prompt is provided, uses the same message prefix
+        as the translation call for Anthropic prompt cache sharing:
+          system: translation_system_prompt (cached from translation)
+          user1: "请翻译：\n{source_text}" (cached from translation)
+          assistant1: translated_text
+          user2: extraction instruction
         """
         # Build existing entries section for context
         existing_section = ""
@@ -761,11 +768,32 @@ class GlossaryManager:
                 + "\n\n"
             )
 
-        prompt = GLOSSARY_EXTRACT_PROMPT.format(
+        # Build extraction instruction (without source/translated — those go in message prefix)
+        extraction_instruction = GLOSSARY_EXTRACT_PROMPT.format(
             existing_section=existing_section,
-            source_text=source_text,
-            translated_text=translated_text,
+            source_text="（见上文）" if translation_system_prompt else source_text,
+            translated_text="（见上文）" if translation_system_prompt else translated_text,
         )
+
+        # Build cache-friendly messages if translation system prompt is available
+        if translation_system_prompt:
+            # Same prefix as translation call → cache hit on source_text
+            prompt = [
+                {"role": "system", "content": translation_system_prompt},
+                {"role": "user", "content": f"请翻译：\n{source_text}"},
+                {"role": "assistant", "content": translated_text},
+                {"role": "user", "content": extraction_instruction},
+            ]
+        else:
+            # Fallback: standalone prompt (no cache sharing)
+            prompt = GLOSSARY_EXTRACT_PROMPT.format(
+                existing_section=existing_section,
+                source_text=source_text,
+                translated_text=translated_text,
+            )
+
+        # For dedup Call 2 cache sharing, keep the full prompt
+        extraction_prompt_for_dedup = prompt
 
         # Extraction with retry
         entries = None
@@ -775,6 +803,7 @@ class GlossaryManager:
                     prompt=prompt,
                     model_configs=self.model_configs,
                     operation_name=f"Glossary extract {chapter_id} (attempt {attempt + 1})",
+                    enable_cache=True,
                 )
                 parsed = parse_llm_json(
                     response,
@@ -795,7 +824,7 @@ class GlossaryManager:
 
         # Dedup: LLM-based pronoun cleaning + duplicate merging (skip if no entries)
         if entries:
-            entries = self._dedup_entries(entries, chapter_id, prompt, response)
+            entries = self._dedup_entries(entries, chapter_id, extraction_prompt_for_dedup, response)
 
         # Update store
         # NOTE: removed_aliases blacklist disabled (see comment in _dedup_entries)

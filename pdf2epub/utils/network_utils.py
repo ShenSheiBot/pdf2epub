@@ -385,6 +385,13 @@ class GeminiClient:
                 f"{final_tokens} tokens generated before cutoff"
             )
 
+        # Capture and store full usage metadata
+        usage_meta = None
+        if chunk_count > 0 and hasattr(chunk, 'usage_metadata'):
+            usage_meta = chunk.usage_metadata
+        self._last_usage_metadata = usage_meta
+        self._last_stream_events = usage_meta.model_dump() if usage_meta else {}
+
         logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) for {operation_name}")
         return aggregated_text
     
@@ -454,7 +461,8 @@ class AnthropicClient:
         max_tokens: int = 8192,
         temperature: float = 0.1,
         operation_name: str = "Anthropic API call",
-        json_mode: bool = False
+        json_mode: bool = False,
+        enable_cache: bool = False,
     ) -> str:
         """Generate content with automatic retry for transient errors.
 
@@ -469,13 +477,37 @@ class AnthropicClient:
 
         # Check if prompt is a list of messages with roles
         messages = None
+        system_text = None
         if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict) and "role" in prompt[0]:
             # It's a conversation history with roles
-            messages = prompt
+            # Extract system messages (Anthropic requires top-level system param)
+            system_msgs = [m for m in prompt if m.get("role") == "system"]
+            messages = [m for m in prompt if m.get("role") != "system"]
+            if system_msgs:
+                system_text = "\n\n".join(m.get("content", "") for m in system_msgs)
         else:
             # Process content for images and create single user message
             content = self._process_content(prompt)
             messages = [{"role": "user", "content": content}]
+
+        # Add cache_control markers only when explicitly requested
+        if enable_cache and system_text:
+            system_param = [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
+        elif system_text:
+            system_param = system_text
+        else:
+            system_param = None
+
+        if enable_cache:
+            # Only mark first user message for caching (hits translation call's cache)
+            # Don't mark assistant messages — cache_write ($3.75/MTok) is more expensive
+            # than regular input ($3/MTok), and downstream cache_read (dedup) rarely triggers
+            for msg in messages:
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 100:
+                        msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                    break
 
         # Build request kwargs
         request_kwargs = {
@@ -485,6 +517,8 @@ class AnthropicClient:
             "max_tokens": max_tokens,
             "stream": True
         }
+        if system_param:
+            request_kwargs["system"] = system_param
 
         # Anthropic doesn't have native JSON mode, use system prompt instead
         if json_mode:
@@ -492,29 +526,38 @@ class AnthropicClient:
 
         # Create message with streaming
         stream = self.client.messages.create(**request_kwargs)
-        
-        # Aggregate streamed response
+
+        # Aggregate streamed response and capture all events
         response_text = ""
         chunk_count = 0
         last_log_length = 0
+        self._last_stream_events = []
+
         for event in stream:
-            if event.type == "content_block_delta":
+            if event.type in ("message_start", "message_delta"):
+                self._last_stream_events.append(event)
+            elif event.type == "content_block_delta":
                 if hasattr(event.delta, 'text'):
                     response_text += event.delta.text
                     chunk_count += 1
-                    
-                    # Log progress periodically - every 500 tokens
+
                     current_tokens = len(self.tokenizer.encode(response_text))
                     if current_tokens - last_log_length >= 500:
                         logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
                         last_log_length = current_tokens
-        
+
         if not response_text:
             raise ValueError(f"Empty response from Anthropic for {operation_name}")
-        
-        # Get final token count
+
         final_tokens = len(self.tokenizer.encode(response_text))
-        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from Anthropic for {operation_name}")
+
+        # Log complete usage metadata
+        for ev in self._last_stream_events:
+            usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
+            if usage:
+                usage_dict = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
+                logger.info(f"Anthropic {operation_name}: {usage_dict}")
+                break
         return response_text
     
     def _process_content(self, prompt: Union[str, List[Dict]]) -> Union[str, List[Dict]]:

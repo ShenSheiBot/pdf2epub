@@ -280,7 +280,8 @@ class LLMClient:
         self,
         prompt: Union[str, List[Dict]],
         model_configs: Optional[List[Dict]] = None,
-        operation_name: str = "LLM generation"
+        operation_name: str = "LLM generation",
+        enable_cache: bool = False,
     ) -> str:
         """
         Generate content using configured models with automatic fallback.
@@ -362,7 +363,8 @@ class LLMClient:
                         model=model,
                         max_retries=max_retries,
                         operation_name=operation_name,
-                        client=client
+                        client=client,
+                        enable_cache=enable_cache,
                     )
                     logger.success(f"Successfully generated with {provider} for {operation_name}")
                     return response
@@ -729,7 +731,8 @@ class LLMClient:
         model: str,
         max_retries: int,
         operation_name: str,
-        client: AnthropicClient = None
+        client: AnthropicClient = None,
+        enable_cache: bool = False,
     ) -> str:
         """Generate content with Anthropic, handling retries internally."""
 
@@ -760,7 +763,8 @@ class LLMClient:
                     model=model,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    operation_name=operation_name
+                    operation_name=operation_name,
+                    enable_cache=enable_cache,
                 )
             except Exception as e:
                 # Check for safety block

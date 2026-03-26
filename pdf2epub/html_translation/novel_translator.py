@@ -452,10 +452,17 @@ class NovelTranslator:
         tl_lines = len([l for l in translated.splitlines() if l.strip()])
         logger.info(f"  Lines: {src_lines} → {tl_lines} (diff={tl_lines - src_lines:+d})")
 
-        # Step 6: Extract glossary (cache hit on same prefix)
+        # Step 6: Extract glossary (cache hit on translation's source prefix)
         if self.glossary_manager:
             chapter_id = unit.text_path.stem
-            self.glossary_manager.extract_and_update(source_text, translated, chapter_id)
+            # Build same system prompt as translation for cache sharing
+            system_prompt = NOVEL_TRANSLATE_PROMPT
+            if glossary_prompt:
+                system_prompt = f"{NOVEL_TRANSLATE_PROMPT}\n\n{glossary_prompt}"
+            self.glossary_manager.extract_and_update(
+                source_text, translated, chapter_id,
+                translation_system_prompt=system_prompt,
+            )
 
     def _run_translation(self, unit: NovelUnit, source_text: str, glossary_prompt: str) -> str:
         """Run translation with deterministic verification.

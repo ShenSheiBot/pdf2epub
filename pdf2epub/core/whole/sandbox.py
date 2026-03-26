@@ -1,11 +1,14 @@
 """
 Sandbox for agent bash command execution.
 
-Phase 1: subprocess with cwd isolation, timeout, and output truncation.
-Phase 2: optional srt CLI wrapping for OS-level sandboxing.
+Uses Anthropic's sandbox-runtime (srt) for OS-level isolation via
+sandbox-exec (macOS) or bubblewrap (Linux). Falls back to subprocess
+with cwd isolation if srt is not available.
 """
 
-import re
+import json
+import os
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -16,48 +19,37 @@ from loguru import logger
 BASH_TIMEOUT_SECONDS = 30
 STDOUT_MAX_BYTES = 32 * 1024  # 32KB
 
-# Reject commands containing absolute paths, path traversal, or home expansion.
-# These patterns catch paths at token boundaries (after whitespace, redirects, or
-# at command start) while avoiding false positives on relative paths and sed patterns.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s;|&()<>])(?<!<)/[a-zA-Z0-9_.]')
-_TRAVERSAL_RE = re.compile(r'(?:^|[\s/])\.\.(?:[\s/]|$)')
-_HOME_RE = re.compile(r'(?:^|[\s;|&()<>])~/')
+_srt_path = shutil.which("srt")
 
 
 class Sandbox:
     """Execute bash commands within an isolated work directory."""
 
     def __init__(self, work_dir: Path):
-        self.work_dir = work_dir
-        self.workspace_dir = work_dir / "workspace"
+        self.work_dir = work_dir.resolve()
+        self.workspace_dir = self.work_dir / "workspace"
+        self._srt_settings_path = self.work_dir / ".srt-settings.json"
 
-    @staticmethod
-    def _check_command(command: str) -> Optional[str]:
-        """Reject commands with absolute paths, traversal, or home expansion."""
-        if _ABS_PATH_RE.search(command):
-            return (
-                "ERROR: Absolute paths are not allowed. "
-                "Use relative paths (e.g., workspace/file.txt, originals/raw_output.txt)."
-            )
-        if _TRAVERSAL_RE.search(command):
-            return (
-                "ERROR: Path traversal (..) is not allowed. "
-                "Stay within the work directory."
-            )
-        if _HOME_RE.search(command):
-            return (
-                "ERROR: Home directory expansion (~/) is not allowed. "
-                "Use relative paths."
-            )
-        return None
+        # Write srt settings: allow write only within work_dir, no network
+        if _srt_path:
+            self._srt_settings_path.write_text(json.dumps({
+                "filesystem": {
+                    "denyRead": [],
+                    "allowWrite": [str(self.work_dir)],
+                    "denyWrite": [],
+                },
+                "network": {
+                    "allowedDomains": [],
+                    "deniedDomains": [],
+                },
+            }))
 
     def execute(self, command: str) -> str:
         """
         Execute a bash command in the sandbox.
 
-        Uses incremental reads to avoid OOM from commands producing huge output.
-        Rejects commands containing absolute paths, path traversal (..), or ~/
-        to prevent filesystem escape.
+        If srt is available, uses OS-level sandboxing (sandbox-exec on macOS,
+        bubblewrap on Linux). Otherwise falls back to subprocess with cwd isolation.
 
         Args:
             command: Shell command string to execute.
@@ -65,69 +57,87 @@ class Sandbox:
         Returns:
             Combined stdout/stderr output, truncated at 32KB if needed.
         """
-        err = self._check_command(command)
-        if err:
-            return err
+        if _srt_path:
+            return self._execute_srt(command)
+        else:
+            return self._execute_fallback(command)
 
+    def _execute_srt(self, command: str) -> str:
+        """Execute via srt sandbox."""
         try:
             read_limit = STDOUT_MAX_BYTES + 4096
+            env = {**os.environ, "PYTHONPATH": str(self.work_dir)}
             proc = subprocess.Popen(
-                ["bash", "-c", command],
+                [_srt_path, "-s", str(self._srt_settings_path), "-c", command],
                 cwd=str(self.work_dir),
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
             )
-
-            # Read stdout and stderr concurrently to avoid deadlock.
-            # Each thread reads up to read_limit bytes.
-            stdout_bytes = b""
-            stderr_bytes = b""
-
-            def _read_stdout():
-                nonlocal stdout_bytes
-                stdout_bytes = proc.stdout.read(read_limit)
-
-            def _read_stderr():
-                nonlocal stderr_bytes
-                stderr_bytes = proc.stderr.read(read_limit)
-
-            t_out = threading.Thread(target=_read_stdout, daemon=True)
-            t_err = threading.Thread(target=_read_stderr, daemon=True)
-            t_out.start()
-            t_err.start()
-            t_out.join(timeout=BASH_TIMEOUT_SECONDS)
-            t_err.join(timeout=max(1, BASH_TIMEOUT_SECONDS - 1))
-
-            try:
-                proc.wait(timeout=max(1, BASH_TIMEOUT_SECONDS))
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                return (
-                    f"ERROR: Command timed out after {BASH_TIMEOUT_SECONDS}s. "
-                    f"Use a simpler command or read the file directly."
-                )
-
-            output = stdout_bytes[:STDOUT_MAX_BYTES].decode(
-                "utf-8", errors="replace"
-            )
-            stderr_str = stderr_bytes[:STDOUT_MAX_BYTES].decode(
-                "utf-8", errors="replace"
-            )
-
-            if proc.returncode != 0:
-                output += f"\n[exit code: {proc.returncode}]"
-                if stderr_str:
-                    output += f"\n[stderr]\n{stderr_str}"
-
-            if len(stdout_bytes) > STDOUT_MAX_BYTES:
-                output += "\n\n[output truncated at 32KB — use read tool to see full content]"
-
-            return output
-
+            return self._collect_output(proc, read_limit)
         except Exception as e:
             return f"ERROR: Command failed: {type(e).__name__}: {e}"
+
+    def _execute_fallback(self, command: str) -> str:
+        """Fallback: subprocess with cwd isolation (no OS sandbox)."""
+        try:
+            read_limit = STDOUT_MAX_BYTES + 4096
+            env = {**os.environ, "PYTHONPATH": str(self.work_dir)}
+            proc = subprocess.Popen(
+                ["bash", "-c", command],
+                cwd=str(self.work_dir),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+            )
+            return self._collect_output(proc, read_limit)
+        except Exception as e:
+            return f"ERROR: Command failed: {type(e).__name__}: {e}"
+
+    def _collect_output(self, proc, read_limit: int) -> str:
+        """Read stdout/stderr from process with timeout."""
+        stdout_bytes = b""
+        stderr_bytes = b""
+
+        def _read_stdout():
+            nonlocal stdout_bytes
+            stdout_bytes = proc.stdout.read(read_limit)
+
+        def _read_stderr():
+            nonlocal stderr_bytes
+            stderr_bytes = proc.stderr.read(read_limit)
+
+        t_out = threading.Thread(target=_read_stdout, daemon=True)
+        t_err = threading.Thread(target=_read_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+        t_out.join(timeout=BASH_TIMEOUT_SECONDS)
+        t_err.join(timeout=max(1, BASH_TIMEOUT_SECONDS - 1))
+
+        try:
+            proc.wait(timeout=max(1, BASH_TIMEOUT_SECONDS))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return (
+                f"ERROR: Command timed out after {BASH_TIMEOUT_SECONDS}s. "
+                f"Use a simpler command or read the file directly."
+            )
+
+        output = stdout_bytes[:STDOUT_MAX_BYTES].decode("utf-8", errors="replace")
+        stderr_str = stderr_bytes[:STDOUT_MAX_BYTES].decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            output += f"\n[exit code: {proc.returncode}]"
+            if stderr_str:
+                output += f"\n[stderr]\n{stderr_str}"
+
+        if len(stdout_bytes) > STDOUT_MAX_BYTES:
+            output += "\n\n[output truncated at 32KB — use read tool to see full content]"
+
+        return output
 
     def is_writable_path(self, path: Path) -> bool:
         """Check if a path is within the writable workspace directory."""

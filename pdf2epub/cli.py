@@ -710,6 +710,316 @@ def translate_html_command(args):
         return 1
 
 
+def translate_novel_command(args):
+    """Handle the translate-novel subcommand (light novel translation)."""
+    from pathlib import Path
+    import shutil
+    from pdf2epub.html_translation.epub_parser import EPUBParser
+    from pdf2epub.html_translation.novel_extractor import NovelExtractor
+    from pdf2epub.html_translation.novel_translator import NovelTranslator
+    from pdf2epub.html_translation.glossary_manager import GlossaryManager
+    from pdf2epub.html_translation.builder import BuildConfig, HTMLEpubBuilder, sanitize_filename
+    from pdf2epub.utils.llm_client import LLMClient
+
+    # Load configuration
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config.yaml")
+        return 1
+
+    # Configure file logging
+    configure_logging(book_title, "translate-novel")
+
+    output_dir = Path("output") / book_title
+
+    # Validate input file before creating output directories
+    epub_path = Path(args.input) if args.input else None
+    if epub_path is None:
+        candidate_path = output_dir / "input.epub"
+        if candidate_path.exists():
+            epub_path = candidate_path
+
+    if epub_path is None or not epub_path.exists():
+        logger.error("Input file not found. Use -i to specify EPUB file.")
+        return 1
+
+    # Validate glossary early
+    if args.glossary:
+        glossary_path = Path(args.glossary)
+        if not glossary_path.exists():
+            logger.error(f"Glossary file not found: {glossary_path}")
+            return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Format conversion if needed
+    from pdf2epub.utils.ebook_converter import needs_conversion, convert_to_epub
+
+    input_epub = output_dir / "input.epub"
+    if needs_conversion(epub_path):
+        try:
+            epub_path, _ = convert_to_epub(epub_path, output_dir)
+        except Exception as e:
+            logger.error(f"Format conversion failed: {e}")
+            return 1
+    elif epub_path.resolve() != input_epub.resolve():
+        shutil.copy2(epub_path, input_epub)
+        epub_path = input_epub
+
+    # Language settings
+    translation_config = config.get("translation", {})
+    source_language = args.source_language or translation_config.get("source_language", "Japanese")
+    target_language = args.target_language or translation_config.get("target_language", "Chinese")
+
+    logger.info(f"Novel translation: {book_title} ({source_language} → {target_language})")
+
+    try:
+        # Step 1: Extract EPUB to plain text
+        parser = EPUBParser(str(epub_path))
+        extractor = NovelExtractor(parser)
+        novel_units_dir = output_dir / "novel_units"
+        units = extractor.extract_all(novel_units_dir)
+
+        content_units = [u for u in units if u.has_content]
+        logger.info(f"Extracted {len(content_units)} content units from {len(units)} spine items")
+
+        # Apply --limit
+        if args.limit:
+            content_units = content_units[:args.limit]
+            logger.info(f"Limiting to first {args.limit} content units")
+
+        # Use EPUB's actual title for translation
+        epub_title = parser.metadata.get('title', book_title)
+        logger.info(f"EPUB title: {epub_title}")
+
+        # Step 2: Translate metadata (title + TOC) using Haiku
+        from pdf2epub.html_translation.builder import HTMLEpubPipeline
+        metadata_models = translation_config.get("models", [
+            {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}
+        ])
+        metadata_config = {**config, "translation_models": metadata_models}
+        pipeline = HTMLEpubPipeline(epub_path, output_dir, metadata_config)
+        translated_metadata = pipeline.translate_metadata(target_language=target_language)
+        logger.info(
+            f"Translated metadata: title='{translated_metadata.get('translated_title')}', "
+            f"{len(translated_metadata.get('toc', []))} TOC entries"
+        )
+
+        # Step 3: Init GlossaryManager
+        llm_client = LLMClient(config)
+        novel_config = config.get("novel", {})
+        glossary_manager = GlossaryManager(
+            output_dir=output_dir,
+            llm_client=llm_client,
+            model_configs=metadata_models,
+            max_tokens=novel_config.get("glossary_max_tokens", 1000),
+            extract_retries=novel_config.get("glossary_extract_retries", 2),
+            dedup_retries=novel_config.get("glossary_dedup_retries", 2),
+        )
+        glossary_manager.load()
+
+        # Load initial glossary if provided
+        if args.glossary:
+            glossary_manager.load_initial_glossary(glossary_path)
+            glossary_manager.save()
+
+        # Step 4: Translate chapters
+        translator = NovelTranslator(
+            config=config,
+            book_title=epub_title,
+            source_language=source_language,
+            target_language=target_language,
+            glossary_manager=glossary_manager,
+            resume=args.resume,
+            output_dir=output_dir,
+        )
+
+        summary = translator.translate_all(content_units)
+        logger.info(f"Translation summary: {summary}")
+
+        # Step 5: Build EPUB
+        if not args.skip_build:
+            import json
+
+            translated_xhtml_dir = output_dir / "translated_xhtml"
+            translated_xhtml_dir.mkdir(parents=True, exist_ok=True)
+            _convert_txt_to_xhtml(
+                units=units,
+                translated_dir=output_dir / "translated_novel",
+                xhtml_dir=translated_xhtml_dir,
+                parser=parser,
+            )
+
+            metadata_path = output_dir / "translated_metadata.json"
+            translated_metadata = None
+            if metadata_path.exists():
+                translated_metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+
+            if translated_metadata and translated_metadata.get('translated_title'):
+                safe_title = sanitize_filename(translated_metadata['translated_title'])
+                output_epub = output_dir / f"{safe_title}.epub"
+            else:
+                output_epub = output_dir / f"{book_title}_translated.epub"
+
+            build_config = BuildConfig(
+                original_epub=epub_path,
+                translated_dir=translated_xhtml_dir,
+                output_path=output_epub,
+                book_title=book_title,
+                translated_metadata=translated_metadata,
+            )
+            builder = HTMLEpubBuilder(build_config)
+            builder.build()
+            logger.success(f"Translated EPUB: {output_epub}")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Novel translation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def _attach_toc_titles(units, flat_toc):
+    """Attach TOC titles to NovelUnit objects by matching href."""
+    from pathlib import Path
+
+    # Build href-to-title mapping from flat TOC
+    href_to_title = {}
+    for entry in flat_toc:
+        href = entry.get('href', '')
+        title = entry.get('title', '')
+        if href and title:
+            # Store by basename for matching
+            basename = Path(href.split('#')[0]).name
+            href_to_title[basename] = title
+            # Also store full href
+            href_to_title[href] = title
+
+    for unit in units:
+        if not unit.source_href:
+            continue
+        basename = Path(unit.source_href.split('#')[0]).name
+        # Try basename match first, then full href
+        title = href_to_title.get(basename) or href_to_title.get(unit.source_href)
+        if title:
+            unit.toc_title = title
+
+
+def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
+    """Convert translated .txt files to .xhtml, preserving original <head>."""
+    import html
+    import re
+    from pathlib import Path
+    from lxml import etree
+
+    IMAGE_PATTERN = r'\[Image:\s*([^\]]+)\]'
+
+    for unit in units:
+        if not unit.text_path:
+            continue
+
+        # Skip image-only pages — let HTMLEpubBuilder preserve original XHTML
+        if not unit.has_content:
+            continue
+
+        txt_path = translated_dir / unit.text_path.name
+        if not txt_path.exists():
+            continue
+
+        text = txt_path.read_text(encoding='utf-8')
+
+        # Get original XHTML <head> for CSS/metadata preservation
+        head_content = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>'
+        if unit.source_href:
+            try:
+                raw = parser.get_raw_content(unit.source_href)
+                if isinstance(raw, bytes):
+                    raw = raw.decode('utf-8')
+                # Extract <head>...</head>
+                head_match = re.search(r'<head[^>]*>(.*?)</head>', raw, re.DOTALL | re.IGNORECASE)
+                if head_match:
+                    head_content = head_match.group(1)
+            except Exception:
+                pass
+
+        # Build image ref → original src mapping from extractor metadata
+        # (image_refs stores basenames; original XHTML may use relative paths)
+        img_src_map = {}
+        if unit.source_href:
+            try:
+                raw_xhtml = parser.get_raw_content(unit.source_href)
+                if isinstance(raw_xhtml, bytes):
+                    raw_xhtml = raw_xhtml.decode('utf-8')
+                for m in re.finditer(r'(?:src|href)=["\']([^"\']*(?:\.jpg|\.jpeg|\.png|\.gif|\.svg))', raw_xhtml, re.IGNORECASE):
+                    original_src = m.group(1)
+                    basename = Path(original_src).name
+                    img_src_map[basename] = original_src
+            except Exception:
+                pass
+
+        def _img_tag(basename):
+            src = img_src_map.get(basename.strip(), basename.strip())
+            return f'<img src="{html.escape(src)}" alt=""/>'
+
+        # Convert text lines to HTML body
+        body_parts = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            # Full-line image placeholder
+            img_match = re.fullmatch(IMAGE_PATTERN, line)
+            if img_match:
+                body_parts.append(
+                    f'<div class="illustration">'
+                    f'{_img_tag(img_match.group(1))}'
+                    f'</div>'
+                )
+            elif re.search(IMAGE_PATTERN, line):
+                # Line contains inline image placeholders mixed with text
+                parts = re.split(f'({IMAGE_PATTERN})', line)
+                html_parts = []
+                i = 0
+                while i < len(parts):
+                    part = parts[i]
+                    inline_match = re.fullmatch(IMAGE_PATTERN, part)
+                    if inline_match:
+                        html_parts.append(_img_tag(inline_match.group(1)))
+                        i += 2  # skip the capture group from split
+                    else:
+                        if part:
+                            html_parts.append(html.escape(part))
+                        i += 1
+                body_parts.append(f'<p>{"".join(html_parts)}</p>')
+            else:
+                body_parts.append(f'<p>{html.escape(line)}</p>')
+
+        body_html = '\n'.join(body_parts)
+
+        # Use the original XHTML filename
+        if unit.source_href:
+            out_name = Path(unit.source_href).name
+        else:
+            out_name = f"{unit.file_name}.xhtml"
+
+        xhtml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+            '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n'
+            '<html xmlns="http://www.w3.org/1999/xhtml">\n'
+            f'<head>\n{head_content}\n</head>\n'
+            f'<body>\n{body_html}\n</body>\n'
+            '</html>'
+        )
+
+        (xhtml_dir / out_name).write_text(xhtml, encoding='utf-8')
+
+
 def build_html_epub_command(args):
     """Handle the build-html-epub subcommand (rebuild EPUB with translated HTML)."""
     from pathlib import Path
@@ -1217,6 +1527,47 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Path to output EPUB file (default: <book_title>_translated.epub)"
     )
     build_html_epub_parser.set_defaults(func=build_html_epub_command)
+
+    # Novel Translation subcommand (text-mode for light novels)
+    translate_novel_parser = subparsers.add_parser(
+        "translate-novel",
+        help="Translate light novel EPUB (text mode + glossary)",
+        description="Translate light novel EPUB using sliding window with glossary management. "
+                    "Optimized for small-context models like murasaki-14b."
+    )
+    translate_novel_parser.add_argument(
+        "-i", "--input",
+        help="Input EPUB file"
+    )
+    translate_novel_parser.add_argument(
+        "--source-language",
+        help="Source language (default: Japanese)"
+    )
+    translate_novel_parser.add_argument(
+        "--target-language",
+        help="Target language (default: from config or Chinese)"
+    )
+    translate_novel_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from previous progress"
+    )
+    translate_novel_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Only translate first N content chapters (for testing)"
+    )
+    translate_novel_parser.add_argument(
+        "--glossary",
+        help="Path to initial glossary file (for series continuation)"
+    )
+    translate_novel_parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip EPUB building step (only translate)"
+    )
+    translate_novel_parser.set_defaults(func=translate_novel_command)
 
     # Patch paper structure subcommand
     patch_parser = subparsers.add_parser(

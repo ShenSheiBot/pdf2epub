@@ -35,14 +35,19 @@ def parse_llm_json(
     Raises:
         json.JSONDecodeError: If parsing fails even with lenient settings
     """
-    # Strip markdown code block markers if present
+    # Extract JSON from markdown code blocks (handles text before/after fences)
     text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]  # Remove ```json
-    elif text.startswith("```"):
-        text = text[3:]  # Remove ```
-    if text.endswith("```"):
-        text = text[:-3]  # Remove trailing ```
+    # Find opening fence (may not be at the start if LLM added explanation)
+    json_fence = text.find("```json")
+    plain_fence = text.find("```") if json_fence < 0 else json_fence
+    if json_fence >= 0:
+        text = text[json_fence + 7:]  # After ```json
+    elif plain_fence >= 0:
+        text = text[plain_fence + 3:]  # After ```
+    # Find closing fence
+    closing_fence = text.find("```")
+    if closing_fence >= 0:
+        text = text[:closing_fence]
     text = text.strip()
 
     try:
@@ -57,6 +62,13 @@ def parse_llm_json(
                     f"json_repair fixed invalid JSON from {operation_name} "
                     f"(original error: {original_error})"
                 )
+                # Save raw response for debugging
+                if save_dir:
+                    save_dir = Path(save_dir)
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    repair_file = save_dir / f"json_repaired_{int(time.time())}.txt"
+                    repair_file.write_text(text, encoding='utf-8')
+                    logger.debug(f"Pre-repair response saved to: {repair_file}")
                 return repaired
         except Exception:
             pass  # repair also failed, fall through to original error

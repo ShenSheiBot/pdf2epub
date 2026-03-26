@@ -30,7 +30,7 @@ GLOSSARY_EXTRACT_PROMPT = """\
 输出JSON数组，每个条目：
 - key: 日文全名（越完整越好，如"宮崎薰"而非"宮崎"）
 - zh_name: 中文翻译名
-- aliases: 该角色/术语的其他日文称呼（昵称、简称等）
+- aliases: 该角色的其他称呼，每个alias包含日文原文和对应中文翻译，格式：[{{"ja": "日文称呼", "zh": "中文翻译"}}]
 - description: 简要描述，包括：性别、身份、与主角关系、当前状态
 
 规则：
@@ -38,6 +38,7 @@ GLOSSARY_EXTRACT_PROMPT = """\
 - key 必须是专有名词（人名、地名、组织名等），不能是纯粹的代词（俺、僕、彼女）
 - aliases 可以包括：姓、名、昵称、以及该角色的专属描述性称呼（如"猫头鹰少女"、"金发少女"等绰号）
 - aliases 不要包括纯粹的人称代词（俺、私、彼女等）
+- 每个alias的zh翻译必须与本章译文中的实际用词一致
 - 不收录章节标题、书名、出版社等元信息
 - description 控制在一两句话
 - 如果和已有术语表有冲突，以本章翻译为准
@@ -54,6 +55,31 @@ _METADATA_PATTERNS = [
     re.compile(r"第[一二三四五六七八九十百千\d]+[章節巻話]"),  # 第一章, 第2話
     re.compile(r"^(プロローグ|エピローグ|Prologue|Epilogue|あとがき|序章|終章)$", re.I),
 ]
+
+
+def _normalize_aliases(aliases: list) -> List[Dict]:
+    """Normalize aliases to structured format [{ja, zh}].
+
+    Handles backward compatibility: plain strings become {"ja": str, "zh": ""}.
+    """
+    result = []
+    for a in aliases:
+        if isinstance(a, dict) and "ja" in a:
+            result.append({"ja": a["ja"], "zh": a.get("zh", "")})
+        elif isinstance(a, str) and a:
+            result.append({"ja": a, "zh": ""})
+    return result
+
+
+def _alias_ja_keys(aliases: list) -> List[str]:
+    """Extract Japanese keys from aliases (handles both formats)."""
+    result = []
+    for a in aliases:
+        if isinstance(a, dict) and "ja" in a:
+            result.append(a["ja"])
+        elif isinstance(a, str) and a:
+            result.append(a)
+    return result
 
 
 def _is_metadata_key(key: str) -> bool:
@@ -279,20 +305,23 @@ class GlossaryManager:
             if key in source_text:
                 matched.append((key, entry))
                 continue
-            # Check aliases
-            for alias in entry.get("aliases", []):
-                if alias and alias in source_text:
+            # Check aliases (by Japanese key)
+            for ja_key in _alias_ja_keys(entry.get("aliases", [])):
+                if ja_key in source_text:
                     matched.append((key, entry))
                     break
 
-        # Format matched entries
+        # Format matched entries with structured alias mapping
         lines = []
         for key, entry in matched:
             zh = entry.get("zh_name", "")
-            aliases = entry.get("aliases", [])
             desc = entry.get("description", "")
-            alias_str = f"（别名：{'、'.join(aliases)}）" if aliases else ""
-            lines.append(f"{key} → {zh}{alias_str}：{desc}")
+            lines.append(f"{key} → {zh}：{desc}")
+            for a in _normalize_aliases(entry.get("aliases", [])):
+                if a["zh"]:
+                    lines.append(f"  {a['ja']} → {a['zh']}")
+                else:
+                    lines.append(f"  {a['ja']}")
 
         recalled = "\n".join(lines)
 
@@ -348,18 +377,14 @@ class GlossaryManager:
         Uses dedup_state to skip already-resolved groups and cache pronoun knowledge.
         Infers new state from Call 2 input/output diff.
         """
-        # Collect all aliases from new entries + existing store
-        all_aliases = set()
+        # Collect all alias ja keys from new entries + existing store
+        all_ja_aliases = set()
         for entry in entries:
-            for a in entry.get("aliases", []):
-                if a:
-                    all_aliases.add(a)
+            all_ja_aliases.update(_alias_ja_keys(entry.get("aliases", [])))
         for store_entry in self.store.values():
-            for a in store_entry.get("aliases", []):
-                if a:
-                    all_aliases.add(a)
+            all_ja_aliases.update(_alias_ja_keys(store_entry.get("aliases", [])))
 
-        if not all_aliases:
+        if not all_ja_aliases:
             return entries
 
         # Build combined entry pool: new entries + existing store entries
@@ -371,12 +396,11 @@ class GlossaryManager:
             if key:
                 entry_pool[key] = entry
 
-        # Build alias → [keys] mapping
+        # Build alias (ja) → [keys] mapping
         alias_to_keys = defaultdict(set)
         for key, entry in entry_pool.items():
-            for a in entry.get("aliases", []):
-                if a:
-                    alias_to_keys[a].add(key)
+            for ja_key in _alias_ja_keys(entry.get("aliases", [])):
+                alias_to_keys[ja_key].add(key)
 
         # Find shared aliases (appear in 2+ entries)
         shared_aliases = {a: keys for a, keys in alias_to_keys.items() if len(keys) >= 2}
@@ -516,13 +540,13 @@ class GlossaryManager:
         all_dedup_aliases = set()
         for e in dedup_result:
             if isinstance(e, dict):
-                all_dedup_aliases.update(e.get("aliases", []))
+                all_dedup_aliases.update(_alias_ja_keys(e.get("aliases", [])))
 
         # Check 1: new keys must exist in entry pool or be an alias of an entry pool key
         all_pool_keys = set(entry_pool.keys())
         all_pool_aliases = set()
         for entry in entry_pool.values():
-            all_pool_aliases.update(entry.get("aliases", []))
+            all_pool_aliases.update(_alias_ja_keys(entry.get("aliases", [])))
 
         for key in dedup_by_key:
             if key not in all_pool_keys and key not in all_pool_aliases:
@@ -537,7 +561,7 @@ class GlossaryManager:
             alias_survives = False
             for key in keys:
                 if key in dedup_by_key:
-                    if alias in dedup_by_key[key].get("aliases", []):
+                    if alias in _alias_ja_keys(dedup_by_key[key].get("aliases", [])):
                         alias_survives = True
                         break
                 else:
@@ -559,11 +583,11 @@ class GlossaryManager:
         """Infer confirmed_not_dup, exclusive_aliases, removed_aliases from Call 2 diff."""
         dedup_by_key = {e["key"]: e for e in dedup_result if isinstance(e, dict) and "key" in e}
 
-        # Collect all aliases in dedup results (to detect absorbed entries)
+        # Collect all alias ja keys in dedup results (to detect absorbed entries)
         all_result_aliases = set()
         for e in dedup_result:
             if isinstance(e, dict):
-                all_result_aliases.update(e.get("aliases", []))
+                all_result_aliases.update(_alias_ja_keys(e.get("aliases", [])))
 
         confirmed = self._get_confirmed_pairs()
         exclusive = self._get_exclusive_aliases()
@@ -647,7 +671,7 @@ class GlossaryManager:
         all_dedup_aliases = set()
         for de in dedup_result:
             if isinstance(de, dict):
-                all_dedup_aliases.update(de.get("aliases", []))
+                all_dedup_aliases.update(_alias_ja_keys(de.get("aliases", [])))
 
         # Update store entries modified by dedup (store-only entries, not in new entries)
         new_keys = {e.get("key", "").strip() for e in entries}
@@ -725,10 +749,11 @@ class GlossaryManager:
             existing_lines = []
             for key, entry in self.store.items():
                 zh = entry.get("zh_name", "")
-                aliases = entry.get("aliases", [])
+                aliases = _normalize_aliases(entry.get("aliases", []))
                 desc = entry.get("description", "")
+                alias_strs = [f"{a['ja']}→{a['zh']}" if a["zh"] else a["ja"] for a in aliases]
                 existing_lines.append(
-                    f"{key} → {zh} (aliases: {', '.join(aliases)}): {desc}"
+                    f"{key} → {zh} (aliases: {', '.join(alias_strs)}): {desc}"
                 )
             existing_section = (
                 "已有术语表（供参考，可更新）：\n"
@@ -786,12 +811,19 @@ class GlossaryManager:
                 continue
 
             zh_name = entry.get("zh_name", "")
-            aliases = [a for a in entry.get("aliases", []) if a]
+            aliases = _normalize_aliases(entry.get("aliases", []))
 
             description = entry.get("description", "")
 
             if key in self.store:
                 old = self.store[key]
+                # Merge aliases by ja key (new zh overwrites old)
+                old_aliases = _normalize_aliases(old.get("aliases", []))
+                old_by_ja = {a["ja"]: a for a in old_aliases}
+                for a in aliases:
+                    old_by_ja[a["ja"]] = a  # New alias overwrites
+                merged_aliases = sorted(old_by_ja.values(), key=lambda a: a["ja"])
+
                 # Push old description to history if changed
                 if old.get("description") != description:
                     history = old.get("history", [])
@@ -802,7 +834,7 @@ class GlossaryManager:
                     })
                     self.store[key] = {
                         "zh_name": zh_name or old.get("zh_name", ""),
-                        "aliases": aliases or old.get("aliases", []),
+                        "aliases": merged_aliases,
                         "description": description,
                         "updated_by": chapter_id,
                         "timestamp": now,
@@ -810,10 +842,8 @@ class GlossaryManager:
                     }
                 else:
                     # Description unchanged — still update aliases and zh_name
-                    old_aliases = set(old.get("aliases", []))
-                    new_aliases = old_aliases | set(aliases)
-                    if new_aliases != old_aliases:
-                        self.store[key]["aliases"] = sorted(new_aliases)
+                    if merged_aliases != old_aliases:
+                        self.store[key]["aliases"] = merged_aliases
                     if zh_name and zh_name != old.get("zh_name"):
                         self.store[key]["zh_name"] = zh_name
             else:

@@ -13,7 +13,12 @@ from pdf2epub.html_translation.novel_translator import (
     make_novel_content_validator,
     strip_spurious_headings,
 )
-from pdf2epub.html_translation.glossary_manager import GlossaryManager
+from pdf2epub.html_translation.glossary_manager import GlossaryManager, _alias_ja_keys
+
+
+def _has_alias(store_entry, ja_name):
+    """Check if a store entry has an alias with the given Japanese name."""
+    return ja_name in _alias_ja_keys(store_entry.get("aliases", []))
 from pdf2epub.html_translation.novel_verifier import (
     _check_preamble,
     _check_alignment,
@@ -197,7 +202,7 @@ class TestGlossaryManager:
         assert entry["history"][0]["description"] == "女主角，学生"
         assert entry["history"][0]["updated_by"] == "ch01"
         # Aliases merged
-        assert "すみれ" in entry["aliases"]
+        assert _has_alias(entry, "すみれ")
 
     def test_save_and_load(self, tmp_path):
         mgr, _ = self._make_manager(tmp_path)
@@ -312,15 +317,15 @@ class TestGlossaryDedup:
 
         # 班主任 kept with 河見 (not in dedup result = unchanged), removed from 青田
         kawami = next(e for e in result if e["key"] == "河見誠一郎")
-        assert "班主任" in kawami["aliases"]  # kept (河見 is the actual homeroom teacher)
+        assert _has_alias(kawami, "班主任")  # kept (河見 is the actual homeroom teacher)
         aota = next(e for e in result if e["key"] == "青田美咲")
-        assert "班主任" not in aota["aliases"]  # removed
+        assert not _has_alias(aota, "班主任")  # removed
 
         # 俺 and あの子 are NOT shared (only 1 key each) — untouched by dedup
         aoi = next(e for e in result if e["key"] == "島崎蒼")
-        assert "俺" in aoi["aliases"]  # kept (not shared)
+        assert _has_alias(aoi, "俺")  # kept (not shared)
         kaoru = next(e for e in result if e["key"] == "宮崎薰")
-        assert "あの子" in kaoru["aliases"]  # kept (not shared)
+        assert _has_alias(kaoru, "あの子")  # kept (not shared)
 
     def test_shared_alias_cleaned(self, tmp_path):
         """Shared alias (班主任) removed from non-owner by LLM dedup."""
@@ -337,13 +342,13 @@ class TestGlossaryDedup:
 
         # 河見 NOT in dedup result → keeps original aliases including 班主任
         kawami = next(e for e in result if e["key"] == "河見誠一郎")
-        assert "班主任" in kawami["aliases"]
-        assert "河見" in kawami["aliases"]
+        assert _has_alias(kawami, "班主任")
+        assert _has_alias(kawami, "河見")
 
         # 青田 modified by dedup — 班主任 removed
         aota = next(e for e in result if e["key"] == "青田美咲")
-        assert "班主任" not in aota["aliases"]
-        assert "青田" in aota["aliases"]
+        assert not _has_alias(aota, "班主任")
+        assert _has_alias(aota, "青田")
 
     def test_store_entry_updated_by_dedup(self, tmp_path):
         """Existing store entry aliases get cleaned when dedup modifies them."""
@@ -351,7 +356,7 @@ class TestGlossaryDedup:
         mgr.store = json.loads(json.dumps(self.EXISTING_STORE))
 
         # Store entry 河見 has "班主任"
-        assert "班主任" in mgr.store["河見誠一郎"]["aliases"]
+        assert _has_alias(mgr.store["河見誠一郎"], "班主任")
 
         # Only Call 2 (班主任 shared alias group)
         # DEDUP_RESPONSE only modifies 青田 (removes 班主任), 河見 unchanged (keeps 班主任)
@@ -486,7 +491,7 @@ class TestGlossaryDedup:
         assert len(result) == 1
         merged = result[0]
         assert merged["key"] == "高千穂弥生"
-        assert "高千穗弥生" in merged["aliases"]
+        assert _has_alias(merged, "高千穗弥生")
 
     def test_dedup_call_failure_nonfatal(self, tmp_path):
         """If dedup calls fail, entries pass through unchanged."""
@@ -519,14 +524,14 @@ class TestGlossaryDedup:
 
         # Store should have all entries; shared alias (班主任) resolved
         assert "河見誠一郎" in mgr.store
-        assert "班主任" in mgr.store["河見誠一郎"]["aliases"]  # kept (owner)
+        assert _has_alias(mgr.store["河見誠一郎"], "班主任")  # kept (owner)
         assert "青田美咲" in mgr.store
-        assert "班主任" not in mgr.store["青田美咲"]["aliases"]  # removed
+        assert not _has_alias(mgr.store["青田美咲"], "班主任")  # removed
         # Non-shared aliases (俺, あの子) are NOT removed (no Call 1, not shared)
         assert "島崎蒼" in mgr.store
-        assert "俺" in mgr.store["島崎蒼"]["aliases"]
+        assert _has_alias(mgr.store["島崎蒼"], "俺")
         assert "宮崎薰" in mgr.store
-        assert "あの子" in mgr.store["宮崎薰"]["aliases"]
+        assert _has_alias(mgr.store["宮崎薰"], "あの子")
 
 
 # ─── Dedup State Persistence ───
@@ -721,10 +726,10 @@ class TestGlossaryDedupState:
         mgr.extract_and_update("source", "translated", "ch03")
 
         # 俺 should NOT be in store (blacklisted)
-        assert "俺" not in mgr.store["島崎蒼"]["aliases"]
+        assert not _has_alias(mgr.store["島崎蒼"], "俺")
         # 蒼 and 島崎 should be there
-        assert "蒼" in mgr.store["島崎蒼"]["aliases"]
-        assert "島崎" in mgr.store["島崎蒼"]["aliases"]
+        assert _has_alias(mgr.store["島崎蒼"], "蒼")
+        assert _has_alias(mgr.store["島崎蒼"], "島崎")
 
     def test_state_inferred_from_empty_result(self, tmp_path):
         """Empty Call 2 result means all entries in group confirmed not-dup."""
@@ -782,10 +787,10 @@ class TestGlossaryDedupState:
 
         # Second attempt's result should be applied
         aota = next(e for e in result if e["key"] == "青田美咲")
-        assert "班主任" not in aota["aliases"]
+        assert not _has_alias(aota, "班主任")
         # 河見 not in dedup result → keeps 班主任
         kawami = next(e for e in result if e["key"] == "河見誠一郎")
-        assert "班主任" in kawami["aliases"]
+        assert _has_alias(kawami, "班主任")
 
     def test_multi_chapter_lifecycle(self, tmp_path):
         """Full 3-chapter scenario with growing dedup state."""
@@ -803,7 +808,7 @@ class TestGlossaryDedupState:
         mgr.extract_and_update("source1", "translated1", "ch01")
 
         # 俺 kept (not shared, no dedup ran)
-        assert "俺" in mgr.store["島崎蒼"]["aliases"]
+        assert _has_alias(mgr.store["島崎蒼"], "俺")
         mock_client.reset_mock()
 
         # --- Chapter 2: New characters, shared alias 先生 ---
@@ -845,9 +850,9 @@ class TestGlossaryDedupState:
         assert mock_client.generate.call_count == 1
 
         # 先生 still in store for 河見 (kept from ch2, no removed_aliases blacklist)
-        assert "先生" in mgr.store.get("河見誠一郎", {}).get("aliases", [])
+        assert _has_alias(mgr.store.get("河見誠一郎", {}), "先生")
         # 俺 still in store for 島崎
-        assert "俺" in mgr.store.get("島崎蒼", {}).get("aliases", [])
+        assert _has_alias(mgr.store.get("島崎蒼", {}), "俺")
 
 
 # ─── E2E: Glossary propagation across chapters ───
@@ -881,10 +886,10 @@ class TestGlossaryE2E:
 
         # ── Verify ch1 state ──
         assert "島崎蒼" in mgr.store
-        assert "俺" in mgr.store["島崎蒼"]["aliases"]  # kept (not shared)
+        assert _has_alias(mgr.store["島崎蒼"], "俺")  # kept (not shared)
         assert "宮崎薰" in mgr.store
-        assert "あの子" in mgr.store["宮崎薰"]["aliases"]  # kept (not shared, no Call 1)
-        assert "スミレ" in mgr.store["宮崎薰"]["aliases"]
+        assert _has_alias(mgr.store["宮崎薰"], "あの子")  # kept (not shared, no Call 1)
+        assert _has_alias(mgr.store["宮崎薰"], "スミレ")
 
         # prev_chapter set
         assert "島崎蒼" in mgr.prev_chapter
@@ -923,7 +928,7 @@ class TestGlossaryE2E:
         # Store has 3 entries now
         assert len(mgr2.store) == 3
         assert "高千穂弥生" in mgr2.store
-        assert "委員長" in mgr2.store["高千穂弥生"]["aliases"]
+        assert _has_alias(mgr2.store["高千穂弥生"], "委員長")
 
         # 島崎蒼 description updated, history has ch01 version
         assert "弥生" in mgr2.store["島崎蒼"]["description"]

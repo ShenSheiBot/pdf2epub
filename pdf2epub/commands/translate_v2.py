@@ -65,6 +65,8 @@ def translate_v2_command(args):
 
     # Setup directories
     output_dir = Path("output") / book_title
+    from pdf2epub.utils.network_utils import set_llm_trace_path
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
 
     # Input can be polished (V2 validated or legacy) or merged pages
     # Priority: polished_markdown/validated > polished_markdown > pages_merged

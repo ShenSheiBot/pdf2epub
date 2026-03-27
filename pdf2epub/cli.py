@@ -13,6 +13,7 @@ from pathlib import Path
 from loguru import logger
 from pdf2epub.utils.logging_config import configure_logging
 from pdf2epub.utils.common import load_config
+from pdf2epub.utils.network_utils import set_llm_trace_path
 from pdf2epub.utils.safety import check_output_directory_conflict
 from pdf2epub.processors import PolishProcessor, TranslateProcessor
 
@@ -86,6 +87,7 @@ def breakdown_command(args):
 
     # Check for conflicts with existing output
     output_dir = check_output_directory_conflict(output_dir, input_pdf)
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
 
     # If directory was renamed, update book_title
     actual_book_title = output_dir.name
@@ -149,6 +151,7 @@ def refine_command(args):
 
     # Determine PDF path
     output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
     if args.input:
         pdf_path = Path(args.input)
     else:
@@ -214,6 +217,7 @@ def ocr_pages_command(args):
 
     # Setup paths
     output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
 
     # Find PDF
     if args.input:
@@ -365,6 +369,7 @@ def extract_entities_command(args):
 
     # Setup paths
     output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine PDF path
@@ -495,6 +500,7 @@ def build_epub_command(args):
 
     # Set up paths
     output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
     toc_tree_path = output_dir / "toc_tree.json"
 
     if not toc_tree_path.exists():
@@ -590,6 +596,7 @@ def translate_html_command(args):
 
     # Setup paths
     output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
     epub_path = Path(args.input) if args.input else None
 
     # If no epub specified, look for original epub in output dir
@@ -733,6 +740,9 @@ def translate_novel_command(args):
     configure_logging(book_title, "translate-novel")
 
     output_dir = Path("output") / book_title
+
+    # Set up unified LLM trace
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
 
     # Validate input file before creating output directories
     epub_path = Path(args.input) if args.input else None
@@ -1038,6 +1048,7 @@ def build_html_epub_command(args):
 
     # Setup paths
     output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
     epub_path = Path(args.input) if args.input else None
 
     # If no epub specified, look for original epub in output dir

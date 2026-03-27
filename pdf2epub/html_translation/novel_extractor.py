@@ -162,7 +162,11 @@ class NovelExtractor:
 
     def _extract_text_recursive(self, element, lines: list, image_refs: list):
         """Recursively extract text from element tree."""
-        tag = etree.QName(element.tag).localname if isinstance(element.tag, str) else ''
+        # Skip comment nodes (e.g. <!-- <script ...> -->)
+        if not isinstance(element.tag, str):
+            return
+
+        tag = etree.QName(element.tag).localname
 
         # Skip non-content elements
         if tag in ('script', 'style', 'head', 'meta', 'link'):
@@ -250,7 +254,9 @@ class NovelExtractor:
 
     def _collect_inline(self, element, parts: list, image_refs: list):
         """Collect inline text content from an element."""
-        tag = etree.QName(element.tag).localname if isinstance(element.tag, str) else ''
+        if not isinstance(element.tag, str):
+            return
+        tag = etree.QName(element.tag).localname
 
         if tag == 'ruby':
             parts.append(self._ruby_to_parentheses(element))

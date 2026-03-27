@@ -1443,3 +1443,145 @@ class TestStripSpuriousHeadings:
         assert strip_spurious_headings(translated, source) == "L1\nL2"
 
 
+# ─── Guardian: unified LLM trace ───
+
+class TestUnifiedLLMTrace:
+    """Guardian tests for the unified LLM trace system.
+
+    1. SDK denylist: no direct SDK calls outside allowed files
+    2. Trace integration: LLM calls produce trace entries
+    3. Trace infrastructure: _write_trace works correctly
+    """
+
+    def test_sdk_denylist_no_bypass(self):
+        """No direct SDK calls (messages.create, chat.completions.create, etc.)
+        outside of allowed files."""
+        import ast
+        from pathlib import Path
+
+        # SDK method chains to deny
+        deny_patterns = {
+            "messages.create",        # Anthropic SDK
+            "completions.create",     # OpenAI SDK (chat.completions.create)
+        }
+        # Note: models.generate_content is harder to detect via AST because
+        # it's a normal attribute call. We check the method chain instead.
+
+        # Allowed files (relative to pdf2epub/)
+        allowed_files = {
+            "utils/network_utils.py",           # The traced wrappers themselves
+            "html_translation/novel_translator.py",  # _stream_with_token_cutoff (has own trace)
+        }
+        # Files completely excluded from scan (OCR, tests, scripts)
+        excluded_prefixes = {
+            "ocr/",
+            "utils/ocr_client.py",
+        }
+
+        pdf2epub_dir = Path("pdf2epub")
+        violations = []
+
+        for py_file in pdf2epub_dir.rglob("*.py"):
+            rel = str(py_file.relative_to(pdf2epub_dir))
+            if any(rel.startswith(p) for p in excluded_prefixes):
+                continue
+            if rel in allowed_files:
+                continue
+
+            try:
+                source = py_file.read_text()
+                tree = ast.parse(source)
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    # Check for .create() calls on known SDK objects
+                    attr = node.func.attr
+                    if attr == "create" and isinstance(node.func.value, ast.Attribute):
+                        parent_attr = node.func.value.attr
+                        chain = f"{parent_attr}.{attr}"
+                        if chain in deny_patterns:
+                            violations.append(f"{rel}:{node.lineno} — {chain}")
+
+        assert violations == [], (
+            f"Direct SDK calls found outside allowed files:\n"
+            + "\n".join(f"  {v}" for v in violations)
+            + "\n\nUse llm_client.generate() or add to allowed_files with justification."
+        )
+
+    def test_trace_write_produces_valid_jsonl(self, tmp_path):
+        """_write_trace produces valid JSONL with all required fields."""
+        from pdf2epub.utils.network_utils import set_llm_trace_path, _write_trace
+
+        trace_path = tmp_path / "test_trace.jsonl"
+        set_llm_trace_path(trace_path)
+
+        _write_trace({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "operation": "test_op",
+            "provider": "test",
+            "model": "test-model",
+            "duration_ms": 100,
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "response_preview": {"head": "hello", "length": 5},
+            "error": None,
+        })
+
+        lines = trace_path.read_text().strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["operation"] == "test_op"
+        assert entry["provider"] == "test"
+        assert entry["error"] is None
+
+        # Clean up
+        set_llm_trace_path(None)
+
+    def test_preview_text_head_tail(self):
+        """_preview_text preserves head and tail for long texts."""
+        from pdf2epub.utils.network_utils import _preview_text
+
+        # Short text — no truncation
+        result = _preview_text("short", 1000)
+        assert result == {"head": "short", "length": 5}
+
+        # Long text — head + tail
+        long_text = "A" * 1000 + "MIDDLE" + "B" * 1000
+        result = _preview_text(long_text, 100)
+        assert result["head"] == long_text[:100]
+        assert result["tail"] == long_text[-100:]
+        assert result["length"] == len(long_text)
+
+        # Empty text
+        result = _preview_text("", 100)
+        assert result == {"head": "", "length": 0}
+
+    def test_trace_disabled_when_path_is_none(self, tmp_path):
+        """No trace file created when trace path is None."""
+        from pdf2epub.utils.network_utils import set_llm_trace_path, _write_trace
+
+        set_llm_trace_path(None)
+        _write_trace({"test": True})
+        # No file should exist
+        assert not (tmp_path / "trace.jsonl").exists()
+
+    def test_preview_messages_handles_structured_content(self):
+        """_preview_messages handles both string and structured content."""
+        from pdf2epub.utils.network_utils import _preview_messages
+
+        messages = [
+            {"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "response text"},
+            ]},
+        ]
+        result = _preview_messages(messages, 1000)
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[0]["content_head"] == "hello world"
+        assert result[1]["role"] == "assistant"
+        assert "response text" in result[1]["content_head"]
+
+

@@ -47,6 +47,8 @@ def polish_v2_command(args):
 
     # Setup directories
     output_dir = Path("output") / book_title
+    from pdf2epub.utils.network_utils import set_llm_trace_path
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
     # Try ocr_markdown first (refine output), then pages_merged (legacy)
     input_dir = output_dir / "ocr_markdown"
     if not input_dir.exists():

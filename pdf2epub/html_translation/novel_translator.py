@@ -279,74 +279,82 @@ class NovelTranslator:
             "system": system_with_cache,
         }
 
-        stream = client.client.messages.create(**request_kwargs)
+        import time as _time
+        from pdf2epub.utils.network_utils import _write_trace, _preview_messages, _preview_text, _max_content_chars
 
+        _trace_start = _time.monotonic()
+        _trace_error = None
         response_text = ""
-        last_token_count = 0
-        budget_hit = False
         stopped_early = False
-        stream_events = []
+        _usage = {}
 
-        for event in stream:
-            if event.type in ("message_start", "message_delta"):
-                stream_events.append(event)
-            elif event.type == "content_block_delta":
-                if hasattr(event.delta, 'text'):
-                    chunk = event.delta.text
-                    response_text += chunk
+        try:
+            stream = client.client.messages.create(**request_kwargs)
 
-                    if budget_hit:
-                        # We hit the budget — finish the current line
-                        if '\n' in chunk:
-                            last_nl = response_text.rfind('\n')
-                            if last_nl > 0:
-                                response_text = response_text[:last_nl]
-                            stopped_early = True
-                            stream.close()
-                            break
-                    elif '\n' in chunk:
-                        # Check token count at line boundaries
-                        current_tokens = self._count_tokens(response_text)
-                        if current_tokens >= max_output_tokens:
-                            budget_hit = True
-                            last_nl = response_text.rfind('\n')
-                            if last_nl > 0:
-                                response_text = response_text[:last_nl]
-                            stopped_early = True
-                            stream.close()
-                            break
-                        last_token_count = current_tokens
+            last_token_count = 0
+            budget_hit = False
+            stream_events = []
 
-        # Clean: remove empty lines
-        cleaned = '\n'.join(l for l in response_text.splitlines() if l.strip())
-        nonempty_lines = len(cleaned.splitlines())
+            for event in stream:
+                if event.type in ("message_start", "message_delta"):
+                    stream_events.append(event)
+                elif event.type == "content_block_delta":
+                    if hasattr(event.delta, 'text'):
+                        chunk = event.delta.text
+                        response_text += chunk
 
-        # Save full trace to log dir
-        # Serialize stream events — each has a .model_dump() or we use vars()
-        serialized_events = []
-        for ev in stream_events:
-            try:
-                serialized_events.append(ev.model_dump())
-            except Exception:
-                serialized_events.append(str(ev))
+                        if budget_hit:
+                            # We hit the budget — finish the current line
+                            if '\n' in chunk:
+                                last_nl = response_text.rfind('\n')
+                                if last_nl > 0:
+                                    response_text = response_text[:last_nl]
+                                stopped_early = True
+                                stream.close()
+                                break
+                        elif '\n' in chunk:
+                            # Check token count at line boundaries
+                            current_tokens = self._count_tokens(response_text)
+                            if current_tokens >= max_output_tokens:
+                                budget_hit = True
+                                last_nl = response_text.rfind('\n')
+                                if last_nl > 0:
+                                    response_text = response_text[:last_nl]
+                                stopped_early = True
+                                stream.close()
+                                break
+                            last_token_count = current_tokens
 
-        self._save_translation_trace({
-            "operation": operation_name,
-            "model": model,
-            "stopped_early": stopped_early,
-            "output_lines": nonempty_lines,
-            "stream_events": serialized_events,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        })
+            # Extract usage from stream events
+            for ev in stream_events:
+                usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
+                if usage:
+                    _usage = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
+                    break
 
-        return cleaned
-
-    def _save_translation_trace(self, trace_entry: dict):
-        """Append translation call trace to logs/translation_calls.jsonl."""
-        trace_path = self.output_dir / "logs" / "translation_calls.jsonl"
-        trace_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(trace_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(trace_entry, ensure_ascii=False) + "\n")
+            # Clean: remove empty lines
+            cleaned = '\n'.join(l for l in response_text.splitlines() if l.strip())
+            return cleaned
+        except Exception as e:
+            _trace_error = str(e)
+            raise
+        finally:
+            _write_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "operation": operation_name,
+                "provider": "anthropic",
+                "model": model,
+                "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
+                "input_tokens": _usage.get("input_tokens", 0),
+                "output_tokens": _usage.get("output_tokens", 0),
+                "cache_read_tokens": _usage.get("cache_read_input_tokens", 0),
+                "cache_write_tokens": _usage.get("cache_creation_input_tokens", 0),
+                "request_messages_preview": _preview_messages(cached_messages, _max_content_chars),
+                "response_preview": _preview_text(response_text, _max_content_chars),
+                "stopped_early": stopped_early,
+                "error": _trace_error,
+                "partial_response_length": len(response_text) if _trace_error else 0,
+            })
 
     # ─── Main Loop ───
 
@@ -546,6 +554,8 @@ class NovelTranslator:
             # Initial translation
             raw_output = generate_fn(prefix=None)
             translated = raw_output
+            init_lines = len([l for l in raw_output.splitlines() if l.strip()])
+            logger.info(f"  Initial translation: {init_lines} lines (attempt {attempt + 1})")
 
             # Verify + continuation loop
             for cont_round in range(max_continuations + 1):
@@ -565,14 +575,17 @@ class NovelTranslator:
                     return fixed_text
 
                 elif action == "continue":
+                    pre_lines = len([l for l in fixed_text.splitlines() if l.strip()])
                     translated = fixed_text
                     # Generate continuation
                     continuation = generate_fn(prefix=translated)
+                    cont_lines = len([l for l in continuation.splitlines() if l.strip()])
                     # Merge
                     translated = translated.rstrip("\n") + "\n" + continuation
+                    total_lines = len([l for l in translated.splitlines() if l.strip()])
                     logger.info(
                         f"  Continuation {cont_round + 1}: "
-                        f"{len([l for l in translated.splitlines() if l.strip()])} total lines"
+                        f"+{cont_lines} lines → {total_lines} total (was {pre_lines})"
                     )
 
                 elif action == "retry":
@@ -581,10 +594,12 @@ class NovelTranslator:
 
             else:
                 # Exhausted continuations without completing
-                logger.warning(f"  Exhausted {max_continuations} continuations")
+                tl_n = len([l for l in (translated or "").splitlines() if l.strip()])
+                logger.warning(f"  Exhausted {max_continuations} continuations ({tl_n} lines)")
                 if translated:
                     return translated
 
         # Exhausted retries — return whatever we have
-        logger.warning(f"  Exhausted {max_retries} retries, returning best effort")
+        tl_n = len([l for l in (translated or "").splitlines() if l.strip()])
+        logger.warning(f"  Exhausted {max_retries} retries, returning best effort ({tl_n} lines)")
         return translated or ""

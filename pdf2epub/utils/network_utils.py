@@ -3,8 +3,13 @@ Refactored network utilities using tenacity for cleaner retry logic.
 """
 
 import base64
+import fcntl
 import httpx
+import json as _json
 import threading
+import time as _time
+from datetime import datetime, timezone
+from pathlib import Path
 from loguru import logger
 from typing import Optional, Dict, Any, Union, List
 from typing import Any as Any  # Explicit for backward compatibility
@@ -19,6 +24,66 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_i
 from tenacity.stop import stop_base
 from tenacity.wait import wait_base
 import tiktoken
+
+
+# ─── Unified LLM Trace ───
+
+_trace_path: Optional[Path] = None
+_max_content_chars: int = 1000  # per side (head/tail)
+
+
+def set_llm_trace_path(path: Optional[Path], max_content_chars: int = 1000):
+    """Set the global LLM trace output path. Call once at startup."""
+    global _trace_path, _max_content_chars
+    _trace_path = path
+    _max_content_chars = max_content_chars
+
+
+def _preview_text(text: str, max_chars: int) -> dict:
+    """Create head+tail preview of text."""
+    if not text:
+        return {"head": "", "length": 0}
+    if max_chars == 0 or len(text) <= max_chars * 2:
+        return {"head": text, "length": len(text)}
+    return {
+        "head": text[:max_chars],
+        "tail": text[-max_chars:],
+        "length": len(text),
+    }
+
+
+def _preview_messages(messages: list, max_chars: int) -> list:
+    """Create previews of message contents."""
+    result = []
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Structured content blocks — preview text blocks only
+            texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            content = "\n".join(texts)
+        elif not isinstance(content, str):
+            content = str(content)
+        preview = _preview_text(content, max_chars)
+        entry = {"role": msg.get("role", "unknown")}
+        entry.update({f"content_{k}": v for k, v in preview.items()})
+        result.append(entry)
+    return result
+
+
+def _write_trace(entry: dict):
+    """Append a trace entry with file locking. Never raises."""
+    if _trace_path is None:
+        return
+    try:
+        _trace_path.parent.mkdir(parents=True, exist_ok=True)
+        line = _json.dumps(entry, ensure_ascii=False, default=str) + "\n"
+        with open(_trace_path, "a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(line)
+    except Exception:
+        pass  # Never break pipeline for logging
 
 
 def _create_method_before_sleep(operation_name_param: str = "operation_name") -> callable:
@@ -262,20 +327,41 @@ class GeminiClient:
     ) -> Any:
         """Generate content with automatic retry for transient errors."""
         logger.info(f"Calling Gemini API for {operation_name}")
-        
+
         if config is None:
             config = self.get_default_config()
-        
-        response = self.client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config
-        )
-        
-        if not response or not response.text:
-            raise ValueError(f"Empty response from Gemini for {operation_name}")
-        
-        return response
+
+        _trace_start = _time.monotonic()
+        _trace_error = None
+        response_text = ""
+        try:
+            response = self.client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+
+            if not response or not response.text:
+                raise ValueError(f"Empty response from Gemini for {operation_name}")
+
+            response_text = response.text or ""
+            return response
+        except Exception as e:
+            _trace_error = str(e)
+            raise
+        finally:
+            _write_trace({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": operation_name,
+                "provider": "gemini",
+                "model": model,
+                "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
+                "input_tokens": 0,  # non-streaming doesn't easily expose usage
+                "output_tokens": 0,
+                "response_preview": _preview_text(response_text, _max_content_chars),
+                "error": _trace_error,
+                "partial_response_length": len(response_text) if _trace_error else 0,
+            })
     
     @retry(
         retry=retry_if_exception(is_transient_gemini_error),
@@ -293,107 +379,130 @@ class GeminiClient:
     ) -> str:
         """Generate content with streaming and automatic retry."""
         logger.info(f"Streaming from Gemini API for {operation_name}")
-        
+
         if config is None:
             config = self.get_default_config()
-        
+
+        _trace_start = _time.monotonic()
+        _trace_error = None
+
         # Stream and aggregate response
         stream_response = self.client.models.generate_content_stream(
             model=model,
             contents=contents,
             config=config
         )
-        
+
         aggregated_text = ""
         chunk_count = 0
         last_log_length = 0
         halted_early = False
-
-        for chunk in stream_response:
-            chunk_count += 1
-
-            # Handle Gemini 3 response format with potential thought parts
-            if hasattr(chunk, 'candidates') and chunk.candidates:
-                for candidate in chunk.candidates:
-                    # Check for early termination
-                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
-                        reason = str(candidate.finish_reason)
-                        if any(term in reason for term in ['PROHIBITED', 'SAFETY', 'BLOCKED']):
-                            raise ValueError(f"Content blocked: {reason}")
-
-                    # Extract text from content parts, filtering out thoughts
-                    if hasattr(candidate, 'content') and candidate.content and candidate.content.parts:
-                        for part in candidate.content.parts:
-                            # Skip thought parts (Gemini 3 thinking mode)
-                            if hasattr(part, 'thought') and part.thought:
-                                continue
-                            if hasattr(part, 'text') and part.text:
-                                aggregated_text += part.text
-            elif hasattr(chunk, 'text') and chunk.text:
-                # Fallback for simpler response format
-                aggregated_text += chunk.text
-
-            # --- Hallucination guard: detect repetition loops ---
-            # Check every 200 chunks to avoid overhead
-            if chunk_count % 200 == 0:
-                halt_reason = _detect_streaming_hallucination(aggregated_text)
-                if halt_reason:
-                    logger.warning(
-                        f"Hallucination detected for {operation_name}: {halt_reason}. "
-                        f"Halting stream at {len(aggregated_text)} chars."
-                    )
-                    halted_early = True
-                    break
-
-            # Log progress periodically - every 500 tokens
-            current_tokens = len(self.tokenizer.encode(aggregated_text))
-            if current_tokens - last_log_length >= 500:
-                logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
-                last_log_length = current_tokens
-        
-        # Log finish reason from last chunk
         finish_reason = None
-        if halted_early:
-            finish_reason = "HALLUCINATION_HALT"
-            # Truncate to last newline to avoid partial lines
-            last_nl = aggregated_text.rfind('\n')
-            if last_nl > 0:
-                aggregated_text = aggregated_text[:last_nl]
-            logger.warning(
-                f"Stream halted early (hallucination) for {operation_name}: "
-                f"truncated to {len(aggregated_text)} chars"
-            )
-        elif chunk_count > 0 and hasattr(chunk, 'candidates') and chunk.candidates:
-            for candidate in chunk.candidates:
-                if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
-                    finish_reason = str(candidate.finish_reason)
-                    logger.debug(f"Stream finished with reason: {finish_reason}")
+        _usage_dict = {}
 
-        if not aggregated_text:
-            logger.error(f"Empty stream: {chunk_count} chunks received for {operation_name}")
-            if finish_reason:
-                logger.error(f"Finish reason: {finish_reason}")
-            raise ValueError(f"Empty stream response for {operation_name}")
+        try:
+            for chunk in stream_response:
+                chunk_count += 1
 
-        # Get final token count
-        final_tokens = len(self.tokenizer.encode(aggregated_text))
+                # Handle Gemini 3 response format with potential thought parts
+                if hasattr(chunk, 'candidates') and chunk.candidates:
+                    for candidate in chunk.candidates:
+                        # Check for early termination
+                        if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                            reason = str(candidate.finish_reason)
+                            if any(term in reason for term in ['PROHIBITED', 'SAFETY', 'BLOCKED']):
+                                raise ValueError(f"Content blocked: {reason}")
 
-        # Log truncation warning — actual retry is handled by caller
-        if finish_reason and 'MAX_TOKENS' in finish_reason.upper():
-            logger.warning(
-                f"Response truncated (MAX_TOKENS) for {operation_name}: "
-                f"{final_tokens} tokens generated before cutoff"
-            )
+                        # Extract text from content parts, filtering out thoughts
+                        if hasattr(candidate, 'content') and candidate.content and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                # Skip thought parts (Gemini 3 thinking mode)
+                                if hasattr(part, 'thought') and part.thought:
+                                    continue
+                                if hasattr(part, 'text') and part.text:
+                                    aggregated_text += part.text
+                elif hasattr(chunk, 'text') and chunk.text:
+                    # Fallback for simpler response format
+                    aggregated_text += chunk.text
 
-        # Capture and store full usage metadata
-        usage_meta = None
-        if chunk_count > 0 and hasattr(chunk, 'usage_metadata'):
-            usage_meta = chunk.usage_metadata
-        self._last_usage_metadata = usage_meta
-        self._last_stream_events = usage_meta.model_dump() if usage_meta else {}
+                # --- Hallucination guard: detect repetition loops ---
+                # Check every 200 chunks to avoid overhead
+                if chunk_count % 200 == 0:
+                    halt_reason = _detect_streaming_hallucination(aggregated_text)
+                    if halt_reason:
+                        logger.warning(
+                            f"Hallucination detected for {operation_name}: {halt_reason}. "
+                            f"Halting stream at {len(aggregated_text)} chars."
+                        )
+                        halted_early = True
+                        break
 
-        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) for {operation_name}")
-        return aggregated_text
+                # Log progress periodically - every 500 tokens
+                current_tokens = len(self.tokenizer.encode(aggregated_text))
+                if current_tokens - last_log_length >= 500:
+                    logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                    last_log_length = current_tokens
+
+            # Log finish reason from last chunk
+            if halted_early:
+                finish_reason = "HALLUCINATION_HALT"
+                # Truncate to last newline to avoid partial lines
+                last_nl = aggregated_text.rfind('\n')
+                if last_nl > 0:
+                    aggregated_text = aggregated_text[:last_nl]
+                logger.warning(
+                    f"Stream halted early (hallucination) for {operation_name}: "
+                    f"truncated to {len(aggregated_text)} chars"
+                )
+            elif chunk_count > 0 and hasattr(chunk, 'candidates') and chunk.candidates:
+                for candidate in chunk.candidates:
+                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                        finish_reason = str(candidate.finish_reason)
+                        logger.debug(f"Stream finished with reason: {finish_reason}")
+
+            if not aggregated_text:
+                logger.error(f"Empty stream: {chunk_count} chunks received for {operation_name}")
+                if finish_reason:
+                    logger.error(f"Finish reason: {finish_reason}")
+                raise ValueError(f"Empty stream response for {operation_name}")
+
+            # Get final token count
+            final_tokens = len(self.tokenizer.encode(aggregated_text))
+
+            # Log truncation warning — actual retry is handled by caller
+            if finish_reason and 'MAX_TOKENS' in finish_reason.upper():
+                logger.warning(
+                    f"Response truncated (MAX_TOKENS) for {operation_name}: "
+                    f"{final_tokens} tokens generated before cutoff"
+                )
+
+            # Capture and store full usage metadata
+            usage_meta = None
+            if chunk_count > 0 and hasattr(chunk, 'usage_metadata'):
+                usage_meta = chunk.usage_metadata
+            self._last_usage_metadata = usage_meta
+            _usage_dict = usage_meta.model_dump() if usage_meta else {}
+            self._last_stream_events = _usage_dict
+
+            logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) for {operation_name}")
+            return aggregated_text
+        except Exception as e:
+            _trace_error = str(e)
+            raise
+        finally:
+            _write_trace({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": operation_name,
+                "provider": "gemini",
+                "model": model,
+                "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
+                "input_tokens": _usage_dict.get("prompt_token_count", 0),
+                "output_tokens": _usage_dict.get("candidates_token_count", 0),
+                "response_preview": _preview_text(aggregated_text, _max_content_chars),
+                "finish_reason": finish_reason,
+                "error": _trace_error,
+                "partial_response_length": len(aggregated_text) if _trace_error else 0,
+            })
     
     @staticmethod
     def get_default_config(temperature: float = 0.1) -> GenerateContentConfig:
@@ -525,40 +634,66 @@ class AnthropicClient:
             request_kwargs["system"] = "You must respond with valid JSON only. No explanations, no markdown code blocks, just raw JSON."
 
         # Create message with streaming
-        stream = self.client.messages.create(**request_kwargs)
-
-        # Aggregate streamed response and capture all events
+        _trace_start = _time.monotonic()
+        _trace_error = None
         response_text = ""
-        chunk_count = 0
-        last_log_length = 0
-        self._last_stream_events = []
+        finish_reason = None
+        _usage = {}
 
-        for event in stream:
-            if event.type in ("message_start", "message_delta"):
-                self._last_stream_events.append(event)
-            elif event.type == "content_block_delta":
-                if hasattr(event.delta, 'text'):
-                    response_text += event.delta.text
-                    chunk_count += 1
+        try:
+            stream = self.client.messages.create(**request_kwargs)
 
-                    current_tokens = len(self.tokenizer.encode(response_text))
-                    if current_tokens - last_log_length >= 500:
-                        logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
-                        last_log_length = current_tokens
+            # Aggregate streamed response and capture all events
+            chunk_count = 0
+            last_log_length = 0
+            self._last_stream_events = []
 
-        if not response_text:
-            raise ValueError(f"Empty response from Anthropic for {operation_name}")
+            for event in stream:
+                if event.type in ("message_start", "message_delta"):
+                    self._last_stream_events.append(event)
+                elif event.type == "content_block_delta":
+                    if hasattr(event.delta, 'text'):
+                        response_text += event.delta.text
+                        chunk_count += 1
 
-        final_tokens = len(self.tokenizer.encode(response_text))
+                        current_tokens = len(self.tokenizer.encode(response_text))
+                        if current_tokens - last_log_length >= 500:
+                            logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                            last_log_length = current_tokens
 
-        # Log complete usage metadata
-        for ev in self._last_stream_events:
-            usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
-            if usage:
-                usage_dict = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
-                logger.info(f"Anthropic {operation_name}: {usage_dict}")
-                break
-        return response_text
+            if not response_text:
+                raise ValueError(f"Empty response from Anthropic for {operation_name}")
+
+            final_tokens = len(self.tokenizer.encode(response_text))
+
+            # Log complete usage metadata
+            for ev in self._last_stream_events:
+                usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
+                if usage:
+                    _usage = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
+                    logger.info(f"Anthropic {operation_name}: {_usage}")
+                    break
+            return response_text
+        except Exception as e:
+            _trace_error = str(e)
+            raise
+        finally:
+            _write_trace({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": operation_name,
+                "provider": "anthropic",
+                "model": model,
+                "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
+                "input_tokens": _usage.get("input_tokens", 0),
+                "output_tokens": _usage.get("output_tokens", 0),
+                "cache_read_tokens": _usage.get("cache_read_input_tokens", 0),
+                "cache_write_tokens": _usage.get("cache_creation_input_tokens", 0),
+                "request_messages_preview": _preview_messages(messages, _max_content_chars),
+                "response_preview": _preview_text(response_text, _max_content_chars),
+                "finish_reason": finish_reason,
+                "error": _trace_error,
+                "partial_response_length": len(response_text) if _trace_error else 0,
+            })
     
     def _process_content(self, prompt: Union[str, List[Dict]]) -> Union[str, List[Dict]]:
         """Process content to handle images properly."""
@@ -677,42 +812,60 @@ class OpenAIClient:
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
-        # Create chat completion with streaming
-        try:
-            stream = self.client.chat.completions.create(**request_kwargs)
-        except Exception as e:
-            logger.error(f"Failed to create OpenAI stream for {operation_name}: {e}")
-            raise
-
-        # Aggregate streamed response
+        _trace_start = _time.monotonic()
+        _trace_error = None
         response_text = ""
-        chunk_count = 0
         finish_reason = None
-        last_log_tokens = 0
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                response_text += chunk.choices[0].delta.content
-                chunk_count += 1
 
-                # Log progress periodically - every 500 tokens
-                current_tokens = len(self.tokenizer.encode(response_text))
-                if current_tokens - last_log_tokens >= 500:
-                    logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
-                    last_log_tokens = current_tokens
+        try:
+            # Create chat completion with streaming
+            stream = self.client.chat.completions.create(**request_kwargs)
 
-            if chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
+            # Aggregate streamed response
+            chunk_count = 0
+            last_log_tokens = 0
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    response_text += chunk.choices[0].delta.content
+                    chunk_count += 1
 
-        if not response_text:
-            raise ValueError(f"Empty response from OpenAI for {operation_name}")
+                    # Log progress periodically - every 500 tokens
+                    current_tokens = len(self.tokenizer.encode(response_text))
+                    if current_tokens - last_log_tokens >= 500:
+                        logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
+                        last_log_tokens = current_tokens
 
-        # Store finish_reason for caller inspection
-        self._last_finish_reason = finish_reason
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
 
-        # Get final token count
-        final_tokens = len(self.tokenizer.encode(response_text))
-        logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from OpenAI for {operation_name} [finish={finish_reason}]")
-        return response_text
+            if not response_text:
+                raise ValueError(f"Empty response from OpenAI for {operation_name}")
+
+            # Store finish_reason for caller inspection
+            self._last_finish_reason = finish_reason
+
+            # Get final token count
+            final_tokens = len(self.tokenizer.encode(response_text))
+            logger.info(f"Streamed {final_tokens} tokens ({chunk_count} chunks) from OpenAI for {operation_name} [finish={finish_reason}]")
+            return response_text
+        except Exception as e:
+            _trace_error = str(e)
+            raise
+        finally:
+            _write_trace({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operation": operation_name,
+                "provider": "openai",
+                "model": model_to_use,
+                "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "request_messages_preview": _preview_messages(formatted_messages, _max_content_chars),
+                "response_preview": _preview_text(response_text, _max_content_chars),
+                "finish_reason": finish_reason,
+                "error": _trace_error,
+                "partial_response_length": len(response_text) if _trace_error else 0,
+            })
 
     def _format_messages(self, prompt: Union[str, List[Dict]]) -> List[Dict]:
         """Format prompt into OpenAI messages format."""

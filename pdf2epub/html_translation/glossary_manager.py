@@ -483,14 +483,24 @@ class GlossaryManager:
 
         for attempt in range(self.dedup_retries + 1):
             try:
-                messages = [
-                    {"role": "user", "content": extraction_prompt},
-                    {"role": "assistant", "content": extraction_response},
-                    {"role": "user", "content": DEDUP_PROMPT.format(
-                        grouped_entries=grouped_text,
-                        error_context=error_context,
-                    )},
-                ]
+                dedup_user_msg = {"role": "user", "content": DEDUP_PROMPT.format(
+                    grouped_entries=grouped_text,
+                    error_context=error_context,
+                )}
+                if isinstance(extraction_prompt, list):
+                    # Cache-sharing mode: extraction_prompt is already a message list
+                    # (system + user + assistant + user). Append extraction response + dedup.
+                    messages = list(extraction_prompt) + [
+                        {"role": "assistant", "content": extraction_response},
+                        dedup_user_msg,
+                    ]
+                else:
+                    # Standalone mode: extraction_prompt is a string
+                    messages = [
+                        {"role": "user", "content": extraction_prompt},
+                        {"role": "assistant", "content": extraction_response},
+                        dedup_user_msg,
+                    ]
                 dedup_response = self.llm_client.generate(
                     prompt=messages,
                     model_configs=self.model_configs,

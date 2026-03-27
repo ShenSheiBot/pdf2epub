@@ -57,9 +57,8 @@ def _check_preamble(source_line: str, translated_line: str, llm_client, model_co
             operation_name="Verifier preamble check",
         )
         answer = result.strip().lower()
-        if "meta" in answer:
-            return "meta-comment"
-        return "translation"
+        verdict = "meta-comment" if "meta" in answer else "translation"
+        return verdict
     except Exception as e:
         logger.warning(f"Preamble check failed: {e}")
         return "translation"  # Fail-open: don't delete lines on error
@@ -83,9 +82,11 @@ def _check_alignment(source_window: List[str], translated_window: List[str],
         )
         answer = result.strip().upper()
         if answer and answer[0] in "ABCD":
-            return answer[0]
-        logger.warning(f"Unexpected alignment result: {answer!r}, defaulting to A")
-        return "A"  # Fail-open
+            verdict = answer[0]
+        else:
+            logger.warning(f"Unexpected alignment result: {answer!r}, defaulting to A")
+            verdict = "A"
+        return verdict
     except Exception as e:
         logger.warning(f"Alignment check failed: {e}")
         return "A"  # Fail-open
@@ -198,6 +199,7 @@ def verify_translation(
     """
     src_lines = [l for l in source_text.splitlines() if l.strip()]
     tl_lines = [l for l in translated_text.splitlines() if l.strip()]
+
 
     if not tl_lines:
         return None, "retry"

@@ -295,9 +295,7 @@ class HTMLTranslateProcessor:
         if self._agent_model is not None:
             return self._agent_model
 
-        from pdf2epub.utils.common import load_config
-        config = load_config()
-        providers = config.get('credentials', {}).get('providers', {})
+        providers = self.config.get('credentials', {}).get('providers', {})
 
         model_name = self._agent_model_name
 
@@ -431,9 +429,9 @@ class HTMLTranslateProcessor:
             )
 
         # Prepare extra originals for agent reference
+        # Note: mapping.json is NOT included — it's only used by code (decompression),
+        # not by the agent. Including it wastes context (can be 100k+ tokens).
         extra_originals = {"source.txt": content}
-        if mapping_json:
-            extra_originals["mapping.json"] = mapping_json
 
         # Content validator: reuse validate_output, return error string or None
         def validate_html_content(result_text: str) -> str | None:

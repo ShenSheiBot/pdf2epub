@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from loguru import logger
 from typing import Optional, Dict, Any, Union, List
-from typing import Any as Any  # Explicit for backward compatibility
 from google.genai.types import (
     GenerateContentConfig,
     HarmBlockThreshold,
@@ -235,28 +234,29 @@ def is_transient_openai_error(exception: Exception) -> bool:
 # --- Streaming hallucination detection ---
 # Detect repetition loops and abnormally long lines during streaming.
 
-_HALLUCINATION_LINE_MAX = 1000       # Max chars per line in structured output
-_HALLUCINATION_WINDOW = 500          # Window size for repetition comparison
 
 
 def _detect_streaming_hallucination(text: str) -> Optional[str]:
     """Check if streaming output shows hallucination patterns.
 
     Returns a reason string if hallucination detected, None otherwise.
-    """
-    # 1. Long line check: any single line > threshold is almost certainly
-    #    a repetition loop (normal TOC titles max ~450 chars across all books)
-    last_nl = text.rfind('\n')
-    current_line_len = len(text) - last_nl - 1 if last_nl >= 0 else len(text)
-    if current_line_len > _HALLUCINATION_LINE_MAX:
-        return f"line length {current_line_len} > {_HALLUCINATION_LINE_MAX}"
+    Only detects repetition loops — non-repeating long output is normal.
 
-    # 2. Repetition loop: compare two adjacent windows at the tail.
-    #    If they're identical, output is stuck in a cycle of period ≤ W.
-    w = _HALLUCINATION_WINDOW
-    if len(text) >= 2 * w:
-        if text[-2 * w:-w] == text[-w:]:
-            return f"repetition loop detected (window={w})"
+    Uses multi-period detection: checks if the tail of the text contains
+    any repeating pattern with period 1-100 chars, repeated 3+ times.
+    This catches both single-char loops (啊啊啊...) and multi-token
+    cycles (啊呀啊呀...) regardless of alignment.
+    """
+    if len(text) < 300:
+        return None
+
+    tail = text[-200:]
+    for period in range(1, 101):
+        if len(tail) < period * 3:
+            break
+        pat = tail[-period:]
+        if tail[-period * 3:-period * 2] == pat and tail[-period * 2:-period] == pat:
+            return f"repetition loop detected (period={period}, pattern={pat[:30]!r})"
 
     return None
 
@@ -426,8 +426,8 @@ class GeminiClient:
                     aggregated_text += chunk.text
 
                 # --- Hallucination guard: detect repetition loops ---
-                # Check every 200 chunks to avoid overhead
-                if chunk_count % 200 == 0:
+                # Check every 20 chunks (~600 chars) for early detection
+                if chunk_count % 20 == 0:
                     halt_reason = _detect_streaming_hallucination(aggregated_text)
                     if halt_reason:
                         logger.warning(
@@ -541,6 +541,19 @@ class GeminiClient:
         )
 
 
+    def embed_content(self, texts: List[str], model: str = "gemini-embedding-001") -> List[List[float]]:
+        """Embed a list of texts using Gemini embedding model.
+
+        Returns list of embedding vectors. Calls are sequential (one per text)
+        because the Gemini SDK embed_content doesn't support batch in v1beta.
+        """
+        results = []
+        for text in texts:
+            resp = self.client.models.embed_content(model=model, contents=text)
+            results.append(resp.embeddings[0].values)
+        return results
+
+
 class AnthropicClient:
     """Wrapper for Anthropic API with smart retry logic."""
     
@@ -648,6 +661,7 @@ class AnthropicClient:
             last_log_length = 0
             self._last_stream_events = []
 
+            halted_early = False
             for event in stream:
                 if event.type in ("message_start", "message_delta"):
                     self._last_stream_events.append(event)
@@ -656,10 +670,27 @@ class AnthropicClient:
                         response_text += event.delta.text
                         chunk_count += 1
 
+                        # Hallucination guard (same as Gemini)
+                        if chunk_count % 20 == 0:
+                            halt_reason = _detect_streaming_hallucination(response_text)
+                            if halt_reason:
+                                logger.warning(
+                                    f"Hallucination detected for {operation_name}: {halt_reason}. "
+                                    f"Halting stream at {len(response_text)} chars."
+                                )
+                                halted_early = True
+                                last_nl = response_text.rfind('\n')
+                                if last_nl > 0:
+                                    response_text = response_text[:last_nl]
+                                break
+
                         current_tokens = len(self.tokenizer.encode(response_text))
                         if current_tokens - last_log_length >= 500:
                             logger.debug(f"Streaming {operation_name}: {current_tokens} tokens")
                             last_log_length = current_tokens
+
+            if halted_early:
+                finish_reason = "HALLUCINATION_HALT"
 
             if not response_text:
                 raise ValueError(f"Empty response from Anthropic for {operation_name}")

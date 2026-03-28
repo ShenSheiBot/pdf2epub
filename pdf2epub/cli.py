@@ -6,7 +6,6 @@ This module provides a single entrypoint for all markdown processing operations
 including polishing OCR output and translating content.
 """
 
-import yaml
 import argparse
 import sys
 from pathlib import Path
@@ -15,7 +14,6 @@ from pdf2epub.utils.logging_config import configure_logging
 from pdf2epub.utils.common import load_config
 from pdf2epub.utils.network_utils import set_llm_trace_path
 from pdf2epub.utils.safety import check_output_directory_conflict
-from pdf2epub.processors import PolishProcessor, TranslateProcessor
 
 # Configure logger
 logger = configure_logging()
@@ -202,7 +200,6 @@ def ocr_pages_command(args):
     """Handle the ocr-pages subcommand (page-level OCR)."""
     from pdf2epub.ocr_pages import ocr_full_book_pagewise
     from pathlib import Path
-    import yaml
 
     # Load configuration
     config = load_config(args.config)
@@ -846,6 +843,67 @@ def translate_novel_command(args):
             output_dir=output_dir,
         )
 
+        # Handle --retranslate: single chapter retranslation
+        if args.retranslate is not None:
+            from pdf2epub.html_translation.novel_translator import NOVEL_TRANSLATE_PROMPT
+            spine_idx = args.retranslate
+            target_unit = None
+            for u in content_units:
+                if u.spine_index == spine_idx:
+                    target_unit = u
+                    break
+            if target_unit is None:
+                logger.error(f"No content unit found at spine index {spine_idx}")
+                return 1
+
+            source_text_raw = target_unit.text_path.read_text(encoding="utf-8")
+            chapter_id = f"{target_unit.spine_index:03d}_{target_unit.file_name}"
+            logger.info(f"Retranslating chapter {chapter_id} ({len(source_text_raw.splitlines())} lines)")
+
+            # Degeneration guard: truncate repetitive kana sequences
+            from pdf2epub.html_translation.chunked_translator import compress_repetitive_source
+            source_text = compress_repetitive_source(source_text_raw)
+
+            # Backup current translation
+            existing = output_dir / "translated_novel" / f"{chapter_id}.txt"
+            if existing.exists():
+                backup = existing.with_suffix(".txt.bak")
+                import shutil
+                shutil.copy2(existing, backup)
+                logger.info(f"Backed up existing translation to {backup.name}")
+
+            # Recall glossary (current state — before rollback, in case translation fails)
+            glossary_prompt = glossary_manager.recall(source_text)
+
+            # Translate first (if this fails, glossary is untouched)
+            translated, exhausted = translator._run_translation(target_unit, source_text, glossary_prompt)
+            if exhausted:
+                logger.warning(f"  Chapter {chapter_id} exhausted retries (hallucinated)")
+
+            # Image repair
+            from pdf2epub.html_translation.novel_translator import repair_images
+            translated = repair_images(source_text_raw, translated)
+
+            # Translation succeeded — now rollback + re-extract glossary (atomic)
+            glossary_manager.rollback_chapter(chapter_id)
+            system_prompt = NOVEL_TRANSLATE_PROMPT
+            if glossary_prompt:
+                system_prompt = f"{NOVEL_TRANSLATE_PROMPT}\n\n{glossary_prompt}"
+            glossary_manager.extract_and_update(
+                source_text, translated, chapter_id,
+                translation_system_prompt=system_prompt,
+            )
+
+            # Write output
+            existing.parent.mkdir(parents=True, exist_ok=True)
+            existing.write_text(translated, encoding="utf-8")
+            logger.info(f"Wrote retranslated chapter to {existing.name}")
+
+            tl_lines = len([l for l in translated.splitlines() if l.strip()])
+            src_lines = len([l for l in source_text.splitlines() if l.strip()])
+            logger.info(f"Retranslation complete: {src_lines} source → {tl_lines} translated")
+            return 0
+
         summary = translator.translate_all(content_units)
         logger.info(f"Translation summary: {summary}")
 
@@ -891,32 +949,6 @@ def translate_novel_command(args):
         import traceback
         traceback.print_exc()
         return 1
-
-
-def _attach_toc_titles(units, flat_toc):
-    """Attach TOC titles to NovelUnit objects by matching href."""
-    from pathlib import Path
-
-    # Build href-to-title mapping from flat TOC
-    href_to_title = {}
-    for entry in flat_toc:
-        href = entry.get('href', '')
-        title = entry.get('title', '')
-        if href and title:
-            # Store by basename for matching
-            basename = Path(href.split('#')[0]).name
-            href_to_title[basename] = title
-            # Also store full href
-            href_to_title[href] = title
-
-    for unit in units:
-        if not unit.source_href:
-            continue
-        basename = Path(unit.source_href.split('#')[0]).name
-        # Try basename match first, then full href
-        title = href_to_title.get(basename) or href_to_title.get(unit.source_href)
-        if title:
-            unit.toc_title = title
 
 
 def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
@@ -1033,7 +1065,7 @@ def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
 def build_html_epub_command(args):
     """Handle the build-html-epub subcommand (rebuild EPUB with translated HTML)."""
     from pathlib import Path
-    from pdf2epub.html_translation import HTMLEpubPipeline, build_html_epub
+    from pdf2epub.html_translation import HTMLEpubPipeline
 
     # Load configuration
     config = load_config(args.config)
@@ -1568,6 +1600,12 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         type=int,
         default=None,
         help="Only translate first N content chapters (for testing)"
+    )
+    translate_novel_parser.add_argument(
+        "--retranslate",
+        type=int,
+        default=None,
+        help="Retranslate a single chapter by spine index (rolls back glossary, retranslates, re-extracts)"
     )
     translate_novel_parser.add_argument(
         "--glossary",

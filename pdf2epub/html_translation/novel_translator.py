@@ -1,9 +1,9 @@
 """
-Novel Translator v4: Cache-friendly chunked translation with agent verification.
+Novel Translator v4: Long-context translation with deterministic verification.
 
-Translates chapters using Sonnet with conversation history append mode for
-near-100% cache hit on continuations. Agent verifies head/tail alignment
-and detects hallucination.
+Translates chapters using Sonnet with token budget streaming. Deterministic
+verifier checks line count alignment and detects hallucination. When initial
+translation is incomplete, falls back to chunked_translator for remaining lines.
 """
 
 import re
@@ -13,7 +13,7 @@ import signal
 import logging
 import tiktoken
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional
 
 from .novel_extractor import NovelUnit
 from .glossary_manager import GlossaryManager
@@ -64,37 +64,9 @@ class NovelState:
         )
 
 
-# ─── Content Validator ───
-
-def make_novel_content_validator(source_text: str):
-    """Create a content validator closure.
-
-    Returns Callable[[str], Optional[str]] — None if valid, error string if not.
-    """
-    source_lines = len([l for l in source_text.splitlines() if l.strip()])
-
-    def validator(result_text: str) -> Optional[str]:
-        result_lines = len([l for l in result_text.splitlines() if l.strip()])
-
-        if result_lines == 0:
-            return "Empty translation output"
-
-        diff = abs(result_lines - source_lines)
-        if diff <= 3:
-            return None
-
-        if result_lines < source_lines:
-            return f"Truncated: {result_lines}/{source_lines} lines. Continue translating."
-
-        return (
-            f"Line count mismatch: {result_lines} translated vs {source_lines} source. "
-            f"Check for preamble or duplicated lines."
-        )
-
-    return validator
 
 
-# ─── Spurious Markdown Cleanup ───
+# ─── Image Repair ───
 
 def strip_spurious_headings(translated_text: str, source_text: str) -> str:
     """Remove markdown heading prefixes (# ## etc.) that don't exist in source.
@@ -114,8 +86,6 @@ def strip_spurious_headings(translated_text: str, source_text: str) -> str:
 
     return '\n'.join(trans_lines)
 
-
-# ─── Image Repair ───
 
 def repair_images(source_text: str, translated_text: str) -> str:
     """Ensure image placeholders match source exactly.
@@ -157,7 +127,7 @@ def repair_images(source_text: str, translated_text: str) -> str:
 # ─── Translator ───
 
 class NovelTranslator:
-    """Translate light novel chapters with agent-assisted continuation and glossary memory."""
+    """Translate light novel chapters with deterministic verification and glossary memory."""
 
     def __init__(
         self,
@@ -188,6 +158,11 @@ class NovelTranslator:
         # LLM client (lazy init)
         self._llm_client = None
         self._model_configs = None
+
+        # Embedding config for verifier/position alignment (optional)
+        novel_config = config.get("novel", {})
+        self._embedding_provider = novel_config.get("embedding_provider")
+        self._embedding_model = novel_config.get("embedding_model", "gemini-embedding-001")
 
     def _get_llm_client(self):
         if self._llm_client is None:
@@ -235,7 +210,12 @@ class NovelTranslator:
         """
         client = self._get_anthropic_client()
         model_configs = self._get_model_configs()
-        model = model_configs[0].get("model", "claude-haiku-4-5-20251001")
+        # Find the anthropic model from config, or fall back to sonnet
+        anthropic_config = next(
+            (m for m in model_configs if m.get("provider", "") == "anthropic"),
+            None,
+        )
+        model = anthropic_config.get("model") if anthropic_config else "claude-sonnet-4-6"
 
         # Use cache_control on system prompt and first user message
         # so source text is cached across continuation rounds
@@ -291,9 +271,12 @@ class NovelTranslator:
         try:
             stream = client.client.messages.create(**request_kwargs)
 
+            from pdf2epub.utils.network_utils import _detect_streaming_hallucination
+
             last_token_count = 0
             budget_hit = False
             stream_events = []
+            chunk_count = 0
 
             for event in stream:
                 if event.type in ("message_start", "message_delta"):
@@ -302,6 +285,22 @@ class NovelTranslator:
                     if hasattr(event.delta, 'text'):
                         chunk = event.delta.text
                         response_text += chunk
+                        chunk_count += 1
+
+                        # Hallucination guard: detect repetition loops
+                        if chunk_count % 20 == 0:
+                            halt_reason = _detect_streaming_hallucination(response_text)
+                            if halt_reason:
+                                logger.warning(
+                                    f"Hallucination detected for {operation_name}: {halt_reason}. "
+                                    f"Halting stream at {len(response_text)} chars."
+                                )
+                                last_nl = response_text.rfind('\n')
+                                if last_nl > 0:
+                                    response_text = response_text[:last_nl]
+                                stopped_early = True
+                                stream.close()
+                                break
 
                         if budget_hit:
                             # We hit the budget — finish the current line
@@ -366,9 +365,13 @@ class NovelTranslator:
         else:
             state = NovelState()
 
+        HALLUCINATION_GRACE_CHAPTERS = 5  # Don't check ratio for first N chapters
+        HALLUCINATION_MAX_RATIO = 0.2    # Abort if hallucination rate exceeds this
+
         start_time = time.time()
         translated_count = 0
         skipped_count = 0
+        hallucinated_count = 0
 
         _prev_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -403,9 +406,40 @@ class NovelTranslator:
                     continue
 
                 logger.info(f"Translating [{idx + 1}/{len(units)}]: {unit.text_path.name}")
-                self._translate_chapter(unit)
+                chapter_failed = self._translate_chapter(unit)
                 translated_count += 1
 
+                if chapter_failed:
+                    hallucinated_count += 1
+                    logger.warning(
+                        f"  Chapter marked as hallucinated "
+                        f"({hallucinated_count}/{translated_count} = "
+                        f"{hallucinated_count/translated_count:.0%})"
+                    )
+
+                    # Check ratio after grace period
+                    if translated_count > HALLUCINATION_GRACE_CHAPTERS:
+                        ratio = hallucinated_count / translated_count
+                        if ratio > HALLUCINATION_MAX_RATIO:
+                            logger.error(
+                                f"Hallucination rate {ratio:.0%} exceeds "
+                                f"{HALLUCINATION_MAX_RATIO:.0%} threshold after "
+                                f"{translated_count} chapters. Aborting translation."
+                            )
+                            # Mark current chapter completed (best-effort saved)
+                            state.completed_units.append(idx)
+                            state.current_unit_index = idx + 1
+                            state.save(self.state_path)
+                            return {
+                                "translated": translated_count,
+                                "skipped": skipped_count,
+                                "hallucinated": hallucinated_count,
+                                "aborted": True,
+                                "abort_reason": f"hallucination rate {ratio:.0%}",
+                            }
+
+                # Always mark completed — hallucinated chapters save best-effort output
+                # and can be fixed later with --retranslate
                 state.completed_units.append(idx)
                 state.current_unit_index = idx + 1
                 state.save(self.state_path)
@@ -424,13 +458,25 @@ class NovelTranslator:
             f"Translation complete: {translated_count} translated, "
             f"{skipped_count} skipped in {elapsed:.1f}s"
         )
-        return {"translated": translated_count, "skipped": skipped_count, "elapsed": elapsed}
+        return {
+            "translated": translated_count,
+            "skipped": skipped_count,
+            "hallucinated": hallucinated_count,
+            "elapsed": elapsed,
+        }
 
     # ─── Chapter Translation ───
 
-    def _translate_chapter(self, unit: NovelUnit):
-        """Translate a single chapter: recall glossary → translate → extract glossary."""
-        source_text = unit.text_path.read_text(encoding="utf-8")
+    def _translate_chapter(self, unit: NovelUnit) -> bool:
+        """Translate a single chapter: recall glossary → translate → extract glossary.
+
+        Returns True if the chapter hallucinated (exhausted retries), False if OK.
+        """
+        source_text_raw = unit.text_path.read_text(encoding="utf-8")
+
+        # Degeneration guard: truncate repetitive kana sequences in source
+        from .chunked_translator import compress_repetitive_source
+        source_text = compress_repetitive_source(source_text_raw)
 
         # Input length guard
         tokens = self._count_tokens(source_text)
@@ -445,11 +491,11 @@ class NovelTranslator:
         if self.glossary_manager:
             glossary_prompt = self.glossary_manager.recall(source_text)
 
-        # Step 2: Translate via agent loop
-        translated = self._run_translation(unit, source_text, glossary_prompt)
+        # Step 2: Translate
+        translated, exhausted = self._run_translation(unit, source_text, glossary_prompt)
 
-        # Step 3: Repair images
-        translated = repair_images(source_text, translated)
+        # Step 3: Repair images (using raw source for correct placeholders)
+        translated = repair_images(source_text_raw, translated)
 
         # Step 4: Save
         dest = self.translated_dir / unit.text_path.name
@@ -472,11 +518,13 @@ class NovelTranslator:
                 translation_system_prompt=system_prompt,
             )
 
-    def _run_translation(self, unit: NovelUnit, source_text: str, glossary_prompt: str) -> str:
+        return exhausted
+
+    def _run_translation(self, unit: NovelUnit, source_text: str, glossary_prompt: str) -> tuple:
         """Run translation with deterministic verification.
 
-        Uses LLM classification (not an agent) for preamble detection and
-        hallucination boundary finding via binary search.
+        Returns (translated_text, exhausted_retries) where exhausted_retries
+        is True if all retry attempts were used without clean completion.
         """
         from .novel_verifier import verify_translation
 
@@ -524,7 +572,7 @@ class NovelTranslator:
 
                 conversation_history.append({
                     "role": "user",
-                    "content": f"请从这句话之后继续翻译（不包含这句话），保持每行对应原文一行：\n> {last_line}",
+                    "content": f"继续翻译，只输出中文译文。上一行译文：\n{last_line}",
                 })
                 op_name = f"Novel continue {unit.file_name} from line {current_translated_lines}"
 
@@ -559,34 +607,52 @@ class NovelTranslator:
 
             # Verify + continuation loop
             for cont_round in range(max_continuations + 1):
-                is_first = (cont_round == 0 and attempt == 0)
                 fixed_text, action = verify_translation(
                     source_text=source_text,
                     translated_text=translated,
                     llm_client=self._get_llm_client(),
                     model_configs=verify_model_configs,
                     is_first_chunk=(cont_round == 0),
+                    embedding_provider=self._embedding_provider,
+                    embedding_model=self._embedding_model,
                 )
 
                 if action == "complete":
                     src_n = len([l for l in source_text.splitlines() if l.strip()])
                     tl_n = len([l for l in fixed_text.splitlines() if l.strip()])
                     logger.info(f"  Lines: {src_n} source → {tl_n} translated (diff={tl_n - src_n:+d})")
-                    return fixed_text
+                    return fixed_text, False
 
                 elif action == "continue":
-                    pre_lines = len([l for l in fixed_text.splitlines() if l.strip()])
                     translated = fixed_text
-                    # Generate continuation
-                    continuation = generate_fn(prefix=translated)
-                    cont_lines = len([l for l in continuation.splitlines() if l.strip()])
-                    # Merge
-                    translated = translated.rstrip("\n") + "\n" + continuation
-                    total_lines = len([l for l in translated.splitlines() if l.strip()])
-                    logger.info(
-                        f"  Continuation {cont_round + 1}: "
-                        f"+{cont_lines} lines → {total_lines} total (was {pre_lines})"
+                    # Switch to chunked translator for remaining lines
+                    from .chunked_translator import translate_remaining
+                    logger.info("  Switching to chunked translator for remaining lines")
+                    remainder, chunk_hall, aligned_pos = translate_remaining(
+                        source_text=source_text,
+                        translated_prefix=translated,
+                        system_prompt=system_prompt,
+                        llm_client=self._get_llm_client(),
+                        model_configs=self._get_model_configs(),
+                        embedding_provider=self._embedding_provider,
+                        embedding_model=self._embedding_model,
                     )
+                    if remainder:
+                        # Truncate prefix to aligned position to avoid overlap.
+                        # The prefix may have more lines than the source position
+                        # if the model split lines or added extra content.
+                        prefix_lines = [l for l in translated.splitlines() if l.strip()]
+                        if len(prefix_lines) > aligned_pos + 1:
+                            logger.info(
+                                f"  Truncating prefix from {len(prefix_lines)} to "
+                                f"{aligned_pos + 1} lines (removing {len(prefix_lines) - aligned_pos - 1} overlap)"
+                            )
+                            translated = "\n".join(prefix_lines[:aligned_pos + 1])
+                        translated = translated.rstrip("\n") + "\n" + remainder
+                    src_n = len([l for l in source_text.splitlines() if l.strip()])
+                    tl_n = len([l for l in translated.splitlines() if l.strip()])
+                    logger.info(f"  Chunked complete: {src_n} source → {tl_n} translated")
+                    return translated, chunk_hall > 0
 
                 elif action == "retry":
                     logger.warning(f"  Verifier requested retry (attempt {attempt + 1})")
@@ -597,9 +663,9 @@ class NovelTranslator:
                 tl_n = len([l for l in (translated or "").splitlines() if l.strip()])
                 logger.warning(f"  Exhausted {max_continuations} continuations ({tl_n} lines)")
                 if translated:
-                    return translated
+                    return translated, True
 
         # Exhausted retries — return whatever we have
         tl_n = len([l for l in (translated or "").splitlines() if l.strip()])
         logger.warning(f"  Exhausted {max_retries} retries, returning best effort ({tl_n} lines)")
-        return translated or ""
+        return translated or "", True

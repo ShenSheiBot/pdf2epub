@@ -276,6 +276,26 @@ class LLMClient:
                 json_mode=json_mode
             )
 
+    def embed_texts(
+        self,
+        texts: List[str],
+        provider: str = "gemini",
+        model: str = "gemini-embedding-001",
+    ) -> Optional[List[List[float]]]:
+        """Embed texts using a Gemini embedding model.
+
+        Returns list of embedding vectors, or None if the provider is not
+        configured or not a GeminiClient.
+        """
+        client = self._get_client(provider)
+        if client is None or not isinstance(client, GeminiClient):
+            return None
+        try:
+            return client.embed_content(texts, model=model)
+        except Exception as e:
+            logger.warning(f"Embedding failed: {e}")
+            return None
+
     def generate(
         self,
         prompt: Union[str, List[Dict]],
@@ -421,6 +441,7 @@ class LLMClient:
         validation_strategy: Optional['ValidationStrategy'] = None,
         operation_name: str = "LLM generation",
         repair_prompt_builder: Optional[Callable[[str, str, str], Union[str, List[Dict]]]] = None,
+        enable_cache: bool = False,
     ) -> str:
         """
         Generate content with validation and retry logic.
@@ -518,7 +539,8 @@ class LLMClient:
                             model=model,
                             max_retries=api_retries,
                             operation_name=operation_name,
-                            client=client
+                            client=client,
+                            enable_cache=enable_cache,
                         )
                     elif provider_type == "openai":
                         response = self._generate_with_openai(

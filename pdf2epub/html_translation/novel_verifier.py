@@ -3,14 +3,16 @@ Deterministic translation verifier for novel translation.
 
 Replaces the agent-based verification with:
 1. Preamble detection via LLM classification (translation/meta-comment)
-2. Hallucination detection via A/B/C/D alignment check + binary search
+2. Hallucination detection via embedding similarity (primary) or A/B/C/D alignment check (fallback)
 
-All LLM calls are simple classification prompts (single letter/word response).
-No agent, no sandbox, no tool use.
+Embedding uses gemini-embedding-001 cross-lingual cosine similarity.
+Falls back to haiku LLM classification if embedding API is unavailable.
 """
 
 import logging
 from typing import List, Optional, Tuple
+
+from .embedding_utils import check_alignment_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +67,28 @@ def _check_preamble(source_line: str, translated_line: str, llm_client, model_co
 
 
 def _check_alignment(source_window: List[str], translated_window: List[str],
-                     llm_client, model_configs) -> str:
+                     llm_client, model_configs,
+                     embedding_provider: Optional[str] = None,
+                     embedding_model: str = "gemini-embedding-001") -> str:
     """Check alignment between source and translated windows.
+
+    Tries embedding-based check first (if embedding_provider configured),
+    falls back to LLM classification.
 
     Returns 'A', 'B', 'C', or 'D'.
     """
+    # Primary: embedding-based check
+    if embedding_provider:
+        result = check_alignment_embedding(
+            source_window, translated_window, llm_client,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+        )
+        if result is not None:
+            return result
+        logger.info("  Embedding alignment unavailable, falling back to LLM")
+
+    # Fallback: LLM classification
     prompt = ALIGNMENT_CHECK_PROMPT.format(
         source="\n".join(source_window),
         translated="\n".join(translated_window),
@@ -137,6 +156,8 @@ def find_hallucination_boundary(
     llm_client,
     model_configs,
     window_size: int = 5,
+    embedding_provider: Optional[str] = None,
+    embedding_model: str = "gemini-embedding-001",
 ) -> int:
     """Binary search for where hallucination starts.
 
@@ -161,7 +182,11 @@ def find_hallucination_boundary(
             hi = mid - 1
             continue
 
-        result = _check_alignment(src_window, tl_window, llm_client, model_configs)
+        result = _check_alignment(
+            src_window, tl_window, llm_client, model_configs,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+        )
         logger.debug(f"  Verifier: binary search pos={mid}, result={result}")
 
         if result != "D":
@@ -181,6 +206,8 @@ def verify_translation(
     llm_client,
     model_configs,
     is_first_chunk: bool = True,
+    embedding_provider: Optional[str] = None,
+    embedding_model: str = "gemini-embedding-001",
 ) -> Tuple[Optional[str], str]:
     """Verify and fix translated text.
 
@@ -190,6 +217,8 @@ def verify_translation(
         llm_client: LLMClient for verification calls.
         model_configs: Model configs for verification calls.
         is_first_chunk: Whether this is the first chunk (run preamble check).
+        embedding_provider: Provider name for embedding (e.g. "gemini"). None = LLM only.
+        embedding_model: Embedding model name.
 
     Returns:
         (fixed_text, action) where action is:
@@ -226,6 +255,8 @@ def verify_translation(
         tl_lines[n - window:n],
         llm_client,
         model_configs,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
     )
 
     if tail_result != "D":
@@ -237,13 +268,17 @@ def verify_translation(
             logger.info(f"  Verifier: truncated ({n} vs {len(src_lines)} source lines, tail={tail_result})")
             return "\n".join(tl_lines), "continue"
         else:
-            # More lines than source — accept anyway since tail is valid
-            logger.info(f"  Verifier: complete with extra lines ({n} vs {len(src_lines)}, tail={tail_result})")
-            return "\n".join(tl_lines), "complete"
+            # Too many lines — likely bilingual output or duplication
+            logger.warning(f"  Verifier: too many lines ({n} vs {len(src_lines)}, +{n - len(src_lines)}), retry")
+            return "\n".join(tl_lines), "retry"
     else:
         # Tail is hallucination — binary search
         logger.warning(f"  Verifier: hallucination detected at tail ({n} lines, tail={tail_result})")
-        boundary = find_hallucination_boundary(src_lines, tl_lines, llm_client, model_configs)
+        boundary = find_hallucination_boundary(
+            src_lines, tl_lines, llm_client, model_configs,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+        )
         truncated = tl_lines[:boundary + 1]
         logger.info(f"  Verifier: truncated to {len(truncated)} lines")
         if len(truncated) < len(src_lines) - LINE_COUNT_TOLERANCE:

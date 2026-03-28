@@ -1138,7 +1138,7 @@ class TestVerifierIntegration:
         from pdf2epub.html_translation.novel_extractor import NovelUnit
         unit = NovelUnit(spine_index=0, file_name="test_ch", text_path=source_path, has_content=True)
 
-        result = translator._run_translation(unit, source_text, "")
+        result, _exhausted = translator._run_translation(unit, source_text, "")
 
         # Should complete successfully
         assert result is not None
@@ -1183,7 +1183,7 @@ class TestVerifierIntegration:
         from pdf2epub.html_translation.novel_extractor import NovelUnit
         unit = NovelUnit(spine_index=0, file_name="test_ch", text_path=source_path, has_content=True)
 
-        result = translator._run_translation(unit, source_text, "")
+        result, _exhausted = translator._run_translation(unit, source_text, "")
 
         assert result is not None
         result_lines = [l for l in result.splitlines() if l.strip()]
@@ -1221,7 +1221,7 @@ class TestVerifierIntegration:
         from pdf2epub.html_translation.novel_extractor import NovelUnit
         unit = NovelUnit(spine_index=0, file_name="test_ch", text_path=source_path, has_content=True)
 
-        result = translator._run_translation(unit, source_text, "")
+        result, _exhausted = translator._run_translation(unit, source_text, "")
 
         assert "以下是翻译" not in result
         result_lines = [l for l in result.splitlines() if l.strip()]

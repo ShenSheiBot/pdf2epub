@@ -902,9 +902,15 @@ class OpenAIClient:
         """Format prompt into OpenAI messages format."""
         if isinstance(prompt, str):
             return [{"role": "user", "content": prompt}]
-        
+
         if isinstance(prompt, list):
-            # Handle multi-part content
+            # Check if this is already a conversation messages list
+            if prompt and isinstance(prompt[0], dict) and "role" in prompt[0]:
+                # Already formatted as messages — pass through, converting
+                # system messages to "system" role (OpenAI/DeepSeek compatible)
+                return [{"role": m["role"], "content": m["content"]} for m in prompt]
+
+            # Handle multi-part content (image + text blocks)
             content_parts = []
             for part in prompt:
                 if isinstance(part, dict):

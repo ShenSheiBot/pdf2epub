@@ -951,6 +951,76 @@ def translate_novel_command(args):
         return 1
 
 
+def build_novel_epub_command(args):
+    """Handle the build-novel-epub subcommand (rebuild EPUB from translated novel text)."""
+    import json
+    from pathlib import Path
+    from pdf2epub.html_translation.epub_parser import EPUBParser
+    from pdf2epub.html_translation.novel_extractor import NovelExtractor
+    from pdf2epub.html_translation.builder import BuildConfig, HTMLEpubBuilder, sanitize_filename
+
+    config = load_config(args.config)
+    book_title = config.get("title")
+
+    if not book_title:
+        logger.error("No title found in config")
+        return 1
+
+    configure_logging(book_title, "build-novel-epub")
+
+    output_dir = Path("output") / book_title
+    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
+    epub_path = output_dir / "input.epub"
+
+    if not epub_path.exists():
+        logger.error(f"Input EPUB not found: {epub_path}")
+        return 1
+
+    try:
+        parser_obj = EPUBParser(str(epub_path))
+        units = NovelExtractor(parser_obj).extract_all(output_dir / "novel_units")
+
+        translated_dir = output_dir / "translated_novel"
+        xhtml_dir = output_dir / "final_xhtml"
+        xhtml_dir.mkdir(parents=True, exist_ok=True)
+
+        # Convert txt to xhtml (partial OK — untranslated chapters keep original)
+        _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser_obj)
+
+        translated_count = sum(1 for u in units if u.has_content and (translated_dir / u.text_path.name).exists())
+        total_content = sum(1 for u in units if u.has_content)
+        logger.info(f"Translated {translated_count}/{total_content} content units")
+
+        metadata_path = output_dir / "translated_metadata.json"
+        translated_metadata = None
+        if metadata_path.exists():
+            translated_metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+
+        if translated_metadata and translated_metadata.get('translated_title'):
+            safe_title = sanitize_filename(translated_metadata['translated_title'])
+            output_epub = output_dir / f"{safe_title}.epub"
+        else:
+            output_epub = output_dir / f"{book_title}_translated.epub"
+
+        build_config = BuildConfig(
+            original_epub=epub_path,
+            translated_dir=xhtml_dir,
+            output_path=output_epub,
+            book_title=book_title,
+            translated_metadata=translated_metadata,
+        )
+        builder = HTMLEpubBuilder(build_config)
+        builder.build()
+        logger.success(f"Built EPUB: {output_epub}")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Build failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
     """Convert translated .txt files to .xhtml, preserving original <head>."""
     import html
@@ -1617,6 +1687,14 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Skip EPUB building step (only translate)"
     )
     translate_novel_parser.set_defaults(func=translate_novel_command)
+
+    # Build Novel EPUB subcommand (rebuild from translated text, no re-translation)
+    build_novel_epub_parser = subparsers.add_parser(
+        "build-novel-epub",
+        help="Build EPUB from translated novel text (no re-translation)",
+        description="Rebuild EPUB from existing translated .txt files. Supports partial translation — untranslated chapters keep original content."
+    )
+    build_novel_epub_parser.set_defaults(func=build_novel_epub_command)
 
     # Patch paper structure subcommand
     patch_parser = subparsers.add_parser(

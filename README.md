@@ -25,12 +25,8 @@
 
 1. **ocr-pages**：逐页进行 OCR，使用多模态 LLM 将每页转换成带有插图的 markdown
 2. **refine**：智能分析 TOC 结构，验证章节边界，生成精确的 toc_tree.json（支持无限层级嵌套）
-3. **polish** / **polish-batch**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
-   - `polish`: 在线处理，实时反馈
-   - `polish-batch`: 批次处理，成本降低 50%，适合大量文件
-4. **translate** / **translate-batch**：（可选）使用 LLM 翻译成目标语言
-   - `translate`: 在线处理，实时反馈
-   - `translate-batch`: 批次处理，成本降低 50%，适合大量文件
+3. **polish**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
+4. **translate**：（可选）使用 LLM 翻译成目标语言
 5. **build-epub**：基于 toc_tree.json 生成 EPUB
 
 ### EPUB 翻译工作流 (NEW - 保留原始格式)
@@ -51,20 +47,31 @@ uv run pdf2epub build-html-epub
 - 翻译后的书籍排版与原书一致
 - 支持增量翻译（`--resume`）和部分测试（`--limit N`）
 
-### 旧版工作流 (Legacy - uses book_structure.json) ⚠️ DEPRECATED
+### 轻小说翻译工作流 (Novel - 文本模式 + 术语表)
 
-1. ~~**breakdown**：使用 Gemini 分析 PDF 结构~~
-2. ~~**ocr**：章节级 OCR~~
-3. **polish**：润色
-4. ~~**epub**：生成 EPUB~~
+适用于轻小说 EPUB 的日→中翻译，支持术语表记忆和退化防护：
 
+1. **translate-novel**：逐章翻译，自动提取/维护术语表，embedding验证对齐
+2. **build-novel-epub**：从翻译文本重建 EPUB（支持部分翻译）
+
+```bash
+# 轻小说翻译示例
+uv run pdf2epub translate-novel -i novel.epub -c config.yaml
+uv run pdf2epub build-novel-epub -c config.yaml
+```
+
+优势：
+- 跨章术语一致性（GlossaryManager 自动维护）
+- Sonnet 退化防护（streaming guard + chunked fallback）
+- Embedding-based 对齐验证（无安全过滤限制）
+- DeepSeek 作为 fallback（R18 内容无审核）
+- 支持 `--resume`、`--retranslate <chapter>`、`--limit N`
 
 ## 推荐LLM：
 
-- breakdown / entity extraction：仅支持 gemini-2.5-pro，一般不会有审核问题
-- polish：deepseek-chat 或 claude-sonnet-4，仅当无审核压力时推荐gemini-2.5-pro
-- translate：deepseek-chat，claude-sonnet-4 翻译流畅度较差，仅当无审核压力时推荐gemini-2.5-pro
-- **polish-batch / translate-batch**：推荐 gemini-3-flash-preview (批次模式，成本降低 50%，适合大量文件)
+- refine / entity extraction：gemini-2.5-pro
+- polish / translate：claude-sonnet-4-6 或 deepseek-chat
+- translate-novel：claude-sonnet-4-6（主）+ deepseek-chat（fallback）
 
 ## 日语OCR架构
 
@@ -116,92 +123,48 @@ cp config.yaml.example config.yaml
 # 编辑 config.yaml 填入你的 API 密钥
 ```
 
-### 配置OCR后端
+### 配置
 
-#### Azure Document Intelligence
-```yaml
-# config.yaml
-ocr_backend: azure  # 使用Azure后端
-
-# Azure配置
-azure_endpoint: https://your-resource.cognitiveservices.azure.com/
-azure_api_key: your-azure-api-key
-```
-
-#### Google Cloud Vision
-```yaml
-# config.yaml
-ocr_backend: vision  # 使用Vision后端
-
-# Google Cloud配置
-service_account_key_path: /path/to/sa-keys.json
-# 或设置环境变量 GOOGLE_APPLICATION_CREDENTIALS
-```
-
-#### Vision Language Models (VLLM)
-```yaml
-# config.yaml
-ocr_backend: vllm  # 使用VLLM后端
-
-# VLLM模型配置
-ocr_vllm_models:
-  - provider: anthropic
-    model: claude-sonnet-4-5-20250929
-    max_retries: 2
-  # 或使用Gemini
-  - provider: gemini
-    model: gemini-2.5-pro
-    max_retries: 1
-
-# API密钥
-anthropic_api_key: your-anthropic-key
-google_api_key: your-google-key
-```
-
-## 使用方法
-
-### 1. 配置文件设置
-
-首先在 `config.yaml` 里配置以下信息：
+参考 `config.yaml.example`。基本结构：
 
 ```yaml
-# 书籍信息
-title: 书名
-author: 作者名
+title: "书名"
 
-# LLM API 密钥
-google_api_key: your-google-api-key
-anthropic_api_key: your-anthropic-api-key  # 可选
-anthropic_base_url: https://api.anthropic.com  # 可选，自定义端点
-openai_api_key: your-openai-api-key  # 可选，支持兼容API如DeepSeek
-openai_base_url: https://api.deepseek.com/v1  # 可选，自定义端点
-openai_model: deepseek-chat  # 可选，模型名称
+credentials:
+  providers:
+    anthropic:
+      type: anthropic
+      api_key: your-key
+      base_url: https://api.anthropic.com  # 可选
+    gemini:
+      type: google
+      api_key: your-key
+    deepseek:
+      type: openai
+      api_key: your-key
+      base_url: https://api.deepseek.com/v1
 
-# 选择OCR后端 (mistral/vertex/vllm/azure/vision)
-ocr_backend: vision  # 日语推荐azure或vision
+ocr:
+  backend: azure  # azure / vision / vllm
 
-# 高级配置
-num_retries: 1  # API重试次数
-max_backoff_seconds: 30  # 最大退避时间
-max_concurrent_workers: 8  # 最大并发API调用数
+translation:
+  source_language: Japanese
+  target_language: Chinese
+  models:
+    - provider: anthropic
+      model: claude-sonnet-4-6
+      api_retries: 2
+      validation_retries: 2
+    - provider: deepseek
+      model: deepseek-chat
+      api_retries: 2
+      validation_retries: 2
 
-# 实体提取模型（可选）
-entity_extraction_model: gemini-2.5-pro
-
-# 翻译配置
-source_language: Japanese
-target_language: Chinese
-
-# 处理模型配置
-polish_models:
-  - provider: anthropic
-    model: claude-sonnet-4-5-20250929
-    max_retries: 2
-
-translation_models:
-  - provider: openai
-    model: deepseek-chat
-    max_retries: 2
+# 轻小说专用配置（可选）
+novel:
+  glossary_max_tokens: 1000
+  embedding_provider: gemini       # embedding 验证
+  embedding_model: gemini-embedding-001
 ```
 
 ### 2. 推荐工作流程（统一CLI）
@@ -331,19 +294,17 @@ uv run pdf2epub build-epub --translated
 
 #### 已有 EPUB 翻译（保留原格式）
 ```bash
-# 适用于已有 EPUB 文件，完整保留原书排版
-
-# 1. 翻译 EPUB 内容（保留 HTML 结构和 CSS）
 uv run pdf2epub translate-html -i book.epub --target-language Chinese
-
-# 2. 重新打包成 EPUB
 uv run pdf2epub build-html-epub
+```
 
-# 可选：增量翻译（中断后继续）
-uv run pdf2epub translate-html -i book.epub --resume
-
-# 可选：测试翻译前几个文件
-uv run pdf2epub translate-html -i book.epub --limit 5
+#### 轻小说翻译（术语表 + 退化防护）
+```bash
+uv run pdf2epub -c config.yaml translate-novel -i novel.epub
+# 中断后继续
+uv run pdf2epub -c config.yaml translate-novel -i novel.epub --resume
+# 单独重建 EPUB（不重翻）
+uv run pdf2epub -c config.yaml build-novel-epub
 ```
 
 #### 英文书籍（无需翻译）
@@ -363,27 +324,7 @@ uv run pdf2epub build-epub
 
 ### 5. 高级配置
 
-#### 多模型自动切换
-系统支持在模型失败或触发安全审核时自动切换：
-
-```yaml
-polish_models:
-  - provider: gemini
-    model: gemini-2.5-pro
-    max_retries: 1  # 瞬时错误重试次数
-  - provider: anthropic
-    model: claude-sonnet-4-5-20250929
-    max_retries: 2
-```
-
-#### OCR 优化设置
-```yaml
-ocr_settings:
-  zoom_factor: 1.5  # 提高图像质量（1.0-3.0）
-  max_workers: 8    # 增加并行数
-  illustration_padding: 30  # 插图检测边距
-  illustration_min_black_pixels: 200  # 插图最小像素数
-```
+系统支持在模型失败或触发安全审核时自动 fallback 到下一个 provider。在 `translation.models` 数组中配置多个 provider 即可。
 
 ### 6. 故障排除
 
@@ -407,8 +348,7 @@ output/
 └── {book_title}/
     ├── input.pdf              # 处理后的PDF
     ├── input_original.pdf     # 原始PDF副本
-    ├── toc_tree.json          # TOC结构（推荐工作流，支持无限层级）
-    ├── book_structure.json    # 书籍结构（旧版工作流）
+    ├── toc_tree.json          # TOC结构（支持无限层级）
     ├── pages/                 # 页级OCR结果
     │   ├── page_001.md
     │   ├── page_002.md
@@ -435,42 +375,6 @@ output/
     └── output.epub            # 最终 EPUB
 ```
 
-## 📝 配置变更说明
-
-**重要**：项目已重构验证架构，以下配置参数已废弃：
-- `polish.truncation_check_lines` 和 `polish.truncation_models`
-- `translation.truncation_check_lines` 和 `translation.truncation_models`
-
-新架构使用 **N-gram Detector + Agent Verification** 两阶段验证，性能更快、成本更低、准确率更高。
-
-详细说明请查看：[CONFIG_CHANGES.md](./CONFIG_CHANGES.md)
-
----
-
-## ⚠️ 已弃用命令 (Deprecated Commands)
-
-以下命令属于旧版工作流，仍可运行但不推荐使用：
-
-| 旧命令 | 替代命令 | 说明 |
-|--------|----------|------|
-| `breakdown` | `ocr-pages` + `refine` | 旧版使用 Gemini 分析结构，新版使用边界验证 |
-| `ocr` | `ocr-pages` + `refine` | 旧版章节级 OCR，新版页级 OCR + 智能拆分 |
-| `epub` | `build-epub` | 旧版使用 book_structure.json，新版使用 toc_tree.json |
-
-### 旧版工作流（不推荐）
-```bash
-# ⚠️ DEPRECATED - 以下命令仍可使用但不推荐
-uv run pdf2epub breakdown -i input.pdf  # 会显示弃用警告
-uv run pdf2epub ocr                      # 会显示弃用警告
-uv run pdf2epub polish
-uv run pdf2epub epub                     # 会显示弃用警告
-```
-
-### 迁移到新工作流
-如果你之前使用旧工作流，建议迁移到新工作流以获得：
-- 更精确的章节边界检测
-- 支持无限层级的 TOC 嵌套
-- 更好的错误恢复和进度跟踪
 
 ## 贡献
 

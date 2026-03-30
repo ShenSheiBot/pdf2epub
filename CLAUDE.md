@@ -128,10 +128,11 @@ uv run pdf2epub polish --resume     # 从上次中断处继续
 - `polish --resume`
 - `translate --resume`
 - `translate-html --resume`
+- `translate-novel --resume`
 
 ---
 
-## 两种翻译工作流
+## 三种翻译工作流
 
 ### PDF 翻译（扫描版）
 
@@ -169,6 +170,26 @@ uv run pdf2epub build-html-epub
 **EPUB 流程风险**：
 - `--limit N` 参数只翻译前 N 个文件（用于测试），其余文件保持原文
 - 如果测试后直接 `build-html-epub`，会生成混合原文和翻译的 EPUB
+
+### 轻小说翻译（术语表 + 退化防护）
+
+```bash
+# 1. 翻译（自动提取术语表、验证对齐、处理退化）
+uv run pdf2epub -c config.yaml translate-novel -i input.epub [--resume]
+
+# 2. 单独重建 EPUB（不重翻，支持部分翻译）
+uv run pdf2epub -c config.yaml build-novel-epub
+
+# 3. 重翻单章
+uv run pdf2epub -c config.yaml translate-novel -i input.epub --retranslate <spine_idx>
+```
+
+**轻小说流程说明**：
+- 需要独立的 config.yaml（指定 `novel.embedding_provider` 等）
+- 术语表存储在 `glossary_store.json`，跨章节维护
+- Sonnet 退化由 streaming guard 捕获，chunked translator 兜底
+- DeepSeek 作为 fallback（R18 内容无审核）
+- `build-novel-epub` 支持部分翻译——未翻译章节保留原文
 
 ---
 

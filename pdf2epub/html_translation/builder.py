@@ -1159,19 +1159,14 @@ class HTMLEpubPipeline:
         try:
             response = llm_client.generate(
                 prompt=prompt,
-                model_configs=self.config.get('translation_models', [
-                    {"provider": "gemini", "model": "gemini-2.5-pro"}
+                model_configs=self.config.get('translation', {}).get('models') or self.config.get('translation_models', [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-6"}
                 ]),
                 operation_name="Translate metadata fields"
             )
-            # Parse JSON response
-            cleaned = response.strip()
-            # Strip markdown fences
-            if cleaned.startswith("```"):
-                cleaned = "\n".join(cleaned.split("\n")[1:])
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            translated = _json.loads(cleaned.strip())
+            # Parse JSON response (use parse_llm_json for robustness)
+            from pdf2epub.utils.common import parse_llm_json
+            translated = parse_llm_json(response, operation_name="Translate metadata fields")
 
             result = {}
             if 'author' in translated:

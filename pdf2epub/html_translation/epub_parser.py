@@ -185,6 +185,9 @@ class EPUBParser:
         # Description
         meta['description'] = get_dc('description')
 
+        # Rights
+        meta['rights'] = get_dc('rights')
+
         logger.info(f"Extracted metadata: {meta['title']} by {meta['author']}")
         return meta
 

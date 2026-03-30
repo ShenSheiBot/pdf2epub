@@ -1149,16 +1149,17 @@ class TestVerifierIntegration:
         assert translator._stream_with_token_cutoff.call_count == 1
         assert mock_llm.generate.call_count == 2
 
-    def test_run_translation_with_continuation(self, tmp_path):
-        """Translation truncated → verifier says continue → generates continuation."""
+    def test_run_translation_with_chunked_fallback(self, tmp_path):
+        """Translation truncated → verifier says continue → switches to chunked mode."""
         source_lines = [f"日本語の行{i}" for i in range(50)]
         source_text = "\n".join(source_lines)
         source_path = tmp_path / "source.txt"
         source_path.write_text(source_text, encoding="utf-8")
 
-        # First chunk: only 20 lines, second chunk: 30 more
+        # Initial translation: only 20 lines
         chunk1 = "\n".join([f"中文第{i}行" for i in range(20)])
-        chunk2 = "\n".join([f"中文第{i}行" for i in range(20, 50)])
+        # Chunked remainder: 30 lines
+        remainder = "\n".join([f"中文第{i}行" for i in range(20, 50)])
 
         config = {
             "title": "test",
@@ -1170,14 +1171,14 @@ class TestVerifierIntegration:
         }
         translator = NovelTranslator(config=config, book_title="test", output_dir=tmp_path)
 
-        # First call returns partial, second returns rest
-        translator._stream_with_token_cutoff = MagicMock(side_effect=[chunk1, chunk2])
+        # Initial translation returns partial
+        translator._stream_with_token_cutoff = MagicMock(return_value=chunk1)
+        # Chunked remainder returns rest
+        translator._translate_chunked_remainder = MagicMock(return_value=remainder)
 
-        # Verifier calls:
-        # Round 1: preamble=translation, tail=A (but line count 20 vs 50 → continue)
-        # Round 2: tail=A (50 vs 50 → complete)
+        # Verifier: preamble=translation, tail=A (but 20 vs 50 → continue)
         mock_llm = MagicMock()
-        mock_llm.generate.side_effect = ["translation", "A", "A"]
+        mock_llm.generate.side_effect = ["translation", "A"]
         translator._llm_client = mock_llm
 
         from pdf2epub.html_translation.novel_extractor import NovelUnit
@@ -1188,8 +1189,8 @@ class TestVerifierIntegration:
         assert result is not None
         result_lines = [l for l in result.splitlines() if l.strip()]
         assert len(result_lines) == 50
-        # 2 translation calls, 3 verifier calls
-        assert translator._stream_with_token_cutoff.call_count == 2
+        # Chunked mode was called
+        translator._translate_chunked_remainder.assert_called_once()
 
     def test_run_translation_preamble_removed(self, tmp_path):
         """Preamble detected and removed."""

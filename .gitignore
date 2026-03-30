@@ -34,3 +34,8 @@ secrets.yaml
 test_*.md
 temp_test/
 docs/plans/
+
+# Experiment scripts (bound to local book data)
+experiments/
+test_*.py
+test_ocr.png

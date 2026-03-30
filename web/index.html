@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF → Markdown OCR</title>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --text: #1a202c;
+      --text-secondary: #64748b;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #10b981;
+      --error: #ef4444;
+      --radius: 12px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 40px 20px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 640px;
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: var(--text-secondary);
+      margin-bottom: 32px;
+      font-size: 0.95rem;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+
+    label {
+      display: block;
+      font-size: 0.875rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
+
+    .field { margin-bottom: 16px; }
+    .field:last-child { margin-bottom: 0; }
+
+    .field .hint {
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+      margin-top: 4px;
+    }
+
+    /* Drop zone */
+    .dropzone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 48px 24px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      background: var(--card);
+      margin-bottom: 20px;
+    }
+
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--accent);
+      background: #f0f7ff;
+    }
+
+    .dropzone.has-file {
+      border-color: var(--success);
+      background: #f0fdf4;
+      padding: 20px 24px;
+    }
+
+    .dropzone-icon {
+      font-size: 2.5rem;
+      margin-bottom: 12px;
+    }
+
+    .dropzone-text {
+      color: var(--text-secondary);
+      font-size: 0.95rem;
+    }
+
+    .file-info {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .file-name {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+
+    .file-size {
+      color: var(--text-secondary);
+      font-size: 0.85rem;
+    }
+
+    .file-remove {
+      color: var(--error);
+      cursor: pointer;
+      font-size: 0.85rem;
+      background: none;
+      border: none;
+      font-weight: 600;
+    }
+
+    /* Buttons */
+    .btn {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Progress */
+    .progress-section {
+      display: none;
+    }
+
+    .progress-section.active {
+      display: block;
+    }
+
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 0.9rem;
+    }
+
+    .progress-status {
+      font-weight: 600;
+    }
+
+    .progress-count {
+      color: var(--text-secondary);
+    }
+
+    .progress-bar-bg {
+      width: 100%;
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 4px;
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+
+    .progress-bar.done {
+      background: var(--success);
+    }
+
+    .progress-bar.error {
+      background: var(--error);
+    }
+
+    .progress-log {
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+      padding: 12px;
+      background: #f8fafc;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .log-success { color: var(--success); }
+    .log-error { color: var(--error); }
+
+    /* Result */
+    .result-section {
+      display: none;
+    }
+
+    .result-section.active {
+      display: block;
+      text-align: center;
+    }
+
+    .result-icon {
+      font-size: 3rem;
+      margin-bottom: 12px;
+    }
+
+    .result-text {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+
+    .btn-download {
+      display: inline-block;
+      padding: 12px 32px;
+      background: var(--success);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.15s;
+    }
+
+    .btn-download:hover { background: #059669; }
+
+    .btn-reset {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 8px 24px;
+      background: transparent;
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+
+    /* Concurrency control */
+    .inline-field {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .inline-field label {
+      margin-bottom: 0;
+      white-space: nowrap;
+    }
+
+    .inline-field input {
+      width: 80px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>PDF → Markdown OCR</h1>
+    <p class="subtitle">Upload a PDF, provide your OCR API credentials, get markdown output.</p>
+
+    <!-- API Config -->
+    <div class="card" id="config-card">
+      <div class="field">
+        <label for="base-url">Base URL</label>
+        <input type="text" id="base-url" placeholder="https://paddle-ocr.shenshei.fans/v1" value="https://paddle-ocr.shenshei.fans/v1">
+        <p class="hint">Mistral OCR compatible endpoint (must have /ocr route)</p>
+      </div>
+      <div class="field">
+        <label for="api-key">API Key</label>
+        <input type="password" id="api-key" placeholder="your-api-key">
+      </div>
+      <div class="field">
+        <div class="inline-field">
+          <label for="concurrency">Concurrency</label>
+          <input type="text" id="concurrency" value="3">
+        </div>
+      </div>
+    </div>
+
+    <!-- File Upload -->
+    <div class="dropzone" id="dropzone">
+      <div class="dropzone-icon">📄</div>
+      <div class="dropzone-text">Drop PDF here or click to select</div>
+      <input type="file" id="file-input" accept=".pdf" hidden>
+    </div>
+
+    <!-- Start Button -->
+    <button class="btn btn-primary" id="start-btn" disabled>Start OCR</button>
+
+    <!-- Progress -->
+    <div class="card progress-section" id="progress-section">
+      <div class="progress-header">
+        <span class="progress-status" id="progress-status">Processing...</span>
+        <span class="progress-count" id="progress-count">0 / 0</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="progress-log" id="progress-log"></div>
+    </div>
+
+    <!-- Result -->
+    <div class="card result-section" id="result-section">
+      <div class="result-icon">✅</div>
+      <div class="result-text" id="result-text">OCR Complete!</div>
+      <button class="btn-download" id="download-btn">Download Markdown ZIP</button>
+      <br>
+      <button class="btn-reset" id="reset-btn">Process Another PDF</button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script>
+    const $ = id => document.getElementById(id);
+    const dropzone = $('dropzone');
+    const fileInput = $('file-input');
+    const startBtn = $('start-btn');
+    const progressSection = $('progress-section');
+    const progressBar = $('progress-bar');
+    const progressStatus = $('progress-status');
+    const progressCount = $('progress-count');
+    const progressLog = $('progress-log');
+    const resultSection = $('result-section');
+
+    let selectedFile = null;
+    let zipBlob = null;
+
+    // --- Drop zone ---
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', e => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      const file = e.dataTransfer.files[0];
+      if (file && file.type === 'application/pdf') setFile(file);
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files[0]) setFile(fileInput.files[0]);
+    });
+
+    function setFile(file) {
+      selectedFile = file;
+      dropzone.classList.add('has-file');
+      dropzone.innerHTML = `
+        <div class="file-info">
+          <div>
+            <div class="file-name">${file.name}</div>
+            <div class="file-size">${(file.size / 1024 / 1024).toFixed(1)} MB</div>
+          </div>
+          <button class="file-remove" onclick="clearFile(event)">Remove</button>
+        </div>
+      `;
+      updateStartBtn();
+    }
+
+    function clearFile(e) {
+      e.stopPropagation();
+      selectedFile = null;
+      fileInput.value = '';
+      dropzone.classList.remove('has-file');
+      dropzone.innerHTML = `
+        <div class="dropzone-icon">📄</div>
+        <div class="dropzone-text">Drop PDF here or click to select</div>
+      `;
+      updateStartBtn();
+    }
+
+    function updateStartBtn() {
+      startBtn.disabled = !selectedFile || !$('api-key').value.trim();
+    }
+
+    $('api-key').addEventListener('input', updateStartBtn);
+
+    // --- Logging ---
+    function log(msg, cls = '') {
+      const line = document.createElement('div');
+      if (cls) line.className = cls;
+      line.textContent = msg;
+      progressLog.appendChild(line);
+      progressLog.scrollTop = progressLog.scrollHeight;
+    }
+
+    // --- OCR API call ---
+    async function ocrPage(pdfBytes, pageNum, baseUrl, apiKey) {
+      const b64 = btoa(String.fromCharCode(...pdfBytes));
+      const dataUrl = `data:application/pdf;base64,${b64}`;
+
+      const payload = {
+        model: 'mistral-ocr-latest',
+        document: { type: 'document_url', document_url: dataUrl },
+        include_image_base64: false,
+      };
+
+      // Try direct request first; if CORS fails, use proxy
+      const headers = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      };
+
+      let resp;
+      try {
+        resp = await fetch(`${baseUrl}/ocr`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+      } catch (e) {
+        // CORS error — fall back to proxy
+        resp = await fetch('/api/ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            base_url: baseUrl,
+            api_key: apiKey,
+            payload,
+          }),
+        });
+      }
+
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
+      }
+
+      const data = await resp.json();
+      const pages = data.pages || [];
+      return pages.map(p => p.markdown || '').join('\n\n');
+    }
+
+    // --- Main ---
+    startBtn.addEventListener('click', async () => {
+      const baseUrl = $('base-url').value.trim().replace(/\/$/, '');
+      const apiKey = $('api-key').value.trim();
+      const concurrency = Math.max(1, parseInt($('concurrency').value) || 3);
+
+      if (!selectedFile || !apiKey || !baseUrl) return;
+
+      // UI state
+      startBtn.disabled = true;
+      startBtn.textContent = 'Processing...';
+      $('config-card').style.opacity = '0.6';
+      $('config-card').style.pointerEvents = 'none';
+      progressSection.classList.add('active');
+      resultSection.classList.remove('active');
+      progressLog.innerHTML = '';
+      progressBar.style.width = '0%';
+      progressBar.className = 'progress-bar';
+
+      try {
+        // Read PDF
+        log('Reading PDF...');
+        const arrayBuf = await selectedFile.arrayBuffer();
+        const pdfDoc = await PDFLib.PDFDocument.load(arrayBuf);
+        const totalPages = pdfDoc.getPageCount();
+        log(`PDF loaded: ${totalPages} pages`);
+        progressCount.textContent = `0 / ${totalPages}`;
+
+        // Split into single pages and OCR with concurrency control
+        const results = new Array(totalPages);
+        let completed = 0;
+        let failed = 0;
+
+        async function processPage(i) {
+          try {
+            const singleDoc = await PDFLib.PDFDocument.create();
+            const [copied] = await singleDoc.copyPages(pdfDoc, [i]);
+            singleDoc.addPage(copied);
+            const pageBytes = await singleDoc.save();
+
+            const md = await ocrPage(new Uint8Array(pageBytes), i + 1, baseUrl, apiKey);
+            results[i] = md;
+            log(`Page ${i + 1} ✓`, 'log-success');
+          } catch (e) {
+            results[i] = `<!-- OCR failed for page ${i + 1}: ${e.message} -->`;
+            log(`Page ${i + 1} ✗ ${e.message}`, 'log-error');
+            failed++;
+          }
+          completed++;
+          const pct = (completed / totalPages * 100).toFixed(0);
+          progressBar.style.width = `${pct}%`;
+          progressCount.textContent = `${completed} / ${totalPages}`;
+          progressStatus.textContent = `Processing... ${pct}%`;
+        }
+
+        // Run with concurrency limit
+        const queue = Array.from({ length: totalPages }, (_, i) => i);
+        const workers = [];
+        for (let w = 0; w < concurrency; w++) {
+          workers.push((async () => {
+            while (queue.length > 0) {
+              const idx = queue.shift();
+              await processPage(idx);
+            }
+          })());
+        }
+        await Promise.all(workers);
+
+        // Build ZIP
+        log('Building ZIP...');
+        progressStatus.textContent = 'Building ZIP...';
+        const zip = new JSZip();
+        const padLen = String(totalPages).length;
+        for (let i = 0; i < totalPages; i++) {
+          const name = `page_${String(i + 1).padStart(padLen, '0')}.md`;
+          zip.file(name, results[i] || '');
+        }
+        zipBlob = await zip.generateAsync({ type: 'blob' });
+
+        // Done
+        progressBar.style.width = '100%';
+        progressBar.classList.add('done');
+        const msg = failed > 0
+          ? `Done! ${totalPages - failed} succeeded, ${failed} failed.`
+          : `Done! All ${totalPages} pages processed.`;
+        progressStatus.textContent = msg;
+        log(msg, failed > 0 ? 'log-error' : 'log-success');
+
+        resultSection.classList.add('active');
+        $('result-text').textContent = msg;
+
+      } catch (e) {
+        progressBar.classList.add('error');
+        progressStatus.textContent = 'Error';
+        log(`Fatal error: ${e.message}`, 'log-error');
+      } finally {
+        startBtn.textContent = 'Start OCR';
+        startBtn.disabled = false;
+        $('config-card').style.opacity = '1';
+        $('config-card').style.pointerEvents = 'auto';
+      }
+    });
+
+    // Download
+    $('download-btn').addEventListener('click', () => {
+      if (!zipBlob) return;
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      const baseName = selectedFile ? selectedFile.name.replace(/\.pdf$/i, '') : 'ocr_result';
+      a.download = `${baseName}_markdown.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    // Reset
+    $('reset-btn').addEventListener('click', () => {
+      resultSection.classList.remove('active');
+      progressSection.classList.remove('active');
+      clearFile(new Event('click'));
+      zipBlob = null;
+    });
+  </script>
+</body>
+</html>

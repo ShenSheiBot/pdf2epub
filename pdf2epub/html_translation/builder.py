@@ -7,7 +7,6 @@ all other resources (CSS, fonts, images, metadata).
 
 import zipfile
 import tempfile
-import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass

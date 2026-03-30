@@ -353,16 +353,3 @@ class BookStructure(Frozen, frozen=True):
         return self._toc
 
 
-def parse_file_key_chapter_number(file_key: str) -> Optional[str]:
-    """
-    Parse chapter number from file key.
-
-    Examples:
-        "chapter_5" -> "5"
-        "chapter_7.1.1" -> "7.1.1"
-        "appendix_a" -> None
-    """
-    match = CHAPTER_NUMBER_PATTERN.match(file_key)
-    if match:
-        return match.group(1)
-    return None

@@ -13,7 +13,6 @@ from loguru import logger
 from pdf2epub.utils.logging_config import configure_logging
 from pdf2epub.utils.common import load_config
 from pdf2epub.utils.network_utils import set_llm_trace_path
-from pdf2epub.utils.safety import check_output_directory_conflict
 
 # Configure logger
 logger = configure_logging()
@@ -24,107 +23,6 @@ def polish_command(args):
     from .commands import polish_v2_command
     return polish_v2_command(args)
 
-
-def breakdown_command(args):
-    """Handle the breakdown subcommand.
-
-    DEPRECATED: This command is part of the legacy workflow.
-    Please use: ocr-pages → refine → polish → build-epub
-    """
-    # ============================================================
-    # ⚠️  DEPRECATED COMMAND - 已弃用命令
-    # ============================================================
-    # This command is part of the LEGACY workflow and may be removed.
-    # 此命令属于旧版工作流，可能会被移除。
-    #
-    # RECOMMENDED workflow / 推荐的新工作流：
-    #   pdf2epub ocr-pages → refine → polish → build-epub
-    # ============================================================
-    logger.warning("=" * 60)
-    logger.warning("⚠️  DEPRECATED: 'breakdown' is part of the legacy workflow")
-    logger.warning("   此命令已弃用，属于旧版工作流")
-    logger.warning("")
-    logger.warning("   Recommended workflow / 推荐工作流:")
-    logger.warning("   pdf2epub ocr-pages -i <pdf>")
-    logger.warning("   pdf2epub refine")
-    logger.warning("   pdf2epub polish")
-    logger.warning("   pdf2epub build-epub")
-    logger.warning("=" * 60)
-
-    from pdf2epub.breakdown import (
-        load_config as load_breakdown_config,
-        preprocess_pdf,
-        analyze_pdf_structure,
-        detect_front_and_back_matter
-    )
-    from pdf2epub.utils.network_utils import create_gemini_client_from_config
-    import json
-
-    # Load configuration
-    config = load_breakdown_config(args.config)
-    
-    # Get input PDF path
-    input_pdf = Path(args.input)
-    if not input_pdf.exists():
-        logger.error(f"Input PDF not found: {input_pdf}")
-        return 1
-    
-    # Get book title from config
-    book_title = config.get("title")
-    if not book_title:
-        book_title = input_pdf.stem
-        logger.warning(f"No title found in config, using PDF filename: {book_title}")
-
-    # Configure file logging
-    configure_logging(book_title, "breakdown")
-
-    logger.info(f"Processing PDF breakdown for: {book_title}")
-
-    # Define output directory
-    output_dir = Path("output") / Path(book_title)
-
-    # Check for conflicts with existing output
-    output_dir = check_output_directory_conflict(output_dir, input_pdf)
-    set_llm_trace_path(output_dir / "logs" / "llm_trace.jsonl")
-
-    # If directory was renamed, update book_title
-    actual_book_title = output_dir.name
-    if actual_book_title != book_title:
-        logger.info(f"Using renamed directory: {actual_book_title}")
-        book_title = actual_book_title
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Setup Gemini API
-    breakdown_config = config.get("breakdown", {})
-    provider_name = breakdown_config.get("provider", "gemini")
-    try:
-        gemini_client = create_gemini_client_from_config(config, provider_name)
-    except ValueError as e:
-        logger.error(str(e))
-        return 1
-    
-    # Use preprocess_pdf which handles page number patches and multi-round compression
-    processed_pdf = preprocess_pdf(input_pdf, output_dir)
-    
-    # Analyze book structure
-    logger.info("Analyzing book structure...")
-    structure = analyze_pdf_structure(gemini_client, processed_pdf, book_title, config)
-    
-    # Add book title to the structure
-    structure['book_title'] = book_title
-    
-    # Detect front matter and back matter automatically
-    structure = detect_front_and_back_matter(structure, processed_pdf)
-    
-    # Save the structured output to the output directory
-    output_file = output_dir / "book_structure.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(structure, f, ensure_ascii=False, indent=2)
-    
-    logger.success(f"Book structure saved to {output_file}")
-    
-    return 0
 
 
 def refine_command(args):
@@ -282,50 +180,6 @@ def ocr_pages_command(args):
         return 1
 
 
-def ocr_command(args):
-    """Handle the OCR subcommand (legacy chapter-based workflow).
-
-    DEPRECATED: This command is part of the legacy workflow.
-    Please use: ocr-pages → refine → polish → build-epub
-    """
-    # ============================================================
-    # ⚠️  DEPRECATED COMMAND - 已弃用命令
-    # ============================================================
-    # This command is part of the LEGACY workflow and may be removed.
-    # 此命令属于旧版工作流，可能会被移除。
-    #
-    # RECOMMENDED workflow / 推荐的新工作流：
-    #   pdf2epub ocr-pages → refine → polish → build-epub
-    # ============================================================
-    logger.warning("=" * 60)
-    logger.warning("⚠️  DEPRECATED: 'ocr' is part of the legacy workflow")
-    logger.warning("   此命令已弃用，属于旧版工作流")
-    logger.warning("")
-    logger.warning("   Use 'ocr-pages' instead / 请使用 'ocr-pages':")
-    logger.warning("   pdf2epub ocr-pages -i <pdf>")
-    logger.warning("   pdf2epub refine")
-    logger.warning("   pdf2epub polish")
-    logger.warning("   pdf2epub build-epub")
-    logger.warning("=" * 60)
-
-    import sys
-    original_argv = sys.argv
-
-    try:
-        from pdf2epub.ocr_chapters import main as ocr_main
-
-        # Build argv for ocr_chapters main
-        new_argv = ['ocr_chapters.py']
-        if hasattr(args, 'resume') and args.resume:
-            new_argv.append('--resume')
-        if hasattr(args, 'aggregate_only') and args.aggregate_only:
-            new_argv.append('--aggregate-only')
-
-        sys.argv = new_argv
-        return ocr_main()
-    finally:
-        sys.argv = original_argv
-
 
 def extract_entities_command(args):
     """Handle the extract-entities subcommand."""
@@ -415,67 +269,6 @@ def extract_entities_command(args):
         logger.error(f"Entity extraction failed: {e}")
         return 1
 
-
-def epub_command(args):
-    """Handle the epub generation subcommand.
-
-    DEPRECATED: This command is part of the legacy workflow.
-    Please use: build-epub (which uses toc_tree.json)
-    """
-    # ============================================================
-    # ⚠️  DEPRECATED COMMAND - 已弃用命令
-    # ============================================================
-    # This command is part of the LEGACY workflow and may be removed.
-    # 此命令属于旧版工作流，可能会被移除。
-    #
-    # RECOMMENDED command / 推荐的新命令：
-    #   pdf2epub build-epub (uses toc_tree.json)
-    # ============================================================
-    logger.warning("=" * 60)
-    logger.warning("⚠️  DEPRECATED: 'epub' is part of the legacy workflow")
-    logger.warning("   此命令已弃用，属于旧版工作流")
-    logger.warning("")
-    logger.warning("   Use 'build-epub' instead / 请使用 'build-epub':")
-    logger.warning("   pdf2epub build-epub [--translated]")
-    logger.warning("=" * 60)
-
-    # Import the main function from generate_epub
-    from pdf2epub.generate_epub import main as generate_epub_main
-    import sys
-
-    # Prepare arguments for generate_epub main function
-    # Save original sys.argv and replace it
-    original_argv = sys.argv
-    try:
-        # Build new argv for generate_epub
-        new_argv = ['generate_epub.py', '-c', args.config]
-        if args.input:
-            new_argv.extend(['-i', args.input])
-        if args.translated:
-            new_argv.append('--translated')
-        if args.zip:
-            new_argv.append('--zip')
-        if args.relevel:
-            new_argv.append('--relevel')
-        if args.global_footnotes:
-            new_argv.append('--global-footnotes')
-        
-        sys.argv = new_argv
-        
-        # Call the main function
-        if args.translated:
-            logger.info("Generating translated EPUB...")
-        else:
-            logger.info("Generating EPUB...")
-        generate_epub_main()
-        
-        return 0
-    except Exception as e:
-        logger.error(f"EPUB generation failed: {e}")
-        return 1
-    finally:
-        # Restore original argv
-        sys.argv = original_argv
 
 
 def build_epub_command(args):
@@ -1215,36 +1008,6 @@ def translate_command(args):
     return translate_v2_command(args)
 
 
-def patch_paper_command(args):
-    """Execute the patch-paper command."""
-    from .patch_paper_structure import patch_paper_structure
-    from .utils.common import load_config
-
-    # Load config to get book title
-    config = load_config(args.config)
-    book_title = config.get("title")
-
-    if not book_title:
-        logger.error("No book title found in config.yaml")
-        return 1
-
-    # Configure file logging
-    configure_logging(book_title, "patch-paper")
-
-    logger.info(f"Patching structure for: {book_title}")
-
-    success = patch_paper_structure(
-        book_title=book_title,
-        chapter_name=args.chapter_name,
-        preserve_toc=not args.no_preserve_toc
-    )
-
-    if success:
-        logger.success("Structure patched successfully!")
-        logger.info("You can now run 'pdf2epub ocr' to process the document as a single chapter")
-
-    return 0 if success else 1
-
 
 def cancel_batch_command(args):
     """Cancel active batch jobs."""
@@ -1283,15 +1046,9 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
   pdf2epub translate-html -i mybook.epub --limit 5
   pdf2epub build-html-epub
 
-===============================================================================
-⚠️  DEPRECATED WORKFLOW / 已弃用工作流 (still works, but not recommended):
-===============================================================================
-
-  # Legacy pipeline (uses book_structure.json):
-  pdf2epub breakdown -i mybook.pdf   # [DEPRECATED]
-  pdf2epub ocr                       # [DEPRECATED]
-  pdf2epub polish
-  pdf2epub epub                      # [DEPRECATED]
+  # Novel Translation (text mode for light novels):
+  pdf2epub translate-novel -i mybook.epub     # Translate with glossary
+  pdf2epub build-novel-epub                   # Rebuild EPUB from translations
 
 ===============================================================================
         """
@@ -1306,28 +1063,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
     subparsers.required = True
     
     # Breakdown subcommand (DEPRECATED)
-    breakdown_parser = subparsers.add_parser(
-        "breakdown",
-        help="[DEPRECATED] Analyze PDF structure (use ocr-pages → refine instead)",
-        description="⚠️ DEPRECATED: This command is part of the legacy workflow. Use 'ocr-pages' + 'refine' instead."
-    )
-    breakdown_parser.add_argument(
-        "-i", "--input",
-        required=True,
-        help="Path to input PDF file"
-    )
-    breakdown_parser.add_argument(
-        "--dpi",
-        type=int,
-        default=150,
-        help="DPI for PDF compression (default: 150)"
-    )
-    breakdown_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force reprocessing even if files exist"
-    )
-    breakdown_parser.set_defaults(func=breakdown_command)
 
     # OCR Pages subcommand (new workflow)
     ocr_pages_parser = subparsers.add_parser(
@@ -1361,24 +1096,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Number of parallel OCR workers (default: from config or 5)"
     )
     ocr_pages_parser.set_defaults(func=ocr_pages_command)
-
-    # OCR subcommand (DEPRECATED - legacy chapter-based workflow)
-    ocr_parser = subparsers.add_parser(
-        "ocr",
-        help="[DEPRECATED] Chapter-based OCR (use ocr-pages → refine instead)",
-        description="⚠️ DEPRECATED: This command is part of the legacy workflow. Use 'ocr-pages' + 'refine' instead."
-    )
-    ocr_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from previous progress"
-    )
-    ocr_parser.add_argument(
-        "--aggregate-only",
-        action="store_true",
-        help="Only aggregate existing pages into chapters (skip OCR)"
-    )
-    ocr_parser.set_defaults(func=ocr_command)
 
     # Refine subcommand (refined breakdown with boundary verification)
     refine_parser = subparsers.add_parser(
@@ -1519,36 +1236,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
     entity_parser.set_defaults(func=extract_entities_command)
     
     # EPUB generation subcommand (DEPRECATED)
-    epub_parser = subparsers.add_parser(
-        "epub",
-        help="[DEPRECATED] Generate EPUB (use build-epub instead)",
-        description="⚠️ DEPRECATED: This command is part of the legacy workflow. Use 'build-epub' instead."
-    )
-    epub_parser.add_argument(
-        "-i", "--input",
-        help="Path to PDF file for cover extraction (optional)"
-    )
-    epub_parser.add_argument(
-        "--translated",
-        action="store_true",
-        help="Generate EPUB from translated markdown instead of polished"
-    )
-    epub_parser.add_argument(
-        "--zip",
-        action="store_true",
-        help="Create password-protected ZIP file after EPUB generation"
-    )
-    epub_parser.add_argument(
-        "--relevel",
-        action="store_true",
-        help="Use LLM to analyze and re-level the book structure (adjust heading hierarchy)"
-    )
-    epub_parser.add_argument(
-        "--global-footnotes",
-        action="store_true",
-        help="Force global footnotes (use last definition, ignore previous definitions)"
-    )
-    epub_parser.set_defaults(func=epub_command)
 
     # Build EPUB subcommand (toc_tree.json driven - new approach)
     build_epub_parser = subparsers.add_parser(
@@ -1697,21 +1384,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
     build_novel_epub_parser.set_defaults(func=build_novel_epub_command)
 
     # Patch paper structure subcommand
-    patch_parser = subparsers.add_parser(
-        "patch-paper",
-        help="Patch book structure for academic papers (single chapter mode)",
-        description="Modify book_structure.json to treat entire document as one chapter"
-    )
-    patch_parser.add_argument(
-        "--chapter-name",
-        help="Name for the single chapter (default: use document title)"
-    )
-    patch_parser.add_argument(
-        "--no-preserve-toc",
-        action="store_true",
-        help="Don't preserve original TOC entries as metadata"
-    )
-    patch_parser.set_defaults(func=patch_paper_command)
 
     # Cancel batch subcommand
     cancel_batch_parser = subparsers.add_parser(

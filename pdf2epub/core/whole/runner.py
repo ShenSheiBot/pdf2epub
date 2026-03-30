@@ -5,7 +5,6 @@ The core primitive: generate → agent inspects → Decision(continue/complete).
 """
 
 import asyncio
-import hashlib
 import json
 import re
 import shutil

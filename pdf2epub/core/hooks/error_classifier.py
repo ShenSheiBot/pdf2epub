@@ -2,7 +2,6 @@
 Error classifier - categorizes errors and determines their effects on unit state.
 """
 
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Literal, Optional, Protocol, runtime_checkable

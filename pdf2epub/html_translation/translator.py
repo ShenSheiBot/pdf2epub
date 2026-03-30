@@ -11,7 +11,6 @@ Supports two modes:
 
 import re
 import json
-import time
 from typing import Dict, Optional, Tuple, List, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed

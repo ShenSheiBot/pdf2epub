@@ -290,11 +290,17 @@ class LLMClient:
         client = self._get_client(provider)
         if client is None or not isinstance(client, GeminiClient):
             return None
-        try:
-            return client.embed_content(texts, model=model)
-        except Exception as e:
-            logger.warning(f"Embedding failed: {e}")
-            return None
+        import time
+        for attempt in range(2):
+            try:
+                return client.embed_content(texts, model=model)
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"Embedding failed (retrying in 5s): {e}")
+                    time.sleep(5)
+                else:
+                    logger.warning(f"Embedding failed (giving up): {e}")
+                    return None
 
     def generate(
         self,

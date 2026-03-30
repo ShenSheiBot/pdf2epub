@@ -294,7 +294,11 @@ def translate_remaining(
             f"{'FALLBACK' if is_fallback else 'OK'}"
         )
 
-    assembled = "\n".join(chunk_translations)
+    # Strip empty lines from each chunk before joining (DeepSeek adds blank lines between paragraphs)
+    cleaned = []
+    for ct in chunk_translations:
+        cleaned.append("\n".join(l for l in ct.splitlines() if l.strip()))
+    assembled = "\n".join(cleaned)
     logger.info(
         f"  Chunked translator complete: {len(chunks)} chunks, "
         f"{hallucination_count} failures"

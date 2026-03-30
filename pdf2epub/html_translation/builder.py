@@ -329,7 +329,12 @@ class HTMLEpubBuilder:
             return
 
         try:
-            # Parse with namespace handling
+            # Register namespaces to preserve original prefixes on write
+            ET.register_namespace('', 'http://www.idpf.org/2007/opf')
+            ET.register_namespace('dc', 'http://purl.org/dc/elements/1.1/')
+            ET.register_namespace('dcterms', 'http://purl.org/dc/terms/')
+            ET.register_namespace('opf', 'http://www.idpf.org/2002/opf')
+
             tree = ET.parse(opf_path)
             root = tree.getroot()
 
@@ -511,6 +516,7 @@ class HTMLEpubBuilder:
             return None
 
         try:
+            ET.register_namespace('', 'http://www.daisy.org/z3986/2005/ncx/')
             tree = ET.parse(ncx_path)
             root = tree.getroot()
 

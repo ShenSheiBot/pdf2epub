@@ -1,0 +1,37 @@
+{
+  "passed": true,
+  "issues": [
+    {
+      "id": "issue-1",
+      "severity": "suggestion",
+      "category": "edge-case",
+      "description": "`--limit` rebuild only converts/translates files that are present in `translated_novel` and HTMLEpubBuilder only replaces matching XHTML names. This yields mixed output by design (untranslated files remain original), so behavior is coherent. Keep in mind stale translated files in output directories can leak across reruns with different limits.",
+      "file": "pdf2epub/cli.py",
+      "line": 823,
+      "suggestion": "Optionally clear or namespace `translated_novel` / `translated_xhtml` between different limit runs to prevent stale-file carryover.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-2",
+      "severity": "suggestion",
+      "category": "suggestion",
+      "description": "Full-line image placeholders are rendered as `<div class=\"illustration\"><img .../></div>`. This is not a structural failure because `<img>` is preserved; it is a presentation choice consistent with the previous builder style and avoids bare image rows.",
+      "file": "pdf2epub/cli.py",
+      "line": 956,
+      "suggestion": "Keep or change to bare `<img>` only if you need strict conformance to the older textual contract; current output remains valid and style-ready.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-3",
+      "severity": "suggestion",
+      "category": "edge-case",
+      "description": "TOC title mapping and XHTML replacement use basename-based matching, matching HTMLEpubBuilder behavior used by this pipeline. This is a known limitation for pathological EPUBs with duplicate basenames but not introduced by v3 changes.",
+      "file": "pdf2epub/cli.py",
+      "line": 873,
+      "suggestion": "Document the limitation and consider a full-path-safe mapping only if cross-folder duplicate basenames appear in real inputs.",
+      "rebuttal_status": "accepted"
+    }
+  ],
+  "summary": "After re-review, the previous warnings are accepted as intentional/legacy-compatible behavior for this implementation: mixed rebuild with --limit is by design, image lines use a styled wrapper around the required `<img>`, and basename-based matching is shared with HTMLEpubBuilder and not a v3-specific regression. No remaining blocking warnings or criticals were identified.",
+  "session": "ses_2e30f7532ffe0VHJd2mPy0vd3N"
+}

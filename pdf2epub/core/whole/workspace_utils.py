@@ -8,10 +8,35 @@ WORKSPACE_UTILS_CODE = '''\
 """Pre-built utilities for agent scripts. Usage: from _utils import ..."""
 import re
 import json
+import pathlib as _pathlib
+
+
+def _resolve_path(rel_path):
+    """Resolve a relative path that may reference originals/ or workspace/.
+    Works whether cwd is work_dir or workspace/."""
+    p = _pathlib.Path(rel_path)
+    if p.exists():
+        return str(p)
+    # Try from parent (if we're in workspace/)
+    parent = _pathlib.Path.cwd().parent / rel_path
+    if parent.exists():
+        return str(parent)
+    return str(p)  # return as-is, let caller handle the error
+
+
+def originals_path(filename=''):
+    """Get the path to a file in originals/. Works from any cwd."""
+    return _resolve_path(_pathlib.Path('originals') / filename if filename else 'originals')
+
+
+def workspace_path(filename=''):
+    """Get the path to a file in workspace/. Works from any cwd."""
+    return _resolve_path(_pathlib.Path('workspace') / filename if filename else 'workspace')
 
 
 def extract_divs(file_path):
     """Extract <div> contents from LLM output file. Returns list of lines."""
+    file_path = _resolve_path(file_path)
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
     # Strip markdown code fences
@@ -27,6 +52,7 @@ def extract_divs(file_path):
 
 def load_source_lines(path='originals/source.txt'):
     """Load source lines (non-empty) from file."""
+    path = _resolve_path(path)
     with open(path, 'r', encoding='utf-8') as f:
         return [l for l in f.read().splitlines() if l.strip()]
 
@@ -96,6 +122,7 @@ def merge_originals(originals_dir='originals'):
     """Extract and merge all translation outputs (raw + continuations).
     Returns list of translated lines."""
     import os
+    originals_dir = _resolve_path(originals_dir)
     all_lines = extract_divs(f'{originals_dir}/raw_output.txt')
 
     # Find continuation files

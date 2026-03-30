@@ -1,0 +1,155 @@
+{
+  "passed": false,
+  "issues": [
+    {
+      "id": "issue-1",
+      "severity": "critical",
+      "category": "bug",
+      "description": "PARTIALLY_SUCCEEDED state not handled in executor polling loop. The executor's polling loop (executor.py:744-769) only checked for SUCCEEDED, FAILED, CANCELLED, and EXPIRED.",
+      "file": "pdf2epub/core/executor/executor.py",
+      "line": 754,
+      "suggestion": "Add PARTIALLY_SUCCEEDED to the SUCCEEDED branch in the polling loop.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-2",
+      "severity": "critical",
+      "category": "bug",
+      "description": "Line-order key correlation breaks on resume. VertexBatchClient stored submitted key orders in self._job_keys (an in-memory dict). On resume, a fresh VertexBatchClient was instantiated with empty _job_keys.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 512,
+      "suggestion": "Persist _job_keys to disk alongside the MegaUnitState.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-3",
+      "severity": "warning",
+      "category": "test-gap",
+      "description": "No VertexBatchClient unit tests exist. There are zero tests for the VertexBatchClient class — no tests for client initialization, GCS bucket auto-creation, JSONL serialization (Vertex format), key correlation in get_results(), error handling for GCS failures, PARTIALLY_SUCCEEDED handling, or _cleanup_gcs. The existing FakeBatchClient has no Vertex-specific capabilities.",
+      "file": "tests/",
+      "suggestion": "Add comprehensive VertexBatchClient tests covering initialization, JSONL format, key correlation, GCS mocking, PARTIALLY_SUCCEEDED, and cleanup.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-4",
+      "severity": "warning",
+      "category": "test-gap",
+      "description": "No factory routing tests for Vertex provider. _create_batch_client_from_config() has Vertex-specific routing logic (factory_v2.py:407-425) but no tests verify provider=='vertex' creates VertexBatchClient, provider=='gemini' still creates GeminiBatchClient, or missing vertex config returns None.",
+      "file": "tests/test_factories.py",
+      "suggestion": "Add parameterized tests for _create_batch_client_from_config() covering vertex and gemini paths.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-5",
+      "severity": "warning",
+      "category": "bug",
+      "description": "cancel_batch --all missed QUEUED state for Vertex jobs.",
+      "file": "pdf2epub/commands/cancel_batch.py",
+      "line": 94,
+      "suggestion": "Add BatchJobState.QUEUED and BatchJobState.CANCELLING to the cancellable states set.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-6",
+      "severity": "warning",
+      "category": "edge-case",
+      "description": "User-specified bucket is not validated at initialization time. When the user provides a bucket name in config, _ensure_bucket() only runs during submit(), not during __init__(). If the bucket doesn't exist or user lacks permissions, the error surfaces mid-batch-submission after prompts have been built for hundreds of units.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 496,
+      "suggestion": "Add a bucket validation call in __init__ or provide a validate() method called by the factory.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-7",
+      "severity": "suggestion",
+      "category": "edge-case",
+      "description": "No bucket location mismatch detection. If the user specifies a bucket in 'us-east1' but location is 'us-central1', cross-region data transfer occurs silently.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 549,
+      "suggestion": "When user provides a bucket, check bucket.location against self.location and log a warning if they differ.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-8",
+      "severity": "suggestion",
+      "category": "edge-case",
+      "description": "GCS API not-enabled error not handled distinctly. The _ensure_bucket() handles 409 and 403 specifically, but doesn't handle the case where storage.googleapis.com API is not enabled, which falls through to generic raise.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 565,
+      "suggestion": "Add a check for 'API not enabled' in the error message and provide a specific error telling the user to enable the Cloud Storage API.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-9",
+      "severity": "warning",
+      "category": "edge-case",
+      "description": "ADC failure does not produce a clear, actionable error message. _get_client() now wraps genai.Client with helpful messaging. However, _get_storage_client() at line 545 still creates storage.Client() without wrapping ADC errors, so if the genai client succeeds but the GCS client fails on ADC, the error is still opaque.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 545,
+      "suggestion": "Wrap storage.Client() in the same try/except pattern used for _get_client() to catch DefaultCredentialsError.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-10",
+      "severity": "warning",
+      "category": "edge-case",
+      "description": "JSON parse errors in GCS result files previously aborted the entire result set.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 749,
+      "suggestion": "Wrap JSON parsing in per-line try/except, treating parse failures as individual unit errors.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-11",
+      "severity": "suggestion",
+      "category": "edge-case",
+      "description": "Model name format difference between Gemini and Vertex not documented in code.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 643,
+      "suggestion": "Add a comment explaining the Vertex SDK auto-adds 'models/' prefix.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-12",
+      "severity": "suggestion",
+      "category": "edge-case",
+      "description": "QUEUED and CANCELLING states not classified in any 'active' states set for consistent state classification across components.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 109,
+      "suggestion": "Consider adding an ACTIVE_STATES set to batch client interface.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-13",
+      "severity": "suggestion",
+      "category": "refactor-needed",
+      "description": "Executor hardcoded batch terminal states instead of using client.COMPLETED_STATES.",
+      "file": "pdf2epub/core/executor/executor.py",
+      "line": 754,
+      "suggestion": "Use self._batch_client.COMPLETED_STATES instead of hardcoded states.",
+      "rebuttal_status": "accepted"
+    },
+    {
+      "id": "issue-14",
+      "severity": "suggestion",
+      "category": "test-gap",
+      "description": "FakeBatchClient doesn't support Vertex-specific states (QUEUED, PARTIALLY_SUCCEEDED, CANCELLING). No existing tests exercise these states through the executor.",
+      "file": "tests/fixtures/fake_batch.py",
+      "line": 81,
+      "suggestion": "Add tests using FakeBatchJobConfig with QUEUED and PARTIALLY_SUCCEEDED states.",
+      "rebuttal_status": "new"
+    },
+    {
+      "id": "issue-15",
+      "severity": "suggestion",
+      "category": "missing-feature",
+      "description": "No logging of GCS download URI when retrieving results.",
+      "file": "pdf2epub/utils/batch_utils.py",
+      "line": 742,
+      "suggestion": "Add logger.info with download URI before the download loop.",
+      "rebuttal_status": "accepted"
+    }
+  ],
+  "summary": "Both critical issues (issue-1: PARTIALLY_SUCCEEDED infinite loop, issue-2: resume key correlation) have been properly fixed and verified in code. The executor now uses client.COMPLETED_STATES dynamically (issue-13), and MegaUnitState persists processing_keys for Vertex line-order correlation across resume. Issue 5 (cancel_batch QUEUED) is fixed. Issue 9 (ADC error) is partially fixed — _get_client() now wraps with helpful message but _get_storage_client() still doesn't (downgraded from critical concern since genai client typically fails first). Issue 10 (JSON parse per-line) and issue 15 (download logging) are fixed. Issue 11 (model name comment) is fixed. All 28 existing batch tests pass without modification, no new regressions introduced. Remaining open warnings are: issue-3 and issue-4 (no Vertex-specific tests or factory routing tests — these are test gaps, not runtime bugs), issue-6 (bucket validation at init time — edge case), and the partial issue-9 coverage. Remaining suggestions (issues 7, 8, 12, 14) are minor edge cases and test improvements. Verdict remains FAIL due to the 2 outstanding warning-level test gaps (issue-3, issue-4) and 1 remaining edge-case warning (issue-6) — the lack of ANY Vertex-specific tests means the implementation is untested beyond code review, which is a meaningful risk for a new provider integration.",
+  "session": "ses_31acd3011ffeOGHRD1aBf1jxZI"
+}

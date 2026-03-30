@@ -1,0 +1,52 @@
+# Audit Report: PASSED
+
+## Verified Items
+
+### Environment Preconditions
+- pdf2epub/core/whole/ exists with all required files (__init__.py, runner.py, sandbox.py, tools.py, prompts/)
+- prompts/ contains only __init__.py and json_refine.py (no Phase 2 files)
+- git diff shows only adaptive_pdf_call.py was modified
+- agent_verifier.py is unmodified
+
+### Part 1: User Scenarios (All Pass)
+- Scenario 1 (valid JSON): complete action exits immediately, no second generate_fn call
+- Scenario 2 (truncated JSON): continue path correctly saves continuation_NNN.txt and calls generate_fn(prefix=...)
+- Scenario 3 (overlapping content): prompt explicitly instructs comparing title AND start_page, removing duplicates from continuation side
+- Scenario 4 (garbage prefix): prompt explicitly lists 接上文, "Continuing from above:", etc. and instructs stripping before first { or [
+- Scenario 5 (hallucination): prompt checks page number jumps by hundreds and title language/style breaks
+- Scenario 6 (max_continuations): AgentLoopExhausted raised and not silently caught, try/finally cleans up temp dir
+- Scenario 7 (bash timeout): 30s timeout set, TimeoutExpired caught and returned as error string
+- Scenario 8 (write to originals/): _check_writable enforces workspace/ path allowlist at tool level (no chmod)
+
+### Part 2: Integration Correctness (All Pass)
+- I-1: response_mime_type="application/json" only in merge_results() (multi-batch merge), NOT in agent loop path
+- I-2: Agent loop replaces only inner json_retry loop; outer validation loop with validate_batch_result, _filter_edge_issues, build_repair_prompt intact
+- I-3: _build_generate_fn constructs proper 3-message multi-turn Content list (not concatenated string)
+- I-4: Fresh agent.run() created inside while loop each round, no message_history carryover
+
+### Part 3: Code Structure (All Pass)
+- S-1: All required files exist and are non-empty
+- S-2: Decision has exactly action: Literal["continue","complete"] and file_path: str (both required, no extras)
+- S-3: All six tools implemented with correct signatures and path enforcement
+- S-4: STDOUT_MAX_BYTES = 32 * 1024 = 32768, truncation message present
+- S-5: _get_agent_model() reads refine.verification.provider/model from config
+- S-6: agent_request_limit read from config with default 100, passed to run_agent_loop_sync
+
+### Part 4: Existing Code Not Broken (All Pass)
+- R-1: agent_verifier.py unmodified (empty diff)
+- R-2: Outer validation loop fully preserved
+- R-3: try/finally cleans temp dir on all exit paths; own_work_dir guard prevents deleting caller-provided dirs
+- R-4: Old json_retry loop fully removed (no dead code)
+
+### Part 5: Grep Checks (All Pass)
+- G-1: response_mime_type guarded to merge path only
+- G-2: AgentLoopExhausted defined in runner.py, imported in __init__.py and adaptive_pdf_call.py
+- G-3: timeout= appears only once in sandbox.py
+- G-4: No subprocess in tools.py (goes through sandbox exclusively)
+- G-5: No chmod in pdf2epub/core/whole/
+- G-6: prompts/ has only __init__.py and json_refine.py
+- G-7: continuation_NNN.txt naming consistent between runner.py and json_refine.py
+- G-8: No test files exist for new code (check not applicable)
+
+## Summary
+All 4 parts of the audit passed. The implementation correctly implements the agent-assisted generation loop with proper continuation support, sandbox protection, config-driven model loading, and cleanup on all exit paths. The integration with adaptive_pdf_call.py is correct — the agent loop replaces only the inner json_retry loop while the outer validation loop remains intact, and response_mime_type is not applied to the agent loop path.

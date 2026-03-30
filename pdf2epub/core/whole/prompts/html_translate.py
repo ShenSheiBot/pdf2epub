@@ -27,7 +27,6 @@ If the translated output has wrong line count or corrupted tag structure, decomp
 - `originals/raw_output.txt` — LLM's raw translation output (read-only)
 - `originals/continuation_NNN.txt` — continuation outputs if any (read-only)
 - `originals/source.txt` — original compressed content before translation (read-only, your ground truth)
-- `originals/mapping.json` — compression mapping with unit types and inner_attr_map (read-only)
 - `workspace/` — your writable work area
 
 ## Your task

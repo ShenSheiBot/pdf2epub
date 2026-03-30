@@ -82,6 +82,18 @@ def _save_agent_trace(result, round_num: int, workspace_dir: Path) -> None:
         logger.warning(f"[agent-loop] Failed to save agent trace: {e}")
 
 
+def _save_agent_trace_from_messages(messages, round_num: int, workspace_dir: Path) -> None:
+    """Save agent trace from a messages list (used when agent crashes before producing a result)."""
+    try:
+        from pydantic_ai.messages import ModelMessagesTypeAdapter
+        trace_bytes = ModelMessagesTypeAdapter.dump_json(messages)
+        trace_path = workspace_dir / f"agent_trace_round_{round_num:03d}.json"
+        trace_path.write_bytes(trace_bytes)
+        logger.debug(f"[agent-loop] Saved crash trace: {trace_path.name} ({len(trace_bytes)} bytes)")
+    except Exception as e:
+        logger.warning(f"[agent-loop] Failed to save crash trace: {e}")
+
+
 def _extract_tool_stats(result) -> dict:
     """Extract tool call statistics from an agent run result. Returns structured dict."""
     from collections import Counter
@@ -302,6 +314,9 @@ async def run_agent_loop(
     content_validator: Optional[ContentValidator] = _validate_json_content,
     extra_originals: Optional[dict[str, str]] = None,
     user_instructions: Optional[str] = None,
+    workspace_utils_code: Optional[str] = None,
+    prefill_fn: Optional[Callable[[Path, Path], list]] = None,
+    pre_continue_check: Optional[Callable[[str, Path], None]] = None,
 ) -> str:
     """
     Universal agent-assisted generation loop.
@@ -344,16 +359,31 @@ async def run_agent_loop(
     workspace_dir = work_dir / "workspace"
 
     try:
+        # Clean up residual files from previous runs when using a fixed work_dir
+        if not own_work_dir:
+            for subdir in (originals_dir, workspace_dir):
+                if subdir.exists():
+                    for f in subdir.iterdir():
+                        if f.is_file() and not f.name.startswith("_agent"):
+                            f.unlink()
         originals_dir.mkdir(parents=True, exist_ok=True)
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write pre-built utilities to workspace
-        from .workspace_utils import WORKSPACE_UTILS_CODE
-        (workspace_dir / "_utils.py").write_text(WORKSPACE_UTILS_CODE, encoding="utf-8")
+        # Write pre-built utilities to work_dir root (cwd for agent bash)
+        # Also write to workspace/ for backward compatibility with existing HTML agents
+        if workspace_utils_code:
+            (work_dir / "_utils.py").write_text(workspace_utils_code, encoding="utf-8")
+            (workspace_dir / "_utils.py").write_text(workspace_utils_code, encoding="utf-8")
+        else:
+            from .workspace_utils import WORKSPACE_UTILS_CODE
+            (work_dir / "_utils.py").write_text(WORKSPACE_UTILS_CODE, encoding="utf-8")
+            (workspace_dir / "_utils.py").write_text(WORKSPACE_UTILS_CODE, encoding="utf-8")
 
         # Write extra reference files into originals/
         if extra_originals:
             for fname, fcontent in extra_originals.items():
+                if fcontent and not fcontent.endswith("\n"):
+                    fcontent += "\n"
                 (originals_dir / fname).write_text(fcontent, encoding="utf-8")
                 logger.debug(f"[agent-loop] Wrote extra original: {fname}")
 
@@ -365,6 +395,8 @@ async def run_agent_loop(
         # Strip markdown fences and BOM before saving
         raw_output = _strip_fences_and_bom(raw_output)
         raw_output_path = originals_dir / "raw_output.txt"
+        if raw_output and not raw_output.endswith("\n"):
+            raw_output += "\n"
         raw_output_path.write_text(raw_output, encoding="utf-8")
         logger.info(
             f"[agent-loop] Initial output: {len(raw_output)} chars → {raw_output_path.name}"
@@ -374,21 +406,57 @@ async def run_agent_loop(
         sandbox = Sandbox(work_dir)
         continuation_count = 0
         empty_continuation_streak = 0
+        _pre_continue_error = None
 
         while True:
             # Create a fresh agent each round (with output validator)
             agent = _create_agent(system_prompt, agent_model, sandbox, content_validator)
             register_tools(agent, sandbox)
 
-            # Build user prompt: instructions (if any) + directory listing
+            # Build user prompt: instructions + environment info + directory listing
             originals_files = sorted(originals_dir.iterdir())
             orig_list = "\n".join(f"  - {f.name}" for f in originals_files)
             workspace_files = sorted(f for f in workspace_dir.iterdir() if not f.name.startswith("_agent"))
             ws_list = "\n".join(f"  - {f.name}" for f in workspace_files) if workspace_files else "  (empty)"
+
+            # Pre-compute file sizes so agent doesn't need to run wc -l
+            file_sizes = []
+            raw_lines = 0
+            cont_lines = 0
+            translated_lines = 0
+            source_lines = 0
+            for f in sorted(originals_dir.iterdir()):
+                if f.is_file() and f.suffix in ('.txt', '.md'):
+                    n = sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.strip())
+                    file_sizes.append(f"  originals/{f.name}: {n} lines")
+                    if f.name == "raw_output.txt":
+                        raw_lines = n
+                    elif f.name.startswith("continuation_"):
+                        cont_lines += n
+                    elif f.name == "source.txt":
+                        source_lines = n
+            for f in sorted(workspace_dir.iterdir()):
+                if f.is_file() and not f.name.startswith("_") and f.suffix in ('.txt', '.md'):
+                    n = sum(1 for line in f.read_text(encoding="utf-8").splitlines() if line.strip())
+                    file_sizes.append(f"  workspace/{f.name}: {n} lines")
+                    if f.name == "translated.txt":
+                        translated_lines = n
+            size_info = "\n".join(file_sizes) if file_sizes else "  (no text files)"
+
+            # Predict post-merge line count
+            if translated_lines > 0 and cont_lines > 0:
+                merge_note = f"\nAfter merging continuation, translated.txt will have ~{translated_lines + cont_lines} lines (source has {source_lines})."
+            elif translated_lines == 0 and raw_lines > 0:
+                merge_note = f"\nAfter merging raw_output, translated.txt will have ~{raw_lines} lines (source has {source_lines})."
+            else:
+                merge_note = ""
+
             dir_listing = (
-                f"Work directory contents:\n"
+                f"Working directory: {work_dir}\n\n"
+                f"File listing:\n"
                 f"originals/:\n{orig_list}\n"
                 f"workspace/:\n{ws_list}\n\n"
+                f"Line counts:\n{size_info}{merge_note}\n\n"
                 f"Inspect the files and produce your decision."
             )
             if user_instructions:
@@ -396,11 +464,27 @@ async def run_agent_loop(
             else:
                 user_prompt = dir_listing
 
+            # Append error from previous pre-continue check if any
+            if _pre_continue_error:
+                user_prompt += (
+                    f"\n\nERROR from previous round: {_pre_continue_error}\n"
+                    f"Fix the issue in workspace/ before continuing."
+                )
+                _pre_continue_error = None
+
             round_num = continuation_count + 1
             logger.info(
                 f"[agent-loop] Running agent (round {round_num}, "
                 f"request_limit={request_limit})..."
             )
+
+            # Build prefill message history if provided
+            prefill_history = None
+            if prefill_fn:
+                try:
+                    prefill_history = prefill_fn(originals_dir, workspace_dir)
+                except Exception as e:
+                    logger.warning(f"[agent-loop] prefill_fn failed: {e}")
 
             round_start = time.perf_counter()
             result = None
@@ -408,23 +492,31 @@ async def run_agent_loop(
             last_agent_err = None
             for attempt in range(_AGENT_RUN_MAX_RETRIES):
                 try:
-                    result = await agent.run(
+                    async with agent.iter(
                         user_prompt,
+                        message_history=prefill_history,
                         usage_limits=UsageLimits(
                             request_limit=request_limit,
                         ),
                         model_settings={
-                            # Anthropic prompt caching — use 1h TTL to match
-                            # CachedAnthropicModel's intermediate breakpoints
                             "anthropic_cache_instructions": "1h",
                             "anthropic_cache_tool_definitions": "1h",
                             "anthropic_cache_messages": "1h",
                         },
-                    )
+                    ) as agent_run:
+                        async for _node in agent_run:
+                            pass
+                        result = agent_run.result
                     last_agent_err = None
                     break
                 except Exception as agent_err:
                     last_agent_err = agent_err
+                    # Always save trace on error — this is the most important time to have it
+                    round_dur = time.perf_counter() - round_start
+                    if 'agent_run' in locals():
+                        _save_agent_trace_from_messages(
+                            agent_run.all_messages(), round_num, workspace_dir
+                        )
                     if _is_transient_agent_error(agent_err) and attempt < _AGENT_RUN_MAX_RETRIES - 1:
                         wait = 2 ** attempt
                         logger.warning(
@@ -434,14 +526,10 @@ async def run_agent_loop(
                             f"Retrying in {wait}s..."
                         )
                         await asyncio.sleep(wait)
-                        # Recreate agent (fresh state) for retry
                         agent = _create_agent(system_prompt, agent_model, sandbox, content_validator)
                         register_tools(agent, sandbox)
                         continue
                     else:
-                        round_dur = time.perf_counter() - round_start
-                        if result is not None:
-                            _save_agent_trace(result, round_num, workspace_dir)
                         _save_round_metrics(
                             workspace_dir, round_num, round_dur,
                             status="error", decision_action=None, decision_file=None,
@@ -500,12 +588,27 @@ async def run_agent_loop(
                         f"(max: {max_continuations}). Giving up."
                     )
 
+                # Clean up previous continuation files so agent starts fresh
+                for old_cont in sorted(originals_dir.glob("continuation_*.txt")):
+                    old_cont.unlink()
+                    logger.debug(f"[agent-loop] Removed stale continuation: {old_cont.name}")
+
                 # Read the prefix file
                 prefix = resolved_path.read_text(encoding="utf-8")
                 logger.info(
                     f"[agent-loop] Continuation {continuation_count}/{max_continuations}: "
                     f"prefix={len(prefix)} chars"
                 )
+
+                # Pre-continue check (if provided)
+                if pre_continue_check:
+                    try:
+                        pre_continue_check(prefix, originals_dir / "source.txt")
+                    except ValueError as e:
+                        logger.warning(f"[agent-loop] Pre-continue check failed: {e}")
+                        _pre_continue_error = str(e)
+                        continuation_count -= 1
+                        continue
 
                 # Call generate_fn with prefix for continuation
                 continuation_output = generate_fn(prefix=prefix)
@@ -514,8 +617,10 @@ async def run_agent_loop(
                 # Strip markdown fences and BOM
                 continuation_output = _strip_fences_and_bom(continuation_output)
 
-                # Always write the artifact (even if empty) for observability
-                continuation_path = originals_dir / f"continuation_{continuation_count:03d}.txt"
+                # Always write as continuation_001.txt (previous ones were cleaned above)
+                continuation_path = originals_dir / "continuation_001.txt"
+                if continuation_output and not continuation_output.endswith("\n"):
+                    continuation_output += "\n"
                 continuation_path.write_text(continuation_output, encoding="utf-8")
 
                 if not continuation_output.strip():
@@ -617,6 +722,9 @@ def run_agent_loop_sync(
     content_validator: Optional[ContentValidator] = _validate_json_content,
     extra_originals: Optional[dict[str, str]] = None,
     user_instructions: Optional[str] = None,
+    workspace_utils_code: Optional[str] = None,
+    prefill_fn: Optional[Callable[[Path, Path], list]] = None,
+    pre_continue_check: Optional[Callable[[str, Path], None]] = None,
 ) -> str:
     """Synchronous wrapper for run_agent_loop."""
     try:
@@ -635,6 +743,9 @@ def run_agent_loop_sync(
         content_validator=content_validator,
         extra_originals=extra_originals,
         user_instructions=user_instructions,
+        workspace_utils_code=workspace_utils_code,
+        prefill_fn=prefill_fn,
+        pre_continue_check=pre_continue_check,
     )
 
     if loop and loop.is_running():

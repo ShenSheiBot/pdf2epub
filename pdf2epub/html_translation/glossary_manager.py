@@ -290,6 +290,55 @@ class GlossaryManager:
             encoding="utf-8",
         )
 
+    def rollback_chapter(self, chapter_id: str):
+        """Roll back all glossary changes made by a specific chapter.
+
+        For each entry where updated_by == chapter_id:
+        - If history is non-empty: restore the most recent history entry
+        - If history is empty: this chapter introduced the term — delete it
+
+        Also cleans up dedup_state confirmed_not_dup pairs referencing deleted keys.
+        Clears prev_chapter (will be re-populated after retranslation).
+        """
+        keys_to_delete = []
+        restored = 0
+
+        for key, entry in self.store.items():
+            if entry.get("updated_by") != chapter_id:
+                continue
+
+            history = entry.get("history", [])
+            if history:
+                # Restore previous version (most recent = last element)
+                prev = history.pop()
+                entry["description"] = prev["description"]
+                entry["updated_by"] = prev["updated_by"]
+                entry["timestamp"] = prev["timestamp"]
+                # Keep current aliases and zh_name (accumulated across chapters)
+                restored += 1
+            else:
+                # This chapter introduced the term — mark for deletion
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            del self.store[key]
+
+        # Clean up dedup_state: remove confirmed_not_dup pairs involving deleted keys
+        if keys_to_delete:
+            deleted_set = set(keys_to_delete)
+            old_pairs = self.dedup_state.get("confirmed_not_dup", [])
+            new_pairs = [p for p in old_pairs
+                         if not (p[0] in deleted_set or p[1] in deleted_set)]
+            if len(new_pairs) != len(old_pairs):
+                self.dedup_state["confirmed_not_dup"] = new_pairs
+
+        # Clear prev_chapter (stale after rollback, re-populated on retranslation)
+        self.prev_chapter = ""
+
+        self.save()
+        logger.info(f"Glossary rollback for {chapter_id}: "
+                     f"{len(keys_to_delete)} deleted, {restored} restored")
+
     def recall(self, source_text: str) -> str:
         """Recall relevant glossary entries for a chapter.
 

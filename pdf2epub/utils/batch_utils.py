@@ -587,11 +587,13 @@ class VertexBatchClient:
             return bucket_name
 
         try:
+            # GCS doesn't support "global" as location; default to US
+            gcs_location = self.location if self.location != "global" else "US"
             bucket = storage_client.create_bucket(
                 bucket_name,
-                location=self.location,
+                location=gcs_location,
             )
-            logger.info(f"Created GCS bucket: {bucket_name} (location={self.location})")
+            logger.info(f"Created GCS bucket: {bucket_name} (location={gcs_location})")
         except Exception as e:
             error_msg = str(e)
             if "409" in error_msg:

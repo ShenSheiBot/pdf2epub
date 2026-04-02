@@ -7,6 +7,7 @@ enabling asynchronous, high-throughput processing at 50% cost reduction.
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
@@ -28,6 +29,33 @@ BATCH_DEFAULTS = {
         "model": "gemini-3-pro-preview",
     },
 }
+
+
+def _write_batch_trace(provider: str, model: str, job_name: str,
+                       usage_metadata: dict, key: str, error: Optional[str] = None):
+    """Write a trace entry for a single batch response. Never raises."""
+    try:
+        from .network_utils import _write_trace
+    except ImportError:
+        return
+    _write_trace({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "operation": f"batch:{key}",
+        "provider": provider,
+        "model": model,
+        "batch_job": job_name,
+        "duration_ms": 0,  # not meaningful for individual batch responses
+        "input_tokens": usage_metadata.get("promptTokenCount", 0),
+        "output_tokens": usage_metadata.get("candidatesTokenCount", 0),
+        "cache_read_tokens": usage_metadata.get("cachedContentTokenCount", 0),
+        "cache_write_tokens": 0,
+        "thinking_tokens": usage_metadata.get("thoughtsTokenCount", 0),
+        "request_messages_preview": [],  # batch input already cleaned up
+        "response_preview": {"head": "", "length": 0},
+        "finish_reason": "batch",
+        "error": error,
+        "partial_response_length": 0,
+    })
 
 
 class BatchJobState(Enum):
@@ -410,6 +438,16 @@ class GeminiBatchClient:
                                 content = candidates[0].content
                                 if hasattr(content, 'parts') and content.parts:
                                     batch_resp.text = content.parts[0].text
+                        # Extract usage metadata for trace
+                        if hasattr(resp.response, 'usage_metadata'):
+                            um = resp.response.usage_metadata
+                            usage = {
+                                "promptTokenCount": getattr(um, 'prompt_token_count', 0) or 0,
+                                "candidatesTokenCount": getattr(um, 'candidates_token_count', 0) or 0,
+                                "thoughtsTokenCount": getattr(um, 'thoughts_token_count', 0) or 0,
+                                "cachedContentTokenCount": getattr(um, 'cached_content_token_count', 0) or 0,
+                            }
+                            _write_batch_trace("gemini", self.model, job_name, usage, batch_resp.key)
                     if hasattr(resp, 'error') and resp.error:
                         batch_resp.error = str(resp.error)
                     results.append(batch_resp)
@@ -437,6 +475,11 @@ class GeminiBatchClient:
                                         parts = candidates[0].get('content', {}).get('parts', [])
                                         if parts:
                                             batch_resp.text = parts[0].get('text', '')
+                                # Trace usage metadata
+                                usage = resp_data.get('usageMetadata', {})
+                                if usage:
+                                    _write_batch_trace("gemini", self.model, job_name, usage, batch_resp.key,
+                                                       error=data.get('error'))
                             elif isinstance(resp_data, str):
                                 batch_resp.text = resp_data
                         if 'error' in data:
@@ -798,14 +841,16 @@ class VertexBatchClient:
                 code = status.get('code', 0)
                 if code != 0:
                     batch_resp.error = status.get('message', f'Error code {code}')
+                    _write_batch_trace("vertex", self.model, job_name, {}, key, error=batch_resp.error)
                     results.append(batch_resp)
                     continue
             elif isinstance(status, str) and status and status.upper() != 'OK':
                 batch_resp.error = status
+                _write_batch_trace("vertex", self.model, job_name, {}, key, error=batch_resp.error)
                 results.append(batch_resp)
                 continue
 
-            # Extract response text
+            # Extract response text and usage metadata
             response = data.get('response', {})
             if isinstance(response, dict):
                 candidates = response.get('candidates', [])
@@ -813,6 +858,10 @@ class VertexBatchClient:
                     parts = candidates[0].get('content', {}).get('parts', [])
                     if parts:
                         batch_resp.text = parts[0].get('text', '')
+                # Trace usage metadata
+                usage = response.get('usageMetadata', {})
+                if usage:
+                    _write_batch_trace("vertex", self.model, job_name, usage, key)
             elif isinstance(response, str):
                 batch_resp.text = response
 

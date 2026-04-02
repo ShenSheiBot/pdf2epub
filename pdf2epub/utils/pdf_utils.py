@@ -238,20 +238,13 @@ def preprocess_pdf(input_pdf, output_dir):
         shutil.copy2(input_pdf, original_pdf)
         logger.info(f"Saved original PDF as: {original_pdf}")
 
-    # Add page number patches to create input.pdf
-    logger.info("Adding page number patches to PDF...")
-    patched_pdf = add_page_number_patches(original_pdf, processed_pdf)
+    # Get file size in MB (check original before adding stamps)
+    file_size_mb = original_pdf.stat().st_size / (1024 * 1024)
 
-    # If patching failed, use the original PDF
-    if patched_pdf != processed_pdf:
-        logger.warning("PDF patching failed, using original PDF without patches")
-        # Copy the original to processed_pdf location
-        shutil.copy2(original_pdf, processed_pdf)
-
-    # Get file size in MB
-    file_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
-
-    # If file size > 45MB, compress it
+    # Compress BEFORE adding stamps — stamp patches (white rectangles)
+    # distort Otsu binarization thresholds, causing JBIG2 to produce
+    # all-black pages on scanned PDFs.
+    source_for_stamps = original_pdf
     if file_size_mb > 45:
         logger.warning(f"PDF file size ({file_size_mb:.2f}MB) exceeds 45MB. Compressing...")
 
@@ -262,11 +255,11 @@ def preprocess_pdf(input_pdf, output_dir):
 
         logger.info("Attempting JBIG2 compression...")
         success, stats = rasterize_to_limit(
-            processed_pdf, temp_output, pages=None, target_mb=45.0
+            original_pdf, temp_output, pages=None, target_mb=45.0
         )
 
         if success:
-            shutil.move(str(temp_output), str(processed_pdf))
+            source_for_stamps = temp_output
             logger.info(
                 f"JBIG2 compressed: {stats['output_size_mb']:.2f}MB @ {stats['dpi']} DPI"
             )
@@ -275,13 +268,13 @@ def preprocess_pdf(input_pdf, output_dir):
             logger.warning("JBIG2 failed, falling back to binarized PNG at 120 DPI...")
             try:
                 success, stats = compress_pdf(
-                    str(processed_pdf),
+                    str(original_pdf),
                     str(temp_output),
                     dpi=120,
                 )
 
                 if success and stats["output_size_mb"] < file_size_mb:
-                    shutil.move(str(temp_output), str(processed_pdf))
+                    source_for_stamps = temp_output
                     logger.info(f"Binarized PNG compressed: {stats['output_size_mb']:.2f}MB")
                 else:
                     logger.warning("Binarized PNG compression did not help")
@@ -292,9 +285,23 @@ def preprocess_pdf(input_pdf, output_dir):
                 if temp_output.exists():
                     temp_output.unlink()
 
-        # Check final file size
-        final_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
-        if final_size_mb > 45:
-            logger.warning(f"PDF is still {final_size_mb:.2f}MB (larger than 45MB) after compression")
+    # Add page number patches AFTER compression
+    logger.info("Adding page number patches to PDF...")
+    patched_pdf = add_page_number_patches(source_for_stamps, processed_pdf)
+
+    # Clean up temp file if used
+    temp_output = output_dir / "compressed_temp.pdf"
+    if temp_output.exists() and temp_output != processed_pdf:
+        temp_output.unlink()
+
+    # If patching failed, use the source directly
+    if patched_pdf != processed_pdf:
+        logger.warning("PDF patching failed, using PDF without patches")
+        shutil.copy2(source_for_stamps, processed_pdf)
+
+    # Check final file size
+    final_size_mb = processed_pdf.stat().st_size / (1024 * 1024)
+    if final_size_mb > 45:
+        logger.warning(f"PDF is still {final_size_mb:.2f}MB (larger than 45MB) after compression")
 
     return processed_pdf

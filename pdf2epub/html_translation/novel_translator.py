@@ -260,7 +260,7 @@ class NovelTranslator:
         }
 
         import time as _time
-        from pdf2epub.utils.network_utils import _write_trace, _preview_messages, _preview_text, _max_content_chars
+        from pdf2epub.utils.network_utils import _write_trace
 
         _trace_start = _time.monotonic()
         _trace_error = None
@@ -348,8 +348,8 @@ class NovelTranslator:
                 "output_tokens": _usage.get("output_tokens", 0),
                 "cache_read_tokens": _usage.get("cache_read_input_tokens", 0),
                 "cache_write_tokens": _usage.get("cache_creation_input_tokens", 0),
-                "request_messages_preview": _preview_messages(cached_messages, _max_content_chars),
-                "response_preview": _preview_text(response_text, _max_content_chars),
+                "raw_request": cached_messages,
+                "raw_response": response_text,
                 "stopped_early": stopped_early,
                 "error": _trace_error,
                 "partial_response_length": len(response_text) if _trace_error else 0,

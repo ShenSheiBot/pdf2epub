@@ -242,7 +242,7 @@ class PolishProcessor(BaseMarkdownProcessor):
         if context.has_previous_context:
             previous_context = {
                 'original': context.previous_original,
-                'processed': context.previous_processed
+                'polished': context.previous_processed
             }
 
         # Preprocess: convert HTML img tags to markdown to avoid LLM corruption

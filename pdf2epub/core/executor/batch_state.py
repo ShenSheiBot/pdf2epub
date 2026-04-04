@@ -11,7 +11,7 @@ import json
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 from loguru import logger
 
 
@@ -42,10 +42,12 @@ class MegaUnitState:
     - job_name: The batch API job name
     - job_state: Current job state (PENDING, RUNNING, SUCCEEDED, etc.)
     - processing_keys: Ordered list of unit keys (for Vertex line-order correlation)
+    - content_fingerprints: {md5_hash: key} map for content-based matching
     """
     job_name: str
     job_state: str = "RUNNING"
     processing_keys: Optional[List[str]] = None
+    content_fingerprints: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict."""
@@ -55,6 +57,8 @@ class MegaUnitState:
         }
         if self.processing_keys is not None:
             d["processing_keys"] = self.processing_keys
+        if self.content_fingerprints is not None:
+            d["content_fingerprints"] = self.content_fingerprints
         return d
 
     @classmethod
@@ -64,6 +68,7 @@ class MegaUnitState:
             job_name=data["job_name"],
             job_state=data.get("job_state", "RUNNING"),
             processing_keys=data.get("processing_keys"),
+            content_fingerprints=data.get("content_fingerprints"),
         )
 
     def save(self, path: Path) -> None:

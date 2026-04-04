@@ -338,6 +338,7 @@ class Executor:
             while pending or futures or batch_futures:
                 # 1. Get ready units
                 ready_ids = self._get_ready_ids(pending, completed, in_progress, unit_states)
+                logger.debug(f"[EXECUTOR] pending={len(pending)} in_progress={len(in_progress)} completed={len(completed)} ready={len(ready_ids)}")
 
                 # 2. Dispatch by chain[0].mode
                 batch_queue: List[str] = []
@@ -638,11 +639,15 @@ class Executor:
                     # Still running, continue waiting
                     logger.info(f"Resuming mega unit {mega_id}: {existing_state.job_name}")
                     job_name = existing_state.job_name
-                # Restore key order for Vertex line-order correlation
+                # Restore key order and content fingerprints for result matching
                 if job_name and existing_state.processing_keys:
                     if hasattr(self._batch_client, '_job_keys'):
                         self._batch_client._job_keys[job_name] = existing_state.processing_keys
                         logger.debug(f"Restored {len(existing_state.processing_keys)} processing keys for {job_name}")
+                if job_name and existing_state.content_fingerprints:
+                    if hasattr(self._batch_client, '_job_fingerprints'):
+                        self._batch_client._job_fingerprints[job_name] = existing_state.content_fingerprints
+                        logger.debug(f"Restored {len(existing_state.content_fingerprints)} content fingerprints for {job_name}")
 
         # Build requests if not resuming
         batch_requests: List[BatchRequest] = []
@@ -706,13 +711,18 @@ class Executor:
                 else:
                     logger.info(f"Submitted mega unit {mega_id}: {job_name} ({len(batch_requests)} units)")
 
-                # Save state (include key order for Vertex line-order correlation on resume)
+                # Save state (include key order and fingerprints for result matching on resume)
                 if state_file:
                     processing_keys = [req.key for req in batch_requests]
+                    # Get content fingerprints from batch client (for content-based matching)
+                    content_fps = None
+                    if hasattr(self._batch_client, '_job_fingerprints'):
+                        content_fps = self._batch_client._job_fingerprints.get(job_name)
                     state = MegaUnitState(
                         job_name=job_name,
                         job_state="RUNNING",
                         processing_keys=processing_keys,
+                        content_fingerprints=content_fps,
                     )
                     state.save(state_file)
             else:

@@ -132,7 +132,7 @@ def translate_v2_command(args):
     else:
         # Check translation section first, then top-level
         translation_config = config.get('translation', {})
-        processing_mode = translation_config.get('processing_mode', config.get('processing_mode', 'sequential'))
+        processing_mode = translation_config.get('processing_mode', config.get('processing_mode', 'parallel'))
         sequential_mode = processing_mode != 'parallel'
     skip_validation = getattr(args, 'skip_validation', False)
 

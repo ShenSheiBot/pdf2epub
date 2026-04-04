@@ -101,7 +101,7 @@ def polish_v2_command(args):
     else:
         # Check polish section first, then top-level
         polish_config = config.get('polish', {})
-        processing_mode = polish_config.get('processing_mode', config.get('processing_mode', 'sequential'))
+        processing_mode = polish_config.get('processing_mode', config.get('processing_mode', 'parallel'))
         sequential_mode = processing_mode != 'parallel'
     skip_validation = getattr(args, 'skip_validation', False)
 

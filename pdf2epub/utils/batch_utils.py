@@ -6,6 +6,7 @@ enabling asynchronous, high-throughput processing at 50% cost reduction.
 """
 
 import json
+import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,30 +33,32 @@ BATCH_DEFAULTS = {
 
 
 def _write_batch_trace(provider: str, model: str, job_name: str,
-                       usage_metadata: dict, key: str, error: Optional[str] = None):
-    """Write a trace entry for a single batch response. Never raises."""
+                       usage_metadata: dict, key: str,
+                       raw_data: Optional[dict] = None,
+                       error: Optional[str] = None):
+    """Write a trace entry for a single batch response. Never raises.
+
+    raw_data: the complete parsed JSONL line from batch output, stored as-is.
+    """
     try:
         from .network_utils import _write_trace
     except ImportError:
         return
-    _write_trace({
+    entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "operation": f"batch:{key}",
         "provider": provider,
         "model": model,
         "batch_job": job_name,
-        "duration_ms": 0,  # not meaningful for individual batch responses
         "input_tokens": usage_metadata.get("promptTokenCount", 0),
         "output_tokens": usage_metadata.get("candidatesTokenCount", 0),
         "cache_read_tokens": usage_metadata.get("cachedContentTokenCount", 0),
-        "cache_write_tokens": 0,
         "thinking_tokens": usage_metadata.get("thoughtsTokenCount", 0),
-        "request_messages_preview": [],  # batch input already cleaned up
-        "response_preview": {"head": "", "length": 0},
-        "finish_reason": "batch",
         "error": error,
-        "partial_response_length": 0,
-    })
+    }
+    if raw_data is not None:
+        entry["raw"] = raw_data
+    _write_trace(entry)
 
 
 class BatchJobState(Enum):
@@ -447,7 +450,13 @@ class GeminiBatchClient:
                                 "thoughtsTokenCount": getattr(um, 'thoughts_token_count', 0) or 0,
                                 "cachedContentTokenCount": getattr(um, 'cached_content_token_count', 0) or 0,
                             }
-                            _write_batch_trace("gemini", self.model, job_name, usage, batch_resp.key)
+                            # Inline response: serialize SDK object to dict for raw trace
+                            raw = {}
+                            try:
+                                raw = resp.to_dict() if hasattr(resp, 'to_dict') else {"key": batch_resp.key}
+                            except Exception:
+                                raw = {"key": batch_resp.key, "_serialization_failed": True}
+                            _write_batch_trace("gemini", self.model, job_name, usage, batch_resp.key, raw_data=raw)
                     if hasattr(resp, 'error') and resp.error:
                         batch_resp.error = str(resp.error)
                     results.append(batch_resp)
@@ -479,7 +488,7 @@ class GeminiBatchClient:
                                 usage = resp_data.get('usageMetadata', {})
                                 if usage:
                                     _write_batch_trace("gemini", self.model, job_name, usage, batch_resp.key,
-                                                       error=data.get('error'))
+                                                       raw_data=data, error=data.get('error'))
                             elif isinstance(resp_data, str):
                                 batch_resp.text = resp_data
                         if 'error' in data:
@@ -565,6 +574,9 @@ class VertexBatchClient:
         self._storage_client = None
         # Track submitted key orders for line-order correlation
         self._job_keys: Dict[str, List[str]] = {}
+        # Track content fingerprints for content-based key matching
+        # (Vertex batch does NOT guarantee output order matches input order)
+        self._job_fingerprints: Dict[str, Dict[str, str]] = {}  # job_name -> {fingerprint: key}
 
         # Set proxy env vars for httpx (google-genai SDK uses trust_env=True)
         # and for google-cloud-storage / google-auth (ADC token refresh)
@@ -714,10 +726,22 @@ class VertexBatchClient:
             config=config if config else None,
         )
 
-        # Store key order for this job
+        # Store key order and content fingerprints for this job
         self._job_keys[job.name] = ordered_keys
+        # Build fingerprint map for content-based matching
+        # (Vertex batch output order is NOT guaranteed to match input order)
+        fingerprints = {}
+        for req in requests:
+            fp = self._content_fingerprint(req.contents)
+            fingerprints[fp] = req.key
+        self._job_fingerprints[job.name] = fingerprints
         logger.info(f"Created Vertex batch job: {job.name}")
         return job.name
+
+    @staticmethod
+    def _content_fingerprint(contents: list) -> str:
+        """Create a deterministic fingerprint from request contents for matching."""
+        return hashlib.md5(json.dumps(contents, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     @default_retry
     def get_status(self, job_name: str) -> BatchJobInfo:
@@ -826,12 +850,30 @@ class VertexBatchClient:
             logger.warning(f"{parse_errors} lines had JSON parse errors")
         logger.info(f"Retrieved {len(all_lines)} results from {len(output_blobs)} output file(s)")
 
-        # Map results using line-order correlation
+        # Map results using content-based fingerprint matching
+        # (Vertex batch does NOT guarantee output order matches input order)
+        fingerprint_map = self._job_fingerprints.get(job_name, {})
         ordered_keys = self._job_keys.get(job_name, [])
 
         results = []
+        matched_by_fingerprint = 0
+        matched_by_position = 0
         for i, data in enumerate(all_lines):
-            key = ordered_keys[i] if i < len(ordered_keys) else f"unknown_{i}"
+            key = None
+
+            # Try content-based matching first (reliable)
+            request_data = data.get('request', {})
+            request_contents = request_data.get('contents', [])
+            if request_contents and fingerprint_map:
+                fp = self._content_fingerprint(request_contents)
+                key = fingerprint_map.get(fp)
+                if key:
+                    matched_by_fingerprint += 1
+
+            # Fall back to line-order correlation (unreliable for Vertex)
+            if key is None:
+                key = ordered_keys[i] if i < len(ordered_keys) else f"unknown_{i}"
+                matched_by_position += 1
 
             batch_resp = BatchResponse(key=key, raw_response=data)
 
@@ -841,12 +883,12 @@ class VertexBatchClient:
                 code = status.get('code', 0)
                 if code != 0:
                     batch_resp.error = status.get('message', f'Error code {code}')
-                    _write_batch_trace("vertex", self.model, job_name, {}, key, error=batch_resp.error)
+                    _write_batch_trace("vertex", self.model, job_name, {}, key, raw_data=data, error=batch_resp.error)
                     results.append(batch_resp)
                     continue
             elif isinstance(status, str) and status and status.upper() != 'OK':
                 batch_resp.error = status
-                _write_batch_trace("vertex", self.model, job_name, {}, key, error=batch_resp.error)
+                _write_batch_trace("vertex", self.model, job_name, {}, key, raw_data=data, error=batch_resp.error)
                 results.append(batch_resp)
                 continue
 
@@ -861,11 +903,23 @@ class VertexBatchClient:
                 # Trace usage metadata
                 usage = response.get('usageMetadata', {})
                 if usage:
-                    _write_batch_trace("vertex", self.model, job_name, usage, key)
+                    _write_batch_trace("vertex", self.model, job_name, usage, key, raw_data=data)
             elif isinstance(response, str):
                 batch_resp.text = response
 
             results.append(batch_resp)
+
+        # Report matching method stats
+        if matched_by_fingerprint > 0 or matched_by_position > 0:
+            logger.info(
+                f"Result key matching: {matched_by_fingerprint} by content fingerprint, "
+                f"{matched_by_position} by position fallback"
+            )
+            if matched_by_position > 0 and fingerprint_map:
+                logger.warning(
+                    f"{matched_by_position} results fell back to position-based matching "
+                    "(output may not contain request field — verify result correctness)"
+                )
 
         # Report missing results
         if ordered_keys and len(all_lines) < len(ordered_keys):

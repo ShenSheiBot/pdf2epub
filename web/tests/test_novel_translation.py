@@ -1540,25 +1540,6 @@ class TestUnifiedLLMTrace:
         # Clean up
         set_llm_trace_path(None)
 
-    def test_preview_text_head_tail(self):
-        """_preview_text preserves head and tail for long texts."""
-        from pdf2epub.utils.network_utils import _preview_text
-
-        # Short text — no truncation
-        result = _preview_text("short", 1000)
-        assert result == {"head": "short", "length": 5}
-
-        # Long text — head + tail
-        long_text = "A" * 1000 + "MIDDLE" + "B" * 1000
-        result = _preview_text(long_text, 100)
-        assert result["head"] == long_text[:100]
-        assert result["tail"] == long_text[-100:]
-        assert result["length"] == len(long_text)
-
-        # Empty text
-        result = _preview_text("", 100)
-        assert result == {"head": "", "length": 0}
-
     def test_trace_disabled_when_path_is_none(self, tmp_path):
         """No trace file created when trace path is None."""
         from pdf2epub.utils.network_utils import set_llm_trace_path, _write_trace
@@ -1568,21 +1549,5 @@ class TestUnifiedLLMTrace:
         # No file should exist
         assert not (tmp_path / "trace.jsonl").exists()
 
-    def test_preview_messages_handles_structured_content(self):
-        """_preview_messages handles both string and structured content."""
-        from pdf2epub.utils.network_utils import _preview_messages
-
-        messages = [
-            {"role": "user", "content": "hello world"},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": "response text"},
-            ]},
-        ]
-        result = _preview_messages(messages, 1000)
-        assert len(result) == 2
-        assert result[0]["role"] == "user"
-        assert result[0]["content_head"] == "hello world"
-        assert result[1]["role"] == "assistant"
-        assert "response text" in result[1]["content_head"]
 
 

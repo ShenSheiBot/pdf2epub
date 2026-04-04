@@ -28,47 +28,12 @@ import tiktoken
 # ─── Unified LLM Trace ───
 
 _trace_path: Optional[Path] = None
-_max_content_chars: int = 1000  # per side (head/tail)
 
 
-def set_llm_trace_path(path: Optional[Path], max_content_chars: int = 1000):
+def set_llm_trace_path(path: Optional[Path]):
     """Set the global LLM trace output path. Call once at startup."""
-    global _trace_path, _max_content_chars
+    global _trace_path
     _trace_path = path
-    _max_content_chars = max_content_chars
-
-
-def _preview_text(text: str, max_chars: int) -> dict:
-    """Create head+tail preview of text."""
-    if not text:
-        return {"head": "", "length": 0}
-    if max_chars == 0 or len(text) <= max_chars * 2:
-        return {"head": text, "length": len(text)}
-    return {
-        "head": text[:max_chars],
-        "tail": text[-max_chars:],
-        "length": len(text),
-    }
-
-
-def _preview_messages(messages: list, max_chars: int) -> list:
-    """Create previews of message contents."""
-    result = []
-    for msg in (messages or []):
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # Structured content blocks — preview text blocks only
-            texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-            content = "\n".join(texts)
-        elif not isinstance(content, str):
-            content = str(content)
-        preview = _preview_text(content, max_chars)
-        entry = {"role": msg.get("role", "unknown")}
-        entry.update({f"content_{k}": v for k, v in preview.items()})
-        result.append(entry)
-    return result
 
 
 def _write_trace(entry: dict):
@@ -356,13 +321,14 @@ class GeminiClient:
                 "provider": "gemini",
                 "model": model,
                 "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
-                "input_tokens": 0,  # non-streaming doesn't easily expose usage
+                "input_tokens": 0,
                 "output_tokens": 0,
-                "response_preview": _preview_text(response_text, _max_content_chars),
+                "raw_request": {"contents": contents, "config": str(config)},
+                "raw_response": response_text,
                 "error": _trace_error,
                 "partial_response_length": len(response_text) if _trace_error else 0,
             })
-    
+
     @retry(
         retry=retry_if_exception(is_transient_gemini_error),
         wait=wait_exponential_with_self_max(multiplier=1),
@@ -498,12 +464,13 @@ class GeminiClient:
                 "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
                 "input_tokens": _usage_dict.get("prompt_token_count", 0),
                 "output_tokens": _usage_dict.get("candidates_token_count", 0),
-                "response_preview": _preview_text(aggregated_text, _max_content_chars),
+                "raw_request": {"contents": contents, "config": str(config)},
+                "raw_response": aggregated_text,
                 "finish_reason": finish_reason,
                 "error": _trace_error,
                 "partial_response_length": len(aggregated_text) if _trace_error else 0,
             })
-    
+
     @staticmethod
     def get_default_config(temperature: float = 0.1) -> GenerateContentConfig:
         """Get default generation config."""
@@ -719,13 +686,13 @@ class AnthropicClient:
                 "output_tokens": _usage.get("output_tokens", 0),
                 "cache_read_tokens": _usage.get("cache_read_input_tokens", 0),
                 "cache_write_tokens": _usage.get("cache_creation_input_tokens", 0),
-                "request_messages_preview": _preview_messages(messages, _max_content_chars),
-                "response_preview": _preview_text(response_text, _max_content_chars),
+                "raw_request": messages,
+                "raw_response": response_text,
                 "finish_reason": finish_reason,
                 "error": _trace_error,
                 "partial_response_length": len(response_text) if _trace_error else 0,
             })
-    
+
     def _process_content(self, prompt: Union[str, List[Dict]]) -> Union[str, List[Dict]]:
         """Process content to handle images properly."""
         if isinstance(prompt, str):
@@ -891,8 +858,8 @@ class OpenAIClient:
                 "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "request_messages_preview": _preview_messages(formatted_messages, _max_content_chars),
-                "response_preview": _preview_text(response_text, _max_content_chars),
+                "raw_request": formatted_messages,
+                "raw_response": response_text,
                 "finish_reason": finish_reason,
                 "error": _trace_error,
                 "partial_response_length": len(response_text) if _trace_error else 0,

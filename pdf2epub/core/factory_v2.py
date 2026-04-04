@@ -577,7 +577,7 @@ def create_processing_pipeline_v2(
     # Configuration overrides (used if config not provided)
     task_type: str = "translate",
     use_batch_validation: bool = True,
-    sequential_mode: bool = True,
+    sequential_mode: bool = False,
     max_workers: Optional[int] = None,
     restore_images: bool = True,
     include_batch_mode: bool = False,

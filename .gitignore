@@ -39,3 +39,4 @@ docs/plans/
 experiments/
 test_*.py
 test_ocr.png
+scripts/realign_*.py

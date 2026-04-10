@@ -351,8 +351,14 @@ def ocr_full_book_pagewise(
     else:
         page_stats = {}
 
+    # Prefer original PDF for OCR (preprocessed version is binarized, ruins images)
+    original_pdf = output_dir / "input_original.pdf"
+    ocr_pdf = original_pdf if original_pdf.exists() else pdf_path
+    if ocr_pdf != pdf_path:
+        logger.info(f"Using original PDF for OCR: {ocr_pdf}")
+
     # Determine page range
-    with fitz.open(pdf_path) as pdf:
+    with fitz.open(ocr_pdf) as pdf:
         total_pages = len(pdf)
 
     if end_page is None:
@@ -397,7 +403,7 @@ def ocr_full_book_pagewise(
         def process_single_page(page_num):
             """Process a single page and return result."""
             try:
-                pdf_bytes = extract_pdf_pages(pdf_path, page_num, page_num)
+                pdf_bytes = extract_pdf_pages(ocr_pdf, page_num, page_num)
                 chunk_info = f"Page {page_num}"
 
                 # Use page_num as image counter base to avoid conflicts

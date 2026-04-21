@@ -874,8 +874,9 @@ class HTMLEpubPipeline:
                 # Include original extension for correct output filename
                 mapping['original_extension'] = original_extension
                 mapping_path = self.compressed_units_dir / f"{file_stem}.mapping.json"
-                with open(mapping_path, 'w', encoding='utf-8') as f:
-                    json.dump(mapping, f, ensure_ascii=False)
+                # Serialize first, then write — prevents truncated files if
+                # json.dumps fails mid-serialization (e.g. non-serializable lxml objects)
+                mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding='utf-8')
 
                 extracted += 1
                 lines = len(compressed.splitlines()) if compressed else 0

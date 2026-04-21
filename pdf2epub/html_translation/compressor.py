@@ -684,6 +684,10 @@ class HTMLCompressor:
         for el in root.iter():
             if el is root:
                 continue
+            # Skip Comment/PI nodes — their .tag is a cython callable, not a string,
+            # which causes json.dump to fail mid-write and truncate mapping files
+            if not isinstance(el.tag, str):
+                continue
             mapping.append({
                 "index": i,
                 "tag": el.tag,
@@ -720,9 +724,9 @@ class HTMLCompressor:
         # 步骤 1：尝试 HTML 规范化修复
         normalized = self._normalize_html(html)
 
-        # 步骤 2：解析并计数
+        # 步骤 2：解析并计数（skip Comment/PI nodes to match _strip_inner_attrs）
         root = self._parse_fragment(normalized)
-        elements = [el for el in root.iter() if el is not root]
+        elements = [el for el in root.iter() if el is not root and isinstance(el.tag, str)]
 
         # 步骤 3：完全匹配 → 直接还原
         if len(elements) == len(attr_map):

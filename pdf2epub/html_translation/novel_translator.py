@@ -275,7 +275,8 @@ class NovelTranslator:
         import time as _time
         from pdf2epub.utils.network_utils import (
             _write_trace, _detect_streaming_hallucination,
-            is_transient_anthropic_error,
+            is_transient_anthropic_error, extract_anthropic_stream_usage,
+            usage_status,
         )
 
         _trace_start = _time.monotonic()
@@ -283,6 +284,7 @@ class NovelTranslator:
         response_text = ""
         stopped_early = False
         _usage = {}
+        _usage_source = "missing"
 
         max_retries = client.num_retries
         last_error = None
@@ -300,6 +302,7 @@ class NovelTranslator:
                     response_text = ""
                     stopped_early = False
                     _usage = {}
+                    _usage_source = "missing"
 
                 try:
                     stream = client.client.messages.create(**request_kwargs)
@@ -355,12 +358,13 @@ class NovelTranslator:
                                         break
                                     last_token_count = current_tokens
 
-                    # Extract usage from stream events
-                    for ev in stream_events:
-                        usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
-                        if usage:
-                            _usage = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
-                            break
+                    # Extract cumulative usage from all stream events.
+                    _usage, _usage_source = extract_anthropic_stream_usage(stream_events)
+                    _status = usage_status(_usage, response_text)
+                    if _usage:
+                        logger.info(f"Anthropic {operation_name} usage ({_status}): {_usage}")
+                    else:
+                        logger.warning(f"Anthropic {operation_name} usage unavailable")
 
                     # Clean: remove empty lines
                     cleaned = '\n'.join(l for l in response_text.splitlines() if l.strip())
@@ -383,6 +387,8 @@ class NovelTranslator:
                 "output_tokens": _usage.get("output_tokens", 0),
                 "cache_read_tokens": _usage.get("cache_read_input_tokens", 0),
                 "cache_write_tokens": _usage.get("cache_creation_input_tokens", 0),
+                "usage_source": _usage_source,
+                "usage_status": usage_status(_usage, response_text),
                 "raw_request": cached_messages,
                 "raw_response": response_text,
                 "stopped_early": stopped_early,

@@ -494,6 +494,7 @@ def translate_html_command(args):
                 return 1
 
             logger.info(f"Translation complete: {summary.get('successful', 0)} files")
+            pipeline.write_translation_report(phase="translation")
 
         logger.success("HTML translation complete!")
         logger.info(f"Output: {output_dir / 'translated_compressed'}")

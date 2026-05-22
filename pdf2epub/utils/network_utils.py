@@ -50,6 +50,65 @@ def _write_trace(entry: dict):
         pass  # Never break pipeline for logging
 
 
+def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+    """Convert provider usage objects into plain dictionaries."""
+    if usage is None:
+        return {}
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if hasattr(usage, "__dict__"):
+        return dict(vars(usage))
+    if isinstance(usage, dict):
+        return usage
+    return {}
+
+
+def _merge_usage_dict(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge streamed usage chunks, keeping cumulative numeric maxima."""
+    for key, value in incoming.items():
+        if value is None:
+            continue
+        if isinstance(value, (int, float)) and isinstance(base.get(key), (int, float)):
+            base[key] = max(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def extract_anthropic_stream_usage(events: List[Any]) -> tuple[Dict[str, Any], str]:
+    """Extract cumulative usage from Anthropic stream events.
+
+    Anthropic reports input tokens on message_start and output tokens on
+    message_delta. Taking the first usage object records output_tokens=0 for
+    successful long streams, so we merge all usage-bearing events instead.
+    """
+    usage: Dict[str, Any] = {}
+    saw_usage = False
+
+    for event in events:
+        candidates = [
+            getattr(event, "usage", None),
+            getattr(getattr(event, "message", None), "usage", None),
+        ]
+        for candidate in candidates:
+            usage_dict = _usage_to_dict(candidate)
+            if not usage_dict:
+                continue
+            saw_usage = True
+            _merge_usage_dict(usage, usage_dict)
+
+    return usage, "anthropic_stream" if saw_usage else "missing"
+
+
+def usage_status(usage: Dict[str, Any], response_text: str) -> str:
+    """Classify whether trace usage is trustworthy enough for reporting."""
+    if not usage:
+        return "missing"
+    if response_text and not usage.get("output_tokens"):
+        return "incomplete"
+    return "ok"
+
+
 def _create_method_before_sleep(operation_name_param: str = "operation_name") -> callable:
     """
     Create a before_sleep callback for class methods that logs exception details.
@@ -621,6 +680,7 @@ class AnthropicClient:
         response_text = ""
         finish_reason = None
         _usage = {}
+        _usage_source = "missing"
 
         try:
             stream = self.client.messages.create(**request_kwargs)
@@ -666,13 +726,13 @@ class AnthropicClient:
 
             final_tokens = len(self.tokenizer.encode(response_text))
 
-            # Log complete usage metadata
-            for ev in self._last_stream_events:
-                usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
-                if usage:
-                    _usage = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
-                    logger.info(f"Anthropic {operation_name}: {_usage}")
-                    break
+            # Log complete usage metadata.
+            _usage, _usage_source = extract_anthropic_stream_usage(self._last_stream_events)
+            _status = usage_status(_usage, response_text)
+            if _usage:
+                logger.info(f"Anthropic {operation_name} usage ({_status}): {_usage}")
+            else:
+                logger.warning(f"Anthropic {operation_name} usage unavailable")
             return response_text
         except Exception as e:
             _trace_error = str(e)
@@ -688,6 +748,8 @@ class AnthropicClient:
                 "output_tokens": _usage.get("output_tokens", 0),
                 "cache_read_tokens": _usage.get("cache_read_input_tokens", 0),
                 "cache_write_tokens": _usage.get("cache_creation_input_tokens", 0),
+                "usage_source": _usage_source,
+                "usage_status": usage_status(_usage, response_text),
                 "raw_request": messages,
                 "raw_response": response_text,
                 "finish_reason": finish_reason,

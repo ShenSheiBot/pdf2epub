@@ -163,6 +163,17 @@ class NovelTranslator:
         novel_config = config.get("novel", {})
         self._embedding_provider = novel_config.get("embedding_provider")
         self._embedding_model = novel_config.get("embedding_model", "gemini-embedding-001")
+        self._hallucination_threshold = novel_config.get("hallucination_threshold", 0.75)
+
+        # Cheap model for bilingual stripping (optional)
+        strip_model = novel_config.get("strip_model")
+        if strip_model:
+            self._strip_model_configs = [{
+                "provider": strip_model.get("provider"),
+                "model": strip_model.get("model"),
+            }]
+        else:
+            self._strip_model_configs = None
 
     def _get_llm_client(self):
         if self._llm_client is None:
@@ -253,14 +264,19 @@ class NovelTranslator:
         request_kwargs = {
             "model": model,
             "messages": cached_messages,
-            "temperature": 0.1,
             "max_tokens": 64000,
             "stream": True,
             "system": system_with_cache,
         }
+        # Opus 4.7+ deprecates temperature; only set for older models
+        if "opus-4-7" not in model:
+            request_kwargs["temperature"] = 0.1
 
         import time as _time
-        from pdf2epub.utils.network_utils import _write_trace
+        from pdf2epub.utils.network_utils import (
+            _write_trace, _detect_streaming_hallucination,
+            is_transient_anthropic_error,
+        )
 
         _trace_start = _time.monotonic()
         _trace_error = None
@@ -268,75 +284,94 @@ class NovelTranslator:
         stopped_early = False
         _usage = {}
 
+        max_retries = client.num_retries
+        last_error = None
+
         try:
-            stream = client.client.messages.create(**request_kwargs)
+            for attempt in range(1 + max_retries):
+                if attempt > 0:
+                    wait = min(2 ** attempt, client.max_backoff_seconds)
+                    logger.warning(
+                        f"Retry {attempt}/{max_retries} for {operation_name}: "
+                        f"waiting {wait}s | {last_error}"
+                    )
+                    _time.sleep(wait)
+                    # Reset state for retry
+                    response_text = ""
+                    stopped_early = False
+                    _usage = {}
 
-            from pdf2epub.utils.network_utils import _detect_streaming_hallucination
+                try:
+                    stream = client.client.messages.create(**request_kwargs)
 
-            last_token_count = 0
-            budget_hit = False
-            stream_events = []
-            chunk_count = 0
+                    last_token_count = 0
+                    budget_hit = False
+                    stream_events = []
+                    chunk_count = 0
 
-            for event in stream:
-                if event.type in ("message_start", "message_delta"):
-                    stream_events.append(event)
-                elif event.type == "content_block_delta":
-                    if hasattr(event.delta, 'text'):
-                        chunk = event.delta.text
-                        response_text += chunk
-                        chunk_count += 1
+                    for event in stream:
+                        if event.type in ("message_start", "message_delta"):
+                            stream_events.append(event)
+                        elif event.type == "content_block_delta":
+                            if hasattr(event.delta, 'text'):
+                                chunk = event.delta.text
+                                response_text += chunk
+                                chunk_count += 1
 
-                        # Hallucination guard: detect repetition loops
-                        if chunk_count % 20 == 0:
-                            halt_reason = _detect_streaming_hallucination(response_text)
-                            if halt_reason:
-                                logger.warning(
-                                    f"Hallucination detected for {operation_name}: {halt_reason}. "
-                                    f"Halting stream at {len(response_text)} chars."
-                                )
-                                last_nl = response_text.rfind('\n')
-                                if last_nl > 0:
-                                    response_text = response_text[:last_nl]
-                                stopped_early = True
-                                stream.close()
-                                break
+                                # Hallucination guard: detect repetition loops
+                                if chunk_count % 20 == 0:
+                                    halt_reason = _detect_streaming_hallucination(response_text)
+                                    if halt_reason:
+                                        logger.warning(
+                                            f"Hallucination detected for {operation_name}: {halt_reason}. "
+                                            f"Halting stream at {len(response_text)} chars."
+                                        )
+                                        last_nl = response_text.rfind('\n')
+                                        if last_nl > 0:
+                                            response_text = response_text[:last_nl]
+                                        stopped_early = True
+                                        stream.close()
+                                        break
 
-                        if budget_hit:
-                            # We hit the budget — finish the current line
-                            if '\n' in chunk:
-                                last_nl = response_text.rfind('\n')
-                                if last_nl > 0:
-                                    response_text = response_text[:last_nl]
-                                stopped_early = True
-                                stream.close()
-                                break
-                        elif '\n' in chunk:
-                            # Check token count at line boundaries
-                            current_tokens = self._count_tokens(response_text)
-                            if current_tokens >= max_output_tokens:
-                                budget_hit = True
-                                last_nl = response_text.rfind('\n')
-                                if last_nl > 0:
-                                    response_text = response_text[:last_nl]
-                                stopped_early = True
-                                stream.close()
-                                break
-                            last_token_count = current_tokens
+                                if budget_hit:
+                                    # We hit the budget — finish the current line
+                                    if '\n' in chunk:
+                                        last_nl = response_text.rfind('\n')
+                                        if last_nl > 0:
+                                            response_text = response_text[:last_nl]
+                                        stopped_early = True
+                                        stream.close()
+                                        break
+                                elif '\n' in chunk:
+                                    # Check token count at line boundaries
+                                    current_tokens = self._count_tokens(response_text)
+                                    if current_tokens >= max_output_tokens:
+                                        budget_hit = True
+                                        last_nl = response_text.rfind('\n')
+                                        if last_nl > 0:
+                                            response_text = response_text[:last_nl]
+                                        stopped_early = True
+                                        stream.close()
+                                        break
+                                    last_token_count = current_tokens
 
-            # Extract usage from stream events
-            for ev in stream_events:
-                usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
-                if usage:
-                    _usage = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
-                    break
+                    # Extract usage from stream events
+                    for ev in stream_events:
+                        usage = getattr(ev, 'usage', None) or getattr(getattr(ev, 'message', None), 'usage', None)
+                        if usage:
+                            _usage = usage.model_dump() if hasattr(usage, 'model_dump') else vars(usage) if hasattr(usage, '__dict__') else {}
+                            break
 
-            # Clean: remove empty lines
-            cleaned = '\n'.join(l for l in response_text.splitlines() if l.strip())
-            return cleaned
-        except Exception as e:
-            _trace_error = str(e)
-            raise
+                    # Clean: remove empty lines
+                    cleaned = '\n'.join(l for l in response_text.splitlines() if l.strip())
+                    return cleaned
+
+                except Exception as e:
+                    last_error = str(e)
+                    if is_transient_anthropic_error(e) and attempt < max_retries:
+                        continue  # retry
+                    _trace_error = str(e)
+                    raise
         finally:
             _write_trace({
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -615,6 +650,8 @@ class NovelTranslator:
                     is_first_chunk=(cont_round == 0),
                     embedding_provider=self._embedding_provider,
                     embedding_model=self._embedding_model,
+                    hallucination_threshold=self._hallucination_threshold,
+                    strip_model_configs=self._strip_model_configs,
                 )
 
                 if action == "complete":
@@ -636,6 +673,7 @@ class NovelTranslator:
                         model_configs=self._get_model_configs(),
                         embedding_provider=self._embedding_provider,
                         embedding_model=self._embedding_model,
+                        position_min_confidence=self._hallucination_threshold,
                     )
                     if remainder:
                         # Truncate prefix to aligned position to avoid overlap.

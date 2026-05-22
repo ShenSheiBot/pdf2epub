@@ -55,6 +55,7 @@ def _find_source_position(
     llm_client,
     embedding_provider: Optional[str] = None,
     embedding_model: str = "gemini-embedding-001",
+    position_min_confidence: float = 0.75,
 ) -> int:
     """Find which source line the last translated line corresponds to.
 
@@ -91,6 +92,7 @@ def _find_source_position(
             last_tl, window, llm_client,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            position_min_confidence=position_min_confidence,
         )
         if idx is not None:
             aligned = start + idx
@@ -183,6 +185,7 @@ def translate_remaining(
     chunk_token_budget: int = 2000,
     embedding_provider: Optional[str] = None,
     embedding_model: str = "gemini-embedding-001",
+    position_min_confidence: float = 0.75,
 ) -> Tuple[str, int, int]:
     """Translate remaining source lines using short-context chunks.
 
@@ -204,6 +207,7 @@ def translate_remaining(
         source_text, translated_prefix, llm_client,
         embedding_provider=embedding_provider,
         embedding_model=embedding_model,
+        position_min_confidence=position_min_confidence,
     )
     remaining_lines = src_lines[pos + 1:]
 

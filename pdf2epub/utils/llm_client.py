@@ -282,13 +282,15 @@ class LLMClient:
         provider: str = "gemini",
         model: str = "gemini-embedding-001",
     ) -> Optional[List[List[float]]]:
-        """Embed texts using a Gemini embedding model.
+        """Embed texts using a provider that supports embeddings.
 
-        Returns list of embedding vectors, or None if the provider is not
-        configured or not a GeminiClient.
+        Supports GeminiClient and OpenAIClient (OpenAI-compatible endpoints).
+        Returns list of embedding vectors, or None if unavailable.
         """
         client = self._get_client(provider)
-        if client is None or not isinstance(client, GeminiClient):
+        if client is None:
+            return None
+        if not isinstance(client, (GeminiClient, OpenAIClient)):
             return None
         import time
         for attempt in range(2):

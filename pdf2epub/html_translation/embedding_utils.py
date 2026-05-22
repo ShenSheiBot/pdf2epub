@@ -57,6 +57,7 @@ def check_alignment_embedding(
     llm_client,
     embedding_provider: str = "gemini",
     embedding_model: str = "gemini-embedding-001",
+    hallucination_threshold: float = HALLUCINATION_THRESHOLD,
 ) -> Optional[str]:
     """Check alignment between source and translated windows using embedding.
 
@@ -83,9 +84,9 @@ def check_alignment_embedding(
         return None
 
     max_sim = float(matrix.max())
-    logger.debug(f"  Embedding alignment: max_sim={max_sim:.3f}, threshold={HALLUCINATION_THRESHOLD}")
+    logger.debug(f"  Embedding alignment: max_sim={max_sim:.3f}, threshold={hallucination_threshold}")
 
-    if max_sim >= HALLUCINATION_THRESHOLD:
+    if max_sim >= hallucination_threshold:
         return "A"  # Valid translation (may be aligned or shifted, but real)
     else:
         return "D"  # Hallucination
@@ -97,6 +98,7 @@ def find_position_embedding(
     llm_client,
     embedding_provider: str = "gemini",
     embedding_model: str = "gemini-embedding-001",
+    position_min_confidence: float = POSITION_MIN_CONFIDENCE,
 ) -> Optional[int]:
     """Find which source line best matches the translated line using embedding.
 
@@ -123,9 +125,9 @@ def find_position_embedding(
     best_sim = sims[best_idx]
 
     # Confidence gate: if best match is too weak, don't trust it
-    if best_sim < POSITION_MIN_CONFIDENCE:
+    if best_sim < position_min_confidence:
         logger.info(
-            f"  Embedding position alignment: low confidence ({best_sim:.3f} < {POSITION_MIN_CONFIDENCE}), skipping"
+            f"  Embedding position alignment: low confidence ({best_sim:.3f} < {position_min_confidence}), skipping"
         )
         return None
 

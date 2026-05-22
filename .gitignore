@@ -12,6 +12,7 @@ uv.lock
 
 # Security - API keys and credentials
 sa-keys.json
+vertex_adc.json
 service-account-*.json
 *-service-account.json
 credentials.json

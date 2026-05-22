@@ -16,6 +16,10 @@ from .embedding_utils import check_alignment_embedding
 
 logger = logging.getLogger(__name__)
 
+BILINGUAL_STRIP_PROMPT = """\
+以下文本是一份日中双语对照翻译，每行日语原文后面紧跟着对应的中文译文。
+请只保留中文译文行，删除所有日语原文行。直接输出结果，不要添加任何说明。"""
+
 PREAMBLE_CHECK_PROMPT = """\
 以下译文的第一行，是原文第一行的翻译，还是"以下是翻译"之类的说明文字？
 只回答：translation 或 meta-comment
@@ -69,7 +73,8 @@ def _check_preamble(source_line: str, translated_line: str, llm_client, model_co
 def _check_alignment(source_window: List[str], translated_window: List[str],
                      llm_client, model_configs,
                      embedding_provider: Optional[str] = None,
-                     embedding_model: str = "gemini-embedding-001") -> str:
+                     embedding_model: str = "gemini-embedding-001",
+                     hallucination_threshold: float = 0.75) -> str:
     """Check alignment between source and translated windows.
 
     Tries embedding-based check first (if embedding_provider configured),
@@ -83,6 +88,7 @@ def _check_alignment(source_window: List[str], translated_window: List[str],
             source_window, translated_window, llm_client,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            hallucination_threshold=hallucination_threshold,
         )
         if result is not None:
             return result
@@ -150,6 +156,33 @@ def remove_preamble(
     return None  # Signal: needs retry
 
 
+def strip_bilingual(
+    tl_lines: List[str],
+    llm_client,
+    strip_model_configs,
+) -> List[str]:
+    """Strip source-language lines from bilingual output using a cheap model.
+
+    When the translation model outputs bilingual (source + translation interleaved),
+    use a cheap model to keep only the target-language lines.
+    """
+    text = "\n".join(tl_lines)
+    try:
+        result = llm_client.generate(
+            prompt=f"{BILINGUAL_STRIP_PROMPT}\n\n{text}",
+            model_configs=strip_model_configs,
+            operation_name="Verifier bilingual strip",
+        )
+        stripped = [l for l in result.splitlines() if l.strip()]
+        if not stripped:
+            logger.warning("  Verifier: bilingual strip returned empty, keeping original")
+            return tl_lines
+        return stripped
+    except Exception as e:
+        logger.warning(f"  Verifier: bilingual strip failed ({e}), keeping original")
+        return tl_lines
+
+
 def find_hallucination_boundary(
     source_lines: List[str],
     translated_lines: List[str],
@@ -158,6 +191,7 @@ def find_hallucination_boundary(
     window_size: int = 5,
     embedding_provider: Optional[str] = None,
     embedding_model: str = "gemini-embedding-001",
+    hallucination_threshold: float = 0.75,
 ) -> int:
     """Binary search for where hallucination starts.
 
@@ -186,6 +220,7 @@ def find_hallucination_boundary(
             src_window, tl_window, llm_client, model_configs,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            hallucination_threshold=hallucination_threshold,
         )
         logger.debug(f"  Verifier: binary search pos={mid}, result={result}")
 
@@ -208,6 +243,8 @@ def verify_translation(
     is_first_chunk: bool = True,
     embedding_provider: Optional[str] = None,
     embedding_model: str = "gemini-embedding-001",
+    hallucination_threshold: float = 0.75,
+    strip_model_configs: Optional[list] = None,
 ) -> Tuple[Optional[str], str]:
     """Verify and fix translated text.
 
@@ -219,6 +256,8 @@ def verify_translation(
         is_first_chunk: Whether this is the first chunk (run preamble check).
         embedding_provider: Provider name for embedding (e.g. "gemini"). None = LLM only.
         embedding_model: Embedding model name.
+        hallucination_threshold: Cosine similarity threshold for hallucination detection.
+        strip_model_configs: Model configs for bilingual stripping (cheap model). None = retry instead.
 
     Returns:
         (fixed_text, action) where action is:
@@ -257,6 +296,7 @@ def verify_translation(
         model_configs,
         embedding_provider=embedding_provider,
         embedding_model=embedding_model,
+        hallucination_threshold=hallucination_threshold,
     )
 
     if tail_result != "D":
@@ -269,8 +309,40 @@ def verify_translation(
             return "\n".join(tl_lines), "continue"
         else:
             # Too many lines — likely bilingual output or duplication
-            logger.warning(f"  Verifier: too many lines ({n} vs {len(src_lines)}, +{n - len(src_lines)}), retry")
-            return "\n".join(tl_lines), "retry"
+            if n >= len(src_lines) * 1.8 and strip_model_configs:
+                # Bilingual output: use cheap model to strip source lines
+                logger.info(f"  Verifier: bilingual detected ({n} vs {len(src_lines)} lines, ratio={n/len(src_lines):.1f}x), stripping")
+                stripped = strip_bilingual(tl_lines, llm_client, strip_model_configs)
+                n_stripped = len(stripped)
+                logger.info(f"  Verifier: stripped {n} → {n_stripped} lines")
+                # Re-check with stripped lines (standard verification)
+                if abs(n_stripped - len(src_lines)) <= LINE_COUNT_TOLERANCE:
+                    # Re-verify tail alignment on stripped output
+                    sw = min(5, n_stripped, len(src_lines))
+                    if sw >= 2:
+                        tail2 = _check_alignment(
+                            src_lines[n_stripped - sw:n_stripped],
+                            stripped[n_stripped - sw:n_stripped],
+                            llm_client, model_configs,
+                            embedding_provider=embedding_provider,
+                            embedding_model=embedding_model,
+                            hallucination_threshold=hallucination_threshold,
+                        )
+                        if tail2 != "D":
+                            logger.info(f"  Verifier: complete after strip ({n_stripped} vs {len(src_lines)}, tail={tail2})")
+                            return "\n".join(stripped), "complete"
+                        logger.warning(f"  Verifier: tail hallucination after strip (tail={tail2}), retry")
+                        return "\n".join(stripped), "retry"
+                    return "\n".join(stripped), "complete"
+                elif n_stripped < len(src_lines) - LINE_COUNT_TOLERANCE:
+                    logger.info(f"  Verifier: truncated after strip ({n_stripped} vs {len(src_lines)})")
+                    return "\n".join(stripped), "continue"
+                else:
+                    logger.warning(f"  Verifier: still too many after strip ({n_stripped} vs {len(src_lines)}), retry")
+                    return "\n".join(stripped), "retry"
+            else:
+                logger.warning(f"  Verifier: too many lines ({n} vs {len(src_lines)}, +{n - len(src_lines)}), retry")
+                return "\n".join(tl_lines), "retry"
     else:
         # Tail is hallucination — binary search
         logger.warning(f"  Verifier: hallucination detected at tail ({n} lines, tail={tail_result})")
@@ -278,6 +350,7 @@ def verify_translation(
             src_lines, tl_lines, llm_client, model_configs,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            hallucination_threshold=hallucination_threshold,
         )
         truncated = tl_lines[:boundary + 1]
         logger.info(f"  Verifier: truncated to {len(truncated)} lines")

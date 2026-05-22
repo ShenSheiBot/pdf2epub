@@ -602,10 +602,12 @@ class AnthropicClient:
         request_kwargs = {
             "model": model,
             "messages": messages,
-            "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True
         }
+        # Opus 4.7+ deprecates temperature parameter
+        if "opus-4-7" not in model:
+            request_kwargs["temperature"] = temperature
         if system_param:
             request_kwargs["system"] = system_param
 
@@ -756,6 +758,14 @@ class OpenAIClient:
 
         # Initialize tokenizer for accurate token counting
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
+
+    def embed_content(self, texts: List[str], model: str = "text-embedding-3-small") -> List[List[float]]:
+        """Embed texts using OpenAI-compatible embeddings endpoint.
+
+        Sends all texts in a single batch request.
+        """
+        resp = self.client.embeddings.create(input=texts, model=model)
+        return [item.embedding for item in resp.data]
 
     @retry(
         retry=retry_if_exception(is_transient_openai_error),

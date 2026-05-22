@@ -17,9 +17,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 
 from pdf2epub.utils.llm_client import LLMClient
-from pdf2epub.core.tracking import ProcessingTracker
 
 from .prompts import create_compressed_translation_prompt, create_compressed_retry_prompt
+from .validation import nonempty_lines, tag_sequence
 
 
 class HTMLTranslateProcessor:
@@ -95,10 +95,6 @@ class HTMLTranslateProcessor:
             if entities_file.exists():
                 logger.info("Auto-detected translation entities file")
                 self.entities = self._load_entities()
-
-        # Initialize ProcessingTracker
-        tracker_path = self.output_dir / "processing_tracker.json"
-        self.processing_tracker = ProcessingTracker(tracker_path, "HTMLTranslateProcessor")
 
         # Initialize LLM client
         self.llm_client = LLMClient(config)
@@ -205,7 +201,7 @@ class HTMLTranslateProcessor:
     @staticmethod
     def _get_tag_seq(text: str) -> list:
         """Extract tag name sequence from HTML text."""
-        return [t.lower() for t in re.findall(r'<(/?[a-zA-Z0-9]+)', text)]
+        return tag_sequence(text)
 
     def validate_output(
         self,
@@ -229,8 +225,8 @@ class HTMLTranslateProcessor:
         Returns:
             Tuple of (is_valid, reason)
         """
-        src_lines = [l for l in original.split('\n') if l.strip()]
-        tgt_lines = [l for l in processed.split('\n') if l.strip()]
+        src_lines = nonempty_lines(original)
+        tgt_lines = nonempty_lines(processed)
 
         # 1. Line count validation
         if len(src_lines) != len(tgt_lines):

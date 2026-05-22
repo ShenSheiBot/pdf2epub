@@ -17,12 +17,15 @@ from loguru import logger
 from xml.etree import ElementTree as ET
 
 from .epub_parser import EPUBParser
+from .validation import nonempty_lines, tag_mismatch_count
 from ..utils.common import parse_llm_json
+
+
+PART_FILE_RE = re.compile(r'^(.+)\.part(\d+)\.md$')
 
 
 def sanitize_filename(name: str) -> str:
     """Sanitize a string for use as a filename."""
-    import re
     # Remove or replace characters that are problematic in filenames
     # Windows: \ / : * ? " < > |
     # Also handle other common issues
@@ -721,7 +724,6 @@ class HTMLEpubBuilder:
         except ImportError:
             # Fallback to regex if BeautifulSoup not available
             logger.debug("BeautifulSoup not available, using regex fallback")
-            import re
             content = nav_path.read_text(encoding='utf-8')
             updated_count = 0
             for href, translated in href_to_title.items():
@@ -949,45 +951,86 @@ class HTMLEpubPipeline:
         Returns:
             Dict mapping base_name -> merged_content
         """
-        import re
-        from collections import defaultdict
-
-        # Group files by base name
-        part_files = defaultdict(list)
-        part_pattern = re.compile(r'^(.+)\.part(\d+)\.md$')
-
-        for f in self.translated_dir.glob("*.part*.md"):
-            match = part_pattern.match(f.name)
-            if match:
-                base_name = match.group(1)
-                part_num = int(match.group(2))
-                part_files[base_name].append((part_num, f))
-
-        # Merge each group in order
-        merged = {}
-        for base_name, parts in part_files.items():
-            # Sort by part number
-            parts.sort(key=lambda x: x[0])
-
-            # Concatenate content
-            content_parts = []
-            for part_num, part_file in parts:
-                content_parts.append(part_file.read_text(encoding='utf-8'))
-
-            merged[base_name] = '\n'.join(content_parts)
+        merged = self._merge_part_files_in_dir(self.translated_dir)
+        part_groups = self._group_part_files(self.translated_dir)
+        for base_name in merged:
+            parts = part_groups.get(base_name, [])
             logger.debug(f"Merged {len(parts)} parts for {base_name}")
 
         return merged
 
     @staticmethod
-    def _nonempty_lines(text: str) -> List[str]:
-        """Return non-empty logical translation lines."""
-        return [line for line in text.splitlines() if line.strip()]
+    def _group_part_files(directory: Path) -> Dict[str, List[tuple[int, Path]]]:
+        """Group *.partN.md files by logical base stem."""
+        from collections import defaultdict
 
-    @staticmethod
-    def _tag_sequence(text: str) -> List[str]:
-        """Extract the simple HTML tag sequence used by compressed validation."""
-        return [tag.lower() for tag in re.findall(r'<(/?[a-zA-Z0-9]+)', text)]
+        part_files: Dict[str, List[tuple[int, Path]]] = defaultdict(list)
+        for file_path in directory.glob("*.part*.md"):
+            match = PART_FILE_RE.match(file_path.name)
+            if match:
+                part_files[match.group(1)].append((int(match.group(2)), file_path))
+
+        for parts in part_files.values():
+            parts.sort(key=lambda item: item[0])
+
+        return dict(part_files)
+
+    @classmethod
+    def _merge_part_files_in_dir(cls, directory: Path) -> Dict[str, str]:
+        """Merge split part files in a directory into base-stem content."""
+        merged = {}
+        for base_name, parts in cls._group_part_files(directory).items():
+            merged[base_name] = '\n'.join(
+                part_file.read_text(encoding='utf-8')
+                for _part_num, part_file in parts
+            )
+        return merged
+
+    def _logical_unit_records(self, merged_translated: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+        """Return logical compressed units using mapping files as the source of truth."""
+        merged_translated = merged_translated or {}
+        merged_sources = self._merge_part_files_in_dir(self.compressed_units_dir)
+        records = []
+
+        for mapping_path in sorted(self.compressed_units_dir.glob("*.mapping.json")):
+            base_stem = mapping_path.name[:-len(".mapping.json")]
+            try:
+                mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                mapping = {}
+
+            source_path = self.compressed_units_dir / f"{base_stem}.md"
+            translated_path = self.translated_dir / f"{base_stem}.md"
+
+            source_content = ""
+            if source_path.exists():
+                source_content = source_path.read_text(encoding="utf-8")
+            elif base_stem in merged_sources:
+                source_content = merged_sources[base_stem]
+
+            translated_content = ""
+            translated_exists = False
+            if base_stem in merged_translated:
+                translated_content = merged_translated[base_stem]
+                translated_exists = True
+            elif translated_path.exists():
+                translated_content = translated_path.read_text(encoding="utf-8")
+                translated_exists = True
+
+            original_ext = mapping.get("original_extension", ".xhtml")
+            records.append({
+                "base_stem": base_stem,
+                "mapping_path": mapping_path,
+                "mapping": mapping,
+                "source_path": source_path,
+                "source_content": source_content,
+                "translated_path": translated_path,
+                "translated_content": translated_content,
+                "translated_exists": translated_exists,
+                "final_path": self.final_dir / f"{base_stem}{original_ext}",
+            })
+
+        return records
 
     @staticmethod
     def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -1081,29 +1124,19 @@ class HTMLEpubPipeline:
             "total_continuations": 0,
         }
 
-        for source_path in sorted(self.compressed_units_dir.glob("*.md")):
-            file_stem = source_path.stem
-            translated_path = self.translated_dir / source_path.name
-            mapping_path = self.compressed_units_dir / f"{file_stem}.mapping.json"
-            original_ext = ".xhtml"
-            if mapping_path.exists():
-                try:
-                    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
-                    original_ext = mapping.get("original_extension", original_ext)
-                except json.JSONDecodeError:
-                    pass
-            final_path = self.final_dir / f"{file_stem}{original_ext}"
+        merged_parts = self._merge_part_files_in_dir(self.translated_dir)
+        for record in self._logical_unit_records(merged_parts):
+            file_stem = record["base_stem"]
+            source_text = record["source_content"]
+            translated_text = record["translated_content"]
+            source_lines = nonempty_lines(source_text)
+            translated_lines = nonempty_lines(translated_text)
 
-            source_text = source_path.read_text(encoding="utf-8")
-            translated_text = translated_path.read_text(encoding="utf-8") if translated_path.exists() else ""
-            source_lines = self._nonempty_lines(source_text)
-            translated_lines = self._nonempty_lines(translated_text)
-
-            tag_mismatches = 0
             compared = min(len(source_lines), len(translated_lines))
-            for src, tgt in zip(source_lines[:compared], translated_lines[:compared]):
-                if self._tag_sequence(src) != self._tag_sequence(tgt):
-                    tag_mismatches += 1
+            tag_mismatches = tag_mismatch_count(
+                source_lines[:compared],
+                translated_lines[:compared],
+            )
 
             agent_stats = self._agent_stats_for_file(file_stem)
             trace_stats = self._trace_stats_for_file(trace_rows, file_stem)
@@ -1115,19 +1148,19 @@ class HTMLEpubPipeline:
                 "translated_lines": len(translated_lines),
                 "line_count_match": len(source_lines) == len(translated_lines),
                 "tag_mismatches": tag_mismatches,
-                "translated_exists": translated_path.exists(),
-                "final_xhtml_exists": final_path.exists(),
+                "translated_exists": record["translated_exists"],
+                "final_xhtml_exists": record["final_path"].exists(),
                 "agent": agent_stats,
                 "llm_trace": trace_stats,
             }
             files.append(file_report)
 
             summary["total_files"] += 1
-            if translated_path.exists():
+            if record["translated_exists"]:
                 summary["translated_files"] += 1
             else:
                 summary["missing_translations"] += 1
-            if translated_path.exists() and len(source_lines) != len(translated_lines):
+            if record["translated_exists"] and len(source_lines) != len(translated_lines):
                 summary["line_mismatch_files"] += 1
             if tag_mismatches:
                 summary["tag_mismatch_files"] += 1
@@ -1169,8 +1202,6 @@ class HTMLEpubPipeline:
         Returns:
             Path to built EPUB
         """
-        import json
-        import re
         from .compressor import HTMLCompressor
 
         compressor = HTMLCompressor()
@@ -1180,69 +1211,18 @@ class HTMLEpubPipeline:
         if merged_parts:
             logger.info(f"Merged {len(merged_parts)} split files")
 
-        # Track which base names have been processed (to avoid duplicates)
-        processed_bases = set()
-
-        # Decompress each translated file
-        for translated_file in self.translated_dir.glob("*.md"):
-            # Skip part files (they've been merged)
-            if re.match(r'.*\.part\d+\.md$', translated_file.name):
+        for record in self._logical_unit_records(merged_parts):
+            base_stem = record["base_stem"]
+            if not record["translated_exists"]:
+                logger.warning(f"No translation found for {base_stem}")
                 continue
 
-            base_stem = translated_file.stem
-            mapping_path = self.compressed_units_dir / f"{base_stem}.mapping.json"
+            if base_stem in merged_parts:
+                logger.debug(f"Using merged content for {base_stem}")
 
-            if mapping_path.exists():
-                # Load mapping
-                with open(mapping_path, 'r', encoding='utf-8') as f:
-                    mapping = json.load(f)
-
-                # Check if we have merged content for this file
-                if base_stem in merged_parts:
-                    # Use merged content from parts
-                    content = merged_parts[base_stem]
-                    logger.debug(f"Using merged content for {base_stem}")
-                else:
-                    # Read translated compressed content directly
-                    content = translated_file.read_text(encoding='utf-8')
-
-                # Decompress to full HTML
-                restored = compressor.decompress(content, mapping)
-
-                # Save to final directory with original extension (.html or .xhtml)
-                original_ext = mapping.get('original_extension', '.xhtml')
-                final_path = self.final_dir / f"{base_stem}{original_ext}"
-                final_path.write_text(restored, encoding='utf-8')
-
-                processed_bases.add(base_stem)
-                logger.debug(f"Decompressed: {base_stem}")
-            else:
-                # Check if this is a base name that only has part files
-                if base_stem in merged_parts:
-                    # We have merged parts but no direct file - need to find mapping
-                    # This shouldn't happen normally, but handle it
-                    logger.warning(f"Found merged parts for {base_stem} but no base file")
-                else:
-                    logger.warning(f"No mapping found for {translated_file.name}")
-
-        # Handle cases where we have merged parts but no base .md file
-        for base_stem, content in merged_parts.items():
-            if base_stem in processed_bases:
-                continue
-
-            mapping_path = self.compressed_units_dir / f"{base_stem}.mapping.json"
-            if mapping_path.exists():
-                with open(mapping_path, 'r', encoding='utf-8') as f:
-                    mapping = json.load(f)
-
-                restored = compressor.decompress(content, mapping)
-                original_ext = mapping.get('original_extension', '.xhtml')
-                final_path = self.final_dir / f"{base_stem}{original_ext}"
-                final_path.write_text(restored, encoding='utf-8')
-
-                logger.debug(f"Decompressed from merged parts: {base_stem}")
-            else:
-                logger.warning(f"No mapping found for merged parts: {base_stem}")
+            restored = compressor.decompress(record["translated_content"], record["mapping"])
+            record["final_path"].write_text(restored, encoding='utf-8')
+            logger.debug(f"Decompressed: {base_stem}")
 
         # Load translated metadata if available
         metadata_path = self.output_dir / "translated_metadata.json"
@@ -1288,8 +1268,6 @@ class HTMLEpubPipeline:
         Returns:
             Dict with translated_title and translated_toc
         """
-        import json
-
         # Check for existing translated metadata (resume support)
         metadata_path = self.output_dir / "translated_metadata.json"
         if metadata_path.exists() and not force:

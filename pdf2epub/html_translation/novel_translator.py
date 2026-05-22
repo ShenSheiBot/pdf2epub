@@ -307,7 +307,6 @@ class NovelTranslator:
                 try:
                     stream = client.client.messages.create(**request_kwargs)
 
-                    last_token_count = 0
                     budget_hit = False
                     stream_events = []
                     chunk_count = 0
@@ -356,8 +355,6 @@ class NovelTranslator:
                                         stopped_early = True
                                         stream.close()
                                         break
-                                    last_token_count = current_tokens
-
                     # Extract cumulative usage from all stream events.
                     _usage, _usage_source = extract_anthropic_stream_usage(stream_events)
                     _status = usage_status(_usage, response_text)

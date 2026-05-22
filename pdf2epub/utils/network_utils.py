@@ -724,8 +724,6 @@ class AnthropicClient:
             if not response_text:
                 raise ValueError(f"Empty response from Anthropic for {operation_name}")
 
-            final_tokens = len(self.tokenizer.encode(response_text))
-
             # Log complete usage metadata.
             _usage, _usage_source = extract_anthropic_stream_usage(self._last_stream_events)
             _status = usage_status(_usage, response_text)

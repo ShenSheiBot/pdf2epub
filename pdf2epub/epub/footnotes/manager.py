@@ -11,7 +11,7 @@ from .models import FootnoteStyle, FootnoteDefinition, NotesSection
 from .scanner import FootnoteScanner
 from .mapper import FootnoteMapper
 from .llm_matcher import LLMSectionMatcher
-from ...chapter_identity import ChapterIdentity
+from ...chapter_identity import ChapterIdentity, strip_part_suffix
 
 
 def _parse_footnote_key(key: str) -> Tuple:
@@ -344,10 +344,11 @@ class FootnoteManager:
             key = page_note_match.group(2)
 
         if self.style == FootnoteStyle.LOCAL:
-            # Check if this chapter is part of a multi-part chapter
-            source_identity = ChapterIdentity.parse(source_chapter)
-            if source_identity:
-                base_chapter = source_identity.base_name
+            # Check if this chapter is part of a multi-part chapter. ChapterIdentity.parse
+            # only handles a single .partN, so fall back to strip_part_suffix for
+            # multiply-nested parts (e.g. chapter_7.4.part3.part1).
+            base_chapter = strip_part_suffix(source_chapter)
+            if ChapterIdentity.parse(base_chapter):
 
                 # Check if this is a multi-part chapter with local mappings
                 if base_chapter in self.mapper.local_occurrence_mapping and len(self.mapper.local_chapter_groups.get(base_chapter, [])) > 1:
@@ -362,7 +363,7 @@ class FootnoteManager:
                         if target_chapter == source_chapter:
                             # Same file, use local anchor with unique ID
                             fnref_id = f"fnref-{source_chapter}-{key}"
-                            source_html = source_identity.html_name
+                            source_html = self.get_html_filename(source_chapter)
                             return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{key}:{occurrence_num}">[{key}]</a></sup>'
                         else:
                             # Cross-part reference within the same chapter
@@ -392,7 +393,7 @@ class FootnoteManager:
                 section_idx = self.notes_sections.index(section)
 
                 # Dynamic occurrence counting - increment counter for each call
-                counter_key = (key, source_chapter)
+                counter_key = (key, base_chapter)
                 current_count = self._section_occurrence_counter.get(counter_key, 0) + 1
                 self._section_occurrence_counter[counter_key] = current_count
                 occurrence = current_count

@@ -11,7 +11,7 @@ from typing import Optional
 import yaml
 from loguru import logger
 from .utils.logging_config import configure_logging
-from .chapter_identity import ChapterIdentity
+from .chapter_identity import ChapterIdentity, strip_part_suffix
 
 # We'll use markdown library - need to add to pyproject.toml: 
 # poetry add markdown
@@ -428,9 +428,15 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
     lines = markdown_content.split('\n')
     processed_lines = []
 
-    # Extract base chapter name using ChapterIdentity
+    # Extract base chapter name using ChapterIdentity. ChapterIdentity.parse only
+    # handles a single .partN, so fall back to strip_part_suffix for multiply-nested
+    # parts (e.g. chapter_7.4.part3.part1) so they map to their parent chapter group.
     source_identity = ChapterIdentity.parse(source_chapter)
-    base_chapter = source_identity.base_name if source_identity else source_chapter
+    if source_identity:
+        base_chapter = source_identity.base_name
+    else:
+        stripped = strip_part_suffix(source_chapter)
+        base_chapter = stripped if ChapterIdentity.parse(stripped) else source_chapter
 
     # Check if this is a multi-part chapter
     is_multi_part = False

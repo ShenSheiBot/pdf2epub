@@ -260,6 +260,48 @@ class ChapterIdentity:
         return self.sort_key < other.sort_key
 
 
+_PART_SUFFIX_RE = re.compile(r'(?:\.part\d+)+$')
+_PART_NUM_RE = re.compile(r'\.part(\d+)')
+
+
+def strip_part_suffix(stem: str) -> str:
+    """Strip a trailing chain of .partN suffixes to get the base chapter name.
+
+    Unlike ChapterIdentity.parse, this handles multiply-nested parts.
+
+    Examples:
+        "chapter_7.4.part3.part1" -> "chapter_7.4"
+        "chapter_5.part2"         -> "chapter_5"
+        "chapter_5"               -> "chapter_5"
+    """
+    # Remove a recognized file extension first (but not .partN)
+    path = Path(stem)
+    if path.suffix.lower() in {'.md', '.html', '.txt', '.json', '.xml'}:
+        stem = path.stem
+    else:
+        stem = path.name
+    return _PART_SUFFIX_RE.sub('', stem)
+
+
+def part_path(stem: str) -> Tuple[int, ...]:
+    """Return the chain of part numbers from a (possibly nested) part name.
+
+    Examples:
+        "chapter_7.4.part3.part1" -> (3, 1)
+        "chapter_5.part2"         -> (2,)
+        "chapter_5"               -> ()
+    """
+    path = Path(stem)
+    if path.suffix.lower() in {'.md', '.html', '.txt', '.json', '.xml'}:
+        stem = path.stem
+    else:
+        stem = path.name
+    suffix_match = _PART_SUFFIX_RE.search(stem)
+    if not suffix_match:
+        return ()
+    return tuple(int(x) for x in _PART_NUM_RE.findall(suffix_match.group(0)))
+
+
 def group_by_base(identities: List[ChapterIdentity]) -> dict:
     """
     Group ChapterIdentity objects by their base name.

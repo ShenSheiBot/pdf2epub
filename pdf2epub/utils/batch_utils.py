@@ -689,11 +689,12 @@ class VertexBatchClient:
         ordered_keys = [req.key for req in requests]
 
         # Write JSONL (Vertex format: no top-level 'key', just 'request')
+        # Vertex batch uses 'generationConfig' (not 'config') in the request proto
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False, encoding='utf-8') as f:
             for req in requests:
                 line = {"request": {"contents": req.contents}}
                 if req.config:
-                    line["request"]["config"] = req.config
+                    line["request"]["generationConfig"] = req.config
                 f.write(json.dumps(line, ensure_ascii=False) + "\n")
             temp_path = f.name
 

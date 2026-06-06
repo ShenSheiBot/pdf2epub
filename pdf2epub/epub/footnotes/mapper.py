@@ -7,7 +7,7 @@ from typing import Dict, List, Set, Tuple
 from loguru import logger
 
 from .models import FootnoteDefinition, NotesSection
-from ...chapter_identity import ChapterIdentity
+from ...chapter_identity import ChapterIdentity, strip_part_suffix, part_path
 
 
 class FootnoteMapper:
@@ -36,13 +36,19 @@ class FootnoteMapper:
         """
         for file_path in files:
             chapter_name = file_path.stem
-            # Use ChapterIdentity to extract base chapter name
+            # Use ChapterIdentity to extract base chapter name. ChapterIdentity.parse
+            # only handles a single .partN, so fall back to strip_part_suffix for
+            # multiply-nested parts (e.g. chapter_7.4.part3.part1).
             identity = ChapterIdentity.parse(chapter_name)
             if identity:
                 base_chapter = identity.base_name
-                if base_chapter not in self.local_chapter_groups:
-                    self.local_chapter_groups[base_chapter] = []
-                self.local_chapter_groups[base_chapter].append(chapter_name)
+            else:
+                base_chapter = strip_part_suffix(chapter_name)
+                if not ChapterIdentity.parse(base_chapter):
+                    continue
+            if base_chapter not in self.local_chapter_groups:
+                self.local_chapter_groups[base_chapter] = []
+            self.local_chapter_groups[base_chapter].append(chapter_name)
 
         # Sort the part files within each group
         for base_chapter in self.local_chapter_groups:
@@ -237,8 +243,13 @@ class FootnoteMapper:
         Returns:
             Tuple for sorting
         """
-        # Use ChapterIdentity for consistent sorting
-        identity = ChapterIdentity.parse(chapter_name)
-        if identity:
-            return identity.sort_key
-        return (999, 0, 0)  # Put unrecognized files at the end
+        # Use ChapterIdentity for the base (category + hierarchical index), and the
+        # full part chain for ordering. The part component is always a tuple so that
+        # single parts (.part1) and nested parts (.part3.part1) sort consistently.
+        base = strip_part_suffix(chapter_name)
+        base_id = ChapterIdentity.parse(base)
+        parts = part_path(chapter_name)
+        if base_id:
+            category, idx_path, _ = base_id.sort_key
+            return (category, list(idx_path), parts)
+        return (999, [], parts)  # Put unrecognized files at the end

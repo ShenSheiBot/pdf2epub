@@ -5,6 +5,7 @@ Optimized replacement for the slow fuzzy-search approach.
 
 import re
 import bisect
+import html
 from typing import List, Tuple, Optional, NamedTuple
 
 # Use rapidfuzz for faster diff (C++ implementation, 10-100x faster than difflib)
@@ -21,6 +22,14 @@ class MatchBlock(NamedTuple):
     a: int  # start in sequence a
     b: int  # start in sequence b
     size: int  # length of match
+
+
+class ImageRef(NamedTuple):
+    """Image reference with raw markup and normalized source path."""
+    raw: str
+    src: str
+    start: int
+    end: int
 
 
 def get_matching_blocks(a: str, b: str) -> List[MatchBlock]:
@@ -44,30 +53,46 @@ from loguru import logger
 
 # Compile regex once for performance
 # Markdown image pattern: ![alt](src)
-MD_IMG_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+MD_IMG_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 # HTML image pattern: <img src="..." ... /> or <img src="..." ...>
 # Also match surrounding div if present
 HTML_IMG_PATTERN = re.compile(
-    r'(?:<div[^>]*>)?\s*<img\s+[^>]*src="([^"]+)"[^>]*/?\s*>\s*(?:</div>)?',
-    re.IGNORECASE
+    r'(?:<div[^>]*>)?\s*<img\s+[^>]*\bsrc\s*=\s*(["\'])([^"\']+)\1[^>]*/?\s*>\s*(?:</div>)?',
+    re.IGNORECASE | re.DOTALL
 )
 
 
-def extract_images_from_markdown(content: str) -> List[Tuple[str, int, int]]:
-    """Extract all image references from markdown and HTML content."""
+def _normalize_image_src(src: str) -> str:
+    """Normalize image src values for comparing equivalent image references."""
+    src = html.unescape(src).strip()
+    if src.startswith("<") and src.endswith(">"):
+        src = src[1:-1].strip()
+    return src
+
+
+def _extract_image_refs(content: str) -> List[ImageRef]:
+    """Extract image references with normalized src values."""
     results = []
 
     # Extract markdown images
     for m in MD_IMG_PATTERN.finditer(content):
-        results.append((m.group(0), m.start(), m.end()))
+        src = _normalize_image_src(m.group(1))
+        if src:
+            results.append(ImageRef(m.group(0), src, m.start(), m.end()))
 
     # Extract HTML images
     for m in HTML_IMG_PATTERN.finditer(content):
-        results.append((m.group(0), m.start(), m.end()))
+        src = _normalize_image_src(m.group(2))
+        if src:
+            results.append(ImageRef(m.group(0), src, m.start(), m.end()))
 
-    # Sort by position
-    results.sort(key=lambda x: x[1])
+    results.sort(key=lambda x: x.start)
     return results
+
+
+def extract_images_from_markdown(content: str) -> List[Tuple[str, int, int]]:
+    """Extract all image references from markdown and HTML content."""
+    return [(ref.raw, ref.start, ref.end) for ref in _extract_image_refs(content)]
 
 
 def _prefix_removed_lengths(
@@ -106,6 +131,15 @@ def _remove_images(text: str, images: List[Tuple[str, int, int]]) -> str:
         prev = e
     parts.append(text[prev:])
     return "".join(parts)
+
+
+def _snap_out_of_spans(pos: int, spans: List[Tuple[int, int]], text_len: int) -> int:
+    """Keep insertion positions outside existing image markup spans."""
+    pos = max(0, min(pos, text_len))
+    for start, end in spans:
+        if start < pos < end:
+            return end
+    return pos
 
 
 def _nearest_mapped_pos(original_noimg_pos: int, blocks: List[MatchBlock]) -> int:
@@ -226,22 +260,29 @@ def restore_lost_images_fast(
     Returns:
         Polished content with restored images
     """
-    original_images = extract_images_from_markdown(original_content)
-    polished_images = extract_images_from_markdown(polished_content)
+    original_refs = _extract_image_refs(original_content)
+    polished_refs = _extract_image_refs(polished_content)
+    original_images = [(ref.raw, ref.start, ref.end) for ref in original_refs]
+    polished_images = [(ref.raw, ref.start, ref.end) for ref in polished_refs]
 
-    orig_set = {img for img, _, _ in original_images}
-    pol_set = {img for img, _, _ in polished_images}
-    lost = list(orig_set - pol_set)
+    polished_srcs = {ref.src for ref in polished_refs}
+    lost_refs: List[ImageRef] = []
+    seen_lost_srcs = set()
+    for ref in original_refs:
+        if ref.src not in polished_srcs and ref.src not in seen_lost_srcs:
+            lost_refs.append(ref)
+            seen_lost_srcs.add(ref.src)
 
-    if not lost:
+    if not lost_refs:
         return polished_content
 
-    logger.info(f"Detected {len(lost)} lost images, attempting fast restoration...")
+    logger.info(f"Detected {len(lost_refs)} lost images, attempting fast restoration...")
 
     # Sort original image spans by start; build helpers
     original_images_sorted = sorted(original_images, key=lambda t: t[1])
     spans = [(s, e) for _, s, e in original_images_sorted]
     ends, prefix = _prefix_removed_lengths(spans)
+    polished_spans = [(ref.start, ref.end) for ref in polished_refs]
 
     # Build texts without images
     original_noimg = _remove_images(original_content, original_images_sorted)
@@ -250,14 +291,11 @@ def restore_lost_images_fast(
     # Diff once and reuse (rapidfuzz is 10-100x faster than difflib)
     blocks = get_matching_blocks(original_noimg, polished_noimg)
 
-    # Index: image markdown -> (start,end) in original
-    pos_by_img = {img: (s, e) for img, s, e in original_images_sorted}
-
     # Plan insertions: list of (polished_offset, img_markdown)
     planned: List[Tuple[int, str]] = []
 
-    for img_md in lost:
-        s, e = pos_by_img[img_md]
+    for ref in lost_refs:
+        s, e = ref.start, ref.end
 
         # Check if image is at the end of original content
         # (within 50 chars of the end, accounting for trailing whitespace)
@@ -301,11 +339,12 @@ def restore_lost_images_fast(
             )
             if local_insert is not None:
                 mapped = left + local_insert  # relocate within the window
-                logger.info(f"Refined position for {img_md} using local context")
+                logger.info(f"Refined position for {ref.raw} using local context")
             else:
-                logger.debug(f"Using difflib mapping for {img_md}")
+                logger.debug(f"Using difflib mapping for {ref.raw}")
 
-        planned.append((mapped, img_md))
+        mapped = _snap_out_of_spans(mapped, polished_spans, len(polished_content))
+        planned.append((mapped, ref.raw))
 
     # Apply all insertions right-to-left to avoid index shifts
     planned.sort(key=lambda t: t[0], reverse=True)

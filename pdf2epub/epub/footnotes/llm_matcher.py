@@ -10,6 +10,7 @@ from loguru import logger
 
 from .models import FootnoteDefinition, NotesSection
 from ...utils.common import parse_llm_json
+from ...utils.unit_id import generate_unit_id
 
 
 class LLMSectionMatcher:
@@ -58,7 +59,7 @@ class LLMSectionMatcher:
                 result = []
                 for i, ch in enumerate(chapters):
                     path = (parent_path or []) + [i + 1]
-                    unit_id = f"chapter_{path[0]}" if len(path) == 1 else f"chapter_{'_'.join(map(str, path))}"
+                    unit_id = generate_unit_id(path)
                     result.append({
                         "unit_id": unit_id,
                         "title": ch.get("title", ""),

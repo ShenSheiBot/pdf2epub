@@ -268,8 +268,8 @@ class NovelTranslator:
             "stream": True,
             "system": system_with_cache,
         }
-        # Opus 4.7+ deprecates temperature; only set for older models
-        if "opus-4-7" not in model:
+        # Opus 4.7+ deprecates temperature; only set for older models.
+        if not any(tag in model for tag in ("opus-4-7", "opus-4-8")):
             request_kwargs["temperature"] = 0.1
 
         import time as _time

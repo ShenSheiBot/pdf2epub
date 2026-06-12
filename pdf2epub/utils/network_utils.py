@@ -664,8 +664,8 @@ class AnthropicClient:
             "max_tokens": max_tokens,
             "stream": True
         }
-        # Opus 4.7+ deprecates temperature parameter.
-        if not any(tag in model for tag in ("opus-4-7", "opus-4-8")):
+        # Opus 4.7+ and fable models deprecate temperature parameter.
+        if not any(tag in model for tag in ("opus-4-7", "opus-4-8", "fable")):
             request_kwargs["temperature"] = temperature
         if system_param:
             request_kwargs["system"] = system_param

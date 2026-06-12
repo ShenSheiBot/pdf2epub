@@ -795,12 +795,8 @@ def main():
     if has_notes_chapter and not args.global_footnotes:
         logger.info("Detected 'Notes' chapter in book structure - auto-enabling global footnote mode")
     
-    # Initialize FootnoteManager to analyze footnote structure
-    logger.info("Analyzing footnote structure...")
-    footnote_manager = FootnoteManager(epub_config.markdown_dir, force_global=force_global_mode)
-    
     # Initialize components
-    converter = ContentConverter(epub_config, footnote_manager)
+    converter = ContentConverter(epub_config)
     builder = EpubBuilder(
         epub_config, converter
     )  # Pass converter for file naming helpers
@@ -811,6 +807,11 @@ def main():
 
     logger.info("Removing duplicate titles from markdown files...")
     converter.remove_duplicate_titles()
+
+    # Analyze footnotes after cleanup so mappings match converted markdown.
+    logger.info("Analyzing footnote structure...")
+    footnote_manager = FootnoteManager(epub_config.markdown_dir, force_global=force_global_mode)
+    converter.footnote_manager = footnote_manager
 
     # Build book structure from markdown
     logger.info("Building TOC from markdown headings...")

@@ -23,12 +23,11 @@ class FootnoteScanner:
         self.definition_chapters: Set[str] = set()  # Chapters that contain definitions
         self.reference_only_chapters: Set[str] = set()  # Chapters with refs but no defs
 
-    def scan_files(self, markdown_dir: Path, files: List[Path]) -> None:
+    def scan_files(self, files: List[Path]) -> None:
         """
         Scan all provided files for footnotes.
 
         Args:
-            markdown_dir: Directory containing markdown files
             files: List of file paths to scan
         """
         for md_file in files:
@@ -62,6 +61,9 @@ class FootnoteScanner:
                     self.definitions[key].append(
                         FootnoteDefinition(key, content, chapter_name, line_num)
                     )
+
+                if def_matches:
+                    continue
 
                 # Check for footnote references [^key] (not followed by colon)
                 ref_matches = re.findall(r'\[\^(\w+)\](?!:)', line)

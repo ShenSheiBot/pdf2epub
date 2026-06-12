@@ -768,14 +768,6 @@ def build_epub(config: BuildEpubConfig) -> Path:
     (epub_dir / "text").mkdir()
     (epub_dir / "images").mkdir()
 
-    # Initialize FootnoteManager for cross-chapter footnote handling
-    # Check if there's a notes chapter to enable global footnote mode
-    auto_global = has_notes_chapter(toc_tree.get('chapters', []))
-    if auto_global:
-        logger.info("Detected notes chapter, enabling global footnote mode")
-    footnote_manager = FootnoteManager(config.markdown_dir, auto_global=auto_global, config=llm_config)
-    logger.debug(f"Initialized FootnoteManager in {footnote_manager.style.value} mode")
-
     # Copy and compress images, get mapping
     image_mapping = {}
     if config.images_dir and config.images_dir.exists():
@@ -805,7 +797,7 @@ def build_epub(config: BuildEpubConfig) -> Path:
     builder = EpubBuilder(minimal_config)
 
     # Create ContentConverter for cleanup operations
-    converter = ContentConverter(minimal_config, footnote_manager)
+    converter = ContentConverter(minimal_config)
 
     # Clean up markdown content before conversion
     removed_headings = converter.clean_invalid_headings()
@@ -815,6 +807,20 @@ def build_epub(config: BuildEpubConfig) -> Path:
     removed_duplicates = converter.remove_duplicate_titles()
     if removed_duplicates > 0:
         logger.info(f"Removed {removed_duplicates} duplicate titles")
+
+    # Initialize FootnoteManager after cleanup so scanned refs/defs match the
+    # markdown that will actually be converted.
+    auto_global = has_notes_chapter(toc_tree.get('chapters', []))
+    if auto_global:
+        logger.info("Detected notes chapter, enabling global footnote mode")
+    footnote_manager = FootnoteManager(
+        config.markdown_dir,
+        auto_global=auto_global,
+        config=llm_config,
+        epub_structure=epub_structure,
+    )
+    converter.footnote_manager = footnote_manager
+    logger.debug(f"Initialized FootnoteManager in {footnote_manager.style.value} mode")
 
     # Create basic EPUB files
     builder.create_mimetype(epub_dir / "mimetype")

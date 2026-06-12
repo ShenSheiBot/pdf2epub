@@ -11,7 +11,6 @@ from typing import Optional
 import yaml
 from loguru import logger
 from .utils.logging_config import configure_logging
-from .chapter_identity import ChapterIdentity, strip_part_suffix
 
 # We'll use markdown library - need to add to pyproject.toml: 
 # poetry add markdown
@@ -286,6 +285,18 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
     # IMPORTANT: Use placeholder to avoid interfering with $...$ LaTeX block matching
     markdown_content = markdown_content.replace(r'\$', '<<<ESCAPED_DOLLAR>>>')
 
+    # OCR/refine placeholders such as "$$$" mean an unknown page number, not math.
+    # Protect them before the $$...$$ display-math pass so they cannot consume
+    # following paragraphs or footnote definitions.
+    dollar_run_placeholders = {}
+
+    def protect_dollar_run(match):
+        token = f"<<<DOLLAR_RUN_{len(dollar_run_placeholders)}>>>"
+        dollar_run_placeholders[token] = match.group(0)
+        return token
+
+    markdown_content = re.sub(r'\${3,}', protect_dollar_run, markdown_content)
+
     # === DISPLAY MATH: Convert $$...$$ blocks to MathML ===
     # Process display math BEFORE inline math to avoid conflicts
     from latex2mathml import converter
@@ -403,6 +414,8 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
 
     # Convert placeholders back to actual dollar signs
     markdown_content = markdown_content.replace('<<<ESCAPED_DOLLAR>>>', '$')
+    for token, dollar_run in dollar_run_placeholders.items():
+        markdown_content = markdown_content.replace(token, dollar_run)
 
     # Now process footnotes
     return preprocess_footnotes(markdown_content, footnote_manager, source_chapter)
@@ -422,120 +435,38 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
     Returns:
         Processed markdown with HTML footnote links
     """
-    import re
-    from loguru import logger
-
     lines = markdown_content.split('\n')
     processed_lines = []
+    definition_occurrence_in_file = {}
+    reference_occurrence_in_file = {}
 
-    # Extract base chapter name using ChapterIdentity. ChapterIdentity.parse only
-    # handles a single .partN, so fall back to strip_part_suffix for multiply-nested
-    # parts (e.g. chapter_7.4.part3.part1) so they map to their parent chapter group.
-    source_identity = ChapterIdentity.parse(source_chapter)
-    if source_identity:
-        base_chapter = source_identity.base_name
-    else:
-        stripped = strip_part_suffix(source_chapter)
-        base_chapter = stripped if ChapterIdentity.parse(stripped) else source_chapter
-
-    # Check if this is a multi-part chapter
-    is_multi_part = False
-    local_mapping = None
-    if base_chapter in footnote_manager.local_occurrence_mapping:
-        chapter_parts = footnote_manager.local_chapter_groups.get(base_chapter, [])
-        if len(chapter_parts) > 1:
-            is_multi_part = True
-            local_mapping = footnote_manager.local_occurrence_mapping[base_chapter]
-            logger.debug(f"Processing {source_chapter} as part of multi-part chapter {base_chapter}")
-
-    # Process each line
-    for line in lines:
+    for line_num, line in enumerate(lines, 1):
         # Check for footnote definition [^key]:
         def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
         if def_match:
             fn_key = def_match.group(1)
             fn_text = def_match.group(2)
-
-            if is_multi_part and local_mapping:
-                # For multi-part chapters, use position-based mapping
-                # Find the position of this definition
-                occurrence_num = None
-
-                # Look up this definition's position directly
-                if 'definition_positions' in local_mapping:
-                    # Find this specific definition by matching chapter and line number
-                    for (key, chapter, line_num), position in local_mapping['definition_positions'].items():
-                        if key == fn_key and chapter == source_chapter:
-                            # We found a definition for this key in this chapter
-                            # Use its position as the occurrence number
-                            occurrence_num = position
-                            break
-
-                # Fallback to legacy mapping if new fields not available
-                if occurrence_num is None and 'definition_by_occurrence' in local_mapping:
-                    for key, defn in local_mapping['definition_by_occurrence'].items():
-                        if key[0] == fn_key and defn.chapter == source_chapter:
-                            occurrence_num = key[1]
-                            break
-
-                # If still not found, default to 1
-                if occurrence_num is None:
-                    occurrence_num = 1
-                    logger.debug(f"Using default occurrence 1 for footnote {fn_key} in {source_chapter}")
-
-                fn_id = f"fn:{fn_key}:{occurrence_num}"
-
-                # Find which part file(s) have references to this footnote
-                ref_chapters = []
-                for ref_key, ref_chapter in local_mapping['reference_occurrence_count'].keys():
-                    if ref_key == fn_key:
-                        # Check if this reference occurrence maps to this definition
-                        ref_occurrence = local_mapping['reference_occurrence_count'][(ref_key, ref_chapter)]
-                        if (fn_key, ref_occurrence) in local_mapping['definition_by_occurrence']:
-                            mapped_def = local_mapping['definition_by_occurrence'][(fn_key, ref_occurrence)]
-                            if mapped_def.chapter == source_chapter:
-                                if ref_chapter not in ref_chapters:
-                                    ref_chapters.append(ref_chapter)
-
-                # Generate backref link with unique ID - always use file name for consistency
-                if ref_chapters:
-                    # Link back to the first referencing chapter
-                    backref_chapter = ref_chapters[0]
-                    fnref_id = f"fnref-{backref_chapter}-{fn_key}"
-                    # Always use file name, even for same-file backrefs
-                    backref_link = f"{footnote_manager.get_html_filename(backref_chapter)}#{fnref_id}"
-                else:
-                    # Fallback - still use file name
-                    fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                    backref_link = f"{footnote_manager.get_html_filename(source_chapter)}#{fnref_id}"
-            else:
-                # Single-part chapter, use simple ID with unique prefix
-                fn_id = f"fn:{fn_key}"
-                fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                # Use file name even for single-part chapters
-                backref_link = f"{footnote_manager.get_html_filename(source_chapter)}#{fnref_id}"
-
-            # Convert to HTML footnote definition (using same format as GLOBAL mode)
-            processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
-            processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text} <a class="footnote-backref" href="{backref_link}" title="Jump back to footnote {fn_key} in the text">↩</a></p>')
-            processed_lines.append('</div>')
+            definition_occurrence_in_file[fn_key] = definition_occurrence_in_file.get(fn_key, 0) + 1
+            processed_lines.append(
+                footnote_manager.get_definition_html(
+                    fn_key,
+                    fn_text,
+                    source_chapter,
+                    line_num=line_num,
+                    occurrence_in_file=definition_occurrence_in_file[fn_key],
+                )
+            )
         else:
             # Process footnote references [^key]
             def replace_ref(match):
                 fn_key = match.group(1)
-
-                if is_multi_part and local_mapping:
-                    # Get the HTML from FootnoteManager for cross-part references
-                    html = footnote_manager.get_footnote_html(fn_key, source_chapter)
-                    if html:
-                        # Extract just the inner HTML (remove the outer sup tags if we're replacing inline)
-                        # The get_footnote_html already returns the full HTML we need
-                        return html
-
-                # Default local reference - use file name for consistency
-                fnref_id = f"fnref-{source_chapter}-{fn_key}"
-                source_html = footnote_manager.get_html_filename(source_chapter)
-                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{fn_key}">[{fn_key}]</a></sup>'
+                reference_occurrence_in_file[fn_key] = reference_occurrence_in_file.get(fn_key, 0) + 1
+                return footnote_manager.get_footnote_html(
+                    fn_key,
+                    source_chapter,
+                    line_num=line_num,
+                    occurrence_in_file=reference_occurrence_in_file[fn_key],
+                ) or match.group(0)
 
             # Replace footnote references
             line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
@@ -566,185 +497,40 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
     """
     lines = markdown_content.split('\n')
     processed_lines = []
-    
-    # Check if this chapter is a definition chapter
-    is_definition_chapter = False
-    if hasattr(footnote_manager, 'definition_chapters'):
-        is_definition_chapter = source_chapter in footnote_manager.definition_chapters
-    if hasattr(footnote_manager, 'primary_definition_chapters') and footnote_manager.primary_definition_chapters:
-        # If primary definition chapters are set (force_global mode), use those instead
-        is_definition_chapter = source_chapter in footnote_manager.primary_definition_chapters
-    
-    # Debug logging
-    from loguru import logger
-    logger.debug(f"Processing {source_chapter}: is_definition_chapter={is_definition_chapter}")
-    
-    # For definition chapters, convert footnote definitions to HTML without renumbering
-    if is_definition_chapter:
-        logger.debug(f"Definition chapter {source_chapter}: converting footnotes without renumbering")
+    reference_occurrence_in_file = {}
+    definition_occurrence_in_file = {}
+    is_definition_chapter = footnote_manager.is_definition_chapter(source_chapter)
 
-        # Check if we're using section-based mapping
-        use_section_mapping = (
-            hasattr(footnote_manager, 'section_definition_by_occurrence') and
-            footnote_manager.section_definition_by_occurrence and
-            hasattr(footnote_manager, 'notes_sections') and
-            footnote_manager.notes_sections
-        )
+    for line_num, line in enumerate(lines, 1):
+        def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+        if def_match and is_definition_chapter:
+            fn_key = def_match.group(1)
+            fn_text = def_match.group(2)
+            definition_occurrence_in_file[fn_key] = definition_occurrence_in_file.get(fn_key, 0) + 1
+            processed_lines.append(
+                footnote_manager.get_definition_html(
+                    fn_key,
+                    fn_text,
+                    source_chapter,
+                    line_num=line_num,
+                    occurrence_in_file=definition_occurrence_in_file[fn_key],
+                )
+            )
+            continue
 
-        if use_section_mapping:
-            # Section-based occurrence counting
-            # First, identify sections in this file by scanning for headers
-            current_section_idx = None
-            section_def_counters = {}  # (section_idx, key) -> count
+        def replace_ref(match):
+            fn_key = match.group(1)
+            reference_occurrence_in_file[fn_key] = reference_occurrence_in_file.get(fn_key, 0) + 1
+            return footnote_manager.get_footnote_html(
+                fn_key,
+                source_chapter,
+                line_num=line_num,
+                occurrence_in_file=reference_occurrence_in_file[fn_key],
+            ) or match.group(0)
 
-            # Build reverse mapping: section -> unit_id (for backref generation)
-            section_to_unit_id = {}
-            for unit_id, section in footnote_manager.chapter_to_section.items():
-                section_idx = footnote_manager.notes_sections.index(section)
-                section_to_unit_id[section_idx] = unit_id
+        line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
+        processed_lines.append(line)
 
-            # Find which section each line belongs to
-            line_to_section = {}
-            for i, line in enumerate(lines):
-                # Check for section headers (matching what was found by LLM)
-                stripped = line.strip()
-                header_text = re.sub(r'^#+\s*', '', stripped)
-
-                # Find matching section
-                for idx, section in enumerate(footnote_manager.notes_sections):
-                    if section.source_file == source_chapter and section.header_text == header_text:
-                        current_section_idx = idx
-                        break
-
-                line_to_section[i] = current_section_idx
-
-            # Process lines with section-aware counting
-            for i, line in enumerate(lines):
-                # Check for footnote definition [^1]:
-                def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
-                if def_match:
-                    fn_key = def_match.group(1)
-                    fn_text = def_match.group(2)
-
-                    section_idx = line_to_section.get(i)
-                    if section_idx is not None:
-                        # Track occurrence within this section
-                        counter_key = (section_idx, fn_key)
-                        if counter_key not in section_def_counters:
-                            section_def_counters[counter_key] = 0
-                        section_def_counters[counter_key] += 1
-                        occurrence_num = section_def_counters[counter_key]
-                    else:
-                        # Fallback to global counting if no section found
-                        global_def_occurrence = getattr(footnote_manager, '_global_def_occurrence', {})
-                        if fn_key not in global_def_occurrence:
-                            global_def_occurrence[fn_key] = 0
-                        global_def_occurrence[fn_key] += 1
-                        occurrence_num = global_def_occurrence[fn_key]
-                        footnote_manager._global_def_occurrence = global_def_occurrence
-
-                    # Generate ID with section-based occurrence
-                    fn_id = f"fn:{fn_key}:{occurrence_num}"
-
-                    # Generate backref link to the source chapter
-                    backref_html = ""
-                    if section_idx is not None and section_idx in section_to_unit_id:
-                        # Find the source chapter that references this footnote
-                        ref_unit_id = section_to_unit_id[section_idx]
-                        # The unit_id is like "chapter_9", we need to find actual file(s)
-                        fnref_id = f"fnref-{ref_unit_id}-{fn_key}-{occurrence_num}"
-
-                        # Find the actual file containing this reference occurrence
-                        ref_file = None
-                        if hasattr(footnote_manager, 'references') and fn_key in footnote_manager.references:
-                            # Get all references for this key
-                            all_refs = footnote_manager.references[fn_key]
-                            # Filter to refs in this chapter (matching unit_id)
-                            chapter_refs = []
-                            for ref in all_refs:
-                                ref_base = ref.chapter.split('.part')[0] if '.part' in ref.chapter else ref.chapter
-                                if ref_base == ref_unit_id:
-                                    chapter_refs.append(ref)
-                            # Sort by file and line number
-                            chapter_refs.sort(key=lambda r: (footnote_manager._chapter_sort_key(r.chapter), r.line_num))
-                            # Get the Nth occurrence (occurrence_num is 1-based)
-                            if occurrence_num <= len(chapter_refs):
-                                ref_file = chapter_refs[occurrence_num - 1].chapter
-
-                        if ref_file:
-                            # Use the actual file containing the reference
-                            backref_link = f"{footnote_manager.get_html_filename(ref_file)}#{fnref_id}"
-                        elif hasattr(footnote_manager, 'local_chapter_groups') and ref_unit_id in footnote_manager.local_chapter_groups:
-                            # Fallback: use the first part file
-                            first_part = footnote_manager.local_chapter_groups[ref_unit_id][0]
-                            backref_link = f"{footnote_manager.get_html_filename(first_part)}#{fnref_id}"
-                        else:
-                            # Single file chapter
-                            backref_link = f"{footnote_manager.get_html_filename(ref_unit_id)}#{fnref_id}"
-                        backref_html = f' <a class="footnote-backref" href="{backref_link}" title="Jump back to footnote {fn_key} in the text">↩</a>'
-
-                    # Output as HTML with occurrence-based ID and backref
-                    processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
-                    processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}{backref_html}</p>')
-                    processed_lines.append('</div>')
-                else:
-                    # Process footnote references [^1] but NOT definitions
-                    def replace_ref(match):
-                        fn_key = match.group(1)
-                        # Get the HTML from FootnoteManager which handles cross-chapter links
-                        return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
-
-                    line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
-                    processed_lines.append(line)
-        else:
-            # Global occurrence counting (original behavior)
-            global_def_occurrence = getattr(footnote_manager, '_global_def_occurrence', {})
-
-            for line in lines:
-                # Check for footnote definition [^1]:
-                def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
-                if def_match:
-                    fn_key = def_match.group(1)
-                    fn_text = def_match.group(2)
-
-                    # Track occurrence number globally across all definition chapters
-                    if fn_key not in global_def_occurrence:
-                        global_def_occurrence[fn_key] = 0
-                    global_def_occurrence[fn_key] += 1
-                    occurrence_num = global_def_occurrence[fn_key]
-
-                    # Store it back to FootnoteManager for persistence across files
-                    footnote_manager._global_def_occurrence = global_def_occurrence
-
-                    # In global mode with occurrence mapping, keep the original numbering
-                    # Add ID based on occurrence number for cross-chapter linking
-                    fn_id = f"fn:{fn_key}:{occurrence_num}"
-
-                    # Output as HTML with occurrence-based ID
-                    processed_lines.append(f'<div class="footnote-def" id="{fn_id}">')
-                    processed_lines.append(f'<p><strong>[{fn_key}]:</strong> {fn_text}</p>')
-                    processed_lines.append('</div>')
-                else:
-                    # Process footnote references [^1] but NOT definitions
-                    def replace_ref(match):
-                        fn_key = match.group(1)
-                        # Get the HTML from FootnoteManager which handles cross-chapter links
-                        return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
-
-                    line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
-                    processed_lines.append(line)
-    else:
-        # For reference chapters, only process references (no definitions to handle)
-        for line in lines:
-            # Process footnote references [^1]
-            def replace_ref(match):
-                fn_key = match.group(1)
-                # Get the HTML from FootnoteManager which handles cross-chapter links
-                return footnote_manager.get_footnote_html(fn_key, source_chapter) or match.group(0)
-            
-            line = re.sub(r'\[\^(\w+)\](?!:)', replace_ref, line)
-            processed_lines.append(line)
-    
     return '\n'.join(processed_lines)
 
 

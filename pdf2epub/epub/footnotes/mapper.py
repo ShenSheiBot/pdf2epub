@@ -18,14 +18,19 @@ class FootnoteMapper:
     def __init__(self):
         # For occurrence-based mapping in GLOBAL mode
         self.reference_occurrence_count: Dict[Tuple[str, str], int] = {}  # (key, chapter) -> occurrence number
+        self.reference_occurrence_in_file: Dict[Tuple[str, str, int], int] = {}  # (key, chapter, occurrence_in_file) -> occurrence number
         self.definition_by_occurrence: Dict[Tuple[str, int], FootnoteDefinition] = {}  # (key, occurrence_num) -> definition
+        self.definition_occurrence_in_file: Dict[Tuple[str, str, int], int] = {}  # (key, chapter, occurrence_in_file) -> occurrence number
 
         # For LOCAL mode with multi-part chapters
         self.local_chapter_groups: Dict[str, List[str]] = {}  # base_chapter -> list of part files
+        self.local_part_to_group: Dict[str, str] = {}  # part file -> logical local footnote group
         self.local_occurrence_mapping: Dict[str, Dict] = {}  # base_chapter -> occurrence mappings
 
         # For section-based mapping in GLOBAL mode (LLM-based)
         self.section_definition_by_occurrence: Dict[Tuple[int, str, int], FootnoteDefinition] = {}
+        self.section_definition_occurrence_by_line: Dict[Tuple[str, str, int], Tuple[int, int]] = {}
+        self.section_definition_occurrence_in_file: Dict[Tuple[str, str, int], Tuple[int, int]] = {}
 
     def build_chapter_groups(self, files: List[Path]) -> None:
         """
@@ -34,6 +39,9 @@ class FootnoteMapper:
         Args:
             files: List of markdown file paths
         """
+        self.local_chapter_groups = {}
+        self.local_part_to_group = {}
+
         for file_path in files:
             chapter_name = file_path.stem
             # Use ChapterIdentity to extract base chapter name. ChapterIdentity.parse
@@ -49,12 +57,57 @@ class FootnoteMapper:
             if base_chapter not in self.local_chapter_groups:
                 self.local_chapter_groups[base_chapter] = []
             self.local_chapter_groups[base_chapter].append(chapter_name)
+            self.local_part_to_group.setdefault(chapter_name, base_chapter)
 
         # Sort the part files within each group
         for base_chapter in self.local_chapter_groups:
             self.local_chapter_groups[base_chapter].sort(key=self._chapter_sort_key)
 
         logger.debug(f"Built {len(self.local_chapter_groups)} chapter groups")
+
+    def augment_chapter_groups_from_structure(self, epub_structure: List[Dict]) -> None:
+        """
+        Add local footnote groups from the refined TOC hierarchy.
+
+        Refine already gives us logical chapter boundaries. If a top-level chapter
+        is split into child sections and the notes are placed at the end of the
+        last child, refs and defs live in sibling unit files. Treat those siblings
+        as one local footnote scope during EPUB linking.
+        """
+        def collect_part_stems(entry: Dict) -> List[str]:
+            stems: List[str] = []
+            for part_file in entry.get('part_files', []):
+                stems.append(Path(part_file).stem)
+            for child in entry.get('children', []):
+                stems.extend(collect_part_stems(child))
+            return stems
+
+        def walk(entries: List[Dict]) -> None:
+            for entry in entries:
+                children = entry.get('children', [])
+                unit_id = entry.get('unit_id')
+
+                if unit_id and children:
+                    stems = sorted(set(collect_part_stems(entry)), key=self._chapter_sort_key)
+                    if len(stems) > 1:
+                        self.local_chapter_groups[unit_id] = stems
+                        for stem in stems:
+                            # Keep the outer refined chapter as the local scope.
+                            # This lets refs in early sibling sections link to
+                            # definitions collected in the final sibling section.
+                            current_group = self.local_part_to_group.get(stem)
+                            default_group = strip_part_suffix(stem)
+                            if current_group is None or current_group == default_group:
+                                self.local_part_to_group[stem] = unit_id
+
+                walk(children)
+
+        walk(epub_structure)
+        logger.debug(f"Augmented local chapter groups from TOC: {len(self.local_chapter_groups)} groups")
+
+    def get_local_group_for_part(self, part_name: str) -> str:
+        """Return the logical local footnote group for a markdown stem."""
+        return self.local_part_to_group.get(part_name, strip_part_suffix(part_name))
 
     def build_occurrence_mapping(
         self,
@@ -74,6 +127,11 @@ class FootnoteMapper:
             force_global: If True, force global style
             auto_global: If True, auto-detected global mode
         """
+        self.reference_occurrence_count = {}
+        self.reference_occurrence_in_file = {}
+        self.definition_by_occurrence = {}
+        self.definition_occurrence_in_file = {}
+
         # Sort all references by chapter and line number
         all_refs = []
         for key, ref_list in references.items():
@@ -83,11 +141,15 @@ class FootnoteMapper:
 
         # Count occurrences of each key in references
         ref_counts = {}
+        occurrence_in_file = {}
         for key, chapter, line_num in all_refs:
             count = ref_counts.get(key, 0) + 1
             ref_counts[key] = count
             # Store the occurrence number for this specific reference
             self.reference_occurrence_count[(key, chapter)] = count
+            file_counter_key = (key, chapter)
+            occurrence_in_file[file_counter_key] = occurrence_in_file.get(file_counter_key, 0) + 1
+            self.reference_occurrence_in_file[(key, chapter, occurrence_in_file[file_counter_key])] = count
 
         # Sort all definitions by chapter and line number
         all_defs = []
@@ -100,10 +162,16 @@ class FootnoteMapper:
 
         # Map definitions by occurrence number
         def_counts = {}
+        definition_in_file = {}
         for key, defn in all_defs:
             count = def_counts.get(key, 0) + 1
             def_counts[key] = count
             self.definition_by_occurrence[(key, count)] = defn
+            file_counter_key = (key, defn.chapter)
+            definition_in_file[file_counter_key] = definition_in_file.get(file_counter_key, 0) + 1
+            self.definition_occurrence_in_file[
+                (key, defn.chapter, definition_in_file[file_counter_key])
+            ] = count
 
         logger.debug(f"Built occurrence mapping: {len(ref_counts)} unique ref keys, {len(def_counts)} unique def keys")
 
@@ -123,7 +191,16 @@ class FootnoteMapper:
             chapter_definitions: Dictionary of chapter -> set of defined keys
             chapter_references: Dictionary of chapter -> set of referenced keys
         """
+        self.local_occurrence_mapping = {}
+
         for base_chapter, part_files in self.local_chapter_groups.items():
+            active_parts = [
+                part_file for part_file in part_files
+                if self.local_part_to_group.get(part_file, base_chapter) == base_chapter
+            ]
+            if len(active_parts) != len(part_files):
+                continue
+
             if len(part_files) <= 1:
                 # Single file chapter, no cross-part references needed
                 continue
@@ -131,10 +208,10 @@ class FootnoteMapper:
             # Build position-based mapping for this chapter group
             chapter_mapping = {
                 'reference_positions': {},  # (key, part_file, line_num) -> position
+                'reference_occurrence_in_file': {},  # (key, part_file, occurrence_in_file) -> position
                 'definition_positions': {},  # (key, part_file, line_num) -> position
-                'position_to_definition': {},  # (key, position) -> definition
-                'reference_to_position': {},  # (key, part_file) -> position (for first ref in file)
-                # Keep legacy fields for compatibility
+                'definition_occurrence_in_file': {},  # (key, part_file, occurrence_in_file) -> position
+                # Kept for manager-internal compatibility while callers use manager APIs.
                 'reference_occurrence_count': {},
                 'definition_by_occurrence': {},
             }
@@ -154,12 +231,14 @@ class FootnoteMapper:
             # Sort references within each key and assign positions
             for key in refs_by_key:
                 refs_by_key[key].sort(key=lambda x: (self._chapter_sort_key(x[0]), x[1]))
+                occurrence_in_file = {}
                 for position, (part_file, line_num) in enumerate(refs_by_key[key], 1):
                     chapter_mapping['reference_positions'][(key, part_file, line_num)] = position
-                    # Store first occurrence for each part file (for get_footnote_html)
-                    if (key, part_file) not in chapter_mapping['reference_to_position']:
-                        chapter_mapping['reference_to_position'][(key, part_file)] = position
-                    # Legacy field
+                    file_counter_key = (key, part_file)
+                    occurrence_in_file[file_counter_key] = occurrence_in_file.get(file_counter_key, 0) + 1
+                    chapter_mapping['reference_occurrence_in_file'][
+                        (key, part_file, occurrence_in_file[file_counter_key])
+                    ] = position
                     chapter_mapping['reference_occurrence_count'][(key, part_file)] = position
 
             # Group definitions by key
@@ -177,10 +256,14 @@ class FootnoteMapper:
             # Sort definitions within each key and assign positions
             for key in defs_by_key:
                 defs_by_key[key].sort(key=lambda x: (self._chapter_sort_key(x.chapter), x.line_num))
+                occurrence_in_file = {}
                 for position, defn in enumerate(defs_by_key[key], 1):
                     chapter_mapping['definition_positions'][(key, defn.chapter, defn.line_num)] = position
-                    chapter_mapping['position_to_definition'][(key, position)] = defn
-                    # Legacy field
+                    file_counter_key = (key, defn.chapter)
+                    occurrence_in_file[file_counter_key] = occurrence_in_file.get(file_counter_key, 0) + 1
+                    chapter_mapping['definition_occurrence_in_file'][
+                        (key, defn.chapter, occurrence_in_file[file_counter_key])
+                    ] = position
                     chapter_mapping['definition_by_occurrence'][(key, position)] = defn
 
             # Validate ref/def counts match
@@ -210,6 +293,11 @@ class FootnoteMapper:
         if not notes_sections:
             return
 
+        self.section_definition_by_occurrence = {}
+        self.section_definition_occurrence_by_line = {}
+        self.section_definition_occurrence_in_file = {}
+        occurrence_in_file: Dict[Tuple[str, str], int] = {}
+
         # Build mapping for each section
         for section_idx, section in enumerate(notes_sections):
             if not section.matched_unit_id:
@@ -230,6 +318,14 @@ class FootnoteMapper:
             for key, def_list in defs_by_key.items():
                 for occurrence, defn in enumerate(def_list, 1):
                     self.section_definition_by_occurrence[(section_idx, key, occurrence)] = defn
+                    self.section_definition_occurrence_by_line[
+                        (key, defn.chapter, defn.line_num)
+                    ] = (section_idx, occurrence)
+                    file_counter_key = (key, defn.chapter)
+                    occurrence_in_file[file_counter_key] = occurrence_in_file.get(file_counter_key, 0) + 1
+                    self.section_definition_occurrence_in_file[
+                        (key, defn.chapter, occurrence_in_file[file_counter_key])
+                    ] = (section_idx, occurrence)
 
         logger.debug(f"Built section occurrence mapping for {len(notes_sections)} sections")
 

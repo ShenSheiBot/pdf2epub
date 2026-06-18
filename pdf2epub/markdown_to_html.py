@@ -18,6 +18,13 @@ from .utils.logging_config import configure_logging
 # Configure logger
 logger = configure_logging()
 
+FOOTNOTE_SYNTAX_RE = re.compile(r'\[\^(\w+)\](?!:)|^\[\^(\w+)\]:', re.MULTILINE)
+
+
+def contains_footnote_syntax(markdown_content: str) -> bool:
+    """Return whether markdown contains supported footnote syntax."""
+    return bool(FOOTNOTE_SYNTAX_RE.search(markdown_content))
+
 
 def load_config(config_path="config.yaml"):
     """Load configuration from config file."""
@@ -443,6 +450,11 @@ def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_c
     for line_num, line in enumerate(lines, 1):
         # Check for footnote definition [^key]:
         def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+        if (
+            not def_match
+            and footnote_manager.is_no_colon_definition_chapter(source_chapter)
+        ):
+            def_match = re.match(r'^\[\^(\w+)\]\s+(.+)', line)
         if def_match:
             fn_key = def_match.group(1)
             fn_text = def_match.group(2)
@@ -503,6 +515,12 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
 
     for line_num, line in enumerate(lines, 1):
         def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+        if (
+            not def_match
+            and is_definition_chapter
+            and footnote_manager.is_no_colon_definition_chapter(source_chapter)
+        ):
+            def_match = re.match(r'^\[\^(\w+)\]\s+(.+)', line)
         if def_match and is_definition_chapter:
             fn_key = def_match.group(1)
             fn_text = def_match.group(2)
@@ -537,161 +555,31 @@ def preprocess_footnotes_global(markdown_content: str, footnote_manager, source_
 def preprocess_footnotes(markdown_content: str, footnote_manager=None, source_chapter: Optional[str] = None) -> str:
     """
     Convert footnote definitions to HTML format and handle footnote references.
-    
+
     Since we're not using the markdown footnotes extension, we need to manually
     convert [^1]: text to proper HTML footnote format.
-    
-    If footnote_manager is provided and in GLOBAL mode, handles cross-chapter footnote links.
-    Otherwise, falls back to local footnote processing.
-    
+
+    Footnote conversion is manager-backed only. This keeps local, split-part, and
+    global notes on the same mapping/backref implementation.
+
     Args:
         markdown_content: The markdown text to process
-        footnote_manager: Optional FootnoteManager for cross-chapter footnote handling  
+        footnote_manager: FootnoteManager for local/global footnote handling
         source_chapter: The source chapter name for footnote linking
     """
-    # Check if we should use footnote manager
-    if footnote_manager and source_chapter:
-        from pdf2epub.epub.footnotes import FootnoteStyle
-        if footnote_manager.get_style() == FootnoteStyle.GLOBAL:
-            return preprocess_footnotes_global(markdown_content, footnote_manager, source_chapter)
-        elif footnote_manager.get_style() == FootnoteStyle.LOCAL:
-            # Use new local handler with multi-part support
-            return preprocess_footnotes_local(markdown_content, footnote_manager, source_chapter)
+    if not contains_footnote_syntax(markdown_content):
+        return markdown_content
 
-    # Fall back to simple local processing (existing logic for backward compatibility)
-    lines = markdown_content.split('\n')
-    
-    # First pass: find all footnote references and definitions, make them unique
-    footnote_ref_counter = {}  # Track how many times we've seen each footnote number
-    footnote_def_counter = {}  # Track how many times we've seen each footnote definition
-    
-    # Count occurrences
-    for line in lines:
-        # Count references like [^1]
-        refs = re.findall(r'\[\^(\d+)\](?!:)', line)
-        for ref in refs:
-            if ref not in footnote_ref_counter:
-                footnote_ref_counter[ref] = 0
-            footnote_ref_counter[ref] += 1
-            
-        # Count definitions like [^1]:
-        defs = re.findall(r'^\[\^(\d+)\]:', line)
-        for def_num in defs:
-            if def_num not in footnote_def_counter:
-                footnote_def_counter[def_num] = 0
-            footnote_def_counter[def_num] += 1
-    
-    # Second pass: process and make unique
-    processed_lines = []
-    in_notes_section = False
-    footnote_list = []
-    current_footnote = None
-    ref_occurrence = {}  # Track which occurrence of each ref we're at
-    def_occurrence = {}  # Track which occurrence of each def we're at
-    
-    for i, line in enumerate(lines):
-        # Check if this is any heading
-        if line.strip().startswith('#'):
-            # If we were collecting footnotes, output them first
-            if footnote_list:
-                processed_lines.append('<div class="footnote">')
-                processed_lines.append('<ol>')
-                for fn_id, fn_num, fn_text in footnote_list:
-                    processed_lines.append(f'<li id="fn:{fn_id}">')
-                    processed_lines.append(f'<p>{fn_text} <a class="footnote-backref" href="#fnref{fn_id}" title="Jump back to footnote {fn_num} in the text">↩</a></p>')
-                    processed_lines.append('</li>')
-                processed_lines.append('</ol>')
-                processed_lines.append('</div>')
-                footnote_list = []
-                current_footnote = None
-            
-            # Check if we're entering a Notes section
-            # Support multiple languages: English, Chinese, Japanese, etc.
-            notes_keywords = ['Notes', 'Footnotes', '注释', '注解', '脚注', '註釋', '註解', '脚註']
-            if any(keyword in line for keyword in notes_keywords):
-                in_notes_section = True
-            else:
-                in_notes_section = False
-            
-            processed_lines.append(line)
-            continue
-        
-        # If we're in the notes section
-        if in_notes_section:
-            # Check if this is a new footnote definition
-            match = re.match(r'^\[\^(\d+)\]:\s*(.*)', line)
-            if match:
-                # If we have a previous footnote, save it
-                if current_footnote:
-                    footnote_list.append(current_footnote)
-                
-                fn_num = match.group(1)
-                fn_text = match.group(2)
-                
-                # Track which occurrence this is
-                if fn_num not in def_occurrence:
-                    def_occurrence[fn_num] = 0
-                def_occurrence[fn_num] += 1
-                
-                # Create unique ID
-                fn_id = f'{fn_num}_{def_occurrence[fn_num]}'
-                current_footnote = (fn_id, fn_num, fn_text)
-            # Check if this is a continuation of the current footnote
-            elif current_footnote and line.strip():
-                # Append to current footnote text
-                fn_id, fn_num, fn_text = current_footnote
-                fn_text += ' ' + line.strip()
-                current_footnote = (fn_id, fn_num, fn_text)
-            # Empty line - keep collecting if we have a current footnote
-            elif not line.strip() and current_footnote:
-                pass  # Just skip empty lines within footnotes
-            else:
-                # End of footnotes or other content
-                if current_footnote:
-                    footnote_list.append(current_footnote)
-                    current_footnote = None
-                
-                # Output collected footnotes if any
-                if footnote_list:
-                    processed_lines.append('<div class="footnote">')
-                    processed_lines.append('<ol>')
-                    for fn_id, fn_num, fn_text in footnote_list:
-                        processed_lines.append(f'<li id="fn:{fn_id}">')
-                        processed_lines.append(f'<p>{fn_text} <a class="footnote-backref" href="#fnref{fn_id}" title="Jump back to footnote {fn_num} in the text">↩</a></p>')
-                        processed_lines.append('</li>')
-                    processed_lines.append('</ol>')
-                    processed_lines.append('</div>')
-                    footnote_list = []
-                    in_notes_section = False
-                
-                processed_lines.append(line)
-        else:
-            # Not in notes section - convert footnote references [^1] to superscript
-            def replace_ref(match):
-                fn_num = match.group(1)
-                if fn_num not in ref_occurrence:
-                    ref_occurrence[fn_num] = 0
-                ref_occurrence[fn_num] += 1
-                fn_id = f'{fn_num}_{ref_occurrence[fn_num]}'
-                return f'<sup id="fnref{fn_id}"><a class="footnote-ref" href="#fn:{fn_id}">[{fn_num}]</a></sup>'
-            
-            line = re.sub(r'\[\^(\d+)\]', replace_ref, line)
-            processed_lines.append(line)
-    
-    # Handle any remaining footnotes at the end
-    if current_footnote:
-        footnote_list.append(current_footnote)
-    if footnote_list:
-        processed_lines.append('<div class="footnote">')
-        processed_lines.append('<ol>')
-        for fn_id, fn_num, fn_text in footnote_list:
-            processed_lines.append(f'<li id="fn:{fn_id}">')
-            processed_lines.append(f'<p>{fn_text} <a class="footnote-backref" href="#fnref{fn_id}" title="Jump back to footnote {fn_num} in the text">↩</a></p>')
-            processed_lines.append('</li>')
-        processed_lines.append('</ol>')
-        processed_lines.append('</div>')
-    
-    return '\n'.join(processed_lines)
+    if not footnote_manager or not source_chapter:
+        raise ValueError("Footnote markdown requires FootnoteManager and source_chapter")
+
+    from pdf2epub.epub.footnotes import FootnoteStyle
+    if footnote_manager.get_style() == FootnoteStyle.GLOBAL:
+        return preprocess_footnotes_global(markdown_content, footnote_manager, source_chapter)
+    if footnote_manager.get_style() == FootnoteStyle.LOCAL:
+        return preprocess_footnotes_local(markdown_content, footnote_manager, source_chapter)
+
+    raise ValueError(f"Unsupported footnote style: {footnote_manager.get_style()}")
 
 
 def convert_markdown_to_html(
@@ -838,7 +726,9 @@ def convert_file(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     include_css: bool = True,
-    standalone: bool = True
+    standalone: bool = True,
+    footnote_manager=None,
+    source_chapter: Optional[str] = None
 ) -> bool:
     """
     Convert a markdown file to HTML.
@@ -867,11 +757,19 @@ def convert_file(
                 title = input_path.stem
         
         # Convert to HTML
+        if source_chapter is None:
+            source_chapter = input_path.stem
+        if footnote_manager is None and contains_footnote_syntax(markdown_content):
+            from pdf2epub.epub.footnotes import FootnoteManager
+            footnote_manager = FootnoteManager(input_path.parent)
+
         html = convert_markdown_to_html(
             markdown_content,
             title=title,
             include_css=include_css,
-            standalone=standalone
+            standalone=standalone,
+            footnote_manager=footnote_manager,
+            source_chapter=source_chapter if footnote_manager else None
         )
         
         # Determine output path
@@ -949,13 +847,24 @@ def main():
         logger.info(f"Converting {len(markdown_files)} markdown files to HTML...")
         
         success_count = 0
+        footnote_manager = None
+        if any(
+            contains_footnote_syntax(md_file.read_text(encoding='utf-8'))
+            for md_file in markdown_files
+            if md_file.exists()
+        ):
+            from pdf2epub.epub.footnotes import FootnoteManager
+            footnote_manager = FootnoteManager(input_path)
+
         for md_file in markdown_files:
             output_file = output_dir / md_file.with_suffix('.html').name
             if convert_file(
                 md_file,
                 output_file,
                 include_css=not args.no_css,
-                standalone=not args.body_only
+                standalone=not args.body_only,
+                footnote_manager=footnote_manager,
+                source_chapter=md_file.stem
             ):
                 success_count += 1
         

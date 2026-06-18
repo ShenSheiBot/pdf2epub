@@ -1,9 +1,11 @@
 from pathlib import Path
 
+import pytest
+
 from pdf2epub.build_epub import process_chapter_content
 from pdf2epub.epub.footnotes import FootnoteManager, FootnoteStyle
 import pdf2epub.epub.footnotes.manager as manager_module
-from pdf2epub.markdown_to_html import convert_markdown_to_html
+from pdf2epub.markdown_to_html import convert_file, convert_markdown_to_html
 
 
 def test_local_footnotes_resolve_across_refined_sibling_units(tmp_path: Path) -> None:
@@ -264,6 +266,74 @@ def test_global_notes_keep_definitions_after_unknown_page_placeholder(tmp_path: 
     assert 'id="fn:1:1"' in notes_html
     assert 'id="fn:2:1"' in notes_html
     assert "$$$" in notes_html
+
+
+def test_no_colon_footnote_definitions_only_in_notes_chapters(tmp_path: Path) -> None:
+    (tmp_path / "chapter_1.md").write_text(
+        "Body note [^1].\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "chapter_2.1.md").write_text(
+        "[^1] Legacy notes definition without colon.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "chapter_3.md").write_text(
+        "[^2] Body-leading marker is still a reference.\n",
+        encoding="utf-8",
+    )
+
+    structure = [
+        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
+        {
+            "unit_id": "chapter_2",
+            "type": "notes",
+            "children": [
+                {
+                    "unit_id": "chapter_2.1",
+                    "file_path": tmp_path / "chapter_2.1.md",
+                    "part_files": [tmp_path / "chapter_2.1.md"],
+                },
+            ],
+        },
+        {"unit_id": "chapter_3", "file_path": tmp_path / "chapter_3.md", "part_files": [tmp_path / "chapter_3.md"]},
+    ]
+    manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
+    manager.configure_from_structure(structure)
+
+    assert "chapter_2.1" in manager.no_colon_definition_chapters
+    assert "chapter_2.1" in manager.primary_definition_chapters
+    assert "chapter_3" not in manager.no_colon_definition_chapters
+    assert manager.references["1"][0].chapter == "chapter_1"
+    assert manager.definitions["1"][0].chapter == "chapter_2.1"
+    assert "2" in manager.references
+    assert "2" not in manager.definitions
+
+    body_html = convert_markdown_to_html(
+        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
+        "Book",
+        standalone=False,
+        footnote_manager=manager,
+        source_chapter="chapter_1",
+    )
+    notes_html = convert_markdown_to_html(
+        (tmp_path / "chapter_2.1.md").read_text(encoding="utf-8"),
+        "Book",
+        standalone=False,
+        footnote_manager=manager,
+        source_chapter="chapter_2.1",
+    )
+    body_marker_html = convert_markdown_to_html(
+        (tmp_path / "chapter_3.md").read_text(encoding="utf-8"),
+        "Book",
+        standalone=False,
+        footnote_manager=manager,
+        source_chapter="chapter_3",
+    )
+
+    assert 'href="chapter_2.1.html#fn:1:1"' in body_html
+    assert 'id="fn:1:1"' in notes_html
+    assert '<strong>[1]:</strong> Legacy notes definition without colon.' in notes_html
+    assert '<sup id="fnref-chapter_3-2">[2]</sup>' in body_marker_html
 
 
 def test_local_orphan_definition_does_not_create_broken_backref(tmp_path: Path) -> None:
@@ -669,3 +739,37 @@ def test_definition_text_marker_is_not_counted_as_body_reference(tmp_path: Path)
 
     assert 'href="chapter_1.html#fnref-chapter_1-1"' in html
     assert 'href="chapter_1.html#fnref-chapter_1-2"' not in html
+
+
+def test_markdown_without_footnotes_does_not_require_manager() -> None:
+    html = convert_markdown_to_html(
+        "Plain paragraph without notes.",
+        "Book",
+        standalone=False,
+    )
+
+    assert "Plain paragraph without notes." in html
+
+
+def test_markdown_footnotes_require_manager() -> None:
+    with pytest.raises(ValueError, match="Footnote markdown requires FootnoteManager"):
+        convert_markdown_to_html(
+            "Body note [^1].\n\n[^1]: Definition.\n",
+            "Book",
+            standalone=False,
+        )
+
+
+def test_convert_file_uses_manager_for_footnotes(tmp_path: Path) -> None:
+    input_path = tmp_path / "chapter_1.md"
+    output_path = tmp_path / "chapter_1.html"
+    input_path.write_text(
+        "Body note [^1].\n\n[^1]: Definition.\n",
+        encoding="utf-8",
+    )
+
+    assert convert_file(input_path, output_path, standalone=False)
+    html = output_path.read_text(encoding="utf-8")
+
+    assert 'id="fnref-chapter_1-1"' in html
+    assert 'href="chapter_1.html#fnref-chapter_1-1"' in html

@@ -4,7 +4,7 @@ Footnote scanning and analysis functionality.
 
 import re
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 from loguru import logger
 
 from .models import FootnoteDefinition, FootnoteReference, FootnoteStyle
@@ -23,17 +23,24 @@ class FootnoteScanner:
         self.definition_chapters: Set[str] = set()  # Chapters that contain definitions
         self.reference_only_chapters: Set[str] = set()  # Chapters with refs but no defs
 
-    def scan_files(self, files: List[Path]) -> None:
+    def scan_files(
+        self,
+        files: List[Path],
+        no_colon_definition_chapters: Optional[Set[str]] = None,
+    ) -> None:
         """
         Scan all provided files for footnotes.
 
         Args:
             files: List of file paths to scan
+            no_colon_definition_chapters: chapter stems where legacy
+                ``[^key] text`` lines should be treated as definitions.
         """
+        no_colon_definition_chapters = no_colon_definition_chapters or set()
         for md_file in files:
-            self._scan_file(md_file)
+            self._scan_file(md_file, no_colon_definition_chapters)
 
-    def _scan_file(self, file_path: Path) -> None:
+    def _scan_file(self, file_path: Path, no_colon_definition_chapters: Set[str]) -> None:
         """
         Scan a single file for footnote definitions and references.
 
@@ -51,13 +58,23 @@ class FootnoteScanner:
             for line_num, line in enumerate(lines, 1):
                 # Check for footnote definitions [^key]:
                 def_matches = re.findall(r'^\[\^(\w+)\]:', line)
+                no_colon_def_match = None
+                if not def_matches and chapter_name in no_colon_definition_chapters:
+                    no_colon_def_match = re.match(r'^\[\^(\w+)\]\s+(.+)', line)
+                    if no_colon_def_match:
+                        def_matches = [no_colon_def_match.group(1)]
                 for key in def_matches:
                     defined_keys.add(key)
                     if key not in self.definitions:
                         self.definitions[key] = []
                     # Extract the content after the definition marker
                     content_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
-                    content = content_match.group(2) if content_match else ""
+                    if content_match:
+                        content = content_match.group(2)
+                    elif no_colon_def_match:
+                        content = no_colon_def_match.group(2)
+                    else:
+                        content = ""
                     self.definitions[key].append(
                         FootnoteDefinition(key, content, chapter_name, line_num)
                     )

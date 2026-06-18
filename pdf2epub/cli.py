@@ -1236,8 +1236,6 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
     )
     entity_parser.set_defaults(func=extract_entities_command)
     
-    # EPUB generation subcommand (DEPRECATED)
-
     # Build EPUB subcommand (toc_tree.json driven - new approach)
     build_epub_parser = subparsers.add_parser(
         "build-epub",

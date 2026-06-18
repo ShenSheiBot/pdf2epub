@@ -2,8 +2,7 @@
 Build EPUB from toc_tree.json structure.
 
 This module generates EPUB files using toc_tree.json as the authoritative
-source for chapter structure and titles. Unlike generate_epub.py which
-scans markdown files, this approach provides:
+source for chapter structure and titles. This provides:
 - Accurate title hierarchy from PDF TOC
 - Consistent chapter numbering
 - Support for unlimited nesting levels
@@ -367,6 +366,8 @@ def flatten_toc_tree(
             'start_page': chapter.get('start_page'),
             'end_page': chapter.get('end_page'),
         }
+        if 'type' in chapter:
+            entry['type'] = chapter['type']
 
         if 'children' in chapter and chapter['children']:
             entry['children'] = flatten_toc_tree(
@@ -399,6 +400,8 @@ def build_epub_structure(
             'title': entry['title'],
             'level': entry['level'],
         }
+        if 'type' in entry:
+            result['type'] = entry['type']
 
         # Find markdown file using unit_id
         index_path = entry.get('index_path')

@@ -831,9 +831,9 @@ structure_refinement:
    - 按 unit 处理
    - Content splitter 仅作 fallback
 
-5. **`pdf2epub/generate_epub.py`**
-   - 使用 `unit_metadata.json` 生成 TOC
-   - 适配新的文件结构
+5. **`pdf2epub/build_epub.py`**
+   - 使用 `toc_tree.json` 生成 TOC
+   - 适配层级文件结构
 
 6. **`pdf2epub/cli.py`**
    - 在 OCR 和 Polish 之间插入 refine 和 merge 阶段

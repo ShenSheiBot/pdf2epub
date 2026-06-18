@@ -690,8 +690,7 @@ class ContentConverter:
         Returns:
             Modified HTML content with anchors added
         """
-        # The structure from build_structure_from_markdown is a list of dicts: [{'title': '...'}, ...]
-        # We extract the title from each dict.
+        # Some callers provide subchapter entries as dicts; extract titles.
         if subchapter_info and isinstance(subchapter_info[0], dict):
             subchapters = [
                 (j, info.get("title", "")) for j, info in enumerate(subchapter_info, 1)

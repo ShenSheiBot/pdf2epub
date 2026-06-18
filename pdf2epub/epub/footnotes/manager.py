@@ -51,6 +51,7 @@ class FootnoteManager:
 
         # Primary definition chapters (for force_global)
         self.primary_definition_chapters: Set[str] = set()
+        self.no_colon_definition_chapters: Set[str] = set()
 
         # Mapping from markdown stems to HTML filenames (for nested parts)
         # e.g., {"chapter_25.part1.part1": "chapter_25_part1.html"}
@@ -107,7 +108,11 @@ class FootnoteManager:
             return
 
         # Scan files for footnotes
-        self.scanner.scan_files(self._chapter_files)
+        self.no_colon_definition_chapters = self._collect_no_colon_definition_chapters()
+        self.scanner.scan_files(
+            self._chapter_files,
+            no_colon_definition_chapters=self.no_colon_definition_chapters,
+        )
         self._drop_replaced_heading_references()
 
         # Determine style
@@ -132,6 +137,28 @@ class FootnoteManager:
             filtered_files.append(md_file)
         return filtered_files
 
+    def _collect_no_colon_definition_chapters(self) -> Set[str]:
+        """Return stems under TOC entries explicitly marked as notes."""
+        stems: Set[str] = set()
+
+        def walk(entries: List[Dict], in_notes: bool = False) -> None:
+            for entry in entries:
+                entry_in_notes = in_notes or entry.get("type") == "notes"
+                if entry_in_notes:
+                    for part_file in entry.get("part_files", []):
+                        stems.add(Path(part_file).stem)
+                    if "file_path" in entry:
+                        stems.add(Path(entry["file_path"]).stem)
+                walk(entry.get("children", []), entry_in_notes)
+
+        if self.epub_structure:
+            walk(self.epub_structure)
+        return stems
+
+    def is_no_colon_definition_chapter(self, source_chapter: str) -> bool:
+        """Return whether legacy ``[^key] text`` lines are definitions here."""
+        return source_chapter in self.no_colon_definition_chapters
+
     def _build_style_mappings(self, run_llm: bool = False) -> None:
         """Build mapper state from the current scanner data and style."""
         self.mapper.build_chapter_groups(self._chapter_files)
@@ -151,6 +178,12 @@ class FootnoteManager:
             # If force_global or auto_global, identify primary definition chapters
             if self.force_global or self.auto_global:
                 self.primary_definition_chapters = self.scanner.identify_primary_definition_chapters()
+                if self.auto_global and self.no_colon_definition_chapters:
+                    typed_note_definition_chapters = {
+                        chapter for chapter in self.no_colon_definition_chapters
+                        if chapter in self.scanner.definition_chapters
+                    }
+                    self.primary_definition_chapters.update(typed_note_definition_chapters)
 
             # Build occurrence mapping for all global styles
             self.mapper.build_occurrence_mapping(
@@ -336,7 +369,11 @@ class FootnoteManager:
         self.mapper.section_definition_occurrence_in_file = {}
         self._chapter_files = self._discover_chapter_files()
         self.scanner = FootnoteScanner()
-        self.scanner.scan_files(self._chapter_files)
+        self.no_colon_definition_chapters = self._collect_no_colon_definition_chapters()
+        self.scanner.scan_files(
+            self._chapter_files,
+            no_colon_definition_chapters=self.no_colon_definition_chapters,
+        )
         self._drop_replaced_heading_references()
         self.style = self.scanner.determine_style(self.force_global, self.auto_global)
         run_llm = bool(

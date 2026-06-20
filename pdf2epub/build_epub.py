@@ -9,7 +9,9 @@ source for chapter structure and titles. This provides:
 """
 
 import json
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -240,16 +242,120 @@ def _remove_duplicate_heading(lines: list, title_line_idx: int, toc_title: str):
 
 # Lazy-loaded embedding model
 _embedding_model = None
+_HEADING_EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_HEADING_EMBEDDING_MIN_RAM_GB = 8.0
+
+
+def _get_total_memory_bytes() -> Optional[int]:
+    """Return total physical memory when the platform exposes it."""
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if pages > 0 and page_size > 0:
+                return int(pages * page_size)
+        except (OSError, ValueError, TypeError):
+            pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            memory_status = MEMORYSTATUSEX()
+            memory_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):
+                return int(memory_status.ullTotalPhys)
+        except Exception:
+            pass
+
+    return None
+
+
+def _embedding_disabled_by_env() -> Optional[bool]:
+    """Return an explicit env override for heading embeddings, if set."""
+    value = os.getenv("PDF2EPUB_HEADING_EMBEDDINGS")
+    if value is None:
+        value = os.getenv("PDF2EPUB_DISABLE_HEADING_EMBEDDINGS")
+        if value is None:
+            return None
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    normalized = value.strip().lower()
+    if normalized in {"0", "false", "no", "off", "difflib", "disabled"}:
+        return True
+    if normalized in {"1", "true", "yes", "on", "embedding", "enabled"}:
+        return False
+    logger.warning(
+        "Ignoring invalid PDF2EPUB_HEADING_EMBEDDINGS value "
+        f"{value!r}; expected enabled/disabled"
+    )
+    return None
+
+
+def _heading_embedding_min_ram_gb() -> float:
+    """Minimum total RAM required before loading sentence-transformer embeddings."""
+    value = os.getenv("PDF2EPUB_HEADING_EMBEDDING_MIN_RAM_GB")
+    if value is None:
+        return _HEADING_EMBEDDING_MIN_RAM_GB
+    try:
+        threshold = float(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid PDF2EPUB_HEADING_EMBEDDING_MIN_RAM_GB value "
+            f"{value!r}; using {_HEADING_EMBEDDING_MIN_RAM_GB:g}GB"
+        )
+        return _HEADING_EMBEDDING_MIN_RAM_GB
+    return max(0.0, threshold)
+
+
+def _should_use_heading_embeddings() -> bool:
+    """Decide whether heading deduplication should load the embedding model."""
+    disabled = _embedding_disabled_by_env()
+    if disabled is not None:
+        return not disabled
+
+    total_memory = _get_total_memory_bytes()
+    min_ram_gb = _heading_embedding_min_ram_gb()
+    if total_memory is None:
+        logger.debug(
+            "Could not detect total RAM; allowing heading embedding model load"
+        )
+        return True
+
+    total_gb = total_memory / (1024 ** 3)
+    if total_gb < min_ram_gb:
+        logger.info(
+            f"Total RAM is {total_gb:.1f}GB, below {min_ram_gb:.1f}GB threshold; "
+            "using difflib for heading deduplication"
+        )
+        return False
+    return True
 
 
 def _get_embedding_model():
     """Lazy load the sentence transformer model."""
     global _embedding_model
     if _embedding_model is None:
+        if not _should_use_heading_embeddings():
+            _embedding_model = False
+            return _embedding_model
         try:
             from sentence_transformers import SentenceTransformer
-            # Small multilingual model (~120MB)
-            _embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+            # Small multilingual model (~120MB), but runtime imports may need much more RAM.
+            _embedding_model = SentenceTransformer(_HEADING_EMBEDDING_MODEL_NAME)
             logger.debug("Loaded embedding model for heading deduplication")
         except ImportError:
             logger.warning("sentence-transformers not installed, falling back to text similarity")

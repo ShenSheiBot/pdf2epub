@@ -24,6 +24,19 @@ from ..utils.common import parse_llm_json
 PART_FILE_RE = re.compile(r'^(.+)\.part(\d+)\.md$')
 
 
+def _make_json_safe(obj: Any) -> Any:
+    """Convert nested compressor metadata to JSON-serializable values."""
+    from collections.abc import Iterable, Mapping
+
+    if isinstance(obj, (bool, int, float, str, type(None))):
+        return obj
+    if isinstance(obj, Mapping):
+        return {str(_make_json_safe(k)): _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes)):
+        return [_make_json_safe(v) for v in obj]
+    return str(obj)
+
+
 def sanitize_filename(name: str) -> str:
     """Sanitize a string for use as a filename."""
     # Remove or replace characters that are problematic in filenames
@@ -122,23 +135,20 @@ class HTMLEpubBuilder:
         replaced = 0
 
         # Get list of translated files
-        translated_files = {f.name: f for f in self.translated_dir.glob("*.xhtml")}
-        translated_files.update({f.name: f for f in self.translated_dir.glob("*.html")})
+        translated_files = {}
+        for ext in ("*.xhtml", "*.html", "*.htm"):
+            translated_files.update({f.name: f for f in self.translated_dir.glob(ext)})
 
         if not translated_files:
             logger.warning("No translated files found in translated_dir")
             return 0
 
         # Find all XHTML/HTML files in extracted EPUB
-        for xhtml_file in extract_dir.rglob("*.xhtml"):
-            if xhtml_file.name in translated_files:
-                self._replace_file(xhtml_file, translated_files[xhtml_file.name])
-                replaced += 1
-
-        for html_file in extract_dir.rglob("*.html"):
-            if html_file.name in translated_files:
-                self._replace_file(html_file, translated_files[html_file.name])
-                replaced += 1
+        for ext in ("*.xhtml", "*.html", "*.htm"):
+            for html_file in extract_dir.rglob(ext):
+                if html_file.name in translated_files:
+                    self._replace_file(html_file, translated_files[html_file.name])
+                    replaced += 1
 
         return replaced
 
@@ -928,7 +938,10 @@ class HTMLEpubPipeline:
                 mapping_path = self.compressed_units_dir / f"{file_stem}.mapping.json"
                 # Serialize first, then write — prevents truncated files if
                 # json.dumps fails mid-serialization (e.g. non-serializable lxml objects)
-                mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding='utf-8')
+                mapping_path.write_text(
+                    json.dumps(_make_json_safe(mapping), ensure_ascii=False),
+                    encoding='utf-8'
+                )
 
                 extracted += 1
                 lines = len(compressed.splitlines()) if compressed else 0

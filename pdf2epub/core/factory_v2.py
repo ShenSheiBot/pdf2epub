@@ -335,6 +335,11 @@ def create_model_chain_from_config(
     else:
         models = config.get('polish', {}).get('models', [])
 
+    # Filter providers disabled at the top level (for example, use_vertex: false).
+    for provider_name in ('vertex',):
+        if not config.get(f'use_{provider_name}', True):
+            models = [m for m in models if m.get('provider') != provider_name]
+
     # Fallback to default
     if not models:
         models = [{'provider': 'gemini', 'model': 'gemini-2.0-flash'}]

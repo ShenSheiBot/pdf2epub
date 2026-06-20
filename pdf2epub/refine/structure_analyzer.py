@@ -7,6 +7,7 @@ Provides:
 """
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -750,6 +751,13 @@ Return ONLY the cleaned text, nothing else.
             for issue in issues:
                 logger.warning(f"  - {issue}")
 
+        # Warn when the cleaned TOC reference suggests many more chapters than
+        # the final tree contains. This is advisory only; do not block output.
+        if toc_reference:
+            self._validate_toc_completeness(
+                chapters, toc_reference, batch_ctx.total_pages
+            )
+
         # Convert to TOCNode tree
         toc_tree = dict_list_to_toc_tree(chapters)
 
@@ -889,6 +897,64 @@ Return ONLY the cleaned text, nothing else.
                 children.sort(key=lambda c: c.get('start_page', 0))
                 _update_levels_recursive(children, parent_level + 1)
                 StructureAnalyzer._fix_containment_overlaps(children)
+
+    @staticmethod
+    def _validate_toc_completeness(
+        chapters: List[Dict],
+        toc_reference: str,
+        total_pages: int,
+    ) -> None:
+        """Log a warning when extracted top-level chapters under-cover the TOC."""
+        if not toc_reference:
+            return
+
+        numbered_entries = re.findall(r'(?:^|\n)\s*(\d+)\s+\S', toc_reference)
+        expected_top_level = len(numbered_entries)
+        if expected_top_level == 0:
+            numbered_lines = [
+                line.strip()
+                for line in toc_reference.strip().split('\n')
+                if re.match(r'^\d+\s', line.strip())
+            ]
+            expected_top_level = len(numbered_lines)
+
+        if expected_top_level == 0:
+            return
+
+        front_matter_titles = {
+            'table of contents', 'inhalt', 'contents', 'sommaire',
+            'vorwort', 'preface', 'préface', 'avant-propos',
+            'zitierweise', 'siglen', 'abbreviations', 'abkürzungen',
+            'introduction', 'introducción', 'einleitung',
+        }
+        actual_chapters = [
+            ch for ch in chapters
+            if ch.get('title', '').strip().lower() not in front_matter_titles
+        ]
+        actual_top_level = len(actual_chapters)
+
+        if actual_top_level >= expected_top_level:
+            logger.info(
+                f"TOC completeness OK: {actual_top_level} top-level chapters "
+                f"(expected ~{expected_top_level} from TOC reference)"
+            )
+            return
+
+        ratio = actual_top_level / expected_top_level
+        logger.warning(
+            f"TOC COMPLETENESS ISSUE: Only {actual_top_level} top-level chapters "
+            f"found, but TOC reference suggests ~{expected_top_level} numbered "
+            f"entries for a {total_pages}-page book (coverage: {ratio:.0%}). "
+            f"The structure analysis may be incomplete; consider re-running refine."
+        )
+
+        if ratio < 0.5:
+            logger.warning(
+                f"CRITICAL: Less than half of expected chapters were found "
+                f"({actual_top_level}/{expected_top_level}). The resulting TOC tree "
+                f"is likely unusable; remaining content may be lumped into a "
+                f"single section."
+            )
 
     def rebreakdown_chapter(
         self,

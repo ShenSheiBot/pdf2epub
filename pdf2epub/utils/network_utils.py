@@ -893,6 +893,8 @@ class OpenAIClient:
             chunk_count = 0
             last_log_tokens = 0
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 if chunk.choices[0].delta.content:
                     response_text += chunk.choices[0].delta.content
                     chunk_count += 1

@@ -81,11 +81,16 @@ class UnitState:
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     def can_retry(self, error_type: ErrorType) -> bool:
-        """Check if retry is possible for this error type."""
+        """
+        Check if retry is possible for this unit.
+
+        Per-error quotas are decremented for accounting, but they do not gate
+        re-queueing here. The active chain and per-entry retries decide when to
+        advance to fallback models.
+        """
         with self._lock:
             return (
                 self.total_quota > 0 and
-                self.quotas.get(error_type, 0) > 0 and
                 len(self.chain) > 0
             )
 

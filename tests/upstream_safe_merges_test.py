@@ -81,6 +81,74 @@ def test_html_builder_replaces_htm_files(tmp_path: Path):
     assert target.read_text(encoding="utf-8") == "translated"
 
 
+def test_html_builder_normalizes_inline_block_wrapper_css():
+    css = (
+        ".bodytext {\n    font-size: 0.77419em\n    }\n"
+        ".caption {\n    font-size: 0.8em\n    }\n"
+    )
+
+    normalized = HTMLEpubBuilder._normalize_css_content(css, {"bodytext"})
+
+    assert "display: block" in normalized
+    assert "font-size: 0.77419em" in normalized
+    assert ".caption {\n    font-size: 0.8em" in normalized
+
+
+def test_html_builder_does_not_duplicate_wrapper_display():
+    css = ".bodytext {\n    display: block;\n    font-size: 0.77419em\n    }\n"
+
+    normalized = HTMLEpubBuilder._normalize_css_content(css, {"bodytext"})
+
+    assert normalized.count("display: block") == 1
+
+
+def test_html_builder_detects_inline_block_wrapper_class(tmp_path: Path):
+    (tmp_path / "chapter.htm").write_text(
+        '<span class="bodytext"><div class="para">Text</div></span>',
+        encoding="utf-8",
+    )
+
+    assert HTMLEpubBuilder._classes_used_as_inline_block_wrappers(tmp_path) == {"bodytext"}
+
+
+def test_html_builder_ignores_inline_span_class(tmp_path: Path):
+    (tmp_path / "chapter.htm").write_text(
+        '<p>Before <span class="bodytext">small inline text</span> after.</p>',
+        encoding="utf-8",
+    )
+
+    assert HTMLEpubBuilder._classes_used_as_inline_block_wrappers(tmp_path) == set()
+
+
+def test_html_builder_skips_mixed_inline_and_block_wrapper_class(tmp_path: Path):
+    (tmp_path / "chapter.htm").write_text(
+        '<span class="bodytext"><div class="para">Text</div></span>'
+        '<p>Before <span class="bodytext">small inline text</span> after.</p>',
+        encoding="utf-8",
+    )
+
+    assert HTMLEpubBuilder._classes_used_as_inline_block_wrappers(tmp_path) == set()
+
+
+def test_html_builder_skips_class_used_on_nonspan_elements(tmp_path: Path):
+    (tmp_path / "chapter.htm").write_text(
+        '<span class="bodytext"><div class="para">Text</div></span>'
+        '<div class="bodytext">Already block</div>',
+        encoding="utf-8",
+    )
+
+    assert HTMLEpubBuilder._classes_used_as_inline_block_wrappers(tmp_path) == set()
+
+
+def test_html_builder_ignores_self_closing_span_before_block(tmp_path: Path):
+    (tmp_path / "chapter.htm").write_text(
+        '<span class="bodytext"/><div class="para">Text</div>',
+        encoding="utf-8",
+    )
+
+    assert HTMLEpubBuilder._classes_used_as_inline_block_wrappers(tmp_path) == set()
+
+
 def test_make_json_safe_converts_non_serializable_values():
     class Token:
         def __str__(self):

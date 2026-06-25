@@ -244,10 +244,17 @@ class HTMLTranslateProcessor:
             detail = "; ".join(mismatches[:5])
             return False, f"{len(mismatches)} tag mismatch(es): {detail}"
 
-        # 3. Target language validation
+        # 3. Content coverage validation. Line/tag checks can still pass when a
+        # model drops prose and preserves only citation links or page markers.
+        if self._target_is_chinese():
+            for i, (src, tgt) in enumerate(zip(src_lines, tgt_lines), start=1):
+                if self._looks_like_omitted_translation(src, tgt):
+                    self._retry_context[file_name] = "content_omission"
+                    return False, f"Possible omitted translation on line {i}"
+
+        # 4. Target language validation
         if self.validate_target_language:
-            target_lower = self.target_language.lower()
-            if target_lower in ["chinese", "中文", "chinese simplified", "zh", "zh-cn"]:
+            if self._target_is_chinese():
                 if not self._contains_chinese(processed):
                     self._retry_context[file_name] = "language_wrong"
                     return False, "Translation does not contain Chinese characters"
@@ -258,11 +265,60 @@ class HTMLTranslateProcessor:
 
         return True, "OK"
 
+    def _target_is_chinese(self) -> bool:
+        target_lower = self.target_language.lower()
+        return target_lower in ["chinese", "中文", "chinese simplified", "简体中文", "zh", "zh-cn"]
+
+    @staticmethod
+    def _visible_text(text: str) -> str:
+        return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', text)).strip()
+
+    @staticmethod
+    def _latin_word_count(text: str) -> int:
+        return len(re.findall(r"[A-Za-z][A-Za-z'’-]*", text))
+
+    @staticmethod
+    def _han_count(text: str) -> int:
+        return len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+
+    @staticmethod
+    def _is_reference_entry(text: str) -> bool:
+        # Bibliography entries can legitimately remain mostly Latin names,
+        # titles, journal names, and years.
+        stripped = text.strip()
+        if re.match(r'^(—+|[-–—]+)\s*(and\s+)?[A-Z]?', stripped):
+            return True
+        return bool(re.match(r"^[A-Z][A-Za-z'’.-]+,\s+[A-Z]", stripped) and re.search(r'\b(18|19|20)\d{2}\b', stripped))
+
+    def _looks_like_omitted_translation(self, source: str, translated: str) -> bool:
+        source_text = self._visible_text(source)
+        target_text = self._visible_text(translated)
+        source_words = self._latin_word_count(source_text)
+
+        if source_words < 50 or self._is_reference_entry(source_text):
+            return False
+
+        target_han = self._han_count(target_text)
+        target_latin = self._latin_word_count(target_text)
+
+        # Good Chinese translation should have some CJK signal. If the output is
+        # still mostly Latin prose, it may be untranslated but not omitted; leave
+        # that to language validation and review rather than blocking tables and
+        # bibliography-like material too aggressively.
+        if target_han >= max(12, source_words // 8):
+            return False
+        if target_latin >= source_words * 0.45:
+            return False
+
+        return True
+
     def _contains_chinese(self, text: str) -> bool:
         """
         Check if text contains Chinese characters.
 
-        Uses sampling for efficiency on large texts.
+        Uses a fast prefix check first, then falls back to the full text. Some
+        EPUB sections such as references and indexes can begin with long runs
+        of names, years, and markup before Chinese text appears.
         """
         # Remove any HTML tags that might be in the content
         text_only = re.sub(r'<[^>]+>', '', text)
@@ -279,7 +335,10 @@ class HTMLTranslateProcessor:
         sample = text_only[:sample_size]
 
         matches = chinese_pattern.findall(sample)
-        return len(matches) >= 5  # At least 5 Chinese chars in sample
+        if len(matches) >= 5:
+            return True
+
+        return len(chinese_pattern.findall(text_only)) >= 5  # At least 5 Chinese chars overall
 
     def _get_agent_model(self):
         """Get or create pydantic-ai Model for the verification agent.

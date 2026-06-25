@@ -9,6 +9,7 @@ import zipfile
 import tempfile
 import json
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -110,7 +111,10 @@ class HTMLEpubBuilder:
                 self._update_toc_ncx(extract_dir, self.config.translated_metadata)
                 self._update_nav_xhtml(extract_dir, self.config.translated_metadata)
 
-            # Step 4: Repackage as EPUB
+            # Step 4: Normalize fragile source CSS before packaging
+            self._normalize_css(extract_dir)
+
+            # Step 5: Repackage as EPUB
             self._package_epub(extract_dir)
 
         logger.info(f"Built EPUB: {self.output_path}")
@@ -157,6 +161,113 @@ class HTMLEpubBuilder:
         content = source.read_text(encoding='utf-8')
         target.write_text(content, encoding='utf-8')
         logger.debug(f"Replaced {target.name}")
+
+    def _normalize_css(self, extract_dir: Path):
+        """Patch fragile source CSS that can break after XHTML reconstruction."""
+        block_wrapper_classes = self._classes_used_as_inline_block_wrappers(extract_dir)
+        if not block_wrapper_classes:
+            return
+
+        for css_file in extract_dir.rglob("*.css"):
+            content = css_file.read_text(encoding='utf-8')
+            normalized = self._normalize_css_content(content, block_wrapper_classes)
+            if normalized != content:
+                css_file.write_text(normalized, encoding='utf-8')
+                logger.debug(f"Normalized CSS: {css_file.name}")
+
+    @staticmethod
+    def _class_names(attrs: str) -> List[str]:
+        match = re.search(
+            r'\bclass\s*=\s*(["\'])(.*?)\1',
+            attrs,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return []
+        return [name for name in re.split(r'\s+', match.group(2).strip()) if name]
+
+    @classmethod
+    def _classes_used_as_inline_block_wrappers(cls, extract_dir: Path) -> Set[str]:
+        """
+        Find classes exclusively used by inline spans that wrap block content.
+
+        These wrappers are invalid-but-common in converted EPUBs. We only
+        normalize classes that are not also used on ordinary inline spans or
+        non-span elements, so a general selector does not accidentally change
+        unrelated inline styling.
+        """
+        tag_pattern = re.compile(
+            r'<([A-Za-z][\w:-]*)\b([^>]*)>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        span_pattern = re.compile(
+            r'<span\b([^>]*)>((?:(?!</span>).){0,5000})</span>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        block_child_pattern = re.compile(
+            r'<\s*(?:div|table|p|section|article|ul|ol|li|tr|td|blockquote|h[1-6])\b',
+            re.IGNORECASE,
+        )
+
+        span_counts: Counter[str] = Counter()
+        block_wrapper_counts: Counter[str] = Counter()
+        nonspan_counts: Counter[str] = Counter()
+        html_files = (
+            list(extract_dir.rglob("*.xhtml"))
+            + list(extract_dir.rglob("*.html"))
+            + list(extract_dir.rglob("*.htm"))
+        )
+        for html_file in html_files:
+            content = html_file.read_text(encoding='utf-8', errors='ignore')
+
+            for match in tag_pattern.finditer(content):
+                tag = match.group(1).lower()
+                for class_name in cls._class_names(match.group(2)):
+                    if tag == "span":
+                        span_counts[class_name] += 1
+                    else:
+                        nonspan_counts[class_name] += 1
+
+            for match in span_pattern.finditer(content):
+                if match.group(1).strip().endswith('/'):
+                    continue
+                if not block_child_pattern.search(match.group(2)):
+                    continue
+                for class_name in cls._class_names(match.group(1)):
+                    block_wrapper_counts[class_name] += 1
+
+        return {
+            class_name
+            for class_name, count in block_wrapper_counts.items()
+            if count == span_counts.get(class_name, 0)
+            and nonspan_counts.get(class_name, 0) == 0
+        }
+
+    @staticmethod
+    def _normalize_css_content(content: str, block_wrapper_classes: Set[str]) -> str:
+        """
+        Make section-level wrappers render consistently.
+
+        Some converted EPUBs use inline spans as wrappers around block elements.
+        EPUB readers may repair that invalid markup by breaking inheritance at
+        nested tables, causing sudden font-size jumps.
+        """
+        normalized = content
+
+        def normalize(match: re.Match) -> str:
+            body = match.group(2)
+            if re.search(r'\bdisplay\s*:', body):
+                return match.group(0)
+            return f"{match.group(1)}\n    display: block;{body}}}"
+
+        for class_name in sorted(block_wrapper_classes):
+            pattern = re.compile(
+                r'(\.' + re.escape(class_name) + r'\s*\{)([^}]*)\}',
+                re.MULTILINE,
+            )
+            normalized = pattern.sub(normalize, normalized)
+
+        return normalized
 
     def _package_epub(self, content_dir: Path):
         """

@@ -324,8 +324,11 @@ class HTMLCompressor:
             })
             return
 
-        # Handle block elements (determined by CSS display)
-        if self._is_block(elem):
+        # Handle block elements (determined by CSS display). Some EPUBs contain
+        # invalid-but-common markup like <span><div class="para">...</div></span>.
+        # Treat inline wrappers that contain block descendants as containers;
+        # otherwise whole page sections collapse into one huge translation unit.
+        if self._is_block_container(elem):
             # Check if contains nested block children
             if self._has_block_children(elem):
                 # Container block: add open marker, recurse, add close marker
@@ -447,10 +450,21 @@ class HTMLCompressor:
             return False
         return not self._is_inline(elem)
 
+    def _has_block_descendants(self, elem) -> bool:
+        """Check if element contains any block-level descendant."""
+        for child in elem.iterdescendants():
+            if isinstance(child, etree._Element) and self._is_block(child):
+                return True
+        return False
+
+    def _is_block_container(self, elem) -> bool:
+        """Treat inline wrappers around block descendants as block containers."""
+        return self._is_block(elem) or self._has_block_descendants(elem)
+
     def _has_block_children(self, elem) -> bool:
         """Check if element contains any block-level children."""
         for child in elem:
-            if isinstance(child, etree._Element) and self._is_block(child):
+            if isinstance(child, etree._Element) and self._is_block_container(child):
                 return True
         return False
 
@@ -486,7 +500,7 @@ class HTMLCompressor:
                 groups.append(('void', child))
                 if child.tail:
                     current_run.append(('text', child.tail))
-            elif isinstance(child, etree._Element) and self._is_block(child):
+            elif isinstance(child, etree._Element) and self._is_block_container(child):
                 if current_run:
                     groups.append(('inline_run', current_run))
                     current_run = []

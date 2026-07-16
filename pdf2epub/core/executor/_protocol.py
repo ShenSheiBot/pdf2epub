@@ -126,7 +126,9 @@ class Executor(Protocol):
     def execute(
         self,
         units: List[WorkUnit],
-        context_base: Optional["ProcessContext"] = None
+        context_base: Optional["ProcessContext"] = None,
+        resume_batch: bool = False,
+        initial_failures: Optional[Dict[str, Exception]] = None,
     ) -> ExecutionResult:
         """
         Execute all units.
@@ -134,6 +136,9 @@ class Executor(Protocol):
         Args:
             units: Units to process
             context_base: Base context for all units
+            resume_batch: Whether to resume existing batch jobs
+            initial_failures: Failures reported by an upstream validator. These
+                enter the same retry/split state machine as model failures.
 
         Returns:
             ExecutionResult with all outcomes

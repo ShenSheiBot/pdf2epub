@@ -21,6 +21,7 @@ import yaml
 
 from .verification_tools import VerificationTools, VerificationFile
 from .._protocol import ValidationResult as CoreValidationResult
+from ..types import ErrorType
 
 
 def load_config() -> dict:
@@ -518,7 +519,8 @@ class PolishBatchValidator:
                 key=r.file_key,
                 is_valid=(r.status == "complete"),
                 reason=r.reason,
-                confidence=r.confidence
+                confidence=r.confidence,
+                error_type=(ErrorType.TRUNCATION if r.status == "truncated" else None),
             )
             for r in results
         }
@@ -575,7 +577,8 @@ class TranslationBatchValidator:
                 key=r.file_key,
                 is_valid=(r.status == "complete"),
                 reason=r.reason,
-                confidence=r.confidence
+                confidence=r.confidence,
+                error_type=(ErrorType.TRUNCATION if r.status == "truncated" else None),
             )
             for r in results
         }

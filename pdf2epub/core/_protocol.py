@@ -13,6 +13,7 @@ Design:
 
 from typing import Protocol, Dict, Any, Optional, Tuple, Union, Literal, runtime_checkable, TYPE_CHECKING
 from dataclasses import dataclass, field
+from .types import ErrorType
 
 if TYPE_CHECKING:
     from .validators import VerificationFile
@@ -379,6 +380,7 @@ class ValidationResult:
     is_valid: bool
     reason: str
     confidence: str = "high"  # high, medium, low
+    error_type: Optional[ErrorType] = None
 
     def __bool__(self) -> bool:
         return self.is_valid

@@ -67,6 +67,7 @@ def handle_split(
     pending: Set[str],
     splitter: "ContentSplitter",
     max_tokens: int = 4000,
+    fallback_chain: Optional[List[ChainEntry]] = None,
 ) -> Tuple[bool, int]:
     """
     Split a failed unit into virtual children.
@@ -82,6 +83,9 @@ def handle_split(
         pending: Pending units set (modified in place)
         splitter: Content splitter to use
         max_tokens: Max tokens per part for splitter
+        fallback_chain: Chain to use when the failed unit exhausted its
+            current chain before splitting. This lets a model retry smaller
+            chunks after a truncation failure.
 
     Returns:
         Tuple of (success, new_depth) - new_depth is the depth of created children
@@ -102,6 +106,23 @@ def handle_split(
     if len(child_contents) <= 1:
         return (False, 0)
 
+    # A truncation failure can remove the only model before splitting. Preserve
+    # that model for smaller children; otherwise they inherit an empty chain.
+    child_chain = list(state.chain)
+    if not child_chain and fallback_chain:
+        # A recovered split may contain fewer units than the batch threshold.
+        # Run a preserved batch-only model through the online dispatch path so
+        # small splits do not immediately lose their only executable entry.
+        child_chain = [
+            ChainEntry(
+                provider=entry.provider,
+                model=entry.model,
+                mode="online" if entry.mode == "batch" else entry.mode,
+                retries=entry.retries,
+            )
+            for entry in fallback_chain
+        ]
+
     # Calculate children's quota (half, integer division)
     child_total_quota = state.total_quota // 2
     child_quotas_template = {k: v // 2 for k, v in state.quotas.items()}
@@ -113,7 +134,7 @@ def handle_split(
         child_ids.append(child_id)
 
         unit_states[child_id] = UnitState(
-            chain=list(state.chain),  # Copy chain
+            chain=child_chain.copy(),
             total_quota=child_total_quota,
             quotas=dict(child_quotas_template),  # Each child gets own dict!
             is_virtual=True,
@@ -268,6 +289,7 @@ class Executor:
         units: List[WorkUnit],
         context_base: Optional["ProcessContext"] = None,
         resume_batch: bool = False,
+        initial_failures: Optional[Dict[str, Exception]] = None,
     ) -> ExecutionResult:
         """
         Execute all units with unified batch/online processing.
@@ -286,6 +308,8 @@ class Executor:
             units: Units to process
             context_base: Base context for all units
             resume_batch: Whether to resume existing batch jobs
+            initial_failures: Failures reported by an upstream validator. They
+                enter the same retry/split state machine as model failures.
 
         Returns:
             ExecutionResult with all outcomes
@@ -333,6 +357,40 @@ class Executor:
         successful_attempts = 0
         splits_performed = 0
         max_depth_reached = 0
+
+        # Feed failures from downstream validators back into the same state
+        # machine used for model failures. This preserves failure typing and
+        # keeps retry/split behavior centralized in the Executor.
+        if initial_failures:
+            for uid, error in initial_failures.items():
+                if uid not in unit_states:
+                    logger.warning(f"Ignoring initial failure for unknown unit {uid}")
+                    continue
+
+                pending.discard(uid)
+                state = unit_states[uid]
+                current_entry = state.get_current_entry()
+                model_str = (
+                    f"{current_entry.provider}/{current_entry.model}"
+                    if current_entry else "validator"
+                )
+                _, split_depth = self._handle_failure(
+                    uid,
+                    ProcessResult(success=False, error=error),
+                    state,
+                    unit_states,
+                    pending,
+                    completed,
+                    failed,
+                    safety_blocked,
+                    validation_failed,
+                    results,
+                    fallback_used,
+                    model_str,
+                )
+                if split_depth > 0:
+                    splits_performed += 1
+                    max_depth_reached = max(max_depth_reached, split_depth)
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             while pending or futures or batch_futures:
@@ -1125,7 +1183,18 @@ class Executor:
                 model_name = current_entry.model if current_entry else None
                 split_threshold = self._get_split_threshold(model_name)
                 split_success, split_depth = handle_split(
-                    unit_id, unit_states, pending, self._splitter, split_threshold
+                    unit_id,
+                    unit_states,
+                    pending,
+                    self._splitter,
+                    split_threshold,
+                    fallback_chain=(
+                        [current_entry]
+                        if error_type == ErrorType.TRUNCATION
+                        and current_entry
+                        and not state.chain
+                        else None
+                    ),
                 )
                 if split_success:
                     return (True, split_depth)

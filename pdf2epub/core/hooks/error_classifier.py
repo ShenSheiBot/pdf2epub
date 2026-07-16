@@ -393,6 +393,9 @@ class DefaultErrorClassifier:
         Returns:
             ErrorType enum value
         """
+        explicit_type = getattr(error, "error_type", None)
+        if isinstance(explicit_type, ErrorType):
+            return explicit_type
         return self.classify_from_string(str(error))
 
     def classify_from_string(self, error_message: str) -> ErrorType:

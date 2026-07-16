@@ -14,6 +14,7 @@ from loguru import logger
 import time
 
 from .types import SplitType, is_sub_key, filter_sub_keys
+from ._protocol import ValidationResult
 from .executor import (
     WorkUnit, ExecutionResult, ChainEntry,
     Executor, DiskFirstSaver,
@@ -21,7 +22,7 @@ from .executor import (
 )
 from .hooks import (
     CompositeHooks,
-    BatchValidationResult,
+    ErrorType,
 )
 from .persistence import ResultPersistence
 from .tracking import ProcessingTracker
@@ -33,6 +34,15 @@ if TYPE_CHECKING:
     from .book_structure import BookStructure
     from ..processors.utils.split_manager import SplitManager
     from ..processors.utils.splitter_strategies import ContentSplitter
+
+
+class BatchValidationFailure(Exception):
+    """Typed failure used to re-enter the Executor after batch validation."""
+
+    def __init__(self, validation: ValidationResult):
+        self.validation = validation
+        self.error_type = validation.error_type or ErrorType.VALIDATION
+        super().__init__(f"Batch validation failed: {validation.reason}")
 
 
 class ProcessingPipelineV2:
@@ -220,33 +230,45 @@ class ProcessingPipelineV2:
         # Step 5: Batch validation (if configured)
         # Only validate real units, not .sub children
         # Pass screener_passed as skip_keys - these already passed individual screeners
-        batch_failed: Set[str] = set()
+        batch_failures: Dict[str, ValidationResult] = {}
         if self._batch_validators and real_result_keys:
             # Build filtered results dict for batch validation
             real_results = {k: exec_result.results[k] for k in real_result_keys}
-            batch_failed = self._run_batch_validation(
+            batch_failures = self._run_batch_validation(
                 real_results, originals,
                 screener_passed=exec_result.screener_passed
             )
 
             # Step 5b: Retry batch validation failures via executor
             # These units need to go back through executor's retry mechanism
-            if batch_failed:
-                logger.info(f"Batch validation failed for {len(batch_failed)} units, retrying via executor")
+            if batch_failures:
+                logger.info(f"Batch validation failed for {len(batch_failures)} units, retrying via executor")
                 # Build retry units from originals
                 retry_units = [
                     WorkUnit(id=key, file_key=key.rsplit('.part', 1)[0] if '.part' in key else key, content=originals[key])
-                    for key in batch_failed if key in originals
+                    for key in batch_failures if key in originals
                 ]
                 if retry_units:
-                    # Execute retry - let executor decide batch/online based on chain state
-                    retry_result = self._executor.execute(retry_units, context_base, resume_batch=False)
+                    # Re-enter Executor with the typed validator failure.
+                    # Executor then applies the normal retry/split state
+                    # machine.
+                    retry_errors = {
+                        key: BatchValidationFailure(batch_failures[key])
+                        for key in batch_failures
+                        if key in originals
+                    }
+                    retry_result = self._executor.execute(
+                        retry_units,
+                        context_base,
+                        resume_batch=False,
+                        initial_failures=retry_errors,
+                    )
 
                     # Update results with retry outcomes
                     for key in retry_result.completed:
                         if key in retry_result.results:
                             exec_result.results[key] = retry_result.results[key]
-                            batch_failed.discard(key)
+                            batch_failures.pop(key, None)
                             real_result_keys.add(key)
 
                     # Merge stats
@@ -257,7 +279,7 @@ class ProcessingPipelineV2:
         # Step 6: Determine final failures (only real units)
         # Note: longest-fallback is handled by Executor (per design v2)
         real_failed = filter_sub_keys(exec_result.failed)  # Filter .sub from executor failures
-        all_failed = real_failed | batch_failed
+        all_failed = real_failed | set(batch_failures)
 
         # Step 7: Promote successful to validated (only real units)
         # Use Promoter (not direct persistence access)
@@ -405,7 +427,7 @@ class ProcessingPipelineV2:
         results: Dict[str, str],
         originals: Dict[str, str],
         screener_passed: Optional[Set[str]] = None
-    ) -> Set[str]:
+    ) -> Dict[str, ValidationResult]:
         """
         Run batch validation on results.
 
@@ -414,11 +436,11 @@ class ProcessingPipelineV2:
             originals: Dict of key -> original content
             screener_passed: Keys that passed individual screeners (skip batch validation)
 
-        Returns set of failed keys.
+        Returns a mapping of failed keys to complete validation results.
         """
         from .validators import VerificationFile
 
-        failed: Set[str] = set()
+        failures: Dict[str, ValidationResult] = {}
 
         # Get skip keys based on chapter type
         skip_keys: Set[str] = set(screener_passed or set())
@@ -447,7 +469,7 @@ class ProcessingPipelineV2:
 
         if not files:
             logger.info("Batch validation: all keys skipped, no validation needed")
-            return failed
+            return failures
 
         # Run each batch validator
         for validator in self._batch_validators:
@@ -457,7 +479,7 @@ class ProcessingPipelineV2:
                 # Process results
                 for key, validation_result in batch_result.items():
                     if not validation_result.is_valid:
-                        failed.add(key)
+                        failures[key] = validation_result
 
                     # Record validation
                     self._tracker.record_validation(key, {
@@ -471,9 +493,16 @@ class ProcessingPipelineV2:
                 # This ensures we don't promote potentially invalid results
                 logger.error(f"Batch validator {validator.name} error: {e}")
                 logger.warning(f"Marking {len(files)} units as validation failed (conservative)")
-                failed.update(files.keys())
+                for key in files:
+                    failures[key] = ValidationResult(
+                        key=key,
+                        is_valid=False,
+                        reason=f"{validator.name} failed: {e}",
+                        confidence="low",
+                        error_type=ErrorType.VALIDATION,
+                    )
 
-        return failed
+        return failures
 
     def _aggregate_all_parts(self, successful_keys: Set[str]):
         """

@@ -9,12 +9,15 @@ import zipfile
 import tempfile
 import json
 import re
+import shutil
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from dataclasses import dataclass
 from loguru import logger
+from lxml import etree as LET
 from xml.etree import ElementTree as ET
 
 from .epub_parser import EPUBParser
@@ -59,6 +62,8 @@ class BuildConfig:
     output_path: Path
     book_title: str
     translated_metadata: Optional[Dict] = None  # Contains translated_title and toc
+    epubcheck_mode: str = "warn"  # off, warn, or strict
+    epubcheck_path: Optional[str] = None
 
 
 class HTMLEpubBuilder:
@@ -117,8 +122,58 @@ class HTMLEpubBuilder:
             # Step 5: Repackage as EPUB
             self._package_epub(extract_dir)
 
+        self._validate_output_epub()
         logger.info(f"Built EPUB: {self.output_path}")
         return self.output_path
+
+    def _validate_output_epub(self) -> None:
+        """Run EPUBCheck when available, optionally failing the build."""
+        mode = self.config.epubcheck_mode.lower().strip()
+        if mode not in {"off", "warn", "strict"}:
+            raise ValueError(
+                f"Invalid epubcheck_mode {self.config.epubcheck_mode!r}; "
+                "expected 'off', 'warn', or 'strict'"
+            )
+        if mode == "off":
+            return
+
+        executable = self.config.epubcheck_path or shutil.which("epubcheck")
+        if not executable:
+            message = "EPUBCheck is not installed; skipping final EPUB validation"
+            if mode == "strict":
+                raise RuntimeError(message)
+            logger.info(message)
+            return
+
+        try:
+            result = subprocess.run(
+                [executable, str(self.output_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            message = f"EPUBCheck could not validate {self.output_path.name}: {exc}"
+            if mode == "strict":
+                raise RuntimeError(message) from exc
+            logger.warning(message)
+            return
+
+        if result.returncode == 0:
+            logger.info(f"EPUBCheck passed: {self.output_path.name}")
+            return
+
+        details = "\n".join(
+            part.strip() for part in (result.stdout, result.stderr) if part.strip()
+        )
+        message = f"EPUBCheck failed for {self.output_path.name}"
+        if details:
+            message = f"{message}:\n{details}"
+        if mode == "strict":
+            raise ValueError(message)
+        logger.warning(message)
 
     def _extract_epub(self, extract_dir: Path):
         """Extract original EPUB to directory."""
@@ -455,13 +510,11 @@ class HTMLEpubBuilder:
             return
 
         try:
-            # Register namespaces to preserve original prefixes on write
-            ET.register_namespace('', 'http://www.idpf.org/2007/opf')
-            ET.register_namespace('dc', 'http://purl.org/dc/elements/1.1/')
-            ET.register_namespace('dcterms', 'http://purl.org/dc/terms/')
-            ET.register_namespace('opf', 'http://www.idpf.org/2002/opf')
-
-            tree = ET.parse(opf_path)
+            # lxml preserves the source namespace map when serializing. The
+            # stdlib ElementTree can emit OPF namespaced attributes such as
+            # opf:role as invalid unqualified attributes when the OPF namespace
+            # is also the document's default namespace.
+            tree = LET.parse(str(opf_path))
             root = tree.getroot()
 
             # Handle namespaces - OPF uses default namespace
@@ -505,22 +558,54 @@ class HTMLEpubBuilder:
 
             # Update dc:creator (author)
             if metadata.get('translated_author'):
-                def _find_dc(tag_suffix):
-                    el = root.find(f'.//dc:{tag_suffix}', namespaces)
-                    if el is None:
-                        for e in root.iter():
-                            if e.tag.endswith(f'}}{tag_suffix}') or e.tag == tag_suffix:
-                                return e
-                    return el
+                creator_elems = root.findall('.//dc:creator', namespaces)
+                if not creator_elems:
+                    creator_elems = [
+                        e for e in root.iter()
+                        if e.tag.endswith('}creator') or e.tag == 'creator'
+                    ]
 
-                creator_elem = _find_dc('creator')
-                if creator_elem is not None:
+                if creator_elems:
+                    creator_elem = creator_elems[0]
                     creator_elem.text = metadata['translated_author']
-                    # Update file-as attribute
+                    translated_file_as = metadata.get('translated_author_file_as')
+
+                    # EPUB 2 stores file-as directly on dc:creator.
                     opf_ns = 'http://www.idpf.org/2007/opf'
                     file_as_key = f'{{{opf_ns}}}file-as'
-                    if file_as_key in creator_elem.attrib and metadata.get('translated_author_file_as'):
-                        creator_elem.attrib[file_as_key] = metadata['translated_author_file_as']
+                    if file_as_key in creator_elem.attrib and translated_file_as:
+                        creator_elem.attrib[file_as_key] = translated_file_as
+
+                    def creator_refinements(creator_id: Optional[str]):
+                        if not creator_id:
+                            return []
+                        target = f'#{creator_id}'
+                        return [
+                            e for e in root.iter()
+                            if isinstance(e.tag, str)
+                            and (e.tag.endswith('}meta') or e.tag == 'meta')
+                            and e.get('refines') == target
+                        ]
+
+                    # EPUB 3 stores file-as and role in refining meta elements.
+                    for refinement in creator_refinements(creator_elem.get('id')):
+                        if refinement.get('property') == 'file-as' and translated_file_as:
+                            refinement.text = translated_file_as
+
+                    # EPUBParser exposes multiple creators as one comma-joined
+                    # author string, and metadata translation returns that same
+                    # combined shape. Replace the original creator list with the
+                    # translated aggregate instead of leaving duplicate authors.
+                    # Remove EPUB 3 refinements together with deleted creators so
+                    # their refines attributes cannot become dangling references.
+                    for extra_creator in creator_elems[1:]:
+                        for refinement in creator_refinements(extra_creator.get('id')):
+                            refinement_parent = refinement.getparent()
+                            if refinement_parent is not None:
+                                refinement_parent.remove(refinement)
+                        parent = extra_creator.getparent()
+                        if parent is not None:
+                            parent.remove(extra_creator)
                     logger.debug(f"Updated creator: {metadata['translated_author']}")
 
             # Update dc:description
@@ -568,7 +653,7 @@ class HTMLEpubBuilder:
                             logger.debug(f"Updated title_sort: {metadata['translated_title_sort']}")
                             break
 
-            tree.write(opf_path, encoding='utf-8', xml_declaration=True)
+            tree.write(str(opf_path), encoding='utf-8', xml_declaration=True)
 
         except Exception as e:
             logger.warning(f"Failed to update content.opf: {e}")
@@ -865,7 +950,9 @@ def build_html_epub(
     translated_dir: Path,
     output_path: Optional[Path] = None,
     book_title: Optional[str] = None,
-    translated_metadata: Optional[Dict] = None
+    translated_metadata: Optional[Dict] = None,
+    epubcheck_mode: str = "warn",
+    epubcheck_path: Optional[str] = None,
 ) -> Path:
     """
     Convenience function to build translated EPUB.
@@ -876,6 +963,8 @@ def build_html_epub(
         output_path: Optional output path (defaults to translated_{original}.epub)
         book_title: Optional book title
         translated_metadata: Optional dict with translated_title and toc entries
+        epubcheck_mode: Final validation mode: off, warn, or strict
+        epubcheck_path: Optional explicit path to the EPUBCheck executable
 
     Returns:
         Path to the built EPUB file
@@ -888,7 +977,9 @@ def build_html_epub(
         translated_dir=translated_dir,
         output_path=output_path,
         book_title=book_title or original_epub.stem,
-        translated_metadata=translated_metadata
+        translated_metadata=translated_metadata,
+        epubcheck_mode=epubcheck_mode,
+        epubcheck_path=epubcheck_path,
     )
 
     builder = HTMLEpubBuilder(config)
@@ -1368,7 +1459,13 @@ class HTMLEpubPipeline:
             translated_dir=self.final_dir,
             output_path=output_epub,
             book_title=self.book_title,
-            translated_metadata=translated_metadata
+            translated_metadata=translated_metadata,
+            epubcheck_mode=self.config.get('html_translation', {}).get(
+                'epubcheck_mode', 'warn'
+            ),
+            epubcheck_path=self.config.get('html_translation', {}).get(
+                'epubcheck_path'
+            ),
         )
         self.write_translation_report(output_epub=result_path, phase="build")
         return result_path

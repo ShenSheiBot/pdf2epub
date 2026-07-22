@@ -731,6 +731,12 @@ def translate_novel_command(args):
                 output_path=output_epub,
                 book_title=book_title,
                 translated_metadata=translated_metadata,
+                epubcheck_mode=config.get("html_translation", {}).get(
+                    "epubcheck_mode", "warn"
+                ),
+                epubcheck_path=config.get("html_translation", {}).get(
+                    "epubcheck_path"
+                ),
             )
             builder = HTMLEpubBuilder(build_config)
             builder.build()
@@ -802,6 +808,12 @@ def build_novel_epub_command(args):
             output_path=output_epub,
             book_title=book_title,
             translated_metadata=translated_metadata,
+            epubcheck_mode=config.get("html_translation", {}).get(
+                "epubcheck_mode", "warn"
+            ),
+            epubcheck_path=config.get("html_translation", {}).get(
+                "epubcheck_path"
+            ),
         )
         builder = HTMLEpubBuilder(build_config)
         builder.build()

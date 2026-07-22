@@ -96,6 +96,13 @@ translation:
 
   truncation_check_lines: 3
 
+# HTML EPUB Build Configuration
+# =============================
+html_translation:
+  # Run EPUBCheck after packaging when it is installed.
+  # off: skip; warn: report errors and keep the EPUB; strict: fail the build.
+  epubcheck_mode: warn
+
 # Polish Configuration
 # ====================
 polish:

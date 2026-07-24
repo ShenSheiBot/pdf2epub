@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from pdf2epub.core._protocol import ValidationResult
@@ -143,7 +144,10 @@ def test_pipeline_passes_batch_failure_into_executor():
     pipeline._batch_validators = [object()]
     pipeline._book_structure = None
     pipeline._executor = executor
-    pipeline._promoter = SimpleNamespace(promote_batch=lambda _keys: None)
+    pipeline._promoter = SimpleNamespace(
+        promote=lambda _key: True,
+        promote_batch=lambda _keys: None,
+    )
     pipeline._tracker = SimpleNamespace(record_attempt=lambda *_args: None)
     pipeline._proactive_split = lambda units: units
     pipeline._get_pending_keys = lambda keys: set(keys)
@@ -165,3 +169,116 @@ def test_pipeline_passes_batch_failure_into_executor():
     assert executor.calls[0] is None
     assert isinstance(executor.calls[1]["chapter_9"], BatchValidationFailure)
     assert executor.calls[1]["chapter_9"].error_type is ErrorType.TRUNCATION
+
+
+def test_pipeline_finalizes_batch_only_after_validation_and_promotion():
+    events = []
+
+    class FakeExecutor:
+        @contextmanager
+        def batch_run_lock(self):
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        def recover_finalizing_batches(self):
+            events.append("recover")
+
+        def execute(self, units, _context_base=None, **_kwargs):
+            events.append("execute")
+            return ExecutionResult(
+                results={units[0].id: "translated"},
+                completed={units[0].id},
+                batch_jobs=[[units[0].id]],
+            )
+
+        def finalize_batch_jobs(self, jobs):
+            assert jobs == [["chapter_1"]]
+            events.append("finalize")
+
+    pipeline = object.__new__(ProcessingPipelineV2)
+    pipeline._split_manager = None
+    pipeline._batch_validators = [object()]
+    pipeline._book_structure = None
+    pipeline._executor = FakeExecutor()
+    pipeline._promoter = SimpleNamespace(
+        promote=lambda key: events.append(f"promote:{key}") or True,
+    )
+    pipeline._tracker = SimpleNamespace(record_attempt=lambda *_args: None)
+    pipeline._proactive_split = lambda units: units
+    pipeline._get_pending_keys = lambda keys: set(keys)
+    pipeline._run_batch_validation = (
+        lambda *_args, **_kwargs: events.append("validate") or {}
+    )
+
+    result = pipeline.process_all(
+        [
+            WorkUnit(
+                id="chapter_1",
+                file_key="chapter_1",
+                content="source",
+            )
+        ]
+    )
+
+    assert result.failed == 0
+    assert events == [
+        "lock-enter",
+        "recover",
+        "execute",
+        "validate",
+        "promote:chapter_1",
+        "finalize",
+        "lock-exit",
+    ]
+
+
+def test_pipeline_resume_restores_full_persisted_batch_membership():
+    calls = []
+
+    class FakeExecutor:
+        def recover_finalizing_batches(self):
+            return None
+
+        def get_resumable_unit_ids(self):
+            return {"chapter_1", "chapter_2"}
+
+        def execute(self, units, _context_base=None, **_kwargs):
+            calls.append([unit.id for unit in units])
+            return ExecutionResult(
+                results={unit.id: "translated" for unit in units},
+                completed={unit.id for unit in units},
+            )
+
+    pipeline = object.__new__(ProcessingPipelineV2)
+    pipeline._split_manager = None
+    pipeline._batch_validators = []
+    pipeline._book_structure = None
+    pipeline._executor = FakeExecutor()
+    pipeline._promoter = SimpleNamespace(promote=lambda _key: True)
+    pipeline._tracker = SimpleNamespace(record_attempt=lambda *_args: None)
+    pipeline._proactive_split = lambda units: units
+    # Simulate a crash after chapter_1 was promoted but before the whole
+    # persisted batch could be finalized.
+    pipeline._get_pending_keys = lambda _keys: {"chapter_2"}
+
+    result = pipeline.process_all(
+        [
+            WorkUnit(
+                id="chapter_1",
+                file_key="chapter_1",
+                content="source 1",
+            ),
+            WorkUnit(
+                id="chapter_2",
+                file_key="chapter_2",
+                content="source 2",
+            ),
+        ],
+        resume=True,
+    )
+
+    assert result.failed == 0
+    assert calls == [["chapter_1", "chapter_2"]]

@@ -120,22 +120,10 @@ class Phase:
 
         logger.info(f"Loaded {len(units)} units")
 
-        # Filter completed if resuming
-        if resume:
-            units = self._filter_completed(units)
-            logger.info(f"{len(units)} units remaining after resume filter")
-
-        if not units:
-            logger.info("All units already completed")
-            return PhaseResult(
-                phase=self._name,
-                total=len(units),
-                completed=len(units),
-                failed=0,
-            )
-
         # Process via pipeline (Pipeline's persistence handles saving)
-        # Pass resume flag for batch state handling
+        # The pipeline owns resume filtering because an active persisted batch
+        # may need units whose validated files were written before a crash.
+        # Pre-filtering here would destroy exact mega-unit membership.
         result = self._pipeline.process_all(units, resume=resume)
 
         duration = time.time() - start_time

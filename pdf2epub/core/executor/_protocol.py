@@ -87,6 +87,7 @@ class ExecutionResult:
     validation_failed: Set[str] = field(default_factory=set)  # Validation failed
     screener_passed: Set[str] = field(default_factory=set)  # Passed individual screener (skip batch)
     fallback_used: Set[str] = field(default_factory=set)   # Used longest fallback (needs warning)
+    batch_jobs: List[List[str]] = field(default_factory=list)  # Jobs awaiting pipeline acceptance
     stats: Dict[str, Any] = field(default_factory=dict)    # Execution statistics
 
     # Detailed statistics (V1 parity)

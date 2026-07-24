@@ -14,7 +14,7 @@ Key features:
 import json
 import re
 from pathlib import Path
-from typing import List, Dict, Tuple, Union
+from typing import Any, List, Dict, Tuple, Union
 from loguru import logger
 
 from ..utils.common import load_config, parse_llm_json
@@ -22,7 +22,10 @@ from ..utils.logging_config import configure_logging
 from ..utils.llm_client import LLMClient
 from ..processors import TranslateProcessor
 from ..core.phase import Phase, PartBasedLoader
-from ..core.factory_v2 import create_processing_pipeline_v2
+from ..core.factory_v2 import (
+    create_processing_pipeline_v2,
+    get_task_model_configs,
+)
 from ..core.book_structure import BookStructure
 from ..chapter_identity import ChapterIdentity
 
@@ -98,6 +101,7 @@ def translate_v2_command(args):
 
     # Create LLM client
     llm_client = LLMClient(config)
+    translation_models = get_task_model_configs(config, "translate")
 
     # Determine use_entities
     if getattr(args, 'no_entities', False):
@@ -115,7 +119,7 @@ def translate_v2_command(args):
         target_language=target_language,
         max_workers=1,  # Not used
         resume=False,   # Not used
-        translation_models=translation_config.get('models'),
+        translation_models=translation_models,
         use_entities=use_entities,
         use_longest_on_failure=False,  # Not used
         book_structure=book_structure_data,
@@ -174,14 +178,18 @@ def translate_v2_command(args):
     # Translate TOC titles (after content, needs translated titles as reference)
     if toc_tree_file.exists():
         logger.info("[v2] Translating TOC titles...")
-        _translate_toc(
+        toc_translated = _translate_toc(
             output_dir=output_dir,
             translate_dir=translate_dir,
             llm_client=llm_client,
-            translation_models=translation_config.get('models'),
+            translation_models=translation_models,
             source_language=source_language,
             target_language=target_language,
+            config=config,
         )
+        if not toc_translated:
+            logger.error("[v2] TOC translation failed; translated content was preserved")
+            return 1
         logger.success("[v2] TOC translation completed")
 
     return 0 if result.failed == 0 else 1
@@ -194,7 +202,32 @@ def _translate_toc(
     translation_models: List[Dict],
     source_language: str,
     target_language: str,
-) -> None:
+    config: Dict[str, Any],
+) -> bool:
+    """Translate and persist TOC while one process owns its lifecycle."""
+    from ..core.executor.batch_state import BatchRunLock
+
+    with BatchRunLock(output_dir / ".toc_translation_lifecycle"):
+        return _translate_toc_locked(
+            output_dir,
+            translate_dir,
+            llm_client,
+            translation_models,
+            source_language,
+            target_language,
+            config,
+        )
+
+
+def _translate_toc_locked(
+    output_dir: Path,
+    translate_dir: Path,
+    llm_client: LLMClient,
+    translation_models: List[Dict],
+    source_language: str,
+    target_language: str,
+    config: Dict[str, Any],
+) -> bool:
     """
     Translate TOC titles using already translated content as reference.
 
@@ -210,18 +243,113 @@ def _translate_toc(
     reference_json = _build_toc_reference_json(output_dir, translate_dir)
     if not reference_json:
         logger.warning("No TOC entries to translate")
-        return
+        return False
+
+    state_path = output_dir / "toc_translation_batch_state.json"
+    translated_path = output_dir / "toc_tree_translated.json"
+    if state_path.exists() and translated_path.exists():
+        try:
+            state_data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state_data = {}
+        if state_data.get("job_state") == "FINALIZED":
+            from ..core.executor import PersistedSingleRequestBatch
+            from ..utils.batch_utils import BatchRequest
+
+            batch_model = next(
+                (
+                    model
+                    for model in translation_models
+                    if model.get("mode") == "batch"
+                ),
+                None,
+            )
+            if not batch_model:
+                logger.error(
+                    "Finalized TOC batch state has no matching current "
+                    "batch model; state was retained"
+                )
+                return False
+            provider = batch_model.get("provider", "gemini")
+            model = batch_model.get("model")
+            request = BatchRequest(
+                key="toc_translation",
+                contents=[{
+                    "role": "user",
+                    "parts": [{
+                        "text": _build_toc_translation_prompt(
+                            reference_json,
+                            source_language,
+                            target_language,
+                        )
+                    }],
+                }],
+                config={"response_mime_type": "application/json"},
+            )
+            expected_sha = PersistedSingleRequestBatch._fingerprint(
+                provider,
+                model,
+                request,
+            )
+            expected_identity = (
+                provider,
+                model,
+                request.key,
+                expected_sha,
+            )
+            actual_identity = (
+                state_data.get("provider"),
+                state_data.get("model"),
+                state_data.get("request_key"),
+                state_data.get("input_sha256"),
+            )
+            if (
+                actual_identity != expected_identity
+                or not isinstance(state_data.get("job_name"), str)
+                or not state_data["job_name"].strip()
+            ):
+                logger.error(
+                    "Finalized TOC batch state does not match the current "
+                    "provider, model, request, or input; state was retained"
+                )
+                return False
+            # The durable output and remote cleanup both completed; only a
+            # crash between deleting the response cache and state remains.
+            state_path.with_suffix(".response.txt").unlink(
+                missing_ok=True
+            )
+            state_path.unlink(missing_ok=True)
+            return True
 
     # Translate
     translations = _translate_toc_batch(
-        reference_json, llm_client, translation_models, source_language, target_language
+        reference_json,
+        llm_client,
+        translation_models,
+        source_language,
+        target_language,
+        config=config,
+        output_dir=output_dir,
     )
     if not translations:
         logger.error("TOC translation failed")
-        return
+        return False
 
     # Save toc_tree_translated.json
-    _save_toc_tree_translated(output_dir, translations, source_language, target_language)
+    if not _save_toc_tree_translated(
+        output_dir,
+        translations,
+        source_language,
+        target_language,
+    ):
+        return False
+    if not _finalize_toc_batch_state(
+        config,
+        output_dir,
+        translation_models,
+    ):
+        return False
+    return True
 
 
 def _build_toc_reference_json(output_dir: Path, translate_dir: Path) -> List[Dict]:
@@ -339,23 +467,14 @@ def _extract_titles_from_translated(translate_dir: Path) -> Dict[str, str]:
     return title_map
 
 
-def _translate_toc_batch(
+def _build_toc_translation_prompt(
     reference_json: List[Dict],
-    llm_client: LLMClient,
-    translation_models: List[Dict],
     source_language: str,
     target_language: str,
-) -> List[Dict]:
-    """
-    Translate entire TOC in one batch using LLM.
-    """
-    if not reference_json:
-        return []
-
-    # Build prompt
+) -> str:
+    """Build the exact request text used by online and batch TOC paths."""
     input_json = json.dumps(reference_json, ensure_ascii=False, indent=2)
-
-    prompt = f"""翻译以下书籍目录结构从{source_language}到简体中文。
+    return f"""翻译以下书籍目录结构从{source_language}到简体中文。
 
 **要求**：
 1. 参考"reference"字段保持术语一致（如果有参考的话）
@@ -379,7 +498,32 @@ def _translate_toc_batch(
 ```
 """
 
+
+def _translate_toc_batch(
+    reference_json: List[Dict],
+    llm_client: LLMClient,
+    translation_models: List[Dict],
+    source_language: str,
+    target_language: str,
+    *,
+    config: Dict[str, Any],
+    output_dir: Path,
+) -> List[Dict]:
+    """
+    Translate entire TOC in one batch using LLM.
+    """
+    if not reference_json:
+        return []
+
+    prompt = _build_toc_translation_prompt(
+        reference_json,
+        source_language,
+        target_language,
+    )
+
     expected_count = len(reference_json)
+    expected_ids = [item["id"] for item in reference_json]
+    expected_id_set = set(expected_ids)
 
     def _validate_toc_json(response: str) -> Tuple[bool, str]:
         """Validate TOC translation response is valid JSON with correct structure."""
@@ -397,12 +541,26 @@ def _translate_toc_batch(
                 f"got {len(translations)}"
             )
 
-        # Check each entry has required fields
+        response_ids = []
         for i, entry in enumerate(translations):
             if not isinstance(entry, dict):
                 return False, f"Entry {i} is not an object"
             if "id" not in entry or "translated" not in entry:
                 return False, f"Entry {i} missing 'id' or 'translated' field"
+            if not isinstance(entry["translated"], str) or not entry["translated"].strip():
+                return False, f"Entry {i} has an empty or non-string translation"
+            response_ids.append(entry["id"])
+
+        if len(set(response_ids)) != len(response_ids):
+            return False, "Response contains duplicate IDs"
+        response_id_set = set(response_ids)
+        if response_id_set != expected_id_set:
+            missing = sorted(expected_id_set - response_id_set)
+            unexpected = sorted(response_id_set - expected_id_set)
+            return False, (
+                f"ID set mismatch: missing={missing[:5]}, "
+                f"unexpected={unexpected[:5]}"
+            )
 
         return True, ""
 
@@ -422,16 +580,34 @@ def _translate_toc_batch(
             )},
         ]
 
-    # Ensure validation retries for TOC translation (repair prompt needs ≥1)
+    # Ensure validation retries for TOC translation (repair prompt needs ≥1).
+    # ``generate_with_validation`` is an online API path, so batch-only models
+    # need a separate, persisted batch round-trip below.
     toc_models = [
         {**m, "validation_retries": max(m.get("validation_retries", 0), 2)}
-        for m in translation_models
+        for m in (translation_models or [])
     ]
+    if toc_models and toc_models[0].get("mode", "online") == "batch":
+        return _translate_toc_with_batch(
+            prompt=prompt,
+            validator=_validate_toc_json,
+            config=config,
+            output_dir=output_dir,
+            batch_models=toc_models,
+        )
+
+    online_models = [
+        m for m in toc_models
+        if m.get("mode", "online") != "batch"
+    ]
+    if not online_models:
+        logger.error("No model configured for TOC translation")
+        return []
 
     try:
         response = llm_client.generate_with_validation(
             prompt=prompt,
-            model_configs=toc_models,
+            model_configs=online_models,
             validator=_validate_toc_json,
             operation_name="TOC batch translation",
             repair_prompt_builder=_build_repair_prompt,
@@ -445,12 +621,131 @@ def _translate_toc_batch(
         return []
 
 
+def _translate_toc_with_batch(
+    *,
+    prompt: str,
+    validator,
+    config: Dict[str, Any],
+    output_dir: Path,
+    batch_models: List[Dict],
+) -> List[Dict]:
+    """Translate a TOC through the generic persisted single-request runner."""
+    from ..core.executor import PersistedSingleRequestBatch
+    from ..utils.batch_utils import (
+        BatchRequest,
+        create_batch_client_from_config,
+    )
+
+    batch_model = next((m for m in batch_models if m.get("mode") == "batch"), None)
+    if not batch_model:
+        logger.error("No batch model configured for TOC translation")
+        return []
+
+    provider = batch_model.get("provider", "gemini")
+    model = batch_model.get("model")
+    poll_interval = config.get("batch", {}).get("poll_interval", 60)
+    state_path = output_dir / "toc_translation_batch_state.json"
+
+    try:
+        client = create_batch_client_from_config(
+            config,
+            provider=provider,
+            model=model,
+        )
+    except ValueError as exc:
+        logger.error(f"Cannot create TOC batch client: {exc}")
+        return []
+
+    request = BatchRequest(
+        key="toc_translation",
+        contents=[{"role": "user", "parts": [{"text": prompt}]}],
+        config={"response_mime_type": "application/json"},
+    )
+    runner = PersistedSingleRequestBatch(
+        client=client,
+        provider=provider,
+        model=model,
+        state_path=state_path,
+        poll_interval=poll_interval,
+    )
+    try:
+        response_text = runner.run(
+            request,
+            validator,
+            display_name="pdf2epub-toc-translation",
+        )
+        translations = parse_llm_json(
+            response_text,
+            operation_name="TOC translation",
+        )
+        return translations
+    except Exception as e:
+        logger.error(f"TOC batch translation failed: {e}")
+        return []
+
+
+def _finalize_toc_batch_state(
+    config: Dict[str, Any],
+    output_dir: Path,
+    translation_models: List[Dict],
+) -> bool:
+    """Finalize a validated TOC batch only after its JSON is durable."""
+    state_path = output_dir / "toc_translation_batch_state.json"
+    if not state_path.exists():
+        return True
+
+    from ..core.executor import PersistedSingleRequestBatch
+    from ..utils.batch_utils import create_batch_client_from_config
+
+    batch_model = next(
+        (
+            model
+            for model in translation_models
+            if model.get("mode") == "batch"
+        ),
+        None,
+    )
+    if not batch_model:
+        logger.error(
+            "TOC batch state exists, but no batch model is configured; "
+            "state was retained"
+        )
+        return False
+
+    provider = batch_model.get("provider", "gemini")
+    model = batch_model.get("model")
+    try:
+        client = create_batch_client_from_config(
+            config,
+            provider=provider,
+            model=model,
+        )
+        runner = PersistedSingleRequestBatch(
+            client=client,
+            provider=provider,
+            model=model,
+            state_path=state_path,
+            poll_interval=config.get("batch", {}).get(
+                "poll_interval",
+                60,
+            ),
+        )
+        runner.finalize()
+    except Exception as exc:
+        logger.error(
+            f"TOC output was saved, but batch finalization failed: {exc}. "
+            "State and response cache were retained for --resume."
+        )
+        return False
+    return True
+
+
 def _save_toc_tree_translated(
     output_dir: Path,
     translations: List[Dict],
     source_language: str,
     target_language: str,
-) -> None:
+) -> bool:
     """
     Save toc_tree_translated.json with translated titles.
     """
@@ -458,7 +753,7 @@ def _save_toc_tree_translated(
     toc_tree_path = output_dir / "toc_tree.json"
     if not toc_tree_path.exists():
         logger.error(f"toc_tree.json not found at {toc_tree_path}")
-        return
+        return False
 
     with open(toc_tree_path, 'r', encoding='utf-8') as f:
         toc_tree = json.load(f)
@@ -505,7 +800,15 @@ def _save_toc_tree_translated(
 
     # Save translated toc_tree
     output_path = output_dir / "toc_tree_translated.json"
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(toc_tree, f, ensure_ascii=False, indent=2)
+    temp_path = output_path.with_suffix(".json.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump(toc_tree, file, ensure_ascii=False, indent=2)
+        temp_path.replace(output_path)
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        logger.error(f"Failed to save translated TOC: {exc}")
+        return False
 
     logger.success(f"Saved translated TOC to {output_path}")
+    return True

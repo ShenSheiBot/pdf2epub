@@ -112,7 +112,7 @@ class AttemptContext:
             self._unit_id, self._model, error_type, error_message
         )
 
-    def skip(self, reason: str, fallback_content: Optional[str] = None) -> None:
+    def skip(self, reason: str, fallback_content: Optional[str] = None) -> bool:
         """
         Mark attempt as skipped (pre-process filter).
 
@@ -130,7 +130,7 @@ class AttemptContext:
         self._recorded = True
         self._result_content = fallback_content
 
-        self._saver._record_skip_internal(
+        return self._saver._record_skip_internal(
             self._unit_id, self._model, reason, fallback_content
         )
 
@@ -320,7 +320,7 @@ class DiskFirstSaver:
         model: str,
         reason: str,
         fallback_content: Optional[str],
-    ) -> None:
+    ) -> bool:
         """
         Internal: Record skipped attempt.
 
@@ -332,7 +332,12 @@ class DiskFirstSaver:
             try:
                 self._persistence.save_raw(unit_id, fallback_content)
             except Exception as e:
-                logger.warning(f"{unit_id}: Failed to save fallback: {e}")
+                logger.error(f"{unit_id}: Failed to save fallback: {e}")
+                if not is_sub_key(unit_id):
+                    self._record_failure_internal(
+                        unit_id, model, "io_error", str(e)
+                    )
+                return False
 
         # Record to tracker (skip .sub units)
         if not is_sub_key(unit_id):
@@ -346,6 +351,7 @@ class DiskFirstSaver:
             self._tracker.record_attempt(unit_id, attempt)
 
         logger.debug(f"{unit_id}: Skipped ({reason})")
+        return True
 
     def _classify_exception(self, exc_type, exc_val) -> str:
         """

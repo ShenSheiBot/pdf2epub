@@ -58,6 +58,25 @@ def test_create_model_chain_filters_disabled_vertex_and_falls_back():
     ]
 
 
+def test_create_model_chain_supports_legacy_polish_models():
+    chain = create_model_chain_from_config(
+        {
+            "polish_models": [
+                {
+                    "provider": "vertex",
+                    "model": "gemini-2.5-flash",
+                    "mode": "batch",
+                }
+            ]
+        },
+        task_type="polish",
+    )
+
+    assert [(entry.provider, entry.model, entry.mode) for entry in chain] == [
+        ("vertex", "gemini-2.5-flash", "batch")
+    ]
+
+
 def test_html_builder_replaces_htm_files(tmp_path: Path):
     translated_dir = tmp_path / "translated"
     translated_dir.mkdir()

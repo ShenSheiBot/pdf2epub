@@ -18,7 +18,10 @@ from ..utils.logging_config import configure_logging
 from ..utils.llm_client import LLMClient
 from ..processors import PolishProcessor
 from ..core.phase import Phase, PartBasedLoader
-from ..core.factory_v2 import create_processing_pipeline_v2
+from ..core.factory_v2 import (
+    create_processing_pipeline_v2,
+    get_task_model_configs,
+)
 from ..core.book_structure import BookStructure
 
 
@@ -84,7 +87,7 @@ def polish_v2_command(args):
         max_workers=1,  # Not used, Pipeline handles concurrency
         resume=False,   # Not used, Phase handles resume
         skip_truncation_check=getattr(args, 'skip_truncation_check', False),
-        polish_models=config.get('polish', {}).get('models'),
+        polish_models=get_task_model_configs(config, "polish"),
         content_type=content_type,
         use_longest_on_failure=False,  # Not used
         book_structure=book_structure_data,

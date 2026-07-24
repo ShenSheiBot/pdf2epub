@@ -172,6 +172,27 @@ class ProcessingPipelineV2:
         context_base: Optional["ProcessContext"] = None,
         resume: bool = False,
     ) -> "ProcessingResultV2":
+        """Process all units while owning the complete batch lifecycle."""
+        batch_run_lock = getattr(
+            self._executor,
+            "batch_run_lock",
+            None,
+        )
+        if callable(batch_run_lock):
+            with batch_run_lock():
+                return self._process_all_locked(
+                    units,
+                    context_base,
+                    resume,
+                )
+        return self._process_all_locked(units, context_base, resume)
+
+    def _process_all_locked(
+        self,
+        units: List[WorkUnit],
+        context_base: Optional["ProcessContext"] = None,
+        resume: bool = False,
+    ) -> "ProcessingResultV2":
         """
         Process all units.
 
@@ -183,6 +204,14 @@ class ProcessingPipelineV2:
         Returns:
             ProcessingResultV2 with statistics
         """
+        recover_finalizing = getattr(
+            self._executor,
+            "recover_finalizing_batches",
+            None,
+        )
+        if callable(recover_finalizing):
+            recover_finalizing()
+
         if not units:
             return ProcessingResultV2(total=0, completed=0, failed=0)
 
@@ -197,6 +226,16 @@ class ProcessingPipelineV2:
 
         # Step 2: Filter completed (resume)
         pending_keys = self._get_pending_keys(all_keys)
+        if resume:
+            get_resumable_ids = getattr(
+                self._executor,
+                "get_resumable_unit_ids",
+                None,
+            )
+            if callable(get_resumable_ids):
+                pending_keys.update(
+                    get_resumable_ids() & all_keys
+                )
         pending_units = [u for u in units if u.id in pending_keys]
 
         if not pending_units:
@@ -212,6 +251,7 @@ class ProcessingPipelineV2:
         # Step 3: Execute via Executor
         # Executor handles all disk writes via DiskFirstSaver (including .sub units)
         exec_result = self._executor.execute(pending_units, context_base, resume_batch=resume)
+        promoted_keys: Set[str] = set()
 
         # Step 4: Filter out .sub virtual units from processing
         # .sub units are Executor's runtime splits - they should:
@@ -242,6 +282,24 @@ class ProcessingPipelineV2:
             # Step 5b: Retry batch validation failures via executor
             # These units need to go back through executor's retry mechanism
             if batch_failures:
+                # Accept and promote everything the whole-batch validators
+                # approved before releasing the original provider artifacts.
+                # Rejected raw outputs remain unvalidated and are safe to
+                # retry from their source inputs.
+                initial_failed = filter_sub_keys(exec_result.failed)
+                accepted_before_retry = (
+                    real_result_keys
+                    - initial_failed
+                    - set(batch_failures)
+                )
+                self._promote_result_keys(
+                    accepted_before_retry,
+                    exec_result,
+                )
+                promoted_keys.update(accepted_before_retry)
+                self._finalize_batch_jobs(exec_result.batch_jobs)
+                exec_result.batch_jobs.clear()
+
                 logger.info(f"Batch validation failed for {len(batch_failures)} units, retrying via executor")
                 # Build retry units from originals
                 retry_units = [
@@ -275,6 +333,10 @@ class ProcessingPipelineV2:
                     exec_result.completed.update(retry_result.completed)
                     exec_result.failed.update(retry_result.failed)
                     exec_result.screener_passed.update(retry_result.screener_passed)
+                    exec_result.fallback_used.update(
+                        retry_result.fallback_used
+                    )
+                    exec_result.batch_jobs.extend(retry_result.batch_jobs)
 
         # Step 6: Determine final failures (only real units)
         # Note: longest-fallback is handled by Executor (per design v2)
@@ -285,22 +347,11 @@ class ProcessingPipelineV2:
         # Use Promoter (not direct persistence access)
         # Separate fallback results from normal results for proper warning handling
         successful = real_result_keys - all_failed
-        fallback_keys = exec_result.fallback_used & successful  # Only successful fallbacks
-        normal_keys = successful - fallback_keys
-
-        # Save fallback results with warning header (for audit/traceability)
-        for key in fallback_keys:
-            content = exec_result.results[key]
-            self._promoter.save_with_warning(
-                key, content,
-                warning="LONGEST_FALLBACK: validation failed after max retries"
-            )
-            self._mark_complete(key, content=content, fallback=True)
-
-        # Promote normal successful results via Promoter
-        # Note: Don't call _mark_complete here - Executor already recorded the attempt
-        if normal_keys:
-            self._promoter.promote_batch(list(normal_keys))
+        self._promote_result_keys(
+            successful - promoted_keys,
+            exec_result,
+        )
+        self._finalize_batch_jobs(exec_result.batch_jobs)
 
         # Step 8: Mark failures via attempt record (only real units)
         from .tracking import AttemptRecord
@@ -330,6 +381,49 @@ class ProcessingPipelineV2:
             results=exec_result.results,  # Full results (including .sub) for debugging
             duration=duration,
         )
+
+    def _promote_result_keys(
+        self,
+        keys: Set[str],
+        exec_result: ExecutionResult,
+    ) -> None:
+        """Promote accepted raw outputs and fail closed on any I/O error."""
+        fallback_keys = exec_result.fallback_used & keys
+        normal_keys = keys - fallback_keys
+
+        for key in fallback_keys:
+            content = exec_result.results[key]
+            saved = self._promoter.save_with_warning(
+                key,
+                content,
+                warning=(
+                    "LONGEST_FALLBACK: validation failed after max retries"
+                ),
+            )
+            if not saved:
+                raise RuntimeError(
+                    f"{key}: failed to promote fallback result"
+                )
+            self._mark_complete(key, content=content, fallback=True)
+
+        for key in normal_keys:
+            if not self._promoter.promote(key):
+                raise RuntimeError(
+                    f"{key}: failed to promote validated result"
+                )
+
+    def _finalize_batch_jobs(
+        self,
+        batch_jobs: List[List[str]],
+    ) -> None:
+        """Release remote artifacts only after pipeline acceptance."""
+        finalize = getattr(self._executor, "finalize_batch_jobs", None)
+        if batch_jobs and not callable(finalize):
+            raise RuntimeError(
+                "Executor returned batch jobs without a finalization API"
+            )
+        if callable(finalize):
+            finalize(batch_jobs)
 
     def _proactive_split(self, units: List[WorkUnit]) -> List[WorkUnit]:
         """

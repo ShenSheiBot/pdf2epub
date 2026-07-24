@@ -182,6 +182,30 @@ def get_split_config(config: Dict[str, Any]) -> Dict[str, Any]:
 # Factory Functions
 # ============================================================
 
+def get_task_model_configs(
+    config: Dict[str, Any],
+    task_type: str,
+) -> List[Dict[str, Any]]:
+    """Return the configured model chain for a processing task.
+
+    ``polish_models`` predates the nested ``polish.models`` layout and is
+    still accepted by the processors and ConfigManager.  Keep model selection
+    in one place so the Executor cannot silently fall back to a different
+    provider when a legacy config is used.
+    """
+    if task_type == "translate":
+        models = config.get("translation", {}).get("models")
+    elif task_type == "polish":
+        models = (
+            config.get("polish", {}).get("models")
+            or config.get("polish_models")
+        )
+    else:
+        raise ValueError(f"Unsupported task type: {task_type}")
+
+    return list(models or [])
+
+
 def create_hooks_from_config(
     config: Dict[str, Any],
     task_type: str = "translate",
@@ -318,7 +342,8 @@ def create_model_chain_from_config(
     """
     Create model chain from configuration.
 
-    Reads models from translation.models or polish.models.
+    Reads models from translation.models or polish.models. The legacy
+    top-level polish_models key remains supported.
     Each model can specify 'mode': 'batch' or 'online' (default: 'online').
 
     Args:
@@ -329,11 +354,7 @@ def create_model_chain_from_config(
     Returns:
         List of ChainEntry
     """
-    # Get task-specific models
-    if task_type == "translate":
-        models = config.get('translation', {}).get('models', [])
-    else:
-        models = config.get('polish', {}).get('models', [])
+    models = get_task_model_configs(config, task_type)
 
     # Filter providers disabled at the top level (for example, use_vertex: false).
     for provider_name in ('vertex',):
@@ -390,62 +411,20 @@ def _create_batch_client_from_config(
     if not batch_entry:
         return None
 
-    # Get credentials for the batch provider
-    credentials = config.get('credentials', {}).get('providers', {})
-    provider_config = credentials.get(batch_entry.provider, {})
+    from ..utils.batch_utils import create_batch_client_from_config
 
-    if not provider_config:
-        from loguru import logger
-        logger.warning(f"No credentials found for batch provider '{batch_entry.provider}'")
-        return None
-
-    api_key = provider_config.get('api_key')
-    base_url = provider_config.get('base_url')
-
-    # Get batch config
-    batch_config = config.get('batch', {})
-    poll_interval = batch_config.get('poll_interval', 60)
+    client = create_batch_client_from_config(
+        config,
+        provider=batch_entry.provider,
+        model=batch_entry.model,
+    )
 
     from loguru import logger
-
-    # Route to Vertex or Gemini batch client
-    if batch_entry.provider == "vertex":
-        project = provider_config.get('project')
-        if not project:
-            logger.warning("No 'project' found for vertex batch provider. "
-                          "Set credentials.providers.vertex.project in config.yaml")
-            return None
-        location = provider_config.get('location', 'us-central1')
-        bucket = provider_config.get('bucket')
-        proxy = provider_config.get('proxy')
-
-        from ..utils.batch_utils import VertexBatchClient
-        logger.info(f"Creating Vertex batch client for {batch_entry.model} "
-                    f"(project={project}, location={location})")
-        return VertexBatchClient(
-            project=project,
-            location=location,
-            model=batch_entry.model,
-            poll_interval=poll_interval,
-            bucket_name=bucket,
-            proxy=proxy,
-        )
-
-    # Gemini batch (default)
-    api_key = provider_config.get('api_key')
-    base_url = provider_config.get('base_url')
-    if not api_key:
-        logger.warning(f"No api_key found for batch provider '{batch_entry.provider}'")
-        return None
-
-    from ..utils.batch_utils import GeminiBatchClient
-    logger.info(f"Creating Gemini batch client for {batch_entry.provider}/{batch_entry.model}")
-    return GeminiBatchClient(
-        api_key=api_key,
-        model=batch_entry.model,
-        poll_interval=poll_interval,
-        base_url=base_url,
+    logger.info(
+        f"Creating batch client for "
+        f"{batch_entry.provider}/{batch_entry.model}"
     )
+    return client
 
 
 # ============================================================

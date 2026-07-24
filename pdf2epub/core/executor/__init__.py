@@ -33,6 +33,11 @@ from .state import (
 )
 
 from .executor import Executor, handle_split
+from .persisted_batch import (
+    PersistedBatchConflictError,
+    PersistedSingleRequestBatch,
+)
+from .batch_state import BatchStateConflictError
 from .saver import DiskFirstSaver, AttemptContext
 
 __all__ = [
@@ -52,6 +57,9 @@ __all__ = [
     # Executor
     'Executor',
     'handle_split',
+    'PersistedBatchConflictError',
+    'PersistedSingleRequestBatch',
+    'BatchStateConflictError',
     # Saver (disk-first persistence)
     'DiskFirstSaver',
     'AttemptContext',

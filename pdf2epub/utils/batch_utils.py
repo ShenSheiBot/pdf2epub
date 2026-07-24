@@ -7,6 +7,8 @@ enabling asynchronous, high-throughput processing at 50% cost reduction.
 
 import json
 import hashlib
+import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,53 @@ BATCH_DEFAULTS = {
         "model": "gemini-3-pro-preview",
     },
 }
+
+_VERTEX_CREDENTIAL_PROBES: set[tuple[str, int]] = set()
+
+
+def probe_explicit_vertex_credentials() -> Path:
+    """Load and refresh only the JSON credential named by the process.
+
+    Vertex batch work must not depend on whichever user happens to be active
+    in gcloud or in the machine-wide ADC file. The refresh is intentionally
+    performed before any batch client can submit work and never logs a token.
+    """
+    credential_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if not credential_path:
+        raise ValueError(
+            "Vertex batch requires process-level "
+            "GOOGLE_APPLICATION_CREDENTIALS pointing to a JSON credential. "
+            "No default ADC or gcloud account fallback is allowed."
+        )
+
+    path = Path(credential_path).expanduser()
+    if not path.is_file():
+        raise ValueError(
+            f"GOOGLE_APPLICATION_CREDENTIALS does not name a readable file: "
+            f"{path}"
+        )
+
+    cache_key = (str(path.resolve()), path.stat().st_mtime_ns)
+    if cache_key in _VERTEX_CREDENTIAL_PROBES:
+        return path
+
+    try:
+        import google.auth
+        from google.auth.transport.requests import Request
+
+        credentials, _ = google.auth.load_credentials_from_file(
+            str(path),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        credentials.refresh(Request())
+    except Exception as exc:
+        raise ValueError(
+            f"Explicit Vertex credential refresh failed for {path}: {exc}"
+        ) from exc
+
+    _VERTEX_CREDENTIAL_PROBES.add(cache_key)
+    logger.info("Validated explicit JSON credentials for Vertex batch")
+    return path
 
 
 def _write_batch_trace(provider: str, model: str, job_name: str,
@@ -193,7 +242,6 @@ class GeminiBatchClient:
 
         return self._client
 
-    @default_retry
     def submit(
         self,
         requests: List[BatchRequest],
@@ -291,9 +339,8 @@ class GeminiBatchClient:
 
         return job_name
 
-    @default_retry
     def _upload_and_create_batch(self, temp_path: str, display_name: Optional[str] = None) -> str:
-        """Upload file and create batch job (with retry)."""
+        """Upload a file and create one batch job without implicit retry."""
         client = self._get_client()
         from google.genai import types
 
@@ -401,7 +448,11 @@ class GeminiBatchClient:
             time.sleep(interval)
 
     @aggressive_retry
-    def get_results(self, job_name: str) -> List[BatchResponse]:
+    def get_results(
+        self,
+        job_name: str,
+        cleanup: bool = True,
+    ) -> List[BatchResponse]:
         """
         Get results from a completed batch job.
 
@@ -497,6 +548,23 @@ class GeminiBatchClient:
 
         return results
 
+    def restore_job_mapping(
+        self,
+        job_name: str,
+        processing_keys: List[str],
+        content_fingerprints: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Restore result correlation metadata after a process restart.
+
+        Gemini preserves request keys in its output, so no client-side state is
+        required. The method exists to provide a common batch-client interface.
+        """
+        return None
+
+    def cleanup_job_artifacts(self, job_name: str) -> None:
+        """No additional provider cleanup is currently implemented."""
+        return None
+
     @default_retry
     def cancel(self, job_name: str) -> bool:
         """
@@ -564,6 +632,13 @@ class VertexBatchClient:
         bucket_name: Optional[str] = None,
         proxy: Optional[str] = None,
     ):
+        # Set proxy env vars before the mandatory credential refresh probe.
+        if proxy:
+            os.environ.setdefault("HTTPS_PROXY", proxy)
+            os.environ.setdefault("HTTP_PROXY", proxy)
+            logger.info(f"Vertex batch client using proxy: {proxy}")
+
+        probe_explicit_vertex_credentials()
         self.project = project
         self.location = location
         self.model = model
@@ -572,19 +647,11 @@ class VertexBatchClient:
         self._proxy = proxy
         self._client = None
         self._storage_client = None
-        # Track submitted key orders for line-order correlation
+        # Track submitted keys so missing responses can be reported exactly.
         self._job_keys: Dict[str, List[str]] = {}
-        # Track content fingerprints for content-based key matching
-        # (Vertex batch does NOT guarantee output order matches input order)
+        # Vertex output order is not guaranteed; fingerprints are the only
+        # accepted result-correlation mechanism.
         self._job_fingerprints: Dict[str, Dict[str, str]] = {}  # job_name -> {fingerprint: key}
-
-        # Set proxy env vars for httpx (google-genai SDK uses trust_env=True)
-        # and for google-cloud-storage / google-auth (ADC token refresh)
-        if proxy:
-            import os
-            os.environ.setdefault("HTTPS_PROXY", proxy)
-            os.environ.setdefault("HTTP_PROXY", proxy)
-            logger.info(f"Vertex batch client using proxy: {proxy}")
 
     def _get_client(self):
         """Get or create the genai client with Vertex AI backend."""
@@ -600,8 +667,8 @@ class VertexBatchClient:
                 if "credentials" in str(e).lower() or "default credentials" in str(e).lower():
                     raise RuntimeError(
                         f"Vertex AI authentication failed: {e}\n"
-                        "Run: gcloud auth application-default login\n"
-                        "Or set GOOGLE_APPLICATION_CREDENTIALS to a service account key file."
+                        "Check the JSON file supplied through this process's "
+                        "GOOGLE_APPLICATION_CREDENTIALS."
                     ) from e
                 raise
             logger.info(f"Created Vertex AI client (project={self.project}, location={self.location})")
@@ -660,14 +727,13 @@ class VertexBatchClient:
             elif "403" in error_msg:
                 raise PermissionError(
                     f"Cannot create GCS bucket '{bucket_name}'. "
-                    f"Ensure ADC credentials have storage.buckets.create permission. "
-                    f"Run: gcloud auth application-default login"
+                    f"Ensure the explicit JSON credentials have "
+                    f"storage.buckets.create permission."
                 ) from e
             raise
 
         return bucket_name
 
-    @default_retry
     def submit(
         self,
         requests: List[BatchRequest],
@@ -677,6 +743,20 @@ class VertexBatchClient:
         if not requests:
             raise ValueError("Cannot submit empty batch")
 
+        ordered_keys = [req.key for req in requests]
+        if len(set(ordered_keys)) != len(ordered_keys):
+            raise ValueError("Vertex batch request keys must be unique")
+
+        fingerprints = {}
+        for req in requests:
+            fp = self._content_fingerprint(req.contents)
+            if fp in fingerprints:
+                raise ValueError(
+                    "Vertex batch cannot safely correlate duplicate request "
+                    f"contents for {fingerprints[fp]!r} and {req.key!r}"
+                )
+            fingerprints[fp] = req.key
+
         client = self._get_client()
         bucket_name = self._ensure_bucket()
         storage_client = self._get_storage_client()
@@ -684,9 +764,6 @@ class VertexBatchClient:
         import tempfile
         import os
         import uuid
-
-        # Preserve key order for line-order correlation
-        ordered_keys = [req.key for req in requests]
 
         # Write JSONL (Vertex format: no top-level 'key', just 'request')
         # Vertex batch uses 'generationConfig' (not 'config') in the request proto
@@ -729,12 +806,8 @@ class VertexBatchClient:
 
         # Store key order and content fingerprints for this job
         self._job_keys[job.name] = ordered_keys
-        # Build fingerprint map for content-based matching
-        # (Vertex batch output order is NOT guaranteed to match input order)
-        fingerprints = {}
-        for req in requests:
-            fp = self._content_fingerprint(req.contents)
-            fingerprints[fp] = req.key
+        # Vertex output order is not guaranteed, so only content-based
+        # correlation is accepted.
         self._job_fingerprints[job.name] = fingerprints
         logger.info(f"Created Vertex batch job: {job.name}")
         return job.name
@@ -742,7 +815,14 @@ class VertexBatchClient:
     @staticmethod
     def _content_fingerprint(contents: list) -> str:
         """Create a deterministic fingerprint from request contents for matching."""
-        return hashlib.md5(json.dumps(contents, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        return hashlib.sha256(
+            json.dumps(
+                contents,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
 
     @default_retry
     def get_status(self, job_name: str) -> BatchJobInfo:
@@ -788,8 +868,69 @@ class VertexBatchClient:
             logger.info(f"Job state: {info.state.name}, waiting {interval}s...")
             time.sleep(interval)
 
+    def restore_job_mapping(
+        self,
+        job_name: str,
+        processing_keys: List[str],
+        content_fingerprints: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Restore client-side metadata needed to correlate Vertex outputs."""
+        if len(set(processing_keys)) != len(processing_keys):
+            raise ValueError("Persisted Vertex processing keys are not unique")
+        if processing_keys and not content_fingerprints:
+            raise ValueError(
+                "Persisted Vertex batch state has no content fingerprints; "
+                "unordered results cannot be correlated safely"
+            )
+        if content_fingerprints and (
+            len(content_fingerprints) != len(processing_keys)
+            or set(content_fingerprints.values()) != set(processing_keys)
+        ):
+            raise ValueError(
+                "Persisted Vertex content fingerprints do not map one-to-one "
+                "to processing keys"
+            )
+        self._job_keys[job_name] = list(processing_keys)
+        if content_fingerprints:
+            self._job_fingerprints[job_name] = dict(content_fingerprints)
+
+    def _correlate_output_key(
+        self,
+        job_name: str,
+        data: Dict,
+        fingerprint_map: Dict[str, str],
+        matched_keys: set[str],
+    ) -> str:
+        """Map one unordered Vertex output to exactly one submitted key."""
+        request_data = data.get("request", {})
+        request_contents = request_data.get("contents", [])
+        if not request_contents:
+            raise ValueError(
+                f"Vertex batch {job_name} returned a line without the "
+                "original request; output order is not a safe correlation "
+                "mechanism"
+            )
+        fingerprint = self._content_fingerprint(request_contents)
+        key = fingerprint_map.get(fingerprint)
+        if key is None:
+            raise ValueError(
+                f"Vertex batch {job_name} returned an unrecognized request "
+                "fingerprint"
+            )
+        if key in matched_keys:
+            raise ValueError(
+                f"Vertex batch {job_name} returned duplicate output for "
+                f"{key!r}"
+            )
+        matched_keys.add(key)
+        return key
+
     @aggressive_retry
-    def get_results(self, job_name: str) -> List[BatchResponse]:
+    def get_results(
+        self,
+        job_name: str,
+        cleanup: bool = True,
+    ) -> List[BatchResponse]:
         """Get results from a completed Vertex batch job via GCS."""
         client = self._get_client()
         job = client.batches.get(name=job_name)
@@ -857,24 +998,20 @@ class VertexBatchClient:
         ordered_keys = self._job_keys.get(job_name, [])
 
         results = []
-        matched_by_fingerprint = 0
-        matched_by_position = 0
-        for i, data in enumerate(all_lines):
-            key = None
+        if ordered_keys and not fingerprint_map:
+            raise ValueError(
+                f"No request fingerprints available for Vertex batch {job_name}; "
+                "refusing position-based result correlation"
+            )
 
-            # Try content-based matching first (reliable)
-            request_data = data.get('request', {})
-            request_contents = request_data.get('contents', [])
-            if request_contents and fingerprint_map:
-                fp = self._content_fingerprint(request_contents)
-                key = fingerprint_map.get(fp)
-                if key:
-                    matched_by_fingerprint += 1
-
-            # Fall back to line-order correlation (unreliable for Vertex)
-            if key is None:
-                key = ordered_keys[i] if i < len(ordered_keys) else f"unknown_{i}"
-                matched_by_position += 1
+        matched_keys = set()
+        for data in all_lines:
+            key = self._correlate_output_key(
+                job_name,
+                data,
+                fingerprint_map,
+                matched_keys,
+            )
 
             batch_resp = BatchResponse(key=key, raw_response=data)
 
@@ -910,55 +1047,117 @@ class VertexBatchClient:
 
             results.append(batch_resp)
 
-        # Report matching method stats
-        if matched_by_fingerprint > 0 or matched_by_position > 0:
+        if matched_keys:
             logger.info(
-                f"Result key matching: {matched_by_fingerprint} by content fingerprint, "
-                f"{matched_by_position} by position fallback"
+                f"Result key matching: {len(matched_keys)} by content fingerprint"
             )
-            if matched_by_position > 0 and fingerprint_map:
-                logger.warning(
-                    f"{matched_by_position} results fell back to position-based matching "
-                    "(output may not contain request field — verify result correctness)"
-                )
 
         # Report missing results
-        if ordered_keys and len(all_lines) < len(ordered_keys):
-            missing = len(ordered_keys) - len(all_lines)
+        missing_keys = [
+            key for key in ordered_keys if key not in matched_keys
+        ]
+        if missing_keys:
             logger.warning(
                 f"Vertex batch returned {len(all_lines)} results but "
-                f"{len(ordered_keys)} were submitted ({missing} missing)"
+                f"{len(ordered_keys)} were submitted "
+                f"({len(missing_keys)} missing)"
             )
-            for i in range(len(all_lines), len(ordered_keys)):
+            for key in missing_keys:
                 results.append(BatchResponse(
-                    key=ordered_keys[i],
+                    key=key,
                     error="No response from Vertex batch (missing from output)",
                 ))
 
-        # Cleanup GCS artifacts (best-effort)
-        self._cleanup_gcs(bucket_name, prefix, blobs)
+        if cleanup:
+            self._cleanup_gcs(bucket_name, prefix, blobs)
 
         return results
+
+    def cleanup_job_artifacts(self, job_name: str) -> None:
+        """Clean up GCS input/output only after the caller accepts results."""
+        client = self._get_client()
+        job = client.batches.get(name=job_name)
+        output_prefix = getattr(getattr(job, "dest", None), "gcs_uri", None)
+        if isinstance(output_prefix, list):
+            output_prefix = output_prefix[0] if output_prefix else None
+        if not output_prefix or not output_prefix.startswith("gs://"):
+            raise ValueError(
+                f"Cannot determine GCS output location for cleanup: {job_name}"
+            )
+
+        parts = output_prefix[5:].split("/", 1)
+        bucket_name = parts[0]
+        prefix = parts[1] if len(parts) > 1 else ""
+        if (
+            not bucket_name
+            or not re.fullmatch(
+                r"batch-outputs/[A-Za-z0-9_-]+/",
+                prefix,
+            )
+        ):
+            raise ValueError(
+                f"Refusing unsafe GCS cleanup prefix "
+                f"{output_prefix!r} for {job_name}"
+            )
+        bucket = self._get_storage_client().bucket(bucket_name)
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        unexpected = [
+            blob.name
+            for blob in blobs
+            if not blob.name.startswith(prefix)
+        ]
+        if unexpected:
+            raise ValueError(
+                f"GCS listed objects outside cleanup prefix {prefix!r}: "
+                f"{unexpected[:3]}"
+            )
+        self._cleanup_gcs(bucket_name, prefix, blobs)
 
     @default_retry
     def _cleanup_gcs(self, bucket_name: str, prefix: str, blobs: list):
         """Clean up GCS input/output files after results are retrieved."""
-        try:
-            storage_client = self._get_storage_client()
-            bucket = storage_client.bucket(bucket_name)
-            for blob in blobs:
+        if (
+            not bucket_name
+            or not re.fullmatch(
+                r"batch-outputs/[A-Za-z0-9_-]+/",
+                prefix,
+            )
+        ):
+            raise ValueError(
+                f"Refusing unsafe GCS cleanup target "
+                f"gs://{bucket_name}/{prefix}"
+            )
+        unexpected = [
+            getattr(blob, "name", None)
+            for blob in blobs
+            if (
+                not isinstance(getattr(blob, "name", None), str)
+                or not blob.name.startswith(prefix)
+            )
+        ]
+        if unexpected:
+            raise ValueError(
+                f"Refusing GCS cleanup with objects outside {prefix!r}: "
+                f"{unexpected[:3]}"
+            )
+        storage_client = self._get_storage_client()
+        bucket = storage_client.bucket(bucket_name)
+        from google.api_core.exceptions import NotFound
+
+        for blob in blobs:
+            try:
                 blob.delete()
-            # Also clean up the input file if we can find it
-            # Input path: batch-inputs/{job_id}.jsonl
-            # Output prefix: batch-outputs/{job_id}/
-            if "batch-outputs/" in prefix:
-                job_id = prefix.split("batch-outputs/")[1].rstrip("/")
-                input_blob = bucket.blob(f"batch-inputs/{job_id}.jsonl")
-                if input_blob.exists():
-                    input_blob.delete()
-            logger.debug(f"Cleaned up GCS artifacts under {prefix}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up GCS artifacts: {e}")
+            except NotFound:
+                pass
+        # Also clean up the input file if we can find it
+        # Input path: batch-inputs/{job_id}.jsonl
+        # Output prefix: batch-outputs/{job_id}/
+        if "batch-outputs/" in prefix:
+            job_id = prefix.split("batch-outputs/")[1].rstrip("/")
+            input_blob = bucket.blob(f"batch-inputs/{job_id}.jsonl")
+            if input_blob.exists():
+                input_blob.delete()
+        logger.debug(f"Cleaned up GCS artifacts under {prefix}")
 
     @default_retry
     def cancel(self, job_name: str) -> bool:
@@ -982,3 +1181,52 @@ class VertexBatchClient:
             if len(jobs) >= limit:
                 break
         return jobs
+
+
+def create_batch_client_from_config(
+    config: Dict[str, Any],
+    provider: str,
+    model: str,
+):
+    """Create the configured batch client for one provider/model pair.
+
+    This is the single construction path used by both the main Executor and
+    small persisted batch operations such as TOC translation.
+    """
+    provider_config = (
+        config.get("credentials", {})
+        .get("providers", {})
+        .get(provider, {})
+    )
+    if not provider_config:
+        raise ValueError(f"No credentials found for batch provider '{provider}'")
+
+    poll_interval = config.get("batch", {}).get("poll_interval", 60)
+    if provider == "vertex":
+        project = provider_config.get("project")
+        if not project:
+            raise ValueError(
+                "Set credentials.providers.vertex.project for Vertex batch"
+            )
+        client = VertexBatchClient(
+            project=project,
+            location=provider_config.get("location", "us-central1"),
+            model=model,
+            poll_interval=poll_interval,
+            bucket_name=provider_config.get("bucket"),
+            proxy=provider_config.get("proxy"),
+        )
+    else:
+        api_key = provider_config.get("api_key")
+        if not api_key:
+            raise ValueError(
+                f"No api_key found for batch provider '{provider}'"
+            )
+        client = GeminiBatchClient(
+            api_key=api_key,
+            model=model,
+            poll_interval=poll_interval,
+            base_url=provider_config.get("base_url"),
+        )
+    client.batch_provider = provider
+    return client

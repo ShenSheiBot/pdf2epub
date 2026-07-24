@@ -14,9 +14,14 @@ Termination condition:
 
 from typing import Dict, List, Set, Optional, Any, Tuple, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
+from contextlib import contextmanager
 from loguru import logger
+import hashlib
+import json
+import re
 import time
 import signal
+import threading
 import tiktoken
 
 from pathlib import Path
@@ -43,9 +48,40 @@ def _count_tokens(text: str) -> int:
         return 0
 
 
+def _batch_request_sha256(
+    provider: str,
+    model: str,
+    unit_ids: List[str],
+    requests: List[Any],
+    skipped_identity: List[Dict[str, Any]],
+) -> str:
+    """Fingerprint every value that determines a submitted batch request."""
+    payload = {
+        "provider": provider,
+        "model": model,
+        "unit_ids": sorted(unit_ids),
+        "requests": [request.to_dict() for request in requests],
+        "skipped": skipped_identity,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 from ._protocol import WorkUnit, ChainEntry, ExecutionResult, ProcessResult
 from .state import UnitState, QuotaConfig, create_unit_state
-from .batch_state import MegaUnitState, get_mega_unit_id, is_safety_error
+from .batch_state import (
+    BatchRunLock,
+    BatchStateConflictError,
+    MegaUnitState,
+    get_mega_unit_id,
+    is_safety_error,
+)
 from .saver import DiskFirstSaver
 from ..hooks import CompositeHooks, ErrorType
 from ..types import is_sub_key
@@ -235,18 +271,32 @@ class Executor:
         if self._batch_states_dir:
             self._batch_states_dir.mkdir(parents=True, exist_ok=True)
 
-        # Register signal handler for batch cancellation on interrupt
+        # Signal handlers are installed only while execute() owns the batch
+        # run lock, then restored even after a normal completion.
         self._original_sigint = None
         self._original_sigterm = None
-        if self._batch_client and self._batch_states_dir:
-            self._original_sigint = signal.getsignal(signal.SIGINT)
-            self._original_sigterm = signal.getsignal(signal.SIGTERM)
-            signal.signal(signal.SIGINT, self._handle_interrupt)
-            signal.signal(signal.SIGTERM, self._handle_interrupt)
+        self._batch_lock_depth = 0
+        self._batch_lifecycle_lock = threading.RLock()
 
         # Circuit breaker state
         self._consecutive_network_failures = 0
         self._network_circuit_broken = False
+
+    def _install_signal_handlers(self) -> None:
+        """Install resumable-interrupt handlers for an active batch run."""
+        self._original_sigint = signal.getsignal(signal.SIGINT)
+        self._original_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, self._handle_interrupt)
+        signal.signal(signal.SIGTERM, self._handle_interrupt)
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore handlers that were active before batch execution."""
+        if self._original_sigint is not None:
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if self._original_sigterm is not None:
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+        self._original_sigint = None
+        self._original_sigterm = None
 
     def _handle_interrupt(self, signum: int, frame: Any) -> None:
         """Handle SIGINT/SIGTERM - keep batch jobs running for resume."""
@@ -254,29 +304,209 @@ class Executor:
         logger.info("Use --resume to continue and retrieve results.")
         logger.info("Use 'pdf2epub cancel-batch' to cancel batch jobs.")
 
-        # Restore original handlers and re-raise
-        if self._original_sigint:
-            signal.signal(signal.SIGINT, self._original_sigint)
-        if self._original_sigterm:
-            signal.signal(signal.SIGTERM, self._original_sigterm)
-
         raise KeyboardInterrupt("Interrupted. Use --resume to continue or 'pdf2epub cancel-batch' to cancel.")
 
-    def _cancel_all_batch_jobs(self) -> None:
-        """Cancel all active batch jobs (iterates batch_states directory)."""
-        if not self._batch_states_dir or not self._batch_states_dir.exists():
+    @contextmanager
+    def batch_run_lock(self):
+        """Own one stage from resume inspection through final promotion."""
+        with self._batch_lifecycle_lock:
+            if not self._batch_client or not self._batch_states_dir:
+                yield
+                return
+            if self._batch_lock_depth > 0:
+                self._batch_lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._batch_lock_depth -= 1
+                return
+            with BatchRunLock(self._batch_states_dir):
+                self._batch_lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._batch_lock_depth = 0
+
+    def _finalize_batch_job(self, unit_ids: List[str]) -> None:
+        """Remove provider artifacts only after results have been handled.
+
+        ``_process_batch_as_unit`` intentionally leaves successful state and
+        remote output in place. The pipeline calls this method only after
+        every returned result has passed validation, retry routing, disk
+        persistence, and promotion. A crash before that point therefore
+        remains resumable.
+        """
+        if not self._batch_states_dir:
             return
 
-        for state_file in self._batch_states_dir.glob("batch_*.json"):
-            try:
-                state = MegaUnitState.load(state_file)
-                if state and state.job_name:
-                    self._batch_client.cancel(state.job_name)
-                    logger.info(f"Cancelled batch job: {state.job_name}")
-            except Exception as e:
-                logger.warning(f"Failed to cancel batch job: {e}")
-            finally:
-                state_file.unlink(missing_ok=True)
+        state_path = (
+            self._batch_states_dir
+            / f"{get_mega_unit_id(unit_ids)}.json"
+        )
+        self._finalize_batch_state_path(state_path)
+
+    def _finalize_batch_state_path(self, state_path: Path) -> None:
+        """Finalize one exact persisted state path."""
+        if not state_path.exists():
+            return
+        state = MegaUnitState.load(state_path)
+        if state is None:
+            raise BatchStateConflictError(
+                f"Batch state {state_path} became unreadable before cleanup"
+            )
+        self._validate_batch_state_for_cleanup(state_path, state)
+
+        # Persist the tombstone before touching remote artifacts. Cleanup is
+        # intentionally idempotent, so a crash after remote deletion but
+        # before local unlink can safely finish on the next run.
+        state.job_state = "FINALIZING"
+        state.save(state_path)
+
+        if (
+            state.job_name
+            and hasattr(self._batch_client, "cleanup_job_artifacts")
+        ):
+            self._batch_client.cleanup_job_artifacts(state.job_name)
+        state_path.unlink()
+
+    def _validate_batch_state_for_cleanup(
+        self,
+        state_path: Path,
+        state: MegaUnitState,
+    ) -> None:
+        """Require complete identity before deleting provider or local state."""
+        unit_ids_valid = (
+            isinstance(state.unit_ids, list)
+            and bool(state.unit_ids)
+            and all(
+                isinstance(unit_id, str) and bool(unit_id)
+                for unit_id in state.unit_ids
+            )
+            and len(set(state.unit_ids)) == len(state.unit_ids)
+        )
+        processing_keys_valid = (
+            isinstance(state.processing_keys, list)
+            and bool(state.processing_keys)
+            and all(
+                isinstance(key, str) and bool(key)
+                for key in state.processing_keys
+            )
+            and unit_ids_valid
+            and set(state.processing_keys).issubset(set(state.unit_ids))
+        )
+        if (
+            not isinstance(state.job_name, str)
+            or not state.job_name.strip()
+            or not isinstance(state.provider, str)
+            or not state.provider
+            or not isinstance(state.model, str)
+            or not state.model
+            or not unit_ids_valid
+            or not processing_keys_valid
+            or not isinstance(state.request_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", state.request_sha256)
+        ):
+            raise BatchStateConflictError(
+                f"Batch cleanup state {state_path} has incomplete or invalid "
+                "job identity; state was retained"
+            )
+        expected_path = (
+            self._batch_states_dir
+            / f"{get_mega_unit_id(state.unit_ids)}.json"
+        )
+        if state_path != expected_path:
+            raise BatchStateConflictError(
+                f"Batch cleanup state filename {state_path.name} does not "
+                "match its unit membership"
+            )
+        if not any(
+            entry.mode == "batch"
+            and entry.provider == state.provider
+            and entry.model == state.model
+            for entry in self._model_chain
+        ):
+            raise BatchStateConflictError(
+                f"Batch cleanup state {state_path} uses "
+                f"{state.provider}/{state.model}, which is absent from the "
+                "current model chain"
+            )
+        client_provider = getattr(
+            self._batch_client,
+            "batch_provider",
+            None,
+        )
+        if client_provider is not None and client_provider != state.provider:
+            raise BatchStateConflictError(
+                f"Batch cleanup state provider {state.provider!r} does not "
+                f"match client provider {client_provider!r}"
+            )
+        client_model = getattr(self._batch_client, "model", None)
+        if client_model is not None and client_model != state.model:
+            raise BatchStateConflictError(
+                f"Batch cleanup state model {state.model!r} does not match "
+                f"client model {client_model!r}"
+            )
+
+    def _recover_finalizing_batches_locked(self) -> None:
+        """Finish idempotent cleanup left between remote and local deletion."""
+        if not self._batch_states_dir:
+            return
+        for state_path in sorted(
+            self._batch_states_dir.glob("batch_*.json")
+        ):
+            state = MegaUnitState.load(state_path)
+            if state is None:
+                raise BatchStateConflictError(
+                    f"Batch state {state_path} is unreadable or corrupted"
+                )
+            if state.job_state != "FINALIZING":
+                continue
+            self._validate_batch_state_for_cleanup(state_path, state)
+            if hasattr(self._batch_client, "cleanup_job_artifacts"):
+                self._batch_client.cleanup_job_artifacts(state.job_name)
+            state_path.unlink()
+
+    def recover_finalizing_batches(self) -> None:
+        """Finish cleanup tombstones before pipeline resume filtering."""
+        if not self._batch_client or not self._batch_states_dir:
+            return
+        with self.batch_run_lock():
+            self._recover_finalizing_batches_locked()
+
+    def get_resumable_unit_ids(self) -> Set[str]:
+        """Return exact mega-unit membership needed for safe resume."""
+        if not self._batch_states_dir:
+            return set()
+        unit_ids: Set[str] = set()
+        with self.batch_run_lock():
+            for state_path in sorted(
+                self._batch_states_dir.glob("batch_*.json")
+            ):
+                state = MegaUnitState.load(state_path)
+                if state is None:
+                    raise BatchStateConflictError(
+                        f"Batch state {state_path} is unreadable or corrupted"
+                    )
+                if state.job_state == "FINALIZING":
+                    continue
+                if not state.unit_ids:
+                    raise BatchStateConflictError(
+                        f"Batch state {state_path} has no persisted unit "
+                        "membership and cannot be resumed safely"
+                    )
+                unit_ids.update(state.unit_ids)
+        return unit_ids
+
+    def finalize_batch_jobs(
+        self,
+        batch_jobs: List[List[str]],
+    ) -> None:
+        """Accept completed jobs after pipeline validation and promotion."""
+        if not batch_jobs or not self._batch_states_dir:
+            return
+        with self.batch_run_lock():
+            for unit_ids in batch_jobs:
+                self._finalize_batch_job(unit_ids)
 
     def _get_split_threshold(self, model_name: Optional[str] = None) -> int:
         """Get the split threshold for a model."""
@@ -317,9 +547,46 @@ class Executor:
         if not units:
             return ExecutionResult()
 
-        # Cancel old batch jobs if not resuming
-        if not resume_batch:
-            self._cancel_all_batch_jobs()
+        if not self._batch_client or not self._batch_states_dir:
+            return self._execute(
+                units,
+                context_base,
+                resume_batch,
+                initial_failures,
+            )
+
+        with self.batch_run_lock():
+            self._recover_finalizing_batches_locked()
+            existing_states = sorted(self._batch_states_dir.glob("batch_*.json"))
+            if existing_states and not resume_batch:
+                state_names = ", ".join(path.name for path in existing_states[:3])
+                if len(existing_states) > 3:
+                    state_names += f", and {len(existing_states) - 3} more"
+                raise RuntimeError(
+                    "Existing batch state found "
+                    f"({state_names}). Use --resume to inspect/resume it, or "
+                    "'pdf2epub cancel-batch' to cancel it explicitly."
+                )
+
+            self._install_signal_handlers()
+            try:
+                return self._execute(
+                    units,
+                    context_base,
+                    resume_batch,
+                    initial_failures,
+                )
+            finally:
+                self._restore_signal_handlers()
+
+    def _execute(
+        self,
+        units: List[WorkUnit],
+        context_base: Optional["ProcessContext"] = None,
+        resume_batch: bool = False,
+        initial_failures: Optional[Dict[str, Exception]] = None,
+    ) -> ExecutionResult:
+        """Run the unified executor after batch ownership checks."""
 
         start_time = time.time()
 
@@ -345,6 +612,7 @@ class Executor:
         validation_failed: Set[str] = set()
         screener_passed: Set[str] = set()
         fallback_used: Set[str] = set()
+        batch_jobs_to_finalize: List[List[str]] = []
 
         # Concurrent state
         pending: Set[str] = {u.id for u in units}
@@ -357,6 +625,71 @@ class Executor:
         successful_attempts = 0
         splits_performed = 0
         max_depth_reached = 0
+
+        resume_groups: List[List[str]] = []
+        if resume_batch and self._batch_states_dir:
+            claimed_ids: Set[str] = set()
+            for state_path in sorted(
+                self._batch_states_dir.glob("batch_*.json")
+            ):
+                state = MegaUnitState.load(state_path)
+                if state is None:
+                    raise BatchStateConflictError(
+                        f"Batch state {state_path} is unreadable or corrupted"
+                    )
+                if state.job_state == "FINALIZING":
+                    continue
+                if not state.unit_ids:
+                    raise BatchStateConflictError(
+                        f"Batch state {state_path} has no persisted unit "
+                        "membership and cannot be resumed safely"
+                    )
+                group = sorted(state.unit_ids)
+                expected_path = (
+                    self._batch_states_dir
+                    / f"{get_mega_unit_id(group)}.json"
+                )
+                if state_path != expected_path:
+                    raise BatchStateConflictError(
+                        f"Batch state filename {state_path.name} does not "
+                        "match its persisted unit membership"
+                    )
+                missing = set(group) - set(unit_states)
+                if missing:
+                    raise BatchStateConflictError(
+                        f"Resume input is missing persisted units: "
+                        f"{sorted(missing)}"
+                    )
+                overlap = claimed_ids & set(group)
+                if overlap:
+                    raise BatchStateConflictError(
+                        "Persisted batch states overlap on units "
+                        f"{sorted(overlap)}. Refusing to guess retry order."
+                    )
+                claimed_ids.update(group)
+
+                for uid in group:
+                    chain = unit_states[uid].chain
+                    matching_index = next(
+                        (
+                            index
+                            for index, entry in enumerate(chain)
+                            if entry.mode == "batch"
+                            and entry.provider == state.provider
+                            and entry.model == state.model
+                        ),
+                        None,
+                    )
+                    if matching_index is None:
+                        raise BatchStateConflictError(
+                            f"Persisted batch model {state.provider}/"
+                            f"{state.model} is absent from the current chain "
+                            f"for {uid!r}"
+                        )
+                    unit_states[uid].chain = list(
+                        chain[matching_index:]
+                    )
+                resume_groups.append(group)
 
         # Feed failures from downstream validators back into the same state
         # machine used for model failures. This preserves failure typing and
@@ -393,6 +726,20 @@ class Executor:
                     max_depth_reached = max(max_depth_reached, split_depth)
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            for group in resume_groups:
+                pending.difference_update(group)
+                in_progress.update(group)
+                future = pool.submit(
+                    self._process_batch_as_unit,
+                    group,
+                    unit_states,
+                    unit_map,
+                    context_base,
+                    originals,
+                    True,
+                )
+                batch_futures[future] = group
+
             while pending or futures or batch_futures:
                 # 1. Get ready units
                 ready_ids = self._get_ready_ids(pending, completed, in_progress, unit_states)
@@ -445,7 +792,12 @@ class Executor:
                         in_progress.update(batch_queue)
                         future = pool.submit(
                             self._process_batch_as_unit,
-                            batch_queue, unit_states, unit_map, context_base, originals, resume_batch
+                            batch_queue,
+                            unit_states,
+                            unit_map,
+                            context_base,
+                            originals,
+                            False,
                         )
                         batch_futures[future] = batch_queue
                     else:
@@ -498,27 +850,54 @@ class Executor:
                                 model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "batch"
 
                                 if result.skipped:
+                                    if self._saver:
+                                        try:
+                                            with self._saver.attempt(uid, "skipped") as attempt:
+                                                saved = attempt.skip(
+                                                    result.skip_reason or "pre-process",
+                                                    result.content,
+                                                )
+                                        except Exception as exc:
+                                            raise BatchStateConflictError(
+                                                f"{uid}: exception while persisting "
+                                                "skipped batch result; batch state "
+                                                "was retained"
+                                            ) from exc
+                                        if not saved:
+                                            raise BatchStateConflictError(
+                                                f"{uid}: failed to persist skipped batch "
+                                                "result; batch state was retained"
+                                            )
                                     skipped.add(uid)
                                     if result.content is not None:
                                         results[uid] = result.content
                                     completed.add(uid)
-                                    if self._saver:
-                                        with self._saver.attempt(uid, "skipped") as attempt:
-                                            attempt.skip(result.skip_reason or "pre-process", result.content)
 
                                 elif result.success:
+                                    if self._saver:
+                                        try:
+                                            with self._saver.attempt(uid, model_str) as attempt:
+                                                saved = attempt.success(
+                                                    result.content,
+                                                    output_tokens=result.output_tokens,
+                                                    context_ready=result.context_ready,
+                                                )
+                                        except Exception as exc:
+                                            raise BatchStateConflictError(
+                                                f"{uid}: exception while persisting "
+                                                "batch result; batch state was "
+                                                "retained"
+                                            ) from exc
+                                        if not saved:
+                                            raise BatchStateConflictError(
+                                                f"{uid}: failed to persist batch result; "
+                                                "batch state was retained"
+                                            )
                                     successful_attempts += 1
                                     results[uid] = result.content
                                     completed.add(uid)
                                     if result.context_ready:
                                         screener_passed.add(uid)
-                                    if self._saver:
-                                        with self._saver.attempt(uid, model_str) as attempt:
-                                            attempt.success(
-                                                result.content,
-                                                output_tokens=result.output_tokens,
-                                                context_ready=result.context_ready,
-                                            )
 
                                 else:
                                     # Failed: unified handling
@@ -531,6 +910,10 @@ class Executor:
                                         splits_performed += 1
                                         max_depth_reached = max(max_depth_reached, split_depth)
 
+                            batch_jobs_to_finalize.append(list(batch_unit_ids))
+
+                        except BatchStateConflictError:
+                            raise
                         except Exception as e:
                             logger.error(f"Batch future error: {e}")
                             # Route through _handle_failure so units can
@@ -563,15 +946,32 @@ class Executor:
                             model_str = f"{current_entry.provider}/{current_entry.model}" if current_entry else "unknown"
 
                             if result.skipped:
+                                if self._saver:
+                                    with self._saver.attempt(uid, "skipped") as attempt:
+                                        saved = attempt.skip(
+                                            result.skip_reason or "pre-process",
+                                            result.content,
+                                        )
+                                    if not saved:
+                                        failed.add(uid)
+                                        continue
                                 skipped.add(uid)
                                 if result.content is not None:
                                     results[uid] = result.content
                                 completed.add(uid)
-                                if self._saver:
-                                    with self._saver.attempt(uid, "skipped") as attempt:
-                                        attempt.skip(result.skip_reason or "pre-process", result.content)
 
                             elif result.success:
+                                if self._saver:
+                                    with self._saver.attempt(uid, model_str) as attempt:
+                                        saved = attempt.success(
+                                            result.content,
+                                            output_tokens=result.output_tokens,
+                                            duration_seconds=result.duration_seconds,
+                                            context_ready=result.context_ready,
+                                        )
+                                    if not saved:
+                                        failed.add(uid)
+                                        continue
                                 successful_attempts += 1
                                 results[uid] = result.content
                                 completed.add(uid)
@@ -580,14 +980,6 @@ class Executor:
                                     if self._context_injector:
                                         self._context_injector.cache_completed(
                                             uid, originals.get(uid, ""), result.content
-                                        )
-                                if self._saver:
-                                    with self._saver.attempt(uid, model_str) as attempt:
-                                        attempt.success(
-                                            result.content,
-                                            output_tokens=result.output_tokens,
-                                            duration_seconds=result.duration_seconds,
-                                            context_ready=result.context_ready,
                                         )
 
                             else:
@@ -628,6 +1020,7 @@ class Executor:
             validation_failed=validation_failed,
             screener_passed=screener_passed,
             fallback_used=fallback_used,
+            batch_jobs=batch_jobs_to_finalize,
             stats=stats,
             total_attempts=total_attempts,
             successful_attempts=successful_attempts,
@@ -666,11 +1059,26 @@ class Executor:
         from .._protocol import ProcessContext
         from ...utils.batch_utils import BatchRequest, BatchJobState
 
+        unit_ids = sorted(unit_ids)
         results: List[Tuple[str, ProcessResult]] = []
 
         # Compute mega unit ID
         mega_id = get_mega_unit_id(unit_ids)
         state_file = self._batch_states_dir / f"{mega_id}.json" if self._batch_states_dir else None
+
+        if state_file and resume_batch and not state_file.exists():
+            other_states = sorted(
+                path
+                for path in self._batch_states_dir.glob("batch_*.json")
+                if path != state_file
+            )
+            if other_states:
+                names = ", ".join(path.name for path in other_states)
+                raise BatchStateConflictError(
+                    f"Existing batch state ({names}) does not match the "
+                    f"current pending unit set ({mega_id}). Refusing to submit "
+                    "a replacement batch."
+                )
 
         # Get batch entry from first unit's chain
         first_state = unit_states[unit_ids[0]]
@@ -684,136 +1092,200 @@ class Executor:
                 )))
             return results
 
-        # Check for resume
-        job_name = None
-        if state_file and state_file.exists():
-            existing_state = MegaUnitState.load(state_file)
-            if existing_state:
-                if existing_state.job_state == "SUCCEEDED":
-                    # Already completed, get cached results
-                    logger.info(f"Mega unit {mega_id} already completed, fetching results")
-                    job_name = existing_state.job_name
-                elif existing_state.job_state in ("PENDING", "RUNNING"):
-                    # Still running, continue waiting
-                    logger.info(f"Resuming mega unit {mega_id}: {existing_state.job_name}")
-                    job_name = existing_state.job_name
-                # Restore key order and content fingerprints for result matching
-                if job_name and existing_state.processing_keys:
-                    if hasattr(self._batch_client, '_job_keys'):
-                        self._batch_client._job_keys[job_name] = existing_state.processing_keys
-                        logger.debug(f"Restored {len(existing_state.processing_keys)} processing keys for {job_name}")
-                if job_name and existing_state.content_fingerprints:
-                    if hasattr(self._batch_client, '_job_fingerprints'):
-                        self._batch_client._job_fingerprints[job_name] = existing_state.content_fingerprints
-                        logger.debug(f"Restored {len(existing_state.content_fingerprints)} content fingerprints for {job_name}")
-
-        # Build requests if not resuming
+        # Rebuild the exact provider requests even on resume. Unit IDs alone
+        # are not a safe identity: source text, prompt templates, context, and
+        # generation config can all change while filenames stay constant.
         batch_requests: List[BatchRequest] = []
         units_to_process: Dict[str, Tuple[WorkUnit, "ProcessContext"]] = {}
-
-        if job_name is None:
-            for uid in unit_ids:
-                unit = self._get_or_create_unit(uid, unit_map, unit_states, originals)
-
-                # Build context
-                if context_base is None:
-                    context = ProcessContext.from_work_unit(unit)
-                else:
-                    context = ProcessContext(
-                        file_key=unit.file_key,
-                        book_title=context_base.book_title,
-                        part_index=unit.part_index,
-                        total_parts=unit.total_parts,
-                        split_version=unit.split_version,
-                        source_language=context_base.source_language,
-                        target_language=context_base.target_language,
-                        content_type=context_base.content_type,
-                        chapter_type=unit.chapter_type or context_base.chapter_type,
-                        chapter_title=unit.chapter_title or context_base.chapter_title,
-                        chapter_number=unit.chapter_number or context_base.chapter_number,
-                        is_notes_chapter=(unit.chapter_type == "notes"),
-                        is_vertical_text=context_base.is_vertical_text,
-                        has_global_footnotes=context_base.has_global_footnotes,
-                        book_language=context_base.book_language,
-                        toc_path=unit.toc_path or context_base.toc_path,
-                        page_range=unit.page_range or context_base.page_range,
-                        extra=context_base.extra,
-                    )
-
-                # Pre-process check
-                pre_result = self._hooks.pre_process(uid, unit.content, context)
-                if not pre_result.should_process:
-                    results.append((uid, ProcessResult(
-                        success=True,
-                        content=pre_result.fallback_result,
-                        skipped=True,
-                        skip_reason=pre_result.skip_reason,
-                    )))
-                    continue
-
-                # Build prompt and request
-                prompt = self._processor.build_prompt(unit.content, context)
-                contents = self._convert_prompt_to_batch_contents(prompt)
-                batch_requests.append(BatchRequest(key=uid, contents=contents))
-                units_to_process[uid] = (unit, context)
-
-            # Submit job if we have requests
-            skipped_count = len(unit_ids) - len(batch_requests)
-            if batch_requests:
-                job_name = self._batch_client.submit(batch_requests)
-                if skipped_count > 0:
-                    logger.info(
-                        f"Submitted mega unit {mega_id}: {job_name} "
-                        f"({len(batch_requests)} units, {skipped_count} skipped by pre-process)"
-                    )
-                else:
-                    logger.info(f"Submitted mega unit {mega_id}: {job_name} ({len(batch_requests)} units)")
-
-                # Save state (include key order and fingerprints for result matching on resume)
-                if state_file:
-                    processing_keys = [req.key for req in batch_requests]
-                    # Get content fingerprints from batch client (for content-based matching)
-                    content_fps = None
-                    if hasattr(self._batch_client, '_job_fingerprints'):
-                        content_fps = self._batch_client._job_fingerprints.get(job_name)
-                    state = MegaUnitState(
-                        job_name=job_name,
-                        job_state="RUNNING",
-                        processing_keys=processing_keys,
-                        content_fingerprints=content_fps,
-                    )
-                    state.save(state_file)
+        skipped_identity: List[Dict[str, Any]] = []
+        for uid in unit_ids:
+            unit = self._get_or_create_unit(
+                uid, unit_map, unit_states, originals
+            )
+            if context_base is None:
+                context = ProcessContext.from_work_unit(unit)
             else:
-                # All units were skipped
-                return results
-        else:
-            # Resuming: rebuild units_to_process from unit_ids
-            for uid in unit_ids:
-                unit = self._get_or_create_unit(uid, unit_map, unit_states, originals)
-                if context_base is None:
-                    context = ProcessContext.from_work_unit(unit)
-                else:
-                    context = ProcessContext(
-                        file_key=unit.file_key,
-                        book_title=context_base.book_title,
-                        part_index=unit.part_index,
-                        total_parts=unit.total_parts,
-                        split_version=unit.split_version,
-                        source_language=context_base.source_language,
-                        target_language=context_base.target_language,
-                        content_type=context_base.content_type,
-                        chapter_type=unit.chapter_type or context_base.chapter_type,
-                        chapter_title=unit.chapter_title or context_base.chapter_title,
-                        chapter_number=unit.chapter_number or context_base.chapter_number,
-                        is_notes_chapter=(unit.chapter_type == "notes"),
-                        is_vertical_text=context_base.is_vertical_text,
-                        has_global_footnotes=context_base.has_global_footnotes,
-                        book_language=context_base.book_language,
-                        toc_path=unit.toc_path or context_base.toc_path,
-                        page_range=unit.page_range or context_base.page_range,
-                        extra=context_base.extra,
+                context = ProcessContext(
+                    file_key=unit.file_key,
+                    book_title=context_base.book_title,
+                    part_index=unit.part_index,
+                    total_parts=unit.total_parts,
+                    split_version=unit.split_version,
+                    source_language=context_base.source_language,
+                    target_language=context_base.target_language,
+                    content_type=context_base.content_type,
+                    chapter_type=unit.chapter_type or context_base.chapter_type,
+                    chapter_title=unit.chapter_title or context_base.chapter_title,
+                    chapter_number=unit.chapter_number or context_base.chapter_number,
+                    is_notes_chapter=(unit.chapter_type == "notes"),
+                    is_vertical_text=context_base.is_vertical_text,
+                    has_global_footnotes=context_base.has_global_footnotes,
+                    book_language=context_base.book_language,
+                    toc_path=unit.toc_path or context_base.toc_path,
+                    page_range=unit.page_range or context_base.page_range,
+                    extra=context_base.extra,
+                )
+
+            pre_result = self._hooks.pre_process(
+                uid, unit.content, context
+            )
+            if not pre_result.should_process:
+                fallback = getattr(pre_result, "fallback_result", None)
+                reason = getattr(pre_result, "skip_reason", "")
+                results.append((uid, ProcessResult(
+                    success=True,
+                    content=fallback,
+                    skipped=True,
+                    skip_reason=reason,
+                )))
+                skipped_identity.append({
+                    "key": uid,
+                    "fallback": fallback,
+                    "reason": reason,
+                })
+                continue
+
+            prompt = self._processor.build_prompt(unit.content, context)
+            contents = self._convert_prompt_to_batch_contents(prompt)
+            batch_requests.append(
+                BatchRequest(key=uid, contents=contents)
+            )
+            units_to_process[uid] = (unit, context)
+
+        if not batch_requests:
+            return results
+
+        processing_keys = [request.key for request in batch_requests]
+        request_sha256 = _batch_request_sha256(
+            batch_entry.provider,
+            batch_entry.model,
+            unit_ids,
+            batch_requests,
+            skipped_identity,
+        )
+
+        content_fps = None
+        fingerprint_fn = getattr(
+            self._batch_client,
+            "_content_fingerprint",
+            None,
+        )
+        if fingerprint_fn:
+            content_fps = {}
+            for request in batch_requests:
+                fingerprint = fingerprint_fn(request.contents)
+                if fingerprint in content_fps:
+                    raise BatchStateConflictError(
+                        "Batch contains duplicate provider requests for "
+                        f"{content_fps[fingerprint]!r} and {request.key!r}; "
+                        "Vertex cannot correlate unordered duplicate outputs "
+                        "safely."
                     )
-                units_to_process[uid] = (unit, context)
+                content_fps[fingerprint] = request.key
+
+        job_name = None
+        existing_state = None
+        if state_file and state_file.exists():
+            if not resume_batch:
+                raise BatchStateConflictError(
+                    f"Batch state {state_file} exists but resume was not "
+                    "explicitly requested."
+                )
+            existing_state = MegaUnitState.load(state_file)
+            if existing_state is None:
+                raise BatchStateConflictError(
+                    f"Batch state {state_file} is unreadable or corrupted. "
+                    "Refusing to overwrite it."
+                )
+            if not existing_state.job_name:
+                raise BatchStateConflictError(
+                    f"Mega unit {mega_id} has no confirmed job name. Inspect "
+                    "the provider job list before cancelling state or "
+                    "submitting a replacement."
+                )
+            actual_identity = (
+                existing_state.provider,
+                existing_state.model,
+                existing_state.unit_ids,
+                existing_state.processing_keys,
+                existing_state.request_sha256,
+            )
+            expected_identity = (
+                batch_entry.provider,
+                batch_entry.model,
+                unit_ids,
+                processing_keys,
+                request_sha256,
+            )
+            if actual_identity != expected_identity:
+                raise BatchStateConflictError(
+                    f"Mega unit {mega_id} does not match the current provider, "
+                    "model, unit membership, or exact request content. "
+                    "Refusing to reuse stale batch output."
+                )
+            if existing_state.job_state == "SUCCEEDED":
+                logger.info(
+                    f"Mega unit {mega_id} already completed, fetching results"
+                )
+            elif existing_state.job_state in (
+                "PENDING",
+                "RUNNING",
+                "FAILED",
+                "CANCELLED",
+                "EXPIRED",
+            ):
+                logger.info(
+                    f"Resuming mega unit {mega_id}: "
+                    f"{existing_state.job_name}"
+                )
+            else:
+                raise BatchStateConflictError(
+                    f"Mega unit {mega_id} has unsupported persisted state "
+                    f"{existing_state.job_state!r}. Inspect or explicitly "
+                    "cancel the state before continuing."
+                )
+            job_name = existing_state.job_name
+            if hasattr(self._batch_client, "restore_job_mapping"):
+                self._batch_client.restore_job_mapping(
+                    job_name,
+                    processing_keys,
+                    content_fps,
+                )
+        else:
+            new_state = MegaUnitState(
+                job_name="",
+                job_state="SUBMITTING",
+                provider=batch_entry.provider,
+                model=batch_entry.model,
+                unit_ids=unit_ids,
+                processing_keys=processing_keys,
+                content_fingerprints=content_fps,
+                request_sha256=request_sha256,
+            )
+            if state_file:
+                new_state.save(state_file)
+            try:
+                job_name = self._batch_client.submit(batch_requests)
+            except Exception as exc:
+                if state_file:
+                    new_state.job_state = "SUBMISSION_UNKNOWN"
+                    new_state.save(state_file)
+                raise BatchStateConflictError(
+                    f"Mega unit {mega_id} may have been accepted by the "
+                    "provider, but no job name was confirmed. Refusing to "
+                    "retry automatically."
+                ) from exc
+
+            skipped_count = len(unit_ids) - len(batch_requests)
+            logger.info(
+                f"Submitted mega unit {mega_id}: {job_name} "
+                f"({len(batch_requests)} units, "
+                f"{skipped_count} skipped by pre-process)"
+            )
+            if state_file:
+                new_state.job_name = job_name
+                new_state.job_state = "RUNNING"
+                new_state.save(state_file)
 
         # Poll for completion
         if job_name:
@@ -849,7 +1321,14 @@ class Executor:
                     BatchJobState.SUCCEEDED, BatchJobState.PARTIALLY_SUCCEEDED,
                 ):
                     if state_file:
-                        state = MegaUnitState(job_name=job_name, job_state="SUCCEEDED")
+                        state = MegaUnitState.load(state_file)
+                        if state is None:
+                            raise BatchStateConflictError(
+                                f"Batch state {state_file} disappeared before "
+                                "completion could be recorded"
+                            )
+                        state.job_name = job_name
+                        state.job_state = "SUCCEEDED"
                         state.save(state_file)
                     break
 
@@ -866,17 +1345,40 @@ class Executor:
                             error=error,
                         )))
 
-                    # Clear state file
                     if state_file:
-                        state_file.unlink(missing_ok=True)
+                        state = MegaUnitState.load(state_file)
+                        if state is None:
+                            raise BatchStateConflictError(
+                                f"Batch state {state_file} disappeared before "
+                                "failure could be recorded"
+                            )
+                        state.job_name = job_name
+                        state.job_state = job_info.state.name
+                        state.save(state_file)
 
                     return results
 
                 time.sleep(self._batch_poll_interval)
 
             # Get results
-            batch_responses = self._batch_client.get_results(job_name)
-            response_map = {r.key: r for r in batch_responses}
+            batch_responses = self._batch_client.get_results(
+                job_name,
+                cleanup=False,
+            )
+            response_map = {}
+            expected_keys = set(units_to_process)
+            for response in batch_responses:
+                if response.key not in expected_keys:
+                    raise BatchStateConflictError(
+                        f"Batch job {job_name} returned unexpected key "
+                        f"{response.key!r}"
+                    )
+                if response.key in response_map:
+                    raise BatchStateConflictError(
+                        f"Batch job {job_name} returned duplicate key "
+                        f"{response.key!r}"
+                    )
+                response_map[response.key] = response
 
             for uid, (unit, context) in units_to_process.items():
                 resp = response_map.get(uid)
@@ -923,10 +1425,6 @@ class Executor:
                         success=False,
                         error=Exception(hook_result.rejection_reason or "Validation failed"),
                     )))
-
-            # Clear state file after processing
-            if state_file:
-                state_file.unlink(missing_ok=True)
 
         return results
 
@@ -1202,13 +1700,29 @@ class Executor:
         # Try longest fallback
         longest = state.get_longest()
         if longest:
+            if self._saver:
+                try:
+                    with self._saver.attempt(
+                        unit_id,
+                        f"{model_str}/fallback",
+                    ) as attempt:
+                        saved = attempt.success(
+                            longest,
+                            output_tokens=_count_tokens(longest),
+                        )
+                except Exception as exc:
+                    raise BatchStateConflictError(
+                        f"{unit_id}: exception while persisting fallback "
+                        "result; batch state was retained"
+                    ) from exc
+                if not saved:
+                    raise BatchStateConflictError(
+                        f"{unit_id}: failed to persist fallback result; "
+                        "batch state was retained"
+                    )
             results[unit_id] = longest
             completed.add(unit_id)
             fallback_used.add(unit_id)
-            # Record fallback via saver
-            if self._saver:
-                with self._saver.attempt(unit_id, f"{model_str}/fallback") as attempt:
-                    attempt.success(longest, output_tokens=_count_tokens(longest))
             logger.warning(f"{unit_id}: Using longest fallback ({len(longest)} chars)")
             return (False, 0)
 

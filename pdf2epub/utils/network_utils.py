@@ -168,9 +168,15 @@ class wait_exponential_with_self_max(wait_base):
 _retry_context = threading.local()
 
 
+class StreamingHallucinationError(RuntimeError):
+    """A retryable repetition loop detected before a stream completed."""
+
+
 # Define transient errors that should trigger retries
 def is_transient_gemini_error(exception: Exception) -> bool:
     """Check if a Gemini API error is transient and should be retried."""
+    if isinstance(exception, StreamingHallucinationError):
+        return True
     # Don't retry content safety blocks - these should fail fast
     error_str = str(exception).lower()
     if any(term in error_str for term in ['prohibited', 'safety', 'blocked', 'harmful']):
@@ -197,7 +203,8 @@ def is_transient_gemini_error(exception: Exception) -> bool:
         'timeout', 'unavailable', '503',
         'internal', '500', '502', '504',
         'resource_exhausted', 'overloaded',
-        'disconnected', 'connection'
+        'disconnected', 'connection',
+        'cancelled', 'canceled', '499',
     ]
 
     return any(keyword in error_str for keyword in transient_keywords)
@@ -279,6 +286,8 @@ def _detect_streaming_hallucination(text: str) -> Optional[str]:
         if len(tail) < period * 3:
             break
         pat = tail[-period:]
+        if not pat.strip():
+            continue
         if tail[-period * 3:-period * 2] == pat and tail[-period * 2:-period] == pat:
             return f"repetition loop detected (period={period}, pattern={pat[:30]!r})"
 
@@ -424,6 +433,7 @@ class GeminiClient:
         chunk_count = 0
         last_log_length = 0
         halted_early = False
+        hallucination_reason = None
         finish_reason = None
         _usage_dict = {}
 
@@ -455,10 +465,13 @@ class GeminiClient:
                 # --- Hallucination guard: detect repetition loops ---
                 # Check every 20 chunks (~600 chars) for early detection
                 if chunk_count % 20 == 0:
-                    halt_reason = _detect_streaming_hallucination(aggregated_text)
-                    if halt_reason:
+                    hallucination_reason = _detect_streaming_hallucination(
+                        aggregated_text
+                    )
+                    if hallucination_reason:
                         logger.warning(
-                            f"Hallucination detected for {operation_name}: {halt_reason}. "
+                            f"Hallucination detected for {operation_name}: "
+                            f"{hallucination_reason}. "
                             f"Halting stream at {len(aggregated_text)} chars."
                         )
                         halted_early = True
@@ -473,13 +486,13 @@ class GeminiClient:
             # Log finish reason from last chunk
             if halted_early:
                 finish_reason = "HALLUCINATION_HALT"
-                # Truncate to last newline to avoid partial lines
-                last_nl = aggregated_text.rfind('\n')
-                if last_nl > 0:
-                    aggregated_text = aggregated_text[:last_nl]
                 logger.warning(
                     f"Stream halted early (hallucination) for {operation_name}: "
-                    f"truncated to {len(aggregated_text)} chars"
+                    "discarding the partial response and retrying"
+                )
+                raise StreamingHallucinationError(
+                    f"Streaming hallucination for {operation_name}: "
+                    f"{hallucination_reason}"
                 )
             elif chunk_count > 0 and hasattr(chunk, 'candidates') and chunk.candidates:
                 for candidate in chunk.candidates:

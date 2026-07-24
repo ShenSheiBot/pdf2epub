@@ -1065,6 +1065,7 @@ def translate_arxiv_command(args):
             or repair_config.get("model", "gpt-5.6-luna")
         ),
         retry_fallbacks=args.retry_fallbacks,
+        retry_repaired=args.retry_repaired,
     )
     resolver = ArxivSourceResolver()
     if args.output_dir:
@@ -1376,6 +1377,11 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         "--retry-fallbacks",
         action="store_true",
         help="Retry units previously kept in the source language",
+    )
+    translate_arxiv_parser.add_argument(
+        "--retry-repaired",
+        action="store_true",
+        help="Retranslate repaired units while retaining the last compile-safe version",
     )
     translate_arxiv_parser.add_argument(
         "--no-local-cache",

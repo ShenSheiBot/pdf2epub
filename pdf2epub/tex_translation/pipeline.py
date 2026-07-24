@@ -40,6 +40,7 @@ class TexTranslationOptions:
     repair_provider: str = "codex"
     repair_model: str = "gpt-5.6-luna"
     retry_fallbacks: bool = False
+    retry_repaired: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,10 @@ class TexTranslationPipeline:
         )
 
         units_by_id = {unit.id: unit for unit in document.units}
-        pending = state.pending_ids(retry_fallbacks=self.options.retry_fallbacks)
+        pending = state.pending_ids(
+            retry_fallbacks=self.options.retry_fallbacks,
+            retry_repaired=self.options.retry_repaired,
+        )
         if limit is not None:
             if limit < 0:
                 raise ValueError("limit must be non-negative")
@@ -213,12 +217,14 @@ class TexTranslationPipeline:
             prompt_version=TRANSLATION_PROMPT_VERSION,
         )
         previous_status = state.data["units"][unit.id].get("status")
-        bypass_failed_cache = (
+        bypass_previous_cache = (
             self.options.retry_fallbacks and previous_status == "fallback_original"
+        ) or (
+            self.options.retry_repaired and previous_status == "repaired"
         )
         cached = (
             cache.get(cache_key)
-            if self.options.use_local_cache and not bypass_failed_cache
+            if self.options.use_local_cache and not bypass_previous_cache
             else None
         )
         provider_usage: dict = {}
@@ -389,7 +395,9 @@ class TexTranslationPipeline:
         logs_dir: Path,
         record: dict,
     ) -> None:
-        translations.pop(unit.id, None)
+        previous_translation = translations.get(unit.id)
+        if previous_translation is None:
+            translations.pop(unit.id, None)
         atomic_write_sources(project_dir, document.render(translations))
         restored = self.compiler.compile(
             project_dir,
@@ -401,11 +409,17 @@ class TexTranslationPipeline:
                 f"Restoring the original source for {unit.id} did not recover "
                 f"a compilable project.\n\n{restored.tail()}"
             )
-        state.commit_fallback(unit.id, record)
-        logger.warning(
-            f"[tex-translate] Kept original source for {unit.id}; "
-            "the project remains compile-safe"
-        )
+        if previous_translation is None:
+            state.commit_fallback(unit.id, record)
+            logger.warning(
+                f"[tex-translate] Kept original source for {unit.id}; "
+                "the project remains compile-safe"
+            )
+        else:
+            logger.warning(
+                f"[tex-translate] Rejected the new candidate for {unit.id}; "
+                "the previously committed translation remains active"
+            )
 
     def _get_repair_agent(self, control_dir: Path) -> TexRepairAgent:
         if self._repair_agent is None:

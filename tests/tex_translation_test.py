@@ -27,6 +27,11 @@ from pdf2epub.tex_translation.prompts import (
     build_translation_messages,
 )
 from pdf2epub.tex_translation.state import TranslationState
+from pdf2epub.utils.network_utils import (
+    StreamingHallucinationError,
+    _detect_streaming_hallucination,
+    is_transient_gemini_error,
+)
 
 
 class FakeLLMClient:
@@ -106,6 +111,21 @@ def test_arxiv_identifier_normalization():
     assert normalize_arxiv_id("hep-th/9901001") == "hep-th/9901001"
 
 
+def test_gemini_cancelled_request_is_retryable():
+    assert is_transient_gemini_error(
+        RuntimeError(
+            "499 CANCELLED. The operation was cancelled."
+        )
+    )
+
+
+def test_streaming_guard_ignores_whitespace_but_retries_real_loops():
+    assert _detect_streaming_hallucination("prefix" + " " * 400) is None
+    loop = _detect_streaming_hallucination("prefix" + "abc" * 100)
+    assert loop is not None
+    assert is_transient_gemini_error(StreamingHallucinationError(loop))
+
+
 def test_codex_provider_resolves_active_openai_compatible_credentials(
     tmp_path: Path,
 ):
@@ -172,20 +192,48 @@ def test_source_copy_rejects_output_nested_inside_source(tmp_path: Path):
 
 def test_cjk_injection_is_idempotent():
     source = (
+        "\\pdfoutput=1\n"
         "\\documentclass{article}\n"
         "\\usepackage[latin1]{inputenc}\n"
+        "\\usepackage{microtype}\n"
         "\\newtheorem{theorem}{Theorem}\n"
         "\\newtheorem{proposition}[theorem]{Proposition}\n"
         "\\begin{document}Hello\\end{document}\n"
     )
     prepared = inject_cjk_support(source)
+    assert "\\ifdefined\\pdfoutput\\pdfoutput=1\\fi" in prepared
     assert "\\usepackage[scheme=plain,fontset=fandol]{ctex}" in prepared
+    assert "\\IfFontExistsTF{Noto Serif CJK SC}" in prepared
+    assert "\\setCJKmainfont{Noto Serif CJK SC}" in prepared
+    assert "\\setCJKmainfont{Source Han Serif SC}" in prepared
+    assert "\\setCJKmainfont{Arial Unicode MS}" in prepared
     assert "\\usepackage[latin1]{inputenc}" not in prepared
+    assert "\\usepackage{microtype}" not in prepared
+    assert "legacy Type1 fonts can break microtype" in prepared
     assert "\\renewcommand{\\abstractname}{摘要}" in prepared
+    assert "\\patchcmd{\\abstract}{Abstract}{摘要}{}{}" in prepared
     assert "\\renewcommand{\\proofname}{证明}" in prepared
     assert "\\newtheorem{theorem}{定理}" in prepared
     assert "\\newtheorem{proposition}[theorem]{命题}" in prepared
     assert inject_cjk_support(prepared) == prepared
+
+
+def test_legacy_cjk_wrappers_are_migrated_to_native_xelatex_support():
+    source = (
+        "\\documentclass{article}\n"
+        "\\usepackage{CJKutf8}\n"
+        "\\begin{document}\n"
+        "\\begin{CJK*}{UTF8}{gbsn}中文\\end{CJK*}\n"
+        "\\end{document}\n"
+    )
+
+    prepared = inject_cjk_support(source)
+
+    assert "\\usepackage{CJKutf8}" not in prepared
+    assert "\\begin{CJK" not in prepared
+    assert "\\end{CJK" not in prepared
+    assert "中文" in prepared
+    assert "\\usepackage[scheme=plain,fontset=fandol]{ctex}" in prepared
 
 
 def test_non_chinese_target_does_not_localize_tex_labels():
@@ -217,6 +265,32 @@ def test_project_scanner_follows_body_includes_and_renders_exactly(tmp_path: Pat
     rendered = document.render({})
     assert rendered == document.sources
     assert "\\usepackage[scheme=plain,fontset=fandol]{ctex}" in rendered["main.tex"]
+
+
+def test_project_scanner_translates_balanced_front_matter_without_the_preamble(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "main.tex").write_text(
+        "\\documentclass{article}\n"
+        "\\newcommand{\\internalname}{Do not translate the preamble}\n"
+        "\\title{An {English} title with $x$}\n"
+        "\\begin{document}\n"
+        "English body.\n"
+        "\\end{document}\n",
+        encoding="utf-8",
+    )
+
+    document = scan_project(source, "main.tex", unit_chars=1_000)
+
+    assert len(document.units) == 2
+    assert document.units[0].source_text.strip() == "English body."
+    assert (
+        document.units[1].source_text
+        == "\\title{An {English} title with $x$}"
+    )
+    assert all("\\newcommand" not in unit.source_text for unit in document.units)
 
 
 def test_translation_prompt_keeps_an_exact_cacheable_prefix():
@@ -299,6 +373,47 @@ def test_translation_state_rebases_layout_when_source_units_are_identical(
     assert state.data["units"]["unit-00001"]["status"] == "fallback_original"
 
 
+def test_translation_state_appends_new_units_without_losing_completed_work(
+    tmp_path: Path,
+):
+    state = TranslationState(tmp_path)
+    body = {
+        "id": "unit-00001",
+        "relative_path": "main.tex",
+        "start": 100,
+        "end": 200,
+        "source_sha256": "same-body",
+    }
+    state.initialize(
+        source_id="paper",
+        source_fingerprint="body-only",
+        layout_fingerprint="old-layout",
+        main_tex="main.tex",
+        units=[body],
+    )
+    state.data["units"]["unit-00001"]["status"] = "translated"
+    state.save()
+    title = {
+        "id": "unit-00002",
+        "relative_path": "main.tex",
+        "start": 20,
+        "end": 60,
+        "source_sha256": "new-title",
+    }
+
+    state.initialize(
+        source_id="paper",
+        source_fingerprint="body-and-title",
+        layout_fingerprint="new-layout",
+        main_tex="main.tex",
+        units=[{**body, "start": 120, "end": 220}, title],
+    )
+
+    assert state.data["units"]["unit-00001"]["status"] == "translated"
+    assert state.data["units"]["unit-00002"]["status"] == "pending"
+    assert state.pending_ids() == ["unit-00002"]
+
+
 def test_translation_state_rejects_rebase_when_a_source_unit_changed(
     tmp_path: Path,
 ):
@@ -317,6 +432,8 @@ def test_translation_state_rejects_rebase_when_a_source_unit_changed(
         main_tex="main.tex",
         units=[original],
     )
+    state.data["units"]["unit-00001"]["status"] = "fallback_original"
+    state.save()
 
     with pytest.raises(ValueError, match="Source tree changed"):
         state.initialize(
@@ -326,6 +443,43 @@ def test_translation_state_rejects_rebase_when_a_source_unit_changed(
             main_tex="main.tex",
             units=[{**original, "source_sha256": "changed-source"}],
         )
+
+
+def test_translation_state_resets_changed_units_while_still_pristine(
+    tmp_path: Path,
+):
+    state = TranslationState(tmp_path)
+    original = {
+        "id": "unit-00001",
+        "relative_path": "main.tex",
+        "start": 100,
+        "end": 200,
+        "source_sha256": "old-source",
+    }
+    state.initialize(
+        source_id="paper",
+        source_fingerprint="old-tree",
+        layout_fingerprint="old-layout",
+        main_tex="main.tex",
+        units=[original],
+    )
+    changed = {
+        **original,
+        "end": 180,
+        "source_sha256": "normalized-source",
+    }
+
+    state.initialize(
+        source_id="paper",
+        source_fingerprint="normalized-tree",
+        layout_fingerprint="normalized-layout",
+        main_tex="main.tex",
+        units=[changed],
+    )
+
+    assert state.data["source_fingerprint"] == "normalized-tree"
+    assert state.data["units"]["unit-00001"]["end"] == 180
+    assert state.data["units"]["unit-00001"]["status"] == "pending"
 
 
 def test_translation_state_rejects_a_changed_language_contract(tmp_path: Path):
@@ -534,3 +688,97 @@ def test_retry_fallbacks_bypasses_the_previous_failed_response_cache(
     assert len(working_llm.calls) == 2
     assert second.summary["translated"] == 2
     assert second.summary["fallback_original"] == 0
+
+
+def test_retry_repaired_bypasses_cache_and_replaces_the_previous_unit(
+    tmp_path: Path,
+):
+    source = tmp_path / "paper"
+    _write_project(source)
+    run_dir = tmp_path / "run"
+    first_pipeline = TexTranslationPipeline(
+        config={},
+        options=TexTranslationOptions(unit_chars=1_000, repair_enabled=False),
+        llm_client=FakeLLMClient(),
+        compiler=FakeCompiler(),
+    )
+    first_pipeline.run(source, run_dir=run_dir)
+
+    state_path = run_dir / ".pdf2epub" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for record in state["units"].values():
+        record["status"] = "repaired"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    retry_llm = FakeLLMClient(
+        lambda text: text.replace("English", "重试译文")
+    )
+    retry_pipeline = TexTranslationPipeline(
+        config={},
+        options=TexTranslationOptions(
+            unit_chars=1_000,
+            repair_enabled=False,
+            retry_repaired=True,
+        ),
+        llm_client=retry_llm,
+        compiler=FakeCompiler(),
+    )
+    result = retry_pipeline.run(source, run_dir=run_dir)
+
+    assert len(retry_llm.calls) == 2
+    assert result.summary["translated"] == 2
+    assert result.summary["repaired"] == 0
+    assert "重试译文" in (result.project_dir / "main.tex").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_failed_retry_repaired_keeps_the_previous_compile_safe_translation(
+    tmp_path: Path,
+):
+    source = tmp_path / "paper"
+    _write_project(source)
+    run_dir = tmp_path / "run"
+    first_pipeline = TexTranslationPipeline(
+        config={},
+        options=TexTranslationOptions(unit_chars=1_000, repair_enabled=False),
+        llm_client=FakeLLMClient(),
+        compiler=FakeCompiler(),
+    )
+    first_pipeline.run(source, run_dir=run_dir)
+
+    state_path = run_dir / ".pdf2epub" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    original_hashes = {
+        unit_id: record["translation_sha256"]
+        for unit_id, record in state["units"].items()
+    }
+    for record in state["units"].values():
+        record["status"] = "repaired"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    retry_llm = FakeLLMClient(
+        lambda text: f"BROKEN_TRANSLATION\n{text}"
+    )
+    retry_pipeline = TexTranslationPipeline(
+        config={},
+        options=TexTranslationOptions(
+            unit_chars=1_000,
+            repair_enabled=False,
+            retry_repaired=True,
+        ),
+        llm_client=retry_llm,
+        compiler=FakeCompiler(),
+    )
+    result = retry_pipeline.run(source, run_dir=run_dir)
+
+    assert len(retry_llm.calls) == 2
+    assert result.summary["repaired"] == 2
+    project_text = (result.project_dir / "main.tex").read_text(encoding="utf-8")
+    assert "中文" in project_text
+    assert "BROKEN_TRANSLATION" not in project_text
+    retained = json.loads(state_path.read_text(encoding="utf-8"))
+    assert {
+        unit_id: record["translation_sha256"]
+        for unit_id, record in retained["units"].items()
+    } == original_hashes

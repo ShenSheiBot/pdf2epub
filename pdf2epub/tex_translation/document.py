@@ -12,16 +12,36 @@ from pathlib import Path, PurePosixPath
 _DOCUMENT_CLASS_RE = re.compile(r"\\documentclass(?:\[[^\]]*\])?\{[^}]+\}")
 _BEGIN_DOCUMENT_RE = re.compile(r"\\begin\s*\{document\}")
 _END_DOCUMENT_RE = re.compile(r"\\end\s*\{document\}")
+_FRONT_MATTER_COMMAND_RE = re.compile(
+    r"(?m)^[ \t]*\\(?:title|subtitle)\*?\s*"
+    r"(?:\[[^\]\n]*\]\s*)?\{"
+)
 _CJK_PACKAGE_RE = re.compile(
-    r"\\(?:usepackage|RequirePackage)(?:\[[^\]]*\])?\{(?:ctex|xeCJK|CJK|CJKutf8)\}"
+    r"\\(?:usepackage|RequirePackage)(?:\[[^\]]*\])?\{(?:ctex|xeCJK)\}"
 )
 _CTEX_CLASS_RE = re.compile(
     r"\\documentclass(?:\[[^\]]*\])?\{(?:ctexart|ctexbook|ctexrep|ctexbeamer)\}"
+)
+_PDFOUTPUT_LINE_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)\\pdfoutput\s*=\s*(?P<value>[01])"
+    r"(?P<suffix>[ \t]*(?:%[^\n]*)?)$"
 )
 _INPUTENC_LINE_RE = re.compile(
     r"(?m)^[ \t]*\\(?:usepackage|RequirePackage)"
     r"(?:\[[^\]\n]*\])?\{inputenc\}[^\n]*(?:\n|\Z)"
 )
+_MICROTYPE_LINE_RE = re.compile(
+    r"(?m)^[ \t]*\\(?:usepackage|RequirePackage)"
+    r"(?:\[[^\]\n]*\])?\{microtype\}[^\n]*(?:\n|\Z)"
+)
+_CJKUTF8_PACKAGE_LINE_RE = re.compile(
+    r"(?m)^[ \t]*\\(?:usepackage|RequirePackage)"
+    r"(?:\[[^\]\n]*\])?\{(?:CJK|CJKutf8)\}[^\n]*(?:\n|\Z)"
+)
+_CJK_ENV_BEGIN_RE = re.compile(
+    r"\\begin\s*\{CJK\*?\}\s*\{UTF8\}\s*\{[^{}]+\}"
+)
+_CJK_ENV_END_RE = re.compile(r"\\end\s*\{CJK\*?\}")
 _NEW_THEOREM_RE = re.compile(
     r"(\\newtheorem\s*\{[^{}]+\}(?:\s*\[[^\]]+\])?\s*\{)"
     r"(Theorem|Corollary|Lemma|Proposition|Claim|Definition|Remark|Example)"
@@ -40,10 +60,19 @@ _COMMENT_RE = re.compile(r"(?m)(?<!\\)%.*$")
 CJK_PACKAGE_PREAMBLE = (
     "\n% Added by pdf2epub for Unicode CJK translation.\n"
     "\\usepackage[scheme=plain,fontset=fandol]{ctex}\n"
+    "\\IfFontExistsTF{Noto Serif CJK SC}{%\n"
+    "  \\setCJKmainfont{Noto Serif CJK SC}%\n"
+    "}{\\IfFontExistsTF{Source Han Serif SC}{%\n"
+    "  \\setCJKmainfont{Source Han Serif SC}%\n"
+    "}{\\IfFontExistsTF{Arial Unicode MS}{%\n"
+    "  \\setCJKmainfont{Arial Unicode MS}%\n"
+    "}{}}}\n"
 )
 CHINESE_LABEL_PREAMBLE = (
+    "\\usepackage{etoolbox}\n"
     "\\AtBeginDocument{%\n"
     "  \\providecommand{\\abstractname}{}\\renewcommand{\\abstractname}{摘要}%\n"
+    "  \\patchcmd{\\abstract}{Abstract}{摘要}{}{}%\n"
     "  \\providecommand{\\contentsname}{}\\renewcommand{\\contentsname}{目录}%\n"
     "  \\providecommand{\\refname}{}\\renewcommand{\\refname}{参考文献}%\n"
     "  \\providecommand{\\proofname}{}\\renewcommand{\\proofname}{证明}%\n"
@@ -139,10 +168,7 @@ def inject_cjk_support(
     target_language: str = "Simplified Chinese",
 ) -> str:
     """Add idempotent XeLaTeX CJK support and target-specific labels."""
-    source = _INPUTENC_LINE_RE.sub(
-        "% Disabled by pdf2epub: XeLaTeX reads UTF-8 natively.\n",
-        source,
-    )
+    source = _normalize_xelatex_source(source)
     localize_chinese = target_language.strip().lower() in _SIMPLIFIED_CHINESE_TARGETS
     if localize_chinese:
         source = _NEW_THEOREM_RE.sub(
@@ -162,6 +188,32 @@ def inject_cjk_support(
     if localize_chinese:
         preamble += CHINESE_LABEL_PREAMBLE
     return source[: match.end()] + preamble + source[match.end() :]
+
+
+def _normalize_xelatex_source(source: str) -> str:
+    """Remove common pdfLaTeX-only directives while preserving their content."""
+    source = _INPUTENC_LINE_RE.sub(
+        "% Disabled by pdf2epub: XeLaTeX reads UTF-8 natively.\n",
+        source,
+    )
+    source = _MICROTYPE_LINE_RE.sub(
+        "% Disabled by pdf2epub: legacy Type1 fonts can break microtype in XeLaTeX.\n",
+        source,
+    )
+    source = _PDFOUTPUT_LINE_RE.sub(
+        lambda match: (
+            f"{match.group('indent')}\\ifdefined\\pdfoutput"
+            f"\\pdfoutput={match.group('value')}\\fi"
+            f"{match.group('suffix')}"
+        ),
+        source,
+    )
+    source = _CJKUTF8_PACKAGE_LINE_RE.sub(
+        "% Replaced by pdf2epub: ctex provides native XeLaTeX CJK support.\n",
+        source,
+    )
+    source = _CJK_ENV_BEGIN_RE.sub("", source)
+    return _CJK_ENV_END_RE.sub("", source)
 
 
 def discover_main_tex(root: Path, explicit: str | Path | None = None) -> str:
@@ -239,7 +291,7 @@ def scan_project(
             warnings.append(f"Referenced TeX file not found: {relative_path}")
             continue
 
-        text = read_tex(path)
+        text = _normalize_xelatex_source(read_tex(path))
         if is_main:
             text = inject_cjk_support(text, target_language=target_language)
         sources[relative_path] = text
@@ -279,6 +331,30 @@ def scan_project(
             )
             next_index += 1
 
+    # TeX commonly places the visible title before \begin{document}. Keep the
+    # preamble itself out of model input, but append its user-facing metadata as
+    # isolated units so existing body unit IDs remain stable across upgrades.
+    main_source = sources[PurePosixPath(main_tex).as_posix()]
+    main_body_start, _ = ranges[PurePosixPath(main_tex).as_posix()]
+    for unit_start, unit_end in _front_matter_ranges(
+        main_source,
+        end=main_body_start,
+    ):
+        fragment = main_source[unit_start:unit_end]
+        if not _has_translatable_text(fragment):
+            continue
+        units.append(
+            TranslationUnit(
+                id=f"unit-{next_index:05d}",
+                relative_path=PurePosixPath(main_tex).as_posix(),
+                start=unit_start,
+                end=unit_end,
+                source_sha256=_sha256_text(fragment),
+                source_text=fragment,
+            )
+        )
+        next_index += 1
+
     source_payload = {
         "main_tex": PurePosixPath(main_tex).as_posix(),
         "sources": sources,
@@ -310,6 +386,41 @@ def _body_range(text: str, *, require_document: bool) -> tuple[int, int]:
         return 0, len(text)
     end = _END_DOCUMENT_RE.search(text, begin.end())
     return begin.end(), end.start() if end else len(text)
+
+
+def _front_matter_ranges(text: str, *, end: int) -> list[tuple[int, int]]:
+    """Return balanced, visible metadata commands from the TeX preamble."""
+    ranges: list[tuple[int, int]] = []
+    for match in _FRONT_MATTER_COMMAND_RE.finditer(text, 0, end):
+        group_end = _balanced_group_end(text, match.end() - 1, limit=end)
+        if group_end is not None:
+            ranges.append((match.start(), group_end))
+    return ranges
+
+
+def _balanced_group_end(text: str, start: int, *, limit: int) -> int | None:
+    """Return the exclusive end of a balanced TeX brace group."""
+    depth = 0
+    for index in range(start, limit):
+        character = text[index]
+        if character not in "{}" or _is_escaped(text, index):
+            continue
+        if character == "{":
+            depth += 1
+            continue
+        depth -= 1
+        if depth == 0:
+            return index + 1
+    return None
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    backslashes = 0
+    index -= 1
+    while index >= 0 and text[index] == "\\":
+        backslashes += 1
+        index -= 1
+    return backslashes % 2 == 1
 
 
 def _find_includes(body: str) -> Iterable[str]:

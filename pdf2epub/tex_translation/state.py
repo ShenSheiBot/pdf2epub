@@ -45,6 +45,21 @@ class TranslationState:
                     translation_spec,
                 )
             except ValueError:
+                if self._can_reset_pristine(
+                    source_id=source_id,
+                    main_tex=main_tex,
+                    translation_spec=translation_spec,
+                ):
+                    self.data = self._new_state_data(
+                        source_id=source_id,
+                        source_fingerprint=source_fingerprint,
+                        layout_fingerprint=layout_fingerprint,
+                        main_tex=main_tex,
+                        units=units,
+                        translation_spec=translation_spec,
+                    )
+                    self.save()
+                    return
                 if not self._can_rebase(
                     source_id=source_id,
                     main_tex=main_tex,
@@ -61,7 +76,27 @@ class TranslationState:
                 if migrates_legacy_spec:
                     self.save()
             return
-        self.data = {
+        self.data = self._new_state_data(
+            source_id=source_id,
+            source_fingerprint=source_fingerprint,
+            layout_fingerprint=layout_fingerprint,
+            main_tex=main_tex,
+            units=units,
+            translation_spec=translation_spec,
+        )
+        self.save()
+
+    @staticmethod
+    def _new_state_data(
+        *,
+        source_id: str,
+        source_fingerprint: str,
+        layout_fingerprint: str,
+        main_tex: str,
+        units: list[dict],
+        translation_spec: dict,
+    ) -> dict:
+        return {
             "version": STATE_VERSION,
             "source_id": source_id,
             "source_fingerprint": source_fingerprint,
@@ -76,7 +111,6 @@ class TranslationState:
                 for unit in units
             },
         }
-        self.save()
 
     def _validate(
         self,
@@ -119,7 +153,7 @@ class TranslationState:
         units: list[dict],
         translation_spec: dict,
     ) -> bool:
-        """Allow preamble/layout upgrades only when every source unit is identical."""
+        """Allow safe layout upgrades while preserving identical existing units."""
         if self.data.get("version") != STATE_VERSION:
             return False
         if self.data.get("source_id") != source_id:
@@ -129,12 +163,35 @@ class TranslationState:
         if self.data.get("translation_spec") != translation_spec:
             return False
         existing = self.data.get("units", {})
-        if list(existing) != [unit["id"] for unit in units]:
+        new_ids = [unit["id"] for unit in units]
+        existing_ids = list(existing)
+        if existing_ids != new_ids[: len(existing_ids)]:
             return False
         return all(
             existing[unit["id"]].get("relative_path") == unit["relative_path"]
             and existing[unit["id"]].get("source_sha256") == unit["source_sha256"]
-            for unit in units
+            for unit in units[: len(existing_ids)]
+        )
+
+    def _can_reset_pristine(
+        self,
+        *,
+        source_id: str,
+        main_tex: str,
+        translation_spec: dict,
+    ) -> bool:
+        """Permit manifest upgrades before any unit has produced a result."""
+        if self.data.get("version") != STATE_VERSION:
+            return False
+        if self.data.get("source_id") != source_id:
+            return False
+        if self.data.get("main_tex") != main_tex:
+            return False
+        if self.data.get("translation_spec") != translation_spec:
+            return False
+        return all(
+            record.get("status", "pending") == "pending"
+            for record in self.data.get("units", {}).values()
         )
 
     def _rebase(
@@ -148,7 +205,14 @@ class TranslationState:
         self.data["source_fingerprint"] = source_fingerprint
         self.data["layout_fingerprint"] = layout_fingerprint
         for unit in units:
-            self.data["units"][unit["id"]].update(unit)
+            record = self.data["units"].setdefault(
+                unit["id"],
+                {
+                    **unit,
+                    "status": "pending",
+                },
+            )
+            record.update(unit)
         self.save()
 
     def completed_translations(self) -> dict[str, str]:
@@ -164,10 +228,17 @@ class TranslationState:
             translations[unit_id] = path.read_text(encoding="utf-8")
         return translations
 
-    def pending_ids(self, *, retry_fallbacks: bool = False) -> list[str]:
+    def pending_ids(
+        self,
+        *,
+        retry_fallbacks: bool = False,
+        retry_repaired: bool = False,
+    ) -> list[str]:
         allowed = {"pending"}
         if retry_fallbacks:
             allowed.add("fallback_original")
+        if retry_repaired:
+            allowed.add("repaired")
         return [
             unit_id
             for unit_id, record in self.data.get("units", {}).items()

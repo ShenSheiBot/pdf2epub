@@ -170,6 +170,11 @@ credentials:
       type: openai
       api_key: your-key
       base_url: https://api.deepseek.com/v1
+    # 可选：供 refine 的 OpenAI Responses PDF 传输使用。
+    openai_pdf:
+      type: openai
+      api_key: your-key
+      base_url: https://your-responses-compatible-endpoint.example/v1
 
 ocr:
   backend: azure  # azure / vision / vllm
@@ -186,6 +191,21 @@ translation:
       model: deepseek-chat
       api_retries: 2
       validation_retries: 2
+
+# 可选：只在明确指定时让 refine 通过 OpenAI Responses API 传入 PDF。
+# 这是 Gemini PDF Part 路径的备用方案，不会在失败时自动切换模型。
+refine:
+  structure:
+    provider: openai_pdf
+    model: "your-pdf-capable-model"
+    toc_model: "your-pdf-capable-model"
+    pdf_transport:
+      type: openai_responses
+      timeout_seconds: 600
+
+# `base_url` 可写兼容端点根地址、.../v1，或 .../v1/responses；适配器会归一化。
+# 分批页数和重叠页数取决于模型、端点和 PDF，不存在通用的 50 页上限。
+# 明确的上下文超限会停止 refine 并保留错误，不会自行切换模型。
 
 # 轻小说专用配置（可选）
 novel:

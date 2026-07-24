@@ -30,6 +30,7 @@ from .adaptive_pdf_call import (
     DirectAnalysisCall,
     validate_chapter_structure,
 )
+from .pdf_transport import PdfTransport
 
 
 def _update_levels_recursive(chapters: List[Dict], target_level: int) -> None:
@@ -53,7 +54,8 @@ class StructureAnalyzer:
         toc_model: str,
         analysis_client: BoundLLMClient,
         analysis_model: str,
-        config: Dict = None
+        config: Dict = None,
+        pdf_transport: Optional[PdfTransport] = None,
     ):
         """
         Initialize the structure analyzer.
@@ -72,6 +74,7 @@ class StructureAnalyzer:
         self.analysis_client = analysis_client
         self.analysis_model = analysis_model
         self.config = config or {}
+        self.pdf_transport = pdf_transport
         self._corrupted_xref_pdfs: set = set()  # PDFs with known corrupted xref
         self._rasterized_pdf_path: Optional[Path] = None  # Cached rasterized PDF path
         self._prefer_rasterized: bool = False  # Set True after first successful rasterization
@@ -81,6 +84,10 @@ class StructureAnalyzer:
         self._learner = PdfPageLimitLearner(
             initial_limit=adaptive_config.get('initial_pages', 900),
             min_limit=adaptive_config.get('min_pages', 100),
+        )
+        direct_analysis_config = self.config.get('refine', {}).get('direct_analysis', {})
+        self._direct_analysis_overlap_pages = max(
+            0, int(direct_analysis_config.get('overlap_pages', 50))
         )
 
     def _compress_pdf_to_limit(self, input_path: Path, output_path: Path, target_mb: float) -> bool:
@@ -167,13 +174,15 @@ class StructureAnalyzer:
             self.structure_client, self.toc_model,
             self._prepare_pdf, self._learner,
             self._prepare_pdf_rasterized,
+            pdf_transport=self.pdf_transport,
+            runtime_config=self.config,
         )
         toc_artifacts = artifacts_dir / "toc_detection" if artifacts_dir else None
-        try:
-            return call.run(pdf_path, pages, artifacts_dir=toc_artifacts)
-        except Exception as e:
-            logger.error(f"TOC detection failed: {e}")
-            return None
+        # A failed request is not evidence that the book has no TOC. In
+        # particular, context limits, authentication errors, and JSON-repair
+        # failures must stop refine before the direct-analysis stage can
+        # produce an unverified replacement structure.
+        return call.run(pdf_path, pages, artifacts_dir=toc_artifacts)
 
     def _clean_toc_text(
         self, toc_start: int, toc_end: int, pages_dir: Path
@@ -798,6 +807,9 @@ Return ONLY the cleaned text, nothing else.
             self._prepare_pdf, self._learner, book_title,
             toc_reference=toc_reference,
             prepare_pdf_rasterized=self._prepare_pdf_rasterized,
+            pdf_transport=self.pdf_transport,
+            overlap_pages=self._direct_analysis_overlap_pages,
+            runtime_config=self.config,
         )
         analysis_artifacts = artifacts_dir / "direct_analysis" if artifacts_dir else None
         return call.run(pdf_path, all_pages, artifacts_dir=analysis_artifacts)

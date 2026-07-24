@@ -7,9 +7,10 @@ Supports recursive verification of nested TOC structures.
 
 import json
 import asyncio
+import re
 from pathlib import Path
-from typing import Optional
-from pydantic import BaseModel
+from typing import Any, Optional
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.usage import UsageLimits
 from pydantic_ai.models.anthropic import AnthropicModel
@@ -35,18 +36,69 @@ def load_config() -> dict:
     return {}
 
 
-def get_model_and_limits():
+def get_model_and_limits(runtime_config: Optional[dict[str, Any]] = None):
     """Get the model for boundary verification and its token limits.
 
-    Priority: Anthropic (Haiku) > POE (Gemini)
+    Priority: explicit refine.agent > Anthropic (Haiku) > POE (Gemini)
 
     Returns:
         Tuple of (model, model_name, max_tokens)
     """
-    config = load_config()
+    config = runtime_config if runtime_config is not None else load_config()
     providers = config.get('credentials', {}).get('providers', {})
     model_limits = config.get('model_output_limits', {})
     default_limit = model_limits.get('_default', 4000)
+
+    agent_config = config.get('refine', {}).get('agent', {})
+    if agent_config:
+        provider_name = agent_config.get('provider')
+        model_name = agent_config.get('model')
+        if not provider_name or not model_name:
+            raise ValueError("refine.agent requires both provider and model")
+        if provider_name not in providers:
+            raise ValueError(
+                f"refine.agent provider '{provider_name}' is not configured"
+            )
+
+        provider_config = providers[provider_name]
+        provider_type = provider_config.get('type') or (
+            'anthropic' if provider_name == 'anthropic' else 'openai'
+        )
+        if provider_type == 'anthropic':
+            provider = AnthropicProvider(
+                api_key=provider_config.get('api_key'),
+                base_url=provider_config.get('base_url'),
+            )
+            model = AnthropicModel(model_name, provider=provider)
+        elif provider_type == 'openai':
+            provider = OpenAIProvider(
+                api_key=provider_config.get('api_key'),
+                base_url=provider_config.get('base_url'),
+            )
+            model = OpenAIChatModel(model_name, provider=provider)
+        elif provider_type == 'google':
+            from google.genai import Client
+            from google.genai.types import HttpOptions
+            from pydantic_ai.models.google import GoogleModel
+            from pydantic_ai.providers.google import GoogleProvider
+
+            client_kwargs = {'api_key': provider_config.get('api_key')}
+            if provider_config.get('base_url'):
+                client_kwargs['http_options'] = HttpOptions(
+                    base_url=provider_config['base_url']
+                )
+            client = Client(**client_kwargs)
+            model = GoogleModel(
+                model_name,
+                provider=GoogleProvider(client=client),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported refine.agent provider type '{provider_type}'"
+            )
+
+        max_tokens = model_limits.get(model_name, default_limit)
+        return model, model_name, max_tokens
 
     # Try Anthropic first (Haiku for speed/cost)
     if 'anthropic' in providers:
@@ -72,7 +124,7 @@ def get_model_and_limits():
         max_tokens = model_limits.get(model_name, default_limit)
         return model, model_name, max_tokens
 
-    raise ValueError("No suitable provider found in config.yaml (need anthropic or poe)")
+    raise ValueError("No suitable provider found (need anthropic or poe)")
 
 
 class Section(BaseModel):
@@ -99,29 +151,68 @@ class ChapterState(BaseModel):
     pages_dir: str
     total_pages: int
     insert_rejections: int = 0  # Consecutive insert_section rejections
+    # Ancestor and sibling labels may be visible near a page boundary, but they
+    # must not be rediscovered as children of the current node.
+    forbidden_insert_titles: list[str] = Field(default_factory=list)
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize a heading enough to catch OCR spacing/punctuation variants."""
+    return re.sub(r"[^\w]+", "", title.casefold(), flags=re.UNICODE)
+
+
+def _titles_equivalent(left: str, right: str) -> bool:
+    """Whether two headings are equal after OCR-neutral punctuation cleanup."""
+    normalized_left = _normalize_title(left)
+    normalized_right = _normalize_title(right)
+    return bool(normalized_left and normalized_left == normalized_right)
+
+
+def _title_supported_as_standalone_line(title: str, page_text: str) -> bool:
+    """Match a proposed heading against complete OCR lines from any backend."""
+    normalized_title = _normalize_title(title)
+    if not normalized_title:
+        return False
+    for line in page_text.splitlines():
+        candidate = line.strip().lstrip("#").strip()
+        if _normalize_title(candidate) == normalized_title:
+            return True
+    return False
 
 
 # Create the agent (lazy initialization)
 _agent = None
 _model_max_tokens = None  # Token limit from config
+_agent_config_key = None
+_model_limit_config_key = None
 
 
-def get_model_max_tokens() -> int:
+def _config_cache_key(runtime_config: Optional[dict[str, Any]]) -> object:
+    """Keep lazy model caches scoped to the config passed for this run."""
+    return id(runtime_config) if runtime_config is not None else "default-config"
+
+
+def get_model_max_tokens(runtime_config: Optional[dict[str, Any]] = None) -> int:
     """Get the model's max token limit from config.
 
     This is used as the threshold for deciding whether to process children.
     """
-    global _model_max_tokens
-    if _model_max_tokens is None:
-        _, _, _model_max_tokens = get_model_and_limits()
+    global _model_max_tokens, _model_limit_config_key
+    config_key = _config_cache_key(runtime_config)
+    if _model_max_tokens is None or _model_limit_config_key != config_key:
+        _, _, _model_max_tokens = get_model_and_limits(runtime_config)
+        _model_limit_config_key = config_key
     return _model_max_tokens
 
 
-def get_agent():
-    global _agent, _model_max_tokens
-    if _agent is None:
-        model, model_name, max_tokens = get_model_and_limits()
+def get_agent(runtime_config: Optional[dict[str, Any]] = None):
+    global _agent, _model_max_tokens, _agent_config_key, _model_limit_config_key
+    config_key = _config_cache_key(runtime_config)
+    if _agent is None or _agent_config_key != config_key:
+        model, model_name, max_tokens = get_model_and_limits(runtime_config)
         _model_max_tokens = max_tokens
+        _model_limit_config_key = config_key
+        _agent_config_key = config_key
         logger.info(f"Using model {model_name} with max_tokens={max_tokens}")
         _agent = Agent(
             model,
@@ -155,6 +246,10 @@ Process:
    - Extend an adjacent section to cover the gap, OR
    - Insert a new section if there's a distinct chapter/heading
 7. If a section seems wrong, verify it by reading the page — it may just have a variant title
+
+Never use insert_section for the current parent, an ancestor, or a sibling
+heading. Those headings may appear at the page boundary you inspect, but they
+are not missing children.
 
 IMPORTANT: When a section title appears mid-page (not line 1), you MUST call set_split before mark_verified. Otherwise the content before the title will be lost!
 
@@ -343,6 +438,39 @@ If issues remain, fix them or confirm they are intentional before finishing.
 
             if after_index < -1 or after_index >= len(sections):
                 return f"Error: Invalid after_index {after_index}"
+
+            prohibited_titles = (
+                ctx.deps.forbidden_insert_titles
+                + [section.title for section in sections]
+            )
+            matching_title = next(
+                (known for known in prohibited_titles if _titles_equivalent(title, known)),
+                None,
+            )
+            if matching_title is not None:
+                ctx.deps.insert_rejections += 1
+                remaining = MAX_INSERT_REJECTIONS - ctx.deps.insert_rejections
+                return (
+                    f"Error: '{title}' duplicates or aliases known heading "
+                    f"'{matching_title}'. Do not insert parent, ancestor, sibling, "
+                    f"or existing child headings as new sections. "
+                    f"({remaining} attempts remaining before insert_section is disabled)"
+                )
+
+            page_file = Path(ctx.deps.pages_dir) / f"page_{start_page:03d}.md"
+            if not page_file.exists():
+                ctx.deps.insert_rejections += 1
+                return f"Error: Start page {start_page} does not exist for inserted section '{title}'."
+            page_text = page_file.read_text(encoding='utf-8')
+            if not _title_supported_as_standalone_line(title, page_text):
+                ctx.deps.insert_rejections += 1
+                remaining = MAX_INSERT_REJECTIONS - ctx.deps.insert_rejections
+                return (
+                    f"Error: OCR page {start_page} has no standalone line "
+                    f"matching '{title}'. Do not infer a new section from body "
+                    f"prose. ({remaining} attempts remaining before "
+                    "insert_section is disabled)"
+                )
 
             # Validate: new section must fit in a gap (no overlap with existing sections)
             if after_index >= 0:
@@ -692,6 +820,8 @@ async def verify_node_boundaries(
     pages_dir: Path,
     total_pages: int,
     max_retries: int = 3,
+    runtime_config: Optional[dict[str, Any]] = None,
+    forbidden_insert_titles: Optional[list[str]] = None,
 ) -> None:
     """Verify boundaries for a single node's children.
 
@@ -710,20 +840,30 @@ async def verify_node_boundaries(
         sections=sections,
         pages_dir=str(pages_dir),
         total_pages=total_pages,
+        forbidden_insert_titles=forbidden_insert_titles or [],
     )
 
     logger.info(f"Verifying {len(sections)} children of '{node.title}'")
     logger.debug(_format_sections(sections))
 
-    agent = get_agent()
+    agent = get_agent(runtime_config)
+
+    forbidden_titles_text = ""
+    if state.forbidden_insert_titles:
+        titles = "; ".join(state.forbidden_insert_titles)
+        forbidden_titles_text = (
+            "\nDo NOT insert a section with any parent, ancestor, or sibling "
+            f"heading from this list: {titles}.\n"
+        )
 
     # First round: normal verification
     await _run_agent_with_retries(
         agent, state,
         f"Verify the boundaries for these {len(sections)} sections. "
         f"Check each section's start_page to ensure the title appears there.\n\n"
-        f"{_format_sections(state.sections)}",
-        max_retries
+        f"{_format_sections(state.sections)}{forbidden_titles_text}",
+        max_retries,
+        runtime_config,
     )
 
     # Check for issues after first round
@@ -744,8 +884,9 @@ async def verify_node_boundaries(
             f"- MISSING SPLIT: Read the shared page and use set_split to define where one section ends and the next begins.\n"
             f"- POSSIBLE SPLIT: Read the page and check if the section title appears later on the page. If so, use set_split.\n\n"
             f"If an issue is intentional (e.g., blank pages, appendix), you can ignore it.\n\n"
-            f"Current state:\n{_format_sections(state.sections)}",
-            max_retries
+            f"Current state:\n{_format_sections(state.sections)}{forbidden_titles_text}",
+            max_retries,
+            runtime_config,
         )
         # Log final state after second round
         final_issues = detect_boundary_issues(state.sections, pages_dir)
@@ -760,9 +901,15 @@ async def verify_node_boundaries(
     node.children = sections_to_toc_children(state.sections, node.children)
 
 
-async def _run_agent_with_retries(agent, state: ChapterState, prompt: str, max_retries: int):
+async def _run_agent_with_retries(
+    agent,
+    state: ChapterState,
+    prompt: str,
+    max_retries: int,
+    runtime_config: Optional[dict[str, Any]] = None,
+):
     """Run agent with retry logic for transient errors."""
-    config = load_config()
+    config = runtime_config if runtime_config is not None else load_config()
     request_limit = config.get('refine', {}).get('agent_request_limit', 100)
     last_error = None
     for attempt in range(max_retries):
@@ -793,6 +940,7 @@ async def verify_toc_recursive(
     total_pages: int,
     max_tokens: int = None,
     max_retries: int = 3,
+    runtime_config: Optional[dict[str, Any]] = None,
 ) -> list[TOCNode]:
     """Recursively verify all boundaries in TOC tree.
 
@@ -815,7 +963,7 @@ async def verify_toc_recursive(
     """
     # Get max_tokens from config if not specified
     if max_tokens is None:
-        max_tokens = get_model_max_tokens()
+        max_tokens = get_model_max_tokens(runtime_config)
         logger.info(f"Using max_tokens={max_tokens} from config")
 
     # First estimate tokens for all nodes
@@ -836,7 +984,9 @@ async def verify_toc_recursive(
 
     # Step 1: Verify top-level chapters
     logger.info("=== Verifying top-level chapters ===")
-    await verify_node_boundaries(root, pages_dir, total_pages, max_retries)
+    await verify_node_boundaries(
+        root, pages_dir, total_pages, max_retries, runtime_config
+    )
     # verify_node_boundaries replaces node.children with a new list (via
     # sections_to_toc_children), so root.children may differ from toc_tree
     # if sections were inserted. Capture the updated reference.
@@ -847,8 +997,15 @@ async def verify_toc_recursive(
             node.estimated_tokens = estimate_tokens(pages_dir, node.start_page, node.end_page)
 
     # Step 2: Process each chapter recursively
-    async def process_node(node: TOCNode, depth: int = 1):
+    async def process_node(
+        node: TOCNode,
+        depth: int = 1,
+        ancestor_titles: Optional[list[str]] = None,
+        sibling_nodes: Optional[list[TOCNode]] = None,
+    ):
         indent = "  " * depth
+        ancestor_titles = ancestor_titles or []
+        sibling_nodes = sibling_nodes or []
 
         # Check if below token threshold
         if node.estimated_tokens < max_tokens:
@@ -860,14 +1017,34 @@ async def verify_toc_recursive(
         # Has children and above threshold - verify them
         if node.children:
             logger.info(f"{indent}=== Verifying children of '{node.title}' ({node.estimated_tokens} tokens) ===")
-            await verify_node_boundaries(node, pages_dir, total_pages, max_retries)
+            forbidden_titles = [
+                *ancestor_titles,
+                node.title,
+                *(sibling.title for sibling in sibling_nodes if sibling is not node),
+            ]
+            await verify_node_boundaries(
+                node,
+                pages_dir,
+                total_pages,
+                max_retries,
+                runtime_config,
+                forbidden_insert_titles=forbidden_titles,
+            )
 
             # Recurse into children (parallel)
-            tasks = [process_node(child, depth + 1) for child in node.children]
+            tasks = [
+                process_node(
+                    child,
+                    depth + 1,
+                    ancestor_titles=[*ancestor_titles, node.title],
+                    sibling_nodes=node.children,
+                )
+                for child in node.children
+            ]
             await asyncio.gather(*tasks)
 
     # Process all top-level chapters in parallel
-    tasks = [process_node(chapter) for chapter in toc_tree]
+    tasks = [process_node(chapter, sibling_nodes=toc_tree) for chapter in toc_tree]
     await asyncio.gather(*tasks)
 
     return toc_tree

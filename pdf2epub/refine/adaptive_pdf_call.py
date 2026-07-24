@@ -10,25 +10,48 @@ Provides:
 - DirectAnalysisCall: Analyze PDF structure directly
 """
 
+import hashlib
 import json
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, List, Optional, TypeVar
+from typing import Any, Callable, List, Optional, Tuple, TypeVar, Union
 
-from google.genai.types import Content, Part
 from loguru import logger
 
-from ..utils.common import parse_llm_json, load_config
+from ..utils.common import parse_llm_json
 from ..utils.network_utils import _retry_context
 from ..utils.llm_client import BoundLLMClient
 from ..core.whole import run_agent_loop, AgentLoopExhausted
 from ..core.whole.runner import run_agent_loop_sync
 from ..core.whole.prompts.json_refine import JSON_REFINE_PROMPT
+from .pdf_transport import (
+    GeminiPdfTransport,
+    PdfPayloadTooLargeError,
+    PdfTransport,
+)
 
 T = TypeVar('T')
 
 
+class MergeValidationError(RuntimeError):
+    """Raised when all merge attempts violate a structural invariant.
+
+    A merge is the only point where independently valid batch results become a
+    single TOC.  Returning an invalid merge lets downstream boundary repair
+    operate on an untrusted tree, so callers must stop and preserve the
+    artifacts for an explicit retry or model decision.
+    """
+
+
+class BatchValidationError(RuntimeError):
+    """A PDF batch remained structurally invalid after repair attempts."""
+
+
 def is_503_error(error: Exception) -> bool:
-    """Check if an exception is a 503 UNAVAILABLE error."""
+    """Check if adaptive PDF batching can address this request failure."""
+    if isinstance(error, PdfPayloadTooLargeError):
+        return True
     error_str = str(error).lower()
     return '503' in error_str or 'unavailable' in error_str
 
@@ -59,7 +82,11 @@ class PdfPageLimitLearner:
     def had_503(self) -> bool:
         return self._had_503
 
-    def report_503(self, attempted_pages: int) -> int:
+    def report_503(
+        self,
+        attempted_pages: int,
+        reason: str = "503 error",
+    ) -> int:
         """
         Report a 503 error, reducing the limit.
 
@@ -83,7 +110,7 @@ class PdfPageLimitLearner:
             )
         self._limit = min(self._limit, new_limit)
         logger.warning(
-            f"503 error at {attempted_pages} pages → learned limit: {self._limit}"
+            f"{reason} at {attempted_pages} pages → learned limit: {self._limit}"
         )
         return self._limit
 
@@ -134,7 +161,8 @@ def run_adaptive_batches(
     operation_name: str,
     overlap: int = 0,
     can_rasterize: bool = False,
-) -> List[T]:
+    return_batches: bool = False,
+) -> Union[List[T], Tuple[List[T], List[List[int]]]]:
     """
     Process pages in batches with adaptive 503 recovery.
 
@@ -150,6 +178,10 @@ def run_adaptive_batches(
         operation_name: For logging
         overlap: Pages of overlap between consecutive batches
         can_rasterize: Whether rasterization fallback is available
+        return_batches: Also return the final successful page sets. This is
+            useful to downstream merging code: adaptive 503 recovery can
+            change batch boundaries, so those boundaries must not be inferred
+            from result order alone.
 
     Returns:
         List of results from each successful batch
@@ -185,10 +217,16 @@ def run_adaptive_batches(
             batch_idx += 1
         except Exception as e:
             if is_503_fn(e):
+                rejection_reason = (
+                    "payload-too-large rejection"
+                    if isinstance(e, PdfPayloadTooLargeError)
+                    else "503 error"
+                )
                 # Strategy: try rasterization first (once per batch), then split
                 if can_rasterize and not tried_rasterize_this_batch:
                     logger.warning(
-                        f"[{operation_name}] 503 error on {len(batch)} pages, "
+                        f"[{operation_name}] {rejection_reason} on "
+                        f"{len(batch)} pages, "
                         f"retrying batch {batch_idx+1} with JBIG2 rasterization..."
                     )
                     tried_rasterize_this_batch = True
@@ -207,14 +245,23 @@ def run_adaptive_batches(
                     except Exception as e2:
                         if not is_503_fn(e2):
                             raise
+                        rejection_reason = (
+                            "payload-too-large rejection"
+                            if isinstance(e2, PdfPayloadTooLargeError)
+                            else "503 error"
+                        )
                         logger.warning(
-                            f"[{operation_name}] 503 even after rasterization, "
+                            f"[{operation_name}] {rejection_reason} even after "
+                            "rasterization, "
                             f"falling back to batch splitting..."
                         )
                         # Fall through to split logic
 
                 # Split: reduce limit and re-batch
-                learner.report_503(len(batch))
+                learner.report_503(
+                    len(batch),
+                    reason=rejection_reason,
+                )
 
                 # Collect all remaining pages (current failed + future batches)
                 remaining_pages = []
@@ -245,6 +292,8 @@ def run_adaptive_batches(
             else:
                 raise
 
+    if return_batches:
+        return results, batches
     return results
 
 
@@ -258,7 +307,11 @@ def _is_cloudflare_proxy_error(e: Exception) -> bool:
 # Structural validation for chapter lists
 # ---------------------------------------------------------------------------
 
-def validate_chapter_structure(chapters: List[dict], path: str = "") -> List[str]:
+def validate_chapter_structure(
+    chapters: List[dict],
+    path: str = "",
+    parent_range: Optional[Tuple[int, int]] = None,
+) -> List[str]:
     """
     Validate a chapter list for structural issues.
 
@@ -275,38 +328,135 @@ def validate_chapter_structure(chapters: List[dict], path: str = "") -> List[str
     issues = []
 
     for i, chapter in enumerate(chapters):
-        title = chapter.get('title', 'unknown')[:40]
+        if not isinstance(chapter, dict):
+            issues.append(
+                f"Chapter entry at {path or '<root>'}[{i}] is not an object"
+            )
+            continue
+        raw_title = chapter.get('title')
+        title = (
+            raw_title[:40]
+            if isinstance(raw_title, str)
+            else repr(raw_title)[:40]
+        )
         chapter_path = f"{path}/{title}" if path else title
+        if not isinstance(raw_title, str) or not raw_title.strip():
+            issues.append(f"Missing or invalid title: {chapter_path}")
 
         start = chapter.get('start_page')
         end = chapter.get('end_page')
+        valid_start = (
+            isinstance(start, int)
+            and not isinstance(start, bool)
+            and start >= 1
+        )
+        valid_end = (
+            isinstance(end, int)
+            and not isinstance(end, bool)
+            and end >= 1
+        )
 
         if start is None:
             issues.append(f"Missing start_page: {chapter_path}")
+        elif not valid_start:
+            issues.append(
+                f"Invalid start_page: {chapter_path} ({start!r})"
+            )
         if end is None:
             issues.append(f"Missing end_page: {chapter_path}")
+        elif not valid_end:
+            issues.append(
+                f"Invalid end_page: {chapter_path} ({end!r})"
+            )
 
-        if start is not None and end is not None:
+        if valid_start and valid_end:
             if end < start:
                 issues.append(
                     f"Invalid range (end < start): {chapter_path} "
                     f"(p{start}-p{end})"
                 )
+            if parent_range is not None:
+                parent_start, parent_end = parent_range
+                if start < parent_start or end > parent_end:
+                    issues.append(
+                        f"Child range escapes parent: {chapter_path} "
+                        f"(p{start}-p{end}, parent p{parent_start}-p{parent_end})"
+                    )
 
             if i + 1 < len(chapters):
-                next_start = chapters[i + 1].get('start_page')
-                if next_start is not None and end > next_start:
-                    next_title = chapters[i + 1].get('title', 'unknown')[:40]
+                next_chapter = chapters[i + 1]
+                next_start = (
+                    next_chapter.get('start_page')
+                    if isinstance(next_chapter, dict)
+                    else None
+                )
+                if (
+                    isinstance(next_start, int)
+                    and not isinstance(next_start, bool)
+                    and end > next_start
+                ):
+                    next_title = (
+                        next_chapter.get('title', 'unknown')[:40]
+                        if isinstance(next_chapter, dict)
+                        else 'invalid'
+                    )
                     issues.append(
                         f"Overlap: '{title}' ends at p{end} "
                         f"but '{next_title}' starts at p{next_start}"
                     )
 
         children = chapter.get('children', [])
-        if children:
-            issues.extend(validate_chapter_structure(children, chapter_path))
+        if not isinstance(children, list):
+            issues.append(f"Invalid children list: {chapter_path}")
+        elif children:
+            child_parent_range = (
+                (start, end)
+                if valid_start and valid_end and end >= start
+                else None
+            )
+            issues.extend(
+                validate_chapter_structure(
+                    children,
+                    chapter_path,
+                    child_parent_range,
+                )
+            )
 
     return issues
+
+
+def _iter_chapter_nodes(chapters: List[dict]):
+    """Yield every chapter node recursively, ignoring malformed children."""
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        yield chapter
+        children = chapter.get('children', [])
+        if isinstance(children, list):
+            yield from _iter_chapter_nodes(children)
+
+
+def _iter_chapter_paths(
+    chapters: List[dict],
+    parent_path: Tuple[str, ...] = (),
+):
+    """Yield normalized structural paths and nodes recursively."""
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        title_key = _chapter_title_key(chapter.get('title'))
+        node_path = (*parent_path, title_key)
+        yield node_path, chapter
+        children = chapter.get('children', [])
+        if isinstance(children, list):
+            yield from _iter_chapter_paths(children, node_path)
+
+
+def _chapter_title_key(title: Any) -> str:
+    """Normalize title punctuation and spacing for merge identity checks."""
+    if not isinstance(title, str):
+        return ""
+    return re.sub(r"[^\w]+", "", title.casefold(), flags=re.UNICODE)
 
 
 # ---------------------------------------------------------------------------
@@ -344,18 +494,26 @@ class AdaptivePdfCall:
         prepare_pdf: Callable,
         learner: PdfPageLimitLearner,
         prepare_pdf_rasterized: Callable = None,
+        pdf_transport: Optional[PdfTransport] = None,
+        runtime_config: Optional[dict] = None,
     ):
         self.client = client
         self.model = model
         self._prepare_pdf = prepare_pdf
         self._prepare_pdf_rasterized = prepare_pdf_rasterized
         self._learner = learner
+        self._pdf_transport = pdf_transport or GeminiPdfTransport(client)
+        self._runtime_config = runtime_config or {}
 
     def build_prompt(self, batch_pages: List[int], batch_idx: int, total_batches: int) -> str:
         """Build the prompt for a single batch. Must be overridden."""
         raise NotImplementedError
 
-    def build_merge_prompt(self, results: List) -> str:
+    def build_merge_prompt(
+        self,
+        results: List,
+        batch_pages: Optional[List[List[int]]] = None,
+    ) -> str:
         """Build prompt for LLM-based merge of multi-batch results."""
         raise NotImplementedError(
             f"{self.__class__.__name__} got {len(results)} batches "
@@ -436,18 +594,212 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             filtered.append(issue)
         return filtered
 
+    def _get_actionable_batch_issues(
+        self,
+        result: Any,
+        batch_idx: int,
+        total_batches: int,
+    ) -> Tuple[List[str], List[str]]:
+        """Return all validator findings and the non-edge subset."""
+        all_issues = self.validate_batch_result(
+            result,
+            batch_idx,
+            total_batches,
+        )
+        if isinstance(result, list):
+            chapters = result
+        elif isinstance(result, dict):
+            chapters = result.get('chapters', [])
+        else:
+            chapters = []
+        actionable = self._filter_edge_issues(
+            all_issues,
+            chapters,
+            batch_idx,
+            total_batches,
+        )
+        return all_issues, actionable
+
+    def _batch_cache_path(
+        self,
+        artifacts_dir: Optional[Path],
+        batch_pages: List[int],
+    ) -> Optional[Path]:
+        if artifacts_dir is None:
+            return None
+        page_key = hashlib.sha256(
+            ",".join(str(page) for page in batch_pages).encode("utf-8")
+        ).hexdigest()[:16]
+        return artifacts_dir / "batch_cache" / f"{page_key}.json"
+
+    def _batch_cache_fingerprint(
+        self,
+        *,
+        prompt: str,
+        pdf_data: bytes,
+        batch_pages: List[int],
+    ) -> str:
+        payload = {
+            "version": 1,
+            "operation": self.operation_name,
+            "model": self.model,
+            "transport": (
+                self._pdf_transport.cache_identity()
+                if hasattr(self._pdf_transport, "cache_identity")
+                else {
+                    "type": type(self._pdf_transport).__qualname__,
+                }
+            ),
+            "prompt": prompt,
+            "pages": batch_pages,
+            "pdf_sha256": hashlib.sha256(pdf_data).hexdigest(),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _load_cached_batch_result(
+        self,
+        *,
+        cache_path: Optional[Path],
+        fingerprint: str,
+        batch_idx: int,
+        total_batches: int,
+    ) -> Any:
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                f"[{self.operation_name}] Ignoring unreadable batch cache "
+                f"{cache_path}: {exc}"
+            )
+            return None
+        if (
+            payload.get("version") != 1
+            or payload.get("fingerprint") != fingerprint
+            or "result" not in payload
+        ):
+            return None
+
+        result = payload["result"]
+        all_issues, actionable = self._get_actionable_batch_issues(
+            result,
+            batch_idx,
+            total_batches,
+        )
+        if actionable:
+            logger.warning(
+                f"[{self.operation_name}] Cached batch result no longer "
+                f"passes validation ({len(actionable)} actionable issue(s)); "
+                "rerunning the model"
+            )
+            return None
+        logger.info(
+            f"[{self.operation_name}] Reusing validated batch result from "
+            f"{cache_path}"
+        )
+        if all_issues:
+            logger.info(
+                f"[{self.operation_name}] Cached result retains "
+                f"{len(all_issues)} tolerated edge issue(s)"
+            )
+        return result
+
     @staticmethod
-    def _get_agent_model():
+    def _save_cached_batch_result(
+        cache_path: Optional[Path],
+        fingerprint: str,
+        result: Any,
+    ) -> None:
+        if cache_path is None:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "fingerprint": fingerprint,
+                    "result": result,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        tmp_path.replace(cache_path)
+
+    def _get_agent_model(self):
         """
         Get a pydantic-ai Model for the JSON repair agent.
 
-        Priority: Anthropic Haiku (best at tool use) > config refine.agent > Poe fallback.
-        Mirrors boundary_agent.get_model_and_limits() pattern.
+        Priority: explicit refine.agent > legacy Anthropic Haiku default >
+        legacy Poe fallback.
         """
-        config = load_config()
+        config = self._runtime_config
         providers = config.get('credentials', {}).get('providers', {})
 
-        # Priority 1: Anthropic (Haiku — fast, good at tool use)
+        # Explicit selection must win even when legacy provider credentials
+        # are also present. Otherwise a requested model upgrade is silently
+        # ignored merely because an Anthropic key exists in the same config.
+        agent_cfg = config.get('refine', {}).get('agent', {})
+        if agent_cfg:
+            provider_name = agent_cfg.get('provider')
+            model_name = agent_cfg.get('model')
+            if not provider_name or not model_name:
+                raise ValueError(
+                    "refine.agent requires both provider and model"
+                )
+            if provider_name not in providers:
+                raise ValueError(
+                    f"refine.agent provider '{provider_name}' is not configured"
+                )
+
+            p = providers[provider_name]
+            provider_type = p.get('type') or (
+                'anthropic' if provider_name == 'anthropic' else 'openai'
+            )
+            if provider_type == 'anthropic':
+                from pydantic_ai.models.anthropic import AnthropicModel
+                from pydantic_ai.providers.anthropic import AnthropicProvider
+                provider = AnthropicProvider(
+                    api_key=p.get('api_key'),
+                    base_url=p.get('base_url'),
+                )
+                logger.info(f"[agent-model] Using explicit Anthropic {model_name}")
+                return AnthropicModel(model_name, provider=provider)
+            if provider_type == 'openai':
+                from pydantic_ai.models.openai import OpenAIChatModel
+                from pydantic_ai.providers.openai import OpenAIProvider
+                provider = OpenAIProvider(
+                    api_key=p.get('api_key'),
+                    base_url=p.get('base_url'),
+                )
+                logger.info(f"[agent-model] Using explicit OpenAI-compat {model_name}")
+                return OpenAIChatModel(model_name, provider=provider)
+            if provider_type == 'google':
+                from pydantic_ai.models.google import GoogleModel
+                from pydantic_ai.providers.google import GoogleProvider
+                from google.genai import Client
+                from google.genai.types import HttpOptions
+                client = Client(
+                    api_key=p.get('api_key'),
+                    http_options=HttpOptions(base_url=p.get('base_url')),
+                )
+                google_provider = GoogleProvider(client=client)
+                logger.info(f"[agent-model] Using explicit Google {model_name}")
+                return GoogleModel(model_name, provider=google_provider)
+            raise ValueError(
+                f"Unsupported refine.agent provider type '{provider_type}'"
+            )
+
+        # Backward-compatible default: Anthropic Haiku.
         if 'anthropic' in providers:
             from pydantic_ai.models.anthropic import AnthropicModel
             from pydantic_ai.providers.anthropic import AnthropicProvider
@@ -460,36 +812,7 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             logger.info(f"[agent-model] Using Anthropic {model_name}")
             return AnthropicModel(model_name, provider=provider)
 
-        # Priority 2: Explicit refine.agent config
-        agent_cfg = config.get('refine', {}).get('agent', {})
-        if agent_cfg.get('provider') and agent_cfg.get('model'):
-            provider_name = agent_cfg['provider']
-            model_name = agent_cfg['model']
-            if provider_name in providers:
-                p = providers[provider_name]
-                provider_type = p.get('type', 'openai')
-                if provider_type == 'openai':
-                    from pydantic_ai.models.openai import OpenAIChatModel
-                    from pydantic_ai.providers.openai import OpenAIProvider
-                    provider = OpenAIProvider(
-                        api_key=p.get('api_key'),
-                        base_url=p.get('base_url'),
-                    )
-                    logger.info(f"[agent-model] Using OpenAI-compat {model_name}")
-                    return OpenAIChatModel(model_name, provider=provider)
-                elif provider_type == 'google':
-                    from pydantic_ai.models.google import GoogleModel, GoogleProvider
-                    from google.genai import Client
-                    from google.genai.types import HttpOptions
-                    client = Client(
-                        api_key=p.get('api_key'),
-                        http_options=HttpOptions(base_url=p.get('base_url')),
-                    )
-                    gp = GoogleProvider(client=client)
-                    logger.info(f"[agent-model] Using Google {model_name}")
-                    return GoogleModel(model_name, provider=gp)
-
-        # Priority 3: Poe fallback (Gemini-2.5-Flash)
+        # Final backward-compatible fallback.
         if 'poe' in providers:
             from pydantic_ai.models.openai import OpenAIChatModel
             from pydantic_ai.providers.openai import OpenAIProvider
@@ -507,43 +830,82 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             "Need 'anthropic' or 'poe' in credentials.providers."
         )
 
-    def _build_generate_fn(self, parts, config, op_name):
+    def _build_generate_fn(self, prompt, pdf_data, config, op_name):
         """
         Build a generate_fn closure for the agent loop.
 
         The returned function follows the contract:
             generate_fn(prefix=None) -> str
 
-        When prefix is None: single-turn call with original parts.
-        When prefix is provided: multi-turn continuation (user → model → user).
+        Transport implementations decide how to represent a continuation. The
+        prefix is always the JSON agent's validated content, never a partial
+        response guessed by this orchestration layer.
         """
         def generate_fn(prefix=None):
-            if prefix is None:
-                contents = parts
-            else:
-                # Multi-turn continuation for Gemini cache optimization:
-                # Message 1 [User]: original prompt + PDF (unchanged → cache hit)
-                # Message 2 [Model]: cleaned prefix (prefix unchanged → partial cache hit)
-                # Message 3 [User]: continuation instruction
-                contents = [
-                    Content(role="user", parts=[
-                        Part(text=p) if isinstance(p, str) else p
-                        for p in parts
-                    ]),
-                    Content(role="model", parts=[Part(text=prefix)]),
-                    Content(role="user", parts=[Part(text="Continue from where you left off. Output only the remaining JSON content, no preamble.")]),
-                ]
-            return self.client.generate_content_stream(
+            return self._pdf_transport.generate_pdf(
                 model=self.model,
-                contents=contents,
+                prompt=prompt,
+                pdf_data=pdf_data,
                 config=config,
                 operation_name=op_name,
+                prefix=prefix,
             )
         return generate_fn
 
     def validate_merge(self, merged: Any, original_results: List) -> bool:
         """Validate merged result. Return True if acceptable."""
         return True
+
+    def get_merge_validation_issues(
+        self,
+        merged: Any,
+        original_results: List,
+    ) -> List[str]:
+        """Return concrete merge problems, or an empty list on success.
+
+        Existing callers can keep overriding ``validate_merge``.  Concrete
+        calls should override this method when they can provide actionable
+        diagnostics for a model retry.
+        """
+        if self.validate_merge(merged, original_results):
+            return []
+        return ["The merged result failed structural validation."]
+
+    def get_merge_evidence_issues(
+        self,
+        merged: Any,
+        original_results: List,
+        batch_pages: Optional[List[List[int]]],
+    ) -> List[str]:
+        """Validate claims that depend on concrete per-batch PDF evidence."""
+        return []
+
+    def build_merge_repair_prompt(
+        self,
+        original_prompt: str,
+        merged: Any,
+        issues: List[str],
+    ) -> str:
+        """Request a corrected merge using the actual validator feedback."""
+        issues_text = "\n".join(f"- {issue}" for issue in issues)
+        candidate_json = json.dumps(merged, ensure_ascii=False, indent=2)
+        if len(candidate_json) > 16000:
+            candidate_json = candidate_json[:16000] + "\n... (truncated)"
+
+        return f"""{original_prompt}
+
+--- YOUR PREVIOUS MERGE FAILED STRUCTURAL VALIDATION ---
+
+Validator findings:
+{issues_text}
+
+Previous merged candidate:
+{candidate_json}
+
+Return the complete corrected JSON. Re-evaluate the per-batch PDF-page
+evidence in the original prompt; do not repeat a page value that the
+validator identified as unsupported or overlapping.
+"""
 
     def parse_result(self, response_text: str) -> Any:
         """Parse LLM response. Default: parse as JSON."""
@@ -552,23 +914,21 @@ Look at the PDF pages carefully to verify page numbers are correct."""
     def _build_merge_generate_fn(self, prompt, config, op_name):
         """Build a generate_fn for merge (text-only, no PDF)."""
         def generate_fn(prefix=None):
-            if prefix is None:
-                contents = [prompt]
-            else:
-                contents = [
-                    Content(role="user", parts=[Part(text=prompt)]),
-                    Content(role="model", parts=[Part(text=prefix)]),
-                    Content(role="user", parts=[Part(text="Continue from where you left off. Output only the remaining JSON content, no preamble.")]),
-                ]
-            return self.client.generate_content_stream(
+            return self._pdf_transport.generate_text(
                 model=self.model,
-                contents=contents,
+                prompt=prompt,
                 config=config,
                 operation_name=op_name,
+                prefix=prefix,
             )
         return generate_fn
 
-    def merge_results(self, results: List, artifacts_dir: Optional[Path] = None) -> Any:
+    def merge_results(
+        self,
+        results: List,
+        artifacts_dir: Optional[Path] = None,
+        batch_pages: Optional[List[List[int]]] = None,
+    ) -> Any:
         """
         Merge results from multiple batches.
 
@@ -580,13 +940,19 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             return results[0]
 
         # Load agent config
-        agent_config = load_config().get('refine', {})
+        agent_config = self._runtime_config.get('refine', {})
         request_limit = agent_config.get('agent_request_limit', 100)
         max_continuations = agent_config.get('max_continuations', 5)
 
         merged = None
+        if batch_pages is None:
+            # Keep the base class compatible with small external subclasses
+            # that still implement the historical one-argument hook.
+            base_prompt = self.build_merge_prompt(results)
+        else:
+            base_prompt = self.build_merge_prompt(results, batch_pages=batch_pages)
+        prompt = base_prompt
         for attempt in range(1 + self.merge_max_retries):
-            prompt = self.build_merge_prompt(results)
             config = self.client.get_default_config(temperature=0.1)
             # NOTE: No response_mime_type="application/json" — agent loop
             # handles JSON validation. Continuation fragments are not valid JSON.
@@ -629,7 +995,15 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                     continue
                 raise
 
-            if self.validate_merge(merged, results):
+            issues = self.get_merge_validation_issues(merged, results)
+            issues.extend(
+                self.get_merge_evidence_issues(
+                    merged,
+                    results,
+                    batch_pages,
+                )
+            )
+            if not issues:
                 logger.info(
                     f"[{self.operation_name}] Merged {len(results)} batches successfully"
                 )
@@ -639,12 +1013,23 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                 f"[{self.operation_name}] Merge validation failed "
                 f"(attempt {attempt + 1}/{1 + self.merge_max_retries})"
             )
+            for issue in issues[:5]:
+                logger.warning(f"  - {issue}")
+            if len(issues) > 5:
+                logger.warning(f"  ... and {len(issues) - 5} more")
+            if attempt < self.merge_max_retries:
+                # Repair prompts always start from the same evidence. Building
+                # on the previous repair prompt recursively would duplicate
+                # the full batch payload and grow the request every round.
+                prompt = self.build_merge_repair_prompt(base_prompt, merged, issues)
 
-        logger.warning(
-            f"[{self.operation_name}] Merge validation still failing after retries, "
-            f"using best result"
+        message = (
+            f"[{self.operation_name}] Merge validation failed after "
+            f"{1 + self.merge_max_retries} attempt(s); refusing to continue "
+            f"with an untrusted structure result"
         )
-        return merged
+        logger.error(message)
+        raise MergeValidationError(message)
 
     def run(self, pdf_path: Path, pages: List[int], artifacts_dir: Optional[Path] = None) -> Any:
         """
@@ -680,14 +1065,30 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             original_prompt = self.build_prompt(batch_pages, batch_idx, total_batches)
             prompt = original_prompt
             result = None
+            cache_path = self._batch_cache_path(
+                artifacts_dir,
+                batch_pages,
+            )
+            cache_fingerprint = self._batch_cache_fingerprint(
+                prompt=original_prompt,
+                pdf_data=pdf_data,
+                batch_pages=batch_pages,
+            )
+            cached_result = self._load_cached_batch_result(
+                cache_path=cache_path,
+                fingerprint=cache_fingerprint,
+                batch_idx=batch_idx,
+                total_batches=total_batches,
+            )
+            if cached_result is not None:
+                return cached_result
 
             # Load agent config
-            agent_config = load_config().get('refine', {})
+            agent_config = self._runtime_config.get('refine', {})
             request_limit = agent_config.get('agent_request_limit', 100)
             max_continuations = agent_config.get('max_continuations', 5)
 
             for attempt in range(1 + self.batch_validation_retries):
-                parts = [prompt, Part.from_bytes(data=pdf_data, mime_type="application/pdf")]
                 config = self.client.get_default_config(temperature=0.1)
                 # NOTE: No response_mime_type="application/json" — the agent loop
                 # handles JSON validation. Continuation fragments are not valid JSON,
@@ -700,7 +1101,7 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                     op_name += f" (fix {attempt})"
 
                 # Agent loop: generate → agent inspects → continue/complete
-                generate_fn = self._build_generate_fn(parts, config, op_name)
+                generate_fn = self._build_generate_fn(prompt, pdf_data, config, op_name)
                 batch_artifacts = None
                 if artifacts_dir:
                     batch_artifacts = artifacts_dir / f"batch_{batch_idx+1}_attempt_{attempt+1}"
@@ -737,20 +1138,30 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                     raise
 
                 # Run batch validation hook
-                all_issues = self.validate_batch_result(result, batch_idx, total_batches)
-                if not all_issues:
-                    return result
-
-                # Filter out edge issues (expected at batch boundaries)
-                chapters = result.get('chapters', []) if isinstance(result, dict) else []
-                actionable_issues = self._filter_edge_issues(
-                    all_issues, chapters, batch_idx, total_batches
+                all_issues, actionable_issues = (
+                    self._get_actionable_batch_issues(
+                        result,
+                        batch_idx,
+                        total_batches,
+                    )
                 )
+                if not all_issues:
+                    self._save_cached_batch_result(
+                        cache_path,
+                        cache_fingerprint,
+                        result,
+                    )
+                    return result
 
                 if not actionable_issues:
                     logger.info(
                         f"[{self.operation_name}] Batch {batch_idx+1}/{total_batches}: "
                         f"{len(all_issues)} edge issue(s) tolerated"
+                    )
+                    self._save_cached_batch_result(
+                        cache_path,
+                        cache_fingerprint,
+                        result,
                     )
                     return result
 
@@ -773,20 +1184,31 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                     )
                     for issue in actionable_issues[:5]:
                         logger.warning(f"  - {issue}")
+                    raise BatchValidationError(
+                        f"[{self.operation_name}] Batch "
+                        f"{batch_idx+1}/{total_batches} remained invalid after "
+                        f"{1 + self.batch_validation_retries} attempt(s); "
+                        "refusing to continue with an untrusted batch result"
+                    )
 
             return result
 
         # Check if rasterization is available
         can_rasterize = self._prepare_pdf_rasterized is not None
 
-        results = run_adaptive_batches(
+        results, successful_batches = run_adaptive_batches(
             pages, process_batch, self._learner, is_503_error,
             self.operation_name, overlap=self.overlap,
             can_rasterize=can_rasterize,
+            return_batches=True,
         )
 
         merge_artifacts = artifacts_dir / "merge" if artifacts_dir else None
-        return self.merge_results(results, artifacts_dir=merge_artifacts)
+        return self.merge_results(
+            results,
+            artifacts_dir=merge_artifacts,
+            batch_pages=successful_batches,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -800,6 +1222,9 @@ class TocDetectionCall(AdaptivePdfCall):
     overlap = 0
 
     def build_prompt(self, batch_pages, batch_idx, total_batches):
+        observed = getattr(self, '_observed_pages_by_batch', {})
+        observed[batch_idx] = set(batch_pages)
+        self._observed_pages_by_batch = observed
         return """Analyze this PDF and find the Table of Contents (TOC) pages.
 
 Look for pages that contain:
@@ -822,12 +1247,91 @@ If no TOC exists, return: {"has_toc": false, "toc_start": null, "toc_end": null}
     def parse_result(self, response_text):
         result = parse_llm_json(response_text, operation_name=self.operation_name)
         if not isinstance(result, dict):
-            logger.warning(f"TOC detection returned {type(result)}, expected dict")
-            return {'has_toc': False, 'toc_start': None, 'toc_end': None}
-        return result
+            raise ValueError(
+                f"TOC detection returned {type(result).__name__}, expected object"
+            )
 
-    def merge_results(self, results, artifacts_dir=None):
+        has_toc = result.get('has_toc')
+        if not isinstance(has_toc, bool):
+            raise ValueError("TOC detection result must contain boolean 'has_toc'")
+        if not has_toc:
+            return {
+                'has_toc': False,
+                'toc_start': None,
+                'toc_end': None,
+            }
+
+        toc_start = result.get('toc_start')
+        toc_end = result.get('toc_end')
+        if (
+            not isinstance(toc_start, int)
+            or isinstance(toc_start, bool)
+            or not isinstance(toc_end, int)
+            or isinstance(toc_end, bool)
+            or toc_start < 1
+            or toc_end < toc_start
+        ):
+            raise ValueError(
+                "TOC detection with has_toc=true requires positive integer "
+                "toc_start/toc_end with toc_end >= toc_start"
+            )
+        return {
+            'has_toc': True,
+            'toc_start': toc_start,
+            'toc_end': toc_end,
+        }
+
+    def validate_batch_result(self, result, batch_idx, total_batches):
+        if not result.get('has_toc'):
+            return []
+        observed = getattr(self, '_observed_pages_by_batch', {}).get(
+            batch_idx,
+            set(),
+        )
+        return self._toc_evidence_issues(result, observed)
+
+    @staticmethod
+    def _toc_evidence_issues(result, observed):
+        start = result['toc_start']
+        end = result['toc_end']
+        claimed_count = end - start + 1
+        if claimed_count > len(observed):
+            return [
+                f"TOC claims {claimed_count} contiguous pages (p{start}-p{end}) "
+                f"but this batch observed only {len(observed)} page(s)"
+            ]
+        unsupported = [
+            page
+            for page in range(start, end + 1)
+            if page not in observed
+        ]
+        if unsupported:
+            return [
+                "TOC range includes page(s) not observed in this PDF batch: "
+                + ", ".join(str(page) for page in unsupported[:10])
+            ]
+        return []
+
+    def merge_results(self, results, artifacts_dir=None, batch_pages=None):
         """Rule-based: pick first result with has_toc=True."""
+        if batch_pages is not None and len(batch_pages) != len(results):
+            raise MergeValidationError(
+                "TOC batch evidence does not align with detection results"
+            )
+        if batch_pages is not None:
+            for index, result in enumerate(results):
+                if not isinstance(result, dict) or not result.get('has_toc'):
+                    continue
+                observed = set(batch_pages[index])
+                evidence_issues = self._toc_evidence_issues(
+                    result,
+                    observed,
+                )
+                if evidence_issues:
+                    raise MergeValidationError(
+                        evidence_issues[0]
+                    )
+
         if len(results) == 1:
             return results[0]
 
@@ -851,12 +1355,24 @@ class DirectAnalysisCall(AdaptivePdfCall):
     merge_max_retries = 2
 
     def __init__(self, client, model, prepare_pdf, learner, book_title: str,
-                 toc_reference: str = None, prepare_pdf_rasterized: Callable = None):
-        super().__init__(client, model, prepare_pdf, learner, prepare_pdf_rasterized)
+                 toc_reference: str = None, prepare_pdf_rasterized: Callable = None,
+                 pdf_transport: Optional[PdfTransport] = None,
+                 overlap_pages: Optional[int] = None,
+                 runtime_config: Optional[dict] = None):
+        super().__init__(
+            client, model, prepare_pdf, learner, prepare_pdf_rasterized,
+            pdf_transport=pdf_transport,
+            runtime_config=runtime_config,
+        )
         self.book_title = book_title
         self.toc_reference = toc_reference
+        if overlap_pages is not None:
+            self.overlap = max(0, int(overlap_pages))
 
     def build_prompt(self, batch_pages, batch_idx, total_batches):
+        observed = getattr(self, '_observed_pages_by_batch', {})
+        observed[batch_idx] = set(batch_pages)
+        self._observed_pages_by_batch = observed
         batch_start, batch_end = min(batch_pages), max(batch_pages)
         batch_num = batch_idx + 1
         is_first = (batch_idx == 0)
@@ -1017,16 +1533,42 @@ A short book may have fewer chapters, but every chapter must be listed.
 - Your output must contain ALL chapters — do not stop after metadata
 """
 
-    def build_merge_prompt(self, results):
+    @staticmethod
+    def _format_observed_page_set(pages: List[int]) -> str:
+        """Compact a concrete PDF page set without implying missing pages exist."""
+        if not pages:
+            return "(no PDF pages observed)"
+
+        ranges = []
+        start = previous = pages[0]
+        for page in pages[1:]:
+            if page == previous + 1:
+                previous = page
+                continue
+            ranges.append(str(start) if start == previous else f"{start}-{previous}")
+            start = previous = page
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        return ", ".join(ranges)
+
+    def build_merge_prompt(self, results, batch_pages=None):
         batch_chapters = [
             r if isinstance(r, list) else r.get('chapters', [])
             for r in results
         ]
 
+        if batch_pages is not None and len(batch_pages) != len(batch_chapters):
+            raise ValueError(
+                "Merge batch evidence does not align with the batch results "
+                f"({len(batch_pages)} page sets for {len(batch_chapters)} results)"
+            )
+
         batch_summaries = []
         for i, chapters in enumerate(batch_chapters):
+            page_evidence = "not recorded"
+            if batch_pages is not None:
+                page_evidence = self._format_observed_page_set(batch_pages[i])
             batch_summaries.append(
-                f"=== Batch {i+1}/{len(batch_chapters)} ===\n"
+                f"=== Batch {i+1}/{len(batch_chapters)} | OBSERVED PDF PAGES: {page_evidence} ===\n"
                 f"{json.dumps(chapters, ensure_ascii=False, indent=2)}"
             )
 
@@ -1038,11 +1580,22 @@ Each batch analyzed a different page range with some overlap. The overlap region
 
 Rules:
 1. Each chapter should appear exactly ONCE
-2. If two batches have the same chapter, use the one with the more accurate page range
-3. A chapter that appears as a top-level entry in one batch but as a child in another — trust the batch that saw MORE context around it
-4. Preserve the hierarchical structure (children nested under parents)
-5. Chapters must be ordered by start_page
-6. Do NOT invent chapters that don't appear in any batch
+2. The ``OBSERVED PDF PAGES`` declaration is evidence, not decoration. A batch
+   can support a start_page or end_page only when that exact physical PDF page
+   is in its observed page set. A value outside that set may have been copied
+   from the book TOC or inferred globally; it must never override an in-range
+   value from another batch.
+3. Reconcile start_page and end_page independently. For each bound, prefer an
+   in-range claim from the batch that actually saw that page. Do not use a
+   batch merely because it has more nodes or a wider-looking hierarchy.
+4. A chapter that appears as a top-level entry in one batch but as a child in
+   another should use the hierarchy supported by the batch that observes the
+   relevant heading and its surrounding pages.
+5. Preserve the hierarchical structure (children nested under parents).
+6. Chapters must be ordered by start_page and must not overlap as siblings.
+7. Do NOT invent chapters or page numbers. If no candidate has visual
+   page-range support for a required bound, return null for that bound rather
+   than guessing; the caller will fail closed and request a new analysis.
 
 Batch results:
 {chr(10).join(batch_summaries)}
@@ -1068,44 +1621,329 @@ Return a single JSON object:
             chapters = result.get('chapters', [])
         if not chapters:
             return ["No chapters extracted — output appears truncated or incomplete"]
-        return validate_chapter_structure(chapters)
+        issues = validate_chapter_structure(chapters)
+        if total_batches == 1:
+            observed = getattr(
+                self,
+                '_observed_pages_by_batch',
+                {},
+            ).get(batch_idx, set())
+            for _node_path, chapter in _iter_chapter_paths(chapters):
+                for field in ('start_page', 'end_page'):
+                    value = chapter.get(field)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value not in observed
+                    ):
+                        issues.append(
+                            f"Single-batch {field}={value} for "
+                            f"{chapter.get('title')!r} was not observed"
+                        )
+        return issues
 
-    def validate_merge(self, merged, original_results):
+    def get_merge_validation_issues(self, merged, original_results):
         # LLM may return a bare list instead of {"chapters": [...]}
         if isinstance(merged, list):
             merged_chapters = merged
         else:
             merged_chapters = merged.get('chapters', [])
 
-        # Check 1: chapter count sanity
-        all_titles = set()
+        expected_title_counts: Counter[str] = Counter()
+        allowed_paths: set[Tuple[str, ...]] = set()
         for r in original_results:
             chapters = r if isinstance(r, list) else r.get('chapters', [])
-            for ch in chapters:
-                all_titles.add(ch.get('title', '').strip().lower())
-        expected_min = max(1, len(all_titles) // 2)
-
-        if len(merged_chapters) < expected_min:
-            logger.warning(
-                f"Merge returned {len(merged_chapters)} chapters "
-                f"(expected >={expected_min})"
+            batch_title_counts = Counter(
+                path[-1]
+                for path, _chapter in _iter_chapter_paths(chapters)
+                if path[-1]
             )
-            return False
-
-        # Check 2: structural validity
-        issues = validate_chapter_structure(merged_chapters)
-        if issues:
-            logger.warning(
-                f"Merge has {len(issues)} structural issues:"
+            for title_key, count in batch_title_counts.items():
+                expected_title_counts[title_key] = max(
+                    expected_title_counts[title_key],
+                    count,
+                )
+            allowed_paths.update(
+                path
+                for path, _chapter in _iter_chapter_paths(chapters)
+                if all(path)
             )
-            for issue in issues[:5]:
-                logger.warning(f"  - {issue}")
-            return False
 
-        return True
+        merged_path_nodes = list(_iter_chapter_paths(merged_chapters))
+        merged_title_counts = Counter(
+            path[-1]
+            for path, _chapter in merged_path_nodes
+            if path[-1]
+        )
+        missing_titles = sorted(
+            (
+                title_key,
+                expected_count - merged_title_counts[title_key],
+            )
+            for title_key, expected_count in expected_title_counts.items()
+            if merged_title_counts[title_key] < expected_count
+        )
+        unexpected_paths = [
+            path
+            for path, _chapter in merged_path_nodes
+            if all(path) and path not in allowed_paths
+        ]
+        structural_issues = validate_chapter_structure(merged_chapters)
+        return [
+            *(
+                [
+                    f"Merge omitted source chapter occurrence(s): "
+                    f"{missing_titles[:10]}"
+                ]
+                if missing_titles
+                else []
+            ),
+            *(
+                [
+                    "Merge placed chapter(s) under unsupported parent path(s): "
+                    + repr(unexpected_paths[:10])
+                ]
+                if unexpected_paths
+                else []
+            ),
+            *structural_issues,
+        ]
 
-    def merge_results(self, results, artifacts_dir=None):
+    def get_merge_evidence_issues(
+        self,
+        merged,
+        original_results,
+        batch_pages,
+    ):
+        if batch_pages is None:
+            return []
+        if len(batch_pages) != len(original_results):
+            return [
+                "Merge batch evidence count does not match source result count"
+            ]
+
+        source_occurrences = defaultdict(list)
+        for result, observed_pages in zip(original_results, batch_pages):
+            chapters = result if isinstance(result, list) else result.get(
+                'chapters',
+                [],
+            )
+            observed = set(observed_pages)
+            for node_path, chapter in _iter_chapter_paths(chapters):
+                if not all(node_path):
+                    continue
+                start = chapter.get('start_page')
+                end = chapter.get('end_page')
+                if not (
+                    isinstance(start, int)
+                    and not isinstance(start, bool)
+                    and isinstance(end, int)
+                    and not isinstance(end, bool)
+                    and start >= 1
+                    and end >= start
+                ):
+                    continue
+                evidence_pages = {
+                    page
+                    for page in observed
+                    if start <= page <= end
+                }
+                if not evidence_pages:
+                    # A TOC-derived/global claim wholly outside this batch is
+                    # not physical evidence for an occurrence.
+                    continue
+                source_occurrences[node_path].append(
+                    {
+                        'raw_interval': (start, end),
+                        'evidence_pages': evidence_pages,
+                        'supported_starts': (
+                            {start} if start in observed else set()
+                        ),
+                        'supported_ends': (
+                            {end} if end in observed else set()
+                        ),
+                    }
+                )
+
+        # The same physical chapter can be reported by multiple overlapping
+        # batches. Collapse source intervals only when they overlap; disjoint
+        # intervals with the same structural path remain distinct occurrences.
+        components_by_path = {}
+        for node_path, occurrences in source_occurrences.items():
+            components = []
+            for occurrence in sorted(
+                occurrences,
+                key=lambda item: (
+                    min(item['evidence_pages']),
+                    max(item['evidence_pages']),
+                ),
+            ):
+                overlapping = [
+                    index
+                    for index, component in enumerate(components)
+                    if (
+                        component['evidence_pages']
+                        & occurrence['evidence_pages']
+                        or occurrence['raw_interval']
+                        in component['raw_intervals']
+                    )
+                ]
+                if not overlapping:
+                    components.append(
+                        {
+                            'evidence_pages': set(
+                                occurrence['evidence_pages']
+                            ),
+                            'raw_intervals': {
+                                occurrence['raw_interval']
+                            },
+                            'supported_starts': set(
+                                occurrence['supported_starts']
+                            ),
+                            'supported_ends': set(
+                                occurrence['supported_ends']
+                            ),
+                        }
+                    )
+                    continue
+
+                primary = components[overlapping[0]]
+                primary['evidence_pages'].update(
+                    occurrence['evidence_pages']
+                )
+                primary['raw_intervals'].add(
+                    occurrence['raw_interval']
+                )
+                primary['supported_starts'].update(
+                    occurrence['supported_starts']
+                )
+                primary['supported_ends'].update(
+                    occurrence['supported_ends']
+                )
+                for index in reversed(overlapping[1:]):
+                    other = components.pop(index)
+                    primary['evidence_pages'].update(
+                        other['evidence_pages']
+                    )
+                    primary['raw_intervals'].update(
+                        other['raw_intervals']
+                    )
+                    primary['supported_starts'].update(
+                        other['supported_starts']
+                    )
+                    primary['supported_ends'].update(
+                        other['supported_ends']
+                    )
+            components_by_path[node_path] = components
+
+        merged_chapters = (
+            merged
+            if isinstance(merged, list)
+            else merged.get('chapters', [])
+        )
+        merged_occurrences = defaultdict(list)
+        for node_path, chapter in _iter_chapter_paths(merged_chapters):
+            start = chapter.get('start_page')
+            end = chapter.get('end_page')
+            if (
+                all(node_path)
+                and isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+            ):
+                merged_occurrences[node_path].append(
+                    {
+                        'start': start,
+                        'end': end,
+                        'title': chapter.get('title', ''),
+                    }
+                )
+
+        issues = []
+        for node_path, components in components_by_path.items():
+            merged_nodes = merged_occurrences.get(node_path, [])
+            if len(merged_nodes) != len(components):
+                issues.append(
+                    f"Merge has {len(merged_nodes)} occurrence(s) for "
+                    f"path {node_path!r}; source evidence has "
+                    f"{len(components)} distinct physical occurrence(s)"
+                )
+                continue
+
+            candidates = []
+            for merged_node in merged_nodes:
+                candidates.append(
+                    [
+                        index
+                        for index, component in enumerate(components)
+                        if (
+                            merged_node['start']
+                            in component['supported_starts']
+                            and merged_node['end']
+                            in component['supported_ends']
+                        )
+                    ]
+                )
+            if any(not candidate_set for candidate_set in candidates):
+                issues.append(
+                    f"Merge combined unsupported bounds for path "
+                    f"{node_path!r}; each occurrence must take start/end "
+                    "claims from one overlapping source-evidence component"
+                )
+                continue
+
+            # Bipartite matching prevents two merged nodes from consuming the
+            # same physical source occurrence.
+            matched_component = {}
+
+            def assign(node_index, seen):
+                for component_index in candidates[node_index]:
+                    if component_index in seen:
+                        continue
+                    seen.add(component_index)
+                    previous = matched_component.get(component_index)
+                    if previous is None or assign(previous, seen):
+                        matched_component[component_index] = node_index
+                        return True
+                return False
+
+            if not all(
+                assign(node_index, set())
+                for node_index in range(len(merged_nodes))
+            ):
+                issues.append(
+                    f"Merge occurrence mapping is ambiguous or duplicated for "
+                    f"path {node_path!r}"
+                )
+
+        for node_path in merged_occurrences:
+            if node_path not in components_by_path:
+                issues.append(
+                    f"Merge path {node_path!r} has no source occurrence evidence"
+                )
+            if len(issues) >= 20:
+                return issues
+        return issues
+
+    def merge_results(self, results, artifacts_dir=None, batch_pages=None):
         if len(results) == 1:
+            issues = self.get_merge_validation_issues(
+                results[0],
+                results,
+            )
+            issues.extend(
+                self.get_merge_evidence_issues(
+                    results[0],
+                    results,
+                    batch_pages,
+                )
+            )
+            if issues:
+                raise MergeValidationError(
+                    f"[{self.operation_name}] Single-batch result failed "
+                    f"evidence validation: {issues[:5]}"
+                )
             return results[0]
 
         # Extract metadata from first/last batch (rule-based, no LLM needed)
@@ -1127,7 +1965,11 @@ Return a single JSON object:
                 metadata['back_cover'] = result.get('back_cover')
 
         # LLM merge for chapters (via base class)
-        merged = super().merge_results(results, artifacts_dir=artifacts_dir)
+        merged = super().merge_results(
+            results,
+            artifacts_dir=artifacts_dir,
+            batch_pages=batch_pages,
+        )
 
         # LLM may return a bare list instead of {"chapters": [...]}
         if isinstance(merged, list):

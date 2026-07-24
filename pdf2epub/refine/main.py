@@ -24,6 +24,7 @@ from .toc_tree import TOCNode, dict_list_to_toc_tree
 from .refiner_state import RefinerState
 from .boundary_agent import verify_toc_recursive, get_model_max_tokens
 from .structure_analyzer import StructureAnalyzer
+from .pdf_transport import create_pdf_transport
 from .page_merger import PageMerger
 
 # Initialize tokenizer
@@ -61,7 +62,7 @@ class RefinedBreakdown:
 
         # Get max_tokens from boundary_agent's model config if not specified
         if max_tokens is None:
-            max_tokens = get_model_max_tokens()
+            max_tokens = get_model_max_tokens(config)
         self.max_tokens = max_tokens
 
         # Get refine config with backward compatibility
@@ -84,12 +85,19 @@ class RefinedBreakdown:
         llm_client = LLMClient(config)
         structure_client = BoundLLMClient(llm_client, structure_provider)
         verification_client = BoundLLMClient(llm_client, verification_provider)
+        pdf_transport = create_pdf_transport(
+            config=config,
+            structure_provider=structure_provider,
+            structure_client=structure_client,
+            transport_config=structure_config.get('pdf_transport'),
+        )
 
         # Initialize components with their respective clients
         self.structure_analyzer = StructureAnalyzer(
             structure_client, structure_model, toc_model,
             verification_client, verification_model,
-            config
+            config,
+            pdf_transport=pdf_transport,
         )
         # Note: BoundaryVerifier and GapAnalyzer replaced by boundary_agent
         self.page_merger = PageMerger()
@@ -100,7 +108,7 @@ class RefinedBreakdown:
         pdf_path: Path,
         output_dir: Path,
         book_title: str,
-        resume: bool = False
+        resume: bool = False,
     ) -> List[Dict]:
         """
         Main entry point: process PDF and generate work units.
@@ -150,8 +158,8 @@ class RefinedBreakdown:
         toc_tree_file = output_dir / "toc_tree.json"
         toc_tree_original = output_dir / "toc_tree_original.json"
 
-        # Priority: toc_tree_original > toc_tree > run analysis
-        # Always use original if available (agent may have modified toc_tree)
+        # Priority: toc_tree_original > toc_tree > analysis.
+        # Always use original if available (agent may have modified toc_tree).
         if toc_tree_original.exists() and resume:
             logger.info("Loading original TOC tree for verification")
             with open(toc_tree_original, 'r', encoding='utf-8') as f:
@@ -181,7 +189,6 @@ class RefinedBreakdown:
             # Insert table_of_contents as a chapter if it exists
             toc_info = book_metadata.get('table_of_contents')
             if toc_info and toc_info.get('start_page') and toc_info.get('end_page'):
-                from .toc_tree import TOCNode
                 toc_chapter = TOCNode(
                     title="Table of Contents",
                     level=1,
@@ -225,10 +232,12 @@ class RefinedBreakdown:
                 toc_tree = asyncio.run(verify_toc_recursive(
                     toc_tree, pages_dir, total_pages,
                     max_tokens=self.max_tokens,
+                    runtime_config=self.config,
                 ))
 
                 # Update toc_data with verified tree
                 toc_data['chapters'] = [node.to_dict() for node in toc_tree]
+
                 with open(toc_tree_file, 'w', encoding='utf-8') as f:
                     json.dump(toc_data, f, indent=2, ensure_ascii=False)
                 logger.success(f"Saved verified TOC tree to {toc_tree_file}")

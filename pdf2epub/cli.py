@@ -1021,6 +1021,88 @@ def translate_command(args):
     return translate_v2_command(args)
 
 
+def translate_arxiv_command(args):
+    """Translate an arXiv/local TeX project with compile-gated whole mode."""
+    from pdf2epub.tex_translation import (
+        TexTranslationOptions,
+        TexTranslationPipeline,
+    )
+    from pdf2epub.tex_translation.arxiv import (
+        ArxivSourceResolver,
+        slugify_source_id,
+    )
+    from pdf2epub.tex_translation.compiler import TexCompiler
+
+    config = load_config(args.config)
+    tex_config = config.get("tex_translation", {})
+    model_config = tex_config.get("model", {})
+    repair_config = tex_config.get("repair", {})
+    compile_config = tex_config.get("compiler", {})
+
+    options = TexTranslationOptions(
+        provider=args.provider or model_config.get("provider", "gemini"),
+        model=args.model or model_config.get("model", "gemini-3.1-pro-preview"),
+        source_language=(
+            args.source_language
+            or tex_config.get("source_language", "English")
+        ),
+        target_language=(
+            args.target_language
+            or tex_config.get("target_language", "Simplified Chinese")
+        ),
+        unit_chars=args.unit_chars or tex_config.get("unit_chars", 12_000),
+        max_retries=model_config.get("max_retries", 2),
+        use_local_cache=not args.no_local_cache,
+        repair_enabled=(
+            repair_config.get("enabled", True) and not args.no_repair
+        ),
+        repair_provider=(
+            args.repair_provider
+            or repair_config.get("provider", "codex")
+        ),
+        repair_model=(
+            args.repair_model
+            or repair_config.get("model", "gpt-5.6-luna")
+        ),
+        retry_fallbacks=args.retry_fallbacks,
+    )
+    resolver = ArxivSourceResolver()
+    if args.output_dir:
+        run_dir = Path(args.output_dir)
+    else:
+        source_id = resolver.source_id(args.source)
+        run_dir = Path("output") / "arxiv" / slugify_source_id(source_id)
+    run_dir = run_dir.resolve()
+    set_llm_trace_path(run_dir / ".pdf2epub" / "logs" / "llm_trace.jsonl")
+
+    pipeline = TexTranslationPipeline(
+        config=config,
+        options=options,
+        compiler=TexCompiler(
+            timeout_seconds=(
+                args.compile_timeout
+                or compile_config.get("timeout_seconds", 180)
+            )
+        ),
+        source_resolver=resolver,
+    )
+    try:
+        result = pipeline.run(
+            args.source,
+            run_dir=run_dir,
+            main_tex=args.main_tex,
+            limit=args.limit,
+        )
+    except Exception as exc:
+        logger.error(f"arXiv/TeX translation failed: {exc}")
+        return 1
+
+    logger.success(f"Translated TeX project: {result.project_dir}")
+    logger.success(f"Compiled PDF: {result.pdf_path}")
+    logger.info(f"State summary: {result.summary}")
+    return 0
+
+
 
 def cancel_batch_command(args):
     """Cancel active batch jobs."""
@@ -1062,6 +1144,10 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
   # Novel Translation (text mode for light novels):
   pdf2epub translate-novel -i mybook.epub     # Translate with glossary
   pdf2epub build-novel-epub                   # Rebuild EPUB from translations
+
+  # arXiv/TeX Translation (compile-gated whole mode):
+  pdf2epub translate-arxiv 2503.01800
+  pdf2epub translate-arxiv ./latex-source --main-tex paper.tex
 
 ===============================================================================
         """
@@ -1224,6 +1310,84 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Don't use longest response on failure (overrides config.yaml)"
     )
     translate_parser.set_defaults(func=translate_command)
+
+    # arXiv / TeX whole-mode translation
+    translate_arxiv_parser = subparsers.add_parser(
+        "translate-arxiv",
+        help="Translate an arXiv or local TeX project and recompile it",
+        description=(
+            "Download or copy a TeX source tree, translate it unit by unit, "
+            "commit only replacements that pass a full XeLaTeX build, and "
+            "produce a resumable translated project."
+        ),
+    )
+    translate_arxiv_parser.add_argument(
+        "source",
+        help="arXiv ID/URL, local source directory, archive, or main .tex file",
+    )
+    translate_arxiv_parser.add_argument(
+        "--main-tex",
+        help="Compilation entry point relative to the source root (auto-detected)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--output-dir",
+        help="Run directory (default: output/arxiv/<source-id>)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--provider",
+        help="Translation provider name (default: tex_translation.model.provider)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--model",
+        help="Translation model ID (default: gemini-3.1-pro-preview)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--source-language",
+        help="Source language (default: English)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--target-language",
+        help="Target language (default: Simplified Chinese)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--unit-chars",
+        type=int,
+        help="Approximate characters per TeX transaction (default: 12000)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Process only the next N pending units; the partial project still compiles",
+    )
+    translate_arxiv_parser.add_argument(
+        "--no-repair",
+        action="store_true",
+        help="On compile failure, keep the original unit without invoking an agent",
+    )
+    translate_arxiv_parser.add_argument(
+        "--repair-provider",
+        help="Whole-mode repair provider (default: codex)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--repair-model",
+        help="Whole-mode repair model (default: gpt-5.6-luna)",
+    )
+    translate_arxiv_parser.add_argument(
+        "--retry-fallbacks",
+        action="store_true",
+        help="Retry units previously kept in the source language",
+    )
+    translate_arxiv_parser.add_argument(
+        "--no-local-cache",
+        action="store_true",
+        help="Disable the content-addressed local translation response cache",
+    )
+    translate_arxiv_parser.add_argument(
+        "--compile-timeout",
+        type=int,
+        help="Seconds allowed for each full-project compile (default: 180)",
+    )
+    translate_arxiv_parser.set_defaults(func=translate_arxiv_command)
 
     # Entity extraction subcommand
     entity_parser = subparsers.add_parser(

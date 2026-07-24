@@ -29,6 +29,13 @@ credentials:
       api_key: "your-openai-api-key"
       base_url: "https://api.openai.com/v1"
 
+    # Optional: reuse the active OpenAI-compatible provider from Codex settings.
+    # No API token is copied into this file.
+    codex:
+      type: codex
+      # config_path: "~/.codex/config.toml"
+      # model_provider: "your-codex-provider"  # defaults to the active provider
+
     deepseek:
       type: openai
       api_key: "your-deepseek-api-key"
@@ -95,6 +102,25 @@ translation:
       validation_retries: 1
 
   truncation_check_lines: 3
+
+# arXiv / LaTeX whole-mode translation
+# =====================================
+# Each TeX unit is committed only after the complete project compiles with
+# ctex + XeLaTeX. Completed units and raw model responses are cached on disk.
+tex_translation:
+  source_language: English
+  target_language: Simplified Chinese
+  unit_chars: 12000
+  model:
+    provider: gemini
+    model: gemini-3.1-pro-preview
+    max_retries: 2
+  compiler:
+    timeout_seconds: 180
+  repair:
+    enabled: true
+    provider: codex
+    model: gpt-5.6-luna
 
 # HTML EPUB Build Configuration
 # =============================

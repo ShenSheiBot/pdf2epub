@@ -67,6 +67,33 @@ uv run pdf2epub build-novel-epub -c config.yaml
 - DeepSeek 作为 fallback（R18 内容无审核）
 - 支持 `--resume`、`--retranslate <chapter>`、`--limit N`
 
+### arXiv / LaTeX 翻译工作流
+
+适用于 arXiv 论文源码或本地 TeX 工程。它不经过 PDF OCR，而是直接翻译
+TeX 正文，并将“完整工程可以用 XeLaTeX 编译”作为每个翻译单元的提交条件。
+
+```bash
+# 直接下载 arXiv 源码、翻译并重新编译
+uv run pdf2epub translate-arxiv 2503.01800
+
+# 翻译本地工程；入口也可以自动识别
+uv run pdf2epub translate-arxiv ./paper-source --main-tex main.tex
+
+# 只处理下一个单元，适合先做小规模验证
+uv run pdf2epub translate-arxiv 2503.01800 --limit 1
+```
+
+该工作流会自动注入 `ctex`、递归跟踪正文中的 `\input` / `\include` /
+`\subfile`，并在 `output/arxiv/<source-id>/project` 中留下可独立重新编译的
+工程。状态、单元译文、编译日志和内容寻址缓存保存在同一运行目录的
+`.pdf2epub` 下；重复执行同一命令会从已编译成功的单元继续，不会再次请求
+LLM。只有候选译文无法编译时才调用 whole-mode repair agent；修复失败则保留
+该单元原文。默认修复模型为 `gpt-5.6-luna`，并可通过配置中的
+`type: codex` 复用本机 Codex 当前选中的 OpenAI-compatible provider，
+无需把 bearer token 复制到 `config.yaml`。
+
+需要本机安装包含 XeLaTeX、`latexmk`、`ctex` 和 Fandol 字体的 TeX Live。
+
 ## 推荐LLM：
 
 - refine / entity extraction：gemini-2.5-pro

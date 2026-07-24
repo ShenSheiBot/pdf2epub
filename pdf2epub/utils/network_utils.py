@@ -332,6 +332,8 @@ class GeminiClient:
 
         self.num_retries = num_retries
         self.max_backoff_seconds = max_backoff_seconds
+        self._last_usage_metadata = None
+        self._last_stream_events: Dict[str, Any] = {}
         # Initialize tokenizer for accurate token counting
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
     
@@ -523,12 +525,27 @@ class GeminiClient:
                 "duration_ms": int((_time.monotonic() - _trace_start) * 1000),
                 "input_tokens": _usage_dict.get("prompt_token_count", 0),
                 "output_tokens": _usage_dict.get("candidates_token_count", 0),
+                "cache_read_tokens": _usage_dict.get(
+                    "cached_content_token_count", 0
+                ),
+                "thought_tokens": _usage_dict.get("thoughts_token_count", 0),
                 "raw_request": {"contents": contents, "config": str(config)},
                 "raw_response": aggregated_text,
                 "finish_reason": finish_reason,
                 "error": _trace_error,
                 "partial_response_length": len(aggregated_text) if _trace_error else 0,
             })
+
+    def get_last_usage(self) -> Dict[str, Any]:
+        """Return normalized usage for the most recent successful stream."""
+        usage = dict(self._last_stream_events or {})
+        return {
+            "input_tokens": usage.get("prompt_token_count", 0) or 0,
+            "output_tokens": usage.get("candidates_token_count", 0) or 0,
+            "cache_read_tokens": usage.get("cached_content_token_count", 0) or 0,
+            "thought_tokens": usage.get("thoughts_token_count", 0) or 0,
+            "total_tokens": usage.get("total_token_count", 0) or 0,
+        }
 
     @staticmethod
     def get_default_config(temperature: float = 0.1) -> GenerateContentConfig:

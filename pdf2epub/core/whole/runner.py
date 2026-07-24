@@ -274,8 +274,8 @@ def _create_agent(
                     f"You returned: {decision.file_path}. "
                     f"Copy/repair into workspace/ first."
                 )
-            content = resolved.read_text(encoding="utf-8", errors="replace").strip()
-            if not content:
+            content = resolved.read_text(encoding="utf-8", errors="replace")
+            if not content.strip():
                 raise ModelRetry(
                     "Selected file is empty. Write content to workspace/ first."
                 )

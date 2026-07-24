@@ -888,6 +888,17 @@ class LLMClient:
             self._safety_blocked_operations.clear()
             logger.info("Cleared all safety blocks")
 
+    def get_last_usage(self, provider: str) -> Dict[str, Any]:
+        """Return normalized usage from the provider's most recent request."""
+        client = self._clients.get(provider)
+        if client is None:
+            return {}
+        getter = getattr(client, "get_last_usage", None)
+        if getter is None:
+            return {}
+        usage = getter()
+        return usage if isinstance(usage, dict) else {}
+
 
 class BoundLLMClient:
     """

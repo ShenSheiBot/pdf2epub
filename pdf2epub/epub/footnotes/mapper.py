@@ -2,12 +2,11 @@
 Footnote mapping functionality for building occurrence-based mappings.
 """
 
-from pathlib import Path
 from typing import Dict, List, Set, Tuple
 from loguru import logger
 
+from .content_index import ContentAddressIndex
 from .models import FootnoteDefinition, NotesSection
-from ...chapter_identity import ChapterIdentity, strip_part_suffix, part_path
 
 
 class FootnoteMapper:
@@ -15,7 +14,9 @@ class FootnoteMapper:
     Builds various mappings between footnote references and definitions.
     """
 
-    def __init__(self):
+    def __init__(self, content_index: ContentAddressIndex):
+        self.content_index = content_index
+
         # For occurrence-based mapping in GLOBAL mode
         self.reference_occurrence_count: Dict[Tuple[str, str], int] = {}  # (key, chapter) -> occurrence number
         self.reference_occurrence_in_file: Dict[Tuple[str, str, int], int] = {}  # (key, chapter, occurrence_in_file) -> occurrence number
@@ -28,86 +29,25 @@ class FootnoteMapper:
         self.local_occurrence_mapping: Dict[str, Dict] = {}  # base_chapter -> occurrence mappings
 
         # For section-based mapping in GLOBAL mode (LLM-based)
-        self.section_definition_by_occurrence: Dict[Tuple[int, str, int], FootnoteDefinition] = {}
-        self.section_definition_occurrence_by_line: Dict[Tuple[str, str, int], Tuple[int, int]] = {}
-        self.section_definition_occurrence_in_file: Dict[Tuple[str, str, int], Tuple[int, int]] = {}
+        self.section_definition_by_occurrence: Dict[Tuple[str, str, int], FootnoteDefinition] = {}
+        self.section_definition_occurrence_by_line: Dict[Tuple[str, str, int], Tuple[str, int]] = {}
+        self.section_definition_occurrence_in_file: Dict[Tuple[str, str, int], Tuple[str, int]] = {}
 
-    def build_chapter_groups(self, files: List[Path]) -> None:
-        """
-        Build groups of files that belong to the same chapter.
-
-        Args:
-            files: List of markdown file paths
-        """
-        self.local_chapter_groups = {}
-        self.local_part_to_group = {}
-
-        for file_path in files:
-            chapter_name = file_path.stem
-            # Use ChapterIdentity to extract base chapter name. ChapterIdentity.parse
-            # only handles a single .partN, so fall back to strip_part_suffix for
-            # multiply-nested parts (e.g. chapter_7.4.part3.part1).
-            identity = ChapterIdentity.parse(chapter_name)
-            if identity:
-                base_chapter = identity.base_name
-            else:
-                base_chapter = strip_part_suffix(chapter_name)
-                if not ChapterIdentity.parse(base_chapter):
-                    continue
-            if base_chapter not in self.local_chapter_groups:
-                self.local_chapter_groups[base_chapter] = []
-            self.local_chapter_groups[base_chapter].append(chapter_name)
-            self.local_part_to_group.setdefault(chapter_name, base_chapter)
-
-        # Sort the part files within each group
-        for base_chapter in self.local_chapter_groups:
-            self.local_chapter_groups[base_chapter].sort(key=self._chapter_sort_key)
-
-        logger.debug(f"Built {len(self.local_chapter_groups)} chapter groups")
-
-    def augment_chapter_groups_from_structure(self, epub_structure: List[Dict]) -> None:
-        """
-        Add local footnote groups from the refined TOC hierarchy.
-
-        Refine already gives us logical chapter boundaries. If a top-level chapter
-        is split into child sections and the notes are placed at the end of the
-        last child, refs and defs live in sibling unit files. Treat those siblings
-        as one local footnote scope during EPUB linking.
-        """
-        def collect_part_stems(entry: Dict) -> List[str]:
-            stems: List[str] = []
-            for part_file in entry.get('part_files', []):
-                stems.append(Path(part_file).stem)
-            for child in entry.get('children', []):
-                stems.extend(collect_part_stems(child))
-            return stems
-
-        def walk(entries: List[Dict]) -> None:
-            for entry in entries:
-                children = entry.get('children', [])
-                unit_id = entry.get('unit_id')
-
-                if unit_id and children:
-                    stems = sorted(set(collect_part_stems(entry)), key=self._chapter_sort_key)
-                    if len(stems) > 1:
-                        self.local_chapter_groups[unit_id] = stems
-                        for stem in stems:
-                            # Keep the outer refined chapter as the local scope.
-                            # This lets refs in early sibling sections link to
-                            # definitions collected in the final sibling section.
-                            current_group = self.local_part_to_group.get(stem)
-                            default_group = strip_part_suffix(stem)
-                            if current_group is None or current_group == default_group:
-                                self.local_part_to_group[stem] = unit_id
-
-                walk(children)
-
-        walk(epub_structure)
-        logger.debug(f"Augmented local chapter groups from TOC: {len(self.local_chapter_groups)} groups")
+    def build_chapter_groups(
+        self,
+        references: Dict[str, List],
+        definitions: Dict[str, List[FootnoteDefinition]],
+    ) -> None:
+        """Build local scopes from the authoritative content address index."""
+        (
+            self.local_chapter_groups,
+            self.local_part_to_group,
+        ) = self.content_index.build_local_groups(references, definitions)
+        logger.debug(f"Built {len(self.local_chapter_groups)} structural chapter groups")
 
     def get_local_group_for_part(self, part_name: str) -> str:
         """Return the logical local footnote group for a markdown stem."""
-        return self.local_part_to_group.get(part_name, strip_part_suffix(part_name))
+        return self.local_part_to_group.get(part_name, part_name)
 
     def build_occurrence_mapping(
         self,
@@ -296,11 +236,13 @@ class FootnoteMapper:
         self.section_definition_by_occurrence = {}
         self.section_definition_occurrence_by_line = {}
         self.section_definition_occurrence_in_file = {}
-        occurrence_in_file: Dict[Tuple[str, str], int] = {}
+        definition_assignments = []
 
-        # Build mapping for each section
-        for section_idx, section in enumerate(notes_sections):
-            if not section.matched_unit_id:
+        # Build mapping for each semantic section. ``matched_unit_id`` is the
+        # stable scope identity; list position is not.
+        for section in notes_sections:
+            scope_unit_id = section.matched_unit_id
+            if not scope_unit_id:
                 continue
 
             # Group definitions by key within this section
@@ -312,20 +254,41 @@ class FootnoteMapper:
 
             # Sort definitions by line number
             for key in defs_by_key:
-                defs_by_key[key].sort(key=lambda d: d.line_num)
+                defs_by_key[key].sort(
+                    key=lambda definition: (
+                        self._chapter_sort_key(definition.chapter),
+                        definition.line_num,
+                    )
+                )
 
             # Store in section_definition_by_occurrence
             for key, def_list in defs_by_key.items():
                 for occurrence, defn in enumerate(def_list, 1):
-                    self.section_definition_by_occurrence[(section_idx, key, occurrence)] = defn
+                    self.section_definition_by_occurrence[(scope_unit_id, key, occurrence)] = defn
                     self.section_definition_occurrence_by_line[
                         (key, defn.chapter, defn.line_num)
-                    ] = (section_idx, occurrence)
-                    file_counter_key = (key, defn.chapter)
-                    occurrence_in_file[file_counter_key] = occurrence_in_file.get(file_counter_key, 0) + 1
-                    self.section_definition_occurrence_in_file[
-                        (key, defn.chapter, occurrence_in_file[file_counter_key])
-                    ] = (section_idx, occurrence)
+                    ] = (scope_unit_id, occurrence)
+                    definition_assignments.append(
+                        (defn, scope_unit_id, occurrence)
+                    )
+
+        # Markdown conversion reports occurrence within the physical file. Build
+        # that index in physical line order, independently of semantic-section
+        # iteration order (a scope may resume after another scope).
+        assignments_by_file: Dict[Tuple[str, str], List] = {}
+        for defn, scope_unit_id, scope_occurrence in definition_assignments:
+            assignments_by_file.setdefault((defn.key, defn.chapter), []).append(
+                (defn, scope_unit_id, scope_occurrence)
+            )
+        for (key, chapter), assignments in assignments_by_file.items():
+            assignments.sort(key=lambda item: item[0].line_num)
+            for occurrence_in_file, (_, scope_unit_id, scope_occurrence) in enumerate(
+                assignments,
+                1,
+            ):
+                self.section_definition_occurrence_in_file[
+                    (key, chapter, occurrence_in_file)
+                ] = (scope_unit_id, scope_occurrence)
 
         logger.debug(f"Built section occurrence mapping for {len(notes_sections)} sections")
 
@@ -339,13 +302,4 @@ class FootnoteMapper:
         Returns:
             Tuple for sorting
         """
-        # Use ChapterIdentity for the base (category + hierarchical index), and the
-        # full part chain for ordering. The part component is always a tuple so that
-        # single parts (.part1) and nested parts (.part3.part1) sort consistently.
-        base = strip_part_suffix(chapter_name)
-        base_id = ChapterIdentity.parse(base)
-        parts = part_path(chapter_name)
-        if base_id:
-            category, idx_path, _ = base_id.sort_key
-            return (category, list(idx_path), parts)
-        return (999, [], parts)  # Put unrecognized files at the end
+        return self.content_index.order_key(chapter_name)

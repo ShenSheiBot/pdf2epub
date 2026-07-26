@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 from loguru import logger
 
+from .content_index import ContentAddressIndex
 from .models import FootnoteDefinition, NotesSection
 from ...utils.common import parse_llm_json
 from ...utils.unit_id import generate_unit_id
@@ -18,7 +19,12 @@ class LLMSectionMatcher:
     Uses LLM to match Notes chapter sections to TOC chapters.
     """
 
-    def __init__(self, markdown_dir: Path, config=None):
+    def __init__(
+        self,
+        markdown_dir: Path,
+        config=None,
+        content_index: Optional[ContentAddressIndex] = None,
+    ):
         """
         Initialize the LLM section matcher.
 
@@ -28,6 +34,7 @@ class LLMSectionMatcher:
         """
         self.markdown_dir = markdown_dir
         self.config = config
+        self.content_index = content_index
         self.notes_sections: List[NotesSection] = []
         self.chapter_to_section: Dict[str, NotesSection] = {}
         self.toc_chapters: List[Dict] = []
@@ -89,7 +96,7 @@ class LLMSectionMatcher:
         """
         # Read all primary definition chapter files
         all_lines = []
-        for chapter_name in sorted(primary_definition_chapters):
+        for chapter_name in self._ordered_chapters(primary_definition_chapters):
             file_path = self.markdown_dir / f"{chapter_name}.md"
             if file_path.exists():
                 try:
@@ -111,6 +118,12 @@ class LLMSectionMatcher:
                     logger.error(f"Error reading {file_path}: {e}")
 
         return '\n'.join(all_lines)
+
+    def _ordered_chapters(self, chapter_names: Set[str]) -> List[str]:
+        """Return source stems in physical EPUB reading order."""
+        if self.content_index:
+            return sorted(chapter_names, key=self.content_index.order_key)
+        return sorted(chapter_names)
 
     def match_sections(self, primary_definition_chapters: Set[str]) -> bool:
         """
@@ -258,7 +271,7 @@ TOC 章节列表：
         all_content = []  # [(line_num, line_text, source_file, local_line_num), ...]
         global_line_num = 0
 
-        for chapter_name in sorted(primary_definition_chapters):
+        for chapter_name in self._ordered_chapters(primary_definition_chapters):
             file_path = self.markdown_dir / f"{chapter_name}.md"
             if file_path.exists():
                 try:
@@ -276,15 +289,25 @@ TOC 章节列表：
         # Find header positions in the content
         header_positions = []  # [(global_line_num, header_text, unit_id, source_file, local_line_num), ...]
 
-        # Create a mapping from header text to unit_id
-        header_to_unit_id = {}
+        # Preserve repeated matched headers instead of collapsing them in a dict.
+        header_to_unit_ids: Dict[str, List[str]] = {}
+        valid_scope_ids = {
+            chapter["unit_id"]
+            for chapter in self.toc_chapters
+            if chapter.get("type") != "notes"
+        }
         for match in matches:
             header = match.get("header", "").strip()
             unit_id = match.get("unit_id", "")
+            if unit_id and unit_id not in valid_scope_ids:
+                logger.warning(
+                    f"Ignoring Notes section match to unknown/non-body unit {unit_id}"
+                )
+                continue
             if header and unit_id:
                 # Normalize header for matching
                 header_normalized = re.sub(r'^#+\s*', '', header).strip()
-                header_to_unit_id[header_normalized] = unit_id
+                header_to_unit_ids.setdefault(header_normalized, []).append(unit_id)
 
         # Scan content to find headers in order
         for global_ln, line, source_file, local_ln in all_content:
@@ -293,15 +316,17 @@ TOC 章节列表：
             line_clean = re.sub(r'^#+\s*', '', line_stripped)
 
             # Check if this line matches any header
-            if line_clean in header_to_unit_id:
-                unit_id = header_to_unit_id[line_clean]
+            if line_clean in header_to_unit_ids and header_to_unit_ids[line_clean]:
+                unit_id = header_to_unit_ids[line_clean].pop(0)
                 header_positions.append((global_ln, line_clean, unit_id, source_file, local_ln))
-                # Remove from dict to avoid duplicates
-                del header_to_unit_id[line_clean]
 
         # Log any unmatched headers
-        for header in header_to_unit_id:
-            logger.warning(f"Header '{header}' not found in Notes content")
+        for header, remaining_unit_ids in header_to_unit_ids.items():
+            if remaining_unit_ids:
+                logger.warning(
+                    f"Header '{header}' not found in Notes content "
+                    f"({len(remaining_unit_ids)} unmatched mapping(s))"
+                )
 
         if not header_positions:
             logger.warning("No headers found in Notes content")
@@ -310,8 +335,12 @@ TOC 章节列表：
         # Sort by position
         header_positions.sort(key=lambda x: x[0])
 
-        # Create sections
+        # Create fragments, then merge fragments mapped to the same semantic TOC
+        # scope. OCR can turn one definition into a heading and split a Notes
+        # section; that must not replace the earlier fragment.
         self.notes_sections = []
+        self.chapter_to_section = {}
+        sections_by_unit_id: Dict[str, NotesSection] = {}
 
         for i, (global_ln, header, unit_id, source_file, local_ln) in enumerate(header_positions):
             # Determine end position
@@ -325,7 +354,7 @@ TOC 章节列表：
             for g_ln, line, src_file, loc_ln in all_content:
                 if global_ln <= g_ln < end_global_ln:
                     # Check for footnote definition
-                    def_match = re.match(r'^\[\^(\w+)\]:\s*(.*)', line)
+                    def_match = re.match(r'^\[\^(\w+)\](?::\s*|\s+)(.*)', line)
                     if def_match:
                         key = def_match.group(1)
                         content = def_match.group(2)
@@ -341,11 +370,35 @@ TOC 章节列表：
                 definitions=section_definitions,
                 matched_unit_id=unit_id
             )
-            self.notes_sections.append(section)
+            existing = sections_by_unit_id.get(unit_id)
+            if existing:
+                existing.definitions.extend(section.definitions)
+                existing.end_line = section.end_line
+                logger.debug(
+                    f"Merged Notes fragment '{header}' into {unit_id}: "
+                    f"{len(section_definitions)} definitions"
+                )
+            else:
+                sections_by_unit_id[unit_id] = section
+                self.notes_sections.append(section)
+                self.chapter_to_section[unit_id] = section
+                logger.debug(
+                    f"Section '{header}' -> {unit_id}: "
+                    f"{len(section_definitions)} definitions"
+                )
 
-            # Build chapter to section mapping
-            self.chapter_to_section[unit_id] = section
-            logger.debug(f"Section '{header}' -> {unit_id}: {len(section_definitions)} definitions")
+        for section in self.notes_sections:
+            section.definitions.sort(
+                key=lambda definition: (
+                    self.content_index.order_key(definition.chapter)
+                    if self.content_index
+                    else definition.chapter,
+                    definition.line_num,
+                )
+            )
 
-        logger.info(f"Parsed {len(self.notes_sections)} sections from Notes chapter")
+        logger.info(
+            f"Parsed {len(header_positions)} Notes fragments into "
+            f"{len(self.notes_sections)} semantic sections"
+        )
         return True

@@ -7,6 +7,7 @@ It automatically detects which style is appropriate based on the book's structur
 
 from .models import FootnoteStyle, FootnoteDefinition, FootnoteReference, NotesSection
 from .manager import FootnoteManager
+from .validator import FootnoteGraphError, inspect_footnote_graph, validate_footnote_graph
 
 __all__ = [
     'FootnoteStyle',
@@ -14,4 +15,7 @@ __all__ = [
     'FootnoteReference',
     'NotesSection',
     'FootnoteManager',
+    'FootnoteGraphError',
+    'inspect_footnote_graph',
+    'validate_footnote_graph',
 ]

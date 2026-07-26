@@ -186,6 +186,7 @@ def translate_v2_command(args):
             source_language=source_language,
             target_language=target_language,
             config=config,
+            resume=resume,
         )
         if not toc_translated:
             logger.error("[v2] TOC translation failed; translated content was preserved")
@@ -203,6 +204,7 @@ def _translate_toc(
     source_language: str,
     target_language: str,
     config: Dict[str, Any],
+    resume: bool = False,
 ) -> bool:
     """Translate and persist TOC while one process owns its lifecycle."""
     from ..core.executor.batch_state import BatchRunLock
@@ -216,7 +218,110 @@ def _translate_toc(
             source_language,
             target_language,
             config,
+            resume,
         )
+
+
+def _validate_translated_toc_output(
+    output_dir: Path,
+    translated_path: Path,
+    source_language: str,
+    target_language: str,
+) -> Tuple[bool, str]:
+    """Validate that a durable translated TOC is complete and source-bound."""
+    original_path = output_dir / "toc_tree.json"
+    try:
+        original = json.loads(original_path.read_text(encoding="utf-8"))
+        translated = json.loads(translated_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"cannot load TOC JSON: {exc}"
+
+    if not isinstance(original, dict) or not isinstance(translated, dict):
+        return False, "original and translated TOCs must be JSON objects"
+
+    expected_root_keys = set(original) | {
+        "book_title",
+        "language",
+        "source_language",
+    }
+    if set(translated) != expected_root_keys:
+        return False, "translated TOC root fields do not match the source"
+
+    translated_title = translated.get("book_title")
+    if not isinstance(translated_title, str) or not translated_title.strip():
+        return False, "translated book title is missing or empty"
+    if translated.get("language") != target_language.lower():
+        return False, "translated TOC target language does not match the request"
+    if translated.get("source_language") != source_language.lower():
+        return False, "translated TOC source language does not match the request"
+
+    for key, value in original.items():
+        if key not in {"book_title", "language", "source_language", "chapters"}:
+            if translated.get(key) != value:
+                return False, f"translated TOC changed source field {key!r}"
+
+    def validate_chapters(
+        original_chapters: Any,
+        translated_chapters: Any,
+        address: str,
+    ) -> Tuple[bool, str]:
+        if not isinstance(original_chapters, list):
+            return False, f"source TOC chapters at {address} are not a list"
+        if not isinstance(translated_chapters, list):
+            return False, f"translated TOC chapters at {address} are not a list"
+        if len(original_chapters) != len(translated_chapters):
+            return False, f"chapter count mismatch at {address}"
+
+        for index, (original_entry, translated_entry) in enumerate(
+            zip(original_chapters, translated_chapters),
+            1,
+        ):
+            entry_address = f"{address}.{index}"
+            if not isinstance(original_entry, dict) or not isinstance(
+                translated_entry,
+                dict,
+            ):
+                return False, f"chapter {entry_address} is not an object"
+
+            expected_keys = set(original_entry) | {"original_title"}
+            if set(translated_entry) != expected_keys:
+                return False, (
+                    f"translated chapter fields do not match the source at "
+                    f"{entry_address}"
+                )
+
+            title = translated_entry.get("title")
+            if not isinstance(title, str) or not title.strip():
+                return False, f"translated title is missing at {entry_address}"
+            if translated_entry.get("original_title") != original_entry.get(
+                "title",
+                "",
+            ):
+                return False, f"original title mismatch at {entry_address}"
+
+            for key, value in original_entry.items():
+                if key not in {"title", "original_title", "children"}:
+                    if translated_entry.get(key) != value:
+                        return False, (
+                            f"translated chapter changed source field {key!r} "
+                            f"at {entry_address}"
+                        )
+
+            valid, reason = validate_chapters(
+                original_entry.get("children", []),
+                translated_entry.get("children", []),
+                entry_address,
+            )
+            if not valid:
+                return valid, reason
+
+        return True, ""
+
+    return validate_chapters(
+        original.get("chapters"),
+        translated.get("chapters"),
+        "chapters",
+    )
 
 
 def _translate_toc_locked(
@@ -227,6 +332,7 @@ def _translate_toc_locked(
     source_language: str,
     target_language: str,
     config: Dict[str, Any],
+    resume: bool = False,
 ) -> bool:
     """
     Translate TOC titles using already translated content as reference.
@@ -247,6 +353,24 @@ def _translate_toc_locked(
 
     state_path = output_dir / "toc_translation_batch_state.json"
     translated_path = output_dir / "toc_tree_translated.json"
+    if resume and translated_path.exists() and not state_path.exists():
+        valid, reason = _validate_translated_toc_output(
+            output_dir,
+            translated_path,
+            source_language,
+            target_language,
+        )
+        if not valid:
+            logger.error(
+                "Existing translated TOC is invalid; refusing to skip or "
+                f"resubmit on resume: {reason}"
+            )
+            return False
+        logger.info(
+            "TOC translation output already exists and has no pending batch "
+            "state; skipping on resume"
+        )
+        return True
     if state_path.exists() and translated_path.exists():
         try:
             state_data = json.loads(state_path.read_text(encoding="utf-8"))
@@ -311,6 +435,18 @@ def _translate_toc_locked(
                 logger.error(
                     "Finalized TOC batch state does not match the current "
                     "provider, model, request, or input; state was retained"
+                )
+                return False
+            valid, reason = _validate_translated_toc_output(
+                output_dir,
+                translated_path,
+                source_language,
+                target_language,
+            )
+            if not valid:
+                logger.error(
+                    "Finalized TOC batch output is invalid; state was "
+                    f"retained: {reason}"
                 )
                 return False
             # The durable output and remote cleanup both completed; only a

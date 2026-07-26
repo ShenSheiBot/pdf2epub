@@ -1421,8 +1421,25 @@ def test_toc_finalized_tombstone_finishes_without_resubmission(
         encoding="utf-8",
     )
     response_path.write_text("validated", encoding="utf-8")
+    (tmp_path / "toc_tree.json").write_text(
+        json.dumps(
+            {
+                "book_title": "Original Book",
+                "language": "english",
+                "chapters": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     (tmp_path / "toc_tree_translated.json").write_text(
-        "{}",
+        json.dumps(
+            {
+                "book_title": "Translated Book",
+                "language": "chinese",
+                "source_language": "english",
+                "chapters": [],
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -1449,6 +1466,113 @@ def test_toc_finalized_tombstone_finishes_without_resubmission(
     )
     assert not state_path.exists()
     assert not response_path.exists()
+
+
+def test_toc_resume_skips_durable_output_without_batch_state(
+    monkeypatch,
+    tmp_path: Path,
+):
+    original_chapter = {
+        "title": "Chapter One",
+        "start_page": 1,
+        "end_page": 2,
+    }
+    (tmp_path / "toc_tree.json").write_text(
+        json.dumps(
+            {
+                "book_title": "Original Book",
+                "language": "english",
+                "chapters": [original_chapter],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "toc_tree_translated.json").write_text(
+        json.dumps(
+            {
+                "book_title": "Translated Book",
+                "language": "chinese",
+                "source_language": "english",
+                "chapters": [
+                    {
+                        **original_chapter,
+                        "title": "Translated Chapter",
+                        "original_title": "Chapter One",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        translate_v2,
+        "_build_toc_reference_json",
+        lambda *_args: [{"id": "book_title"}],
+    )
+    monkeypatch.setattr(
+        translate_v2,
+        "_translate_toc_batch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "resume must not resubmit a completed TOC"
+        ),
+    )
+
+    assert translate_v2._translate_toc_locked(
+        tmp_path,
+        tmp_path,
+        object(),
+        [{"provider": "vertex", "model": "model", "mode": "batch"}],
+        "English",
+        "Chinese",
+        {},
+        resume=True,
+    )
+
+
+def test_toc_resume_rejects_incomplete_durable_output_without_resubmission(
+    monkeypatch,
+    tmp_path: Path,
+):
+    (tmp_path / "toc_tree.json").write_text(
+        json.dumps(
+            {
+                "book_title": "Original Book",
+                "language": "english",
+                "chapters": [{"title": "Chapter One"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "toc_tree_translated.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        translate_v2,
+        "_build_toc_reference_json",
+        lambda *_args: [
+            {"id": "book_title"},
+            {"id": "chapter_1"},
+        ],
+    )
+    monkeypatch.setattr(
+        translate_v2,
+        "_translate_toc_batch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid durable output must fail closed on resume"
+        ),
+    )
+
+    assert not translate_v2._translate_toc_locked(
+        tmp_path,
+        tmp_path,
+        object(),
+        [{"provider": "vertex", "model": "model", "mode": "batch"}],
+        "English",
+        "Chinese",
+        {},
+        resume=True,
+    )
 
 
 def test_malformed_toc_finalized_state_is_retained(

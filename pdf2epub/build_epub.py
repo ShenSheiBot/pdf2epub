@@ -783,21 +783,16 @@ def build_epub(config: BuildEpubConfig) -> Path:
         Path to generated EPUB file
     """
     import shutil
-    import tempfile
     from .epub.builder import EpubBuilder
     from .epub.converter import ContentConverter
-    from .epub.footnotes import FootnoteManager
-    from .utils.config_manager import load_config
+    from .epub.footnotes import FootnoteManager, validate_footnote_graph
 
     logger.info(f"Building EPUB for: {config.book_title}")
     logger.info(f"Source: {'translated' if config.translated else 'polished_markdown'}")
 
-    # Load config for LLM-based footnote matching
-    try:
-        llm_config = load_config()
-    except Exception as e:
-        logger.debug(f"Could not load config for LLM: {e}")
-        llm_config = None
+    # Use the exact command config. Loading the repository default here would
+    # silently switch providers/models when ``-c`` selected a per-book config.
+    llm_config = config.config
 
     # Load toc_tree.json
     toc_tree = load_toc_tree(config.toc_tree_path)
@@ -940,11 +935,9 @@ def build_epub(config: BuildEpubConfig) -> Path:
     generate_hierarchical_toc_ncx(epub_structure, config.book_title, epub_dir / "toc.ncx")
     generate_hierarchical_toc_html(epub_structure, config.book_title, epub_dir / "text" / "toc.html", language)
 
-    # Configure footnote manager with epub structure (for HTML filename mapping)
-    footnote_manager.configure_from_structure(epub_structure)
-
     # Process and convert chapters
     all_html_files = []
+    generated_html = {}
 
     def process_chapters(entries: List[Dict]):
         """Recursively process all chapters with files."""
@@ -1013,6 +1006,7 @@ def build_epub(config: BuildEpubConfig) -> Path:
                             f.write(html_content)
 
                         all_html_files.append(html_filename)
+                        generated_html[html_filename] = html_content
                         logger.debug(f"Created {html_filename}")
 
             # Process children
@@ -1021,6 +1015,17 @@ def build_epub(config: BuildEpubConfig) -> Path:
 
     process_chapters(epub_structure)
     logger.info(f"Converted {len(all_html_files)} HTML files")
+    footnote_report = validate_footnote_graph(generated_html)
+    if footnote_report["unlinked_sup_count"]:
+        logger.warning(
+            f"Kept {footnote_report['unlinked_sup_count']} ambiguous footnote "
+            "reference(s) visible but unlinked"
+        )
+    logger.info(
+        "Validated footnote graph: "
+        f"{footnote_report['forward_hrefs']} forward link(s), "
+        f"{footnote_report['backref_hrefs']} backlink(s)"
+    )
 
     # Handle cover image
     cover_image = None

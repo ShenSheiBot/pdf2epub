@@ -476,6 +476,45 @@ def test_boundary_agent_honors_explicit_refine_agent(monkeypatch):
     assert observed["provider"][1]["api_key"] == "explicit-key"
 
 
+def test_anthropic_refine_agent_prefers_process_api_key(monkeypatch):
+    observed = {}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "process-key")
+    monkeypatch.setattr(
+        boundary_agent,
+        "AnthropicProvider",
+        lambda **kwargs: observed.update(kwargs) or ("provider", kwargs),
+    )
+    monkeypatch.setattr(
+        boundary_agent,
+        "AnthropicModel",
+        lambda model_name, provider: ("model", model_name, provider),
+    )
+
+    model, model_name, _ = boundary_agent.get_model_and_limits(
+        {
+            "credentials": {
+                "providers": {
+                    "anthropic": {
+                        "type": "anthropic",
+                        "api_key": "stale-config-key",
+                        "base_url": "https://anthropic.example",
+                    }
+                }
+            },
+            "refine": {
+                "agent": {
+                    "provider": "anthropic",
+                    "model": "test-haiku",
+                }
+            },
+        }
+    )
+
+    assert model_name == "test-haiku"
+    assert model[0] == "model"
+    assert observed["api_key"] == "process-key"
+
+
 def test_explicit_google_agent_uses_google_provider_module(monkeypatch):
     import google.genai
     import pydantic_ai.models.google

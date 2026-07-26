@@ -12,6 +12,7 @@ Provides:
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -769,7 +770,7 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                 from pydantic_ai.models.anthropic import AnthropicModel
                 from pydantic_ai.providers.anthropic import AnthropicProvider
                 provider = AnthropicProvider(
-                    api_key=p.get('api_key'),
+                    api_key=os.environ.get('ANTHROPIC_API_KEY') or p.get('api_key'),
                     base_url=p.get('base_url'),
                 )
                 logger.info(f"[agent-model] Using explicit Anthropic {model_name}")
@@ -805,7 +806,7 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             from pydantic_ai.providers.anthropic import AnthropicProvider
             p = providers['anthropic']
             provider = AnthropicProvider(
-                api_key=p.get('api_key'),
+                api_key=os.environ.get('ANTHROPIC_API_KEY') or p.get('api_key'),
                 base_url=p.get('base_url'),
             )
             model_name = 'claude-haiku-4-5-20251001'

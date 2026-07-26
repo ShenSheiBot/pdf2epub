@@ -16,7 +16,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from bs4 import BeautifulSoup
 from loguru import logger
 
 from pdf2epub.build_epub import (
@@ -27,7 +26,7 @@ from pdf2epub.build_epub import (
     markdown_to_html,
     process_chapter_content,
 )
-from pdf2epub.epub.footnotes import FootnoteManager
+from pdf2epub.epub.footnotes import FootnoteManager, inspect_footnote_graph
 
 
 STAGE_CANDIDATES = (
@@ -207,77 +206,6 @@ def render_html_files(
     return html_files
 
 
-def inspect_html_links(html_files: dict[str, str]) -> dict[str, Any]:
-    ids_by_file: dict[str, set[str]] = {}
-    duplicate_ids: list[tuple[str, str, int]] = []
-    hrefs: list[tuple[str, str, str]] = []
-    unlinked: list[tuple[str, str | None, str]] = []
-
-    for filename, html in html_files.items():
-        soup = BeautifulSoup(html, "html.parser")
-        id_counts = Counter(
-            tag["id"] for tag in soup.find_all(attrs={"id": True}) if tag.get("id")
-        )
-        ids_by_file[filename] = set(id_counts)
-        duplicate_ids.extend(
-            (filename, id_value, count)
-            for id_value, count in id_counts.items()
-            if count > 1 and id_value.startswith(("fn:", "fnref"))
-        )
-
-        for tag in soup.find_all("a", href=True):
-            href = tag["href"]
-            if "#fn" not in href:
-                continue
-            target_file = filename
-            target_id = href
-            if "#" in href:
-                before_hash, target_id = href.split("#", 1)
-                if before_hash:
-                    target_file = Path(before_hash).name
-            hrefs.append((filename, target_file, target_id))
-
-        for sup in soup.find_all("sup"):
-            sup_id = sup.get("id")
-            if not sup_id or not sup_id.startswith("fnref-"):
-                continue
-            if sup.find("a", href=True):
-                continue
-            unlinked.append((filename, sup_id, sup.get_text("", strip=True)))
-
-    forward_broken = []
-    backref_broken = []
-    forward_hrefs = 0
-    backref_hrefs = 0
-
-    for source_file, target_file, target_id in hrefs:
-        if target_id.startswith("fn:"):
-            forward_hrefs += 1
-            bucket = forward_broken
-        elif target_id.startswith("fnref"):
-            backref_hrefs += 1
-            bucket = backref_broken
-        else:
-            continue
-
-        if target_id not in ids_by_file.get(target_file, set()):
-            bucket.append((source_file, f"{target_file}#{target_id}"))
-
-    return {
-        "hrefs": len(hrefs),
-        "forward_hrefs": forward_hrefs,
-        "backref_hrefs": backref_hrefs,
-        "forward_broken_count": len(forward_broken),
-        "backref_broken_count": len(backref_broken),
-        "forward_broken_samples": forward_broken[:20],
-        "backref_broken_samples": backref_broken[:20],
-        "duplicate_footnote_id_count": len(duplicate_ids),
-        "duplicate_footnote_id_samples": duplicate_ids[:20],
-        "unlinked_sup_count": len(unlinked),
-        "unlinked_samples": unlinked[:20],
-    }
-
-
 def audit_book(book_dir: Path) -> dict[str, Any]:
     selected = select_stage(book_dir)
     if not selected:
@@ -290,8 +218,11 @@ def audit_book(book_dir: Path) -> dict[str, Any]:
         epub_structure = build_epub_structure(toc_structure, markdown_dir)
         auto_global = has_notes_chapter(toc_tree.get("chapters", []))
 
-        manager = FootnoteManager(markdown_dir, auto_global=auto_global, epub_structure=epub_structure)
-        manager.configure_from_structure(epub_structure)
+        manager = FootnoteManager(
+            markdown_dir,
+            auto_global=auto_global,
+            epub_structure=epub_structure,
+        )
 
         references = sum(len(refs) for refs in manager.references.values())
         definitions = sum(len(defs) for defs in manager.definitions.values())
@@ -310,7 +241,7 @@ def audit_book(book_dir: Path) -> dict[str, Any]:
         )
 
         html_files = render_html_files(book_title, language, epub_structure, manager)
-        link_report = inspect_html_links(html_files)
+        link_report = inspect_footnote_graph(html_files)
 
         missing_keys = sorted(k for k in manager.references if k not in manager.definitions)
         true_missing_ref_count = sum(len(manager.references[k]) for k in missing_keys)
@@ -372,6 +303,7 @@ def main() -> int:
         "forward_broken": sum(int(r.get("forward_broken_count", 0) or 0) for r in ok_results),
         "backref_broken": sum(int(r.get("backref_broken_count", 0) or 0) for r in ok_results),
         "duplicate_footnote_ids": sum(int(r.get("duplicate_footnote_id_count", 0) or 0) for r in ok_results),
+        "invalid_footnote_ids": sum(int(r.get("invalid_footnote_id_count", 0) or 0) for r in ok_results),
         "unlinked": sum(int(r.get("unlinked_sup_count", 0) or 0) for r in ok_results),
         "true_missing_refs": sum(int(r.get("true_missing_ref_count", 0) or 0) for r in ok_results),
     }
@@ -387,7 +319,12 @@ def main() -> int:
 
     print(json.dumps({"report": str(args.report), **totals, "summary": dict(summary)}, ensure_ascii=False))
 
-    has_broken = totals["forward_broken"] or totals["backref_broken"] or totals["duplicate_footnote_ids"]
+    has_broken = (
+        totals["forward_broken"]
+        or totals["backref_broken"]
+        or totals["duplicate_footnote_ids"]
+        or totals["invalid_footnote_ids"]
+    )
     has_error = bool(summary.get("error"))
     has_unlinked = bool(totals["unlinked"])
     if has_broken or has_error or (args.fail_on_unlinked and has_unlinked):

@@ -2,16 +2,95 @@
 Main FootnoteManager class that coordinates all footnote processing.
 """
 
+import html
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from loguru import logger
 
+from .content_index import ContentAddressIndex
 from .models import FootnoteStyle, FootnoteDefinition, NotesSection
 from .scanner import FootnoteScanner
 from .mapper import FootnoteMapper
 from .llm_matcher import LLMSectionMatcher
-from ...chapter_identity import ChapterIdentity, strip_part_suffix
+
+
+_ALLOWED_INLINE_HTML = {
+    "a",
+    "abbr",
+    "acronym",
+    "b",
+    "bdo",
+    "big",
+    "br",
+    "cite",
+    "code",
+    "del",
+    "dfn",
+    "em",
+    "i",
+    "img",
+    "ins",
+    "kbd",
+    "q",
+    "samp",
+    "small",
+    "span",
+    "strong",
+    "sub",
+    "sup",
+    "tt",
+    "var",
+}
+
+_ALLOWED_MATHML = {
+    "annotation",
+    "annotation-xml",
+    "maction",
+    "maligngroup",
+    "malignmark",
+    "math",
+    "menclose",
+    "merror",
+    "mfenced",
+    "mfrac",
+    "mglyph",
+    "mi",
+    "mlabeledtr",
+    "mmultiscripts",
+    "mn",
+    "mo",
+    "mover",
+    "mpadded",
+    "mphantom",
+    "mprescripts",
+    "mroot",
+    "mrow",
+    "ms",
+    "mscarries",
+    "mscarry",
+    "msgroup",
+    "msline",
+    "mslongdiv",
+    "mspace",
+    "msqrt",
+    "msrow",
+    "mstack",
+    "mstyle",
+    "msub",
+    "msubsup",
+    "msup",
+    "mtable",
+    "mtd",
+    "mtext",
+    "mtr",
+    "munder",
+    "munderover",
+    "none",
+    "semantics",
+}
+
+_ALLOWED_DEFINITION_HTML = _ALLOWED_INLINE_HTML | _ALLOWED_MATHML
 
 
 class FootnoteManager:
@@ -38,11 +117,16 @@ class FootnoteManager:
         self.auto_global = auto_global
         self.config = config
         self.epub_structure = epub_structure
-        self._chapter_files: List[Path] = []
+        self._chapter_files = self._discover_chapter_files()
+        self.content_index = (
+            ContentAddressIndex.from_structure(epub_structure)
+            if epub_structure
+            else ContentAddressIndex.from_files(self._chapter_files)
+        )
 
         # Initialize components
         self.scanner = FootnoteScanner()
-        self.mapper = FootnoteMapper()
+        self.mapper = FootnoteMapper(self.content_index)
         self.llm_matcher: Optional[LLMSectionMatcher] = None
 
         # Enable global mode if either forced or auto-detected
@@ -52,10 +136,6 @@ class FootnoteManager:
         # Primary definition chapters (for force_global)
         self.primary_definition_chapters: Set[str] = set()
         self.no_colon_definition_chapters: Set[str] = set()
-
-        # Mapping from markdown stems to HTML filenames (for nested parts)
-        # e.g., {"chapter_25.part1.part1": "chapter_25_part1.html"}
-        self._html_filename_mapping: Dict[str, str] = {}
 
         # Analyze the footnote structure
         self._analyze_footnote_structure()
@@ -125,6 +205,14 @@ class FootnoteManager:
 
     def _discover_chapter_files(self) -> List[Path]:
         """Return chapter markdown files, excluding unsplit originals with parts."""
+        content_index = getattr(self, "content_index", None)
+        if self.epub_structure and content_index:
+            return [
+                self.markdown_dir / f"{source_stem}.md"
+                for source_stem in content_index.sources
+                if (self.markdown_dir / f"{source_stem}.md").exists()
+            ]
+
         chapter_files = sorted(self.markdown_dir.glob("chapter_*.md"))
         filtered_files = []
         for md_file in chapter_files:
@@ -161,12 +249,13 @@ class FootnoteManager:
 
     def _build_style_mappings(self, run_llm: bool = False) -> None:
         """Build mapper state from the current scanner data and style."""
-        self.mapper.build_chapter_groups(self._chapter_files)
+        self.mapper.build_chapter_groups(
+            self.scanner.references,
+            self.scanner.definitions,
+        )
 
         if self.style == FootnoteStyle.LOCAL:
             self.primary_definition_chapters = set()
-            if self.epub_structure:
-                self.mapper.augment_chapter_groups_from_structure(self.epub_structure)
             self.mapper.build_local_occurrence_mappings(
                 self.scanner.references,
                 self.scanner.definitions,
@@ -195,8 +284,12 @@ class FootnoteManager:
             )
 
             # Try LLM-based section matching for better accuracy
-            if run_llm and self.config and (self.force_global or self.auto_global):
-                self.llm_matcher = LLMSectionMatcher(self.markdown_dir, self.config)
+            if run_llm and (self.force_global or self.auto_global):
+                self.llm_matcher = LLMSectionMatcher(
+                    self.markdown_dir,
+                    self.config,
+                    content_index=self.content_index,
+                )
                 if self.llm_matcher.load_toc_tree():
                     if self.llm_matcher.match_sections(self.primary_definition_chapters):
                         self.mapper.build_section_occurrence_mapping(self.llm_matcher.notes_sections)
@@ -333,40 +426,15 @@ class FootnoteManager:
 
     def configure_from_structure(self, epub_structure: List[Dict]) -> None:
         """
-        Configure HTML filename mapping from epub_structure.
-
-        This builds the mapping from markdown stems to HTML filenames,
-        needed for nested part files where ChapterIdentity can't parse
-        the filename (e.g., chapter_25.part1.part1 -> chapter_25_part1.html).
+        Replace the structural address index and rescan current markdown.
 
         Args:
             epub_structure: The hierarchical structure from build_epub_structure()
         """
         self.epub_structure = epub_structure
-        mapping = {}
-
-        def walk(entries):
-            for entry in entries:
-                if 'file_path' in entry and 'unit_id' in entry:
-                    unit_id = entry['unit_id']
-                    part_files = entry.get('part_files', [entry['file_path']])
-                    for idx, part_file in enumerate(part_files):
-                        stem = Path(part_file).stem
-                        if len(part_files) > 1:
-                            mapping[stem] = f"{unit_id}_part{idx + 1}.html"
-                        else:
-                            mapping[stem] = f"{unit_id}.html"
-                if 'children' in entry:
-                    walk(entry['children'])
-
-        walk(epub_structure)
-        self._html_filename_mapping = mapping
-        logger.debug(f"Configured HTML filename mapping with {len(mapping)} entries")
-
+        self.content_index = ContentAddressIndex.from_structure(epub_structure)
         self.llm_matcher = None
-        self.mapper.section_definition_by_occurrence = {}
-        self.mapper.section_definition_occurrence_by_line = {}
-        self.mapper.section_definition_occurrence_in_file = {}
+        self.mapper = FootnoteMapper(self.content_index)
         self._chapter_files = self._discover_chapter_files()
         self.scanner = FootnoteScanner()
         self.no_colon_definition_chapters = self._collect_no_colon_definition_chapters()
@@ -377,8 +445,7 @@ class FootnoteManager:
         self._drop_replaced_heading_references()
         self.style = self.scanner.determine_style(self.force_global, self.auto_global)
         run_llm = bool(
-            self.config
-            and self.style == FootnoteStyle.GLOBAL
+            self.style == FootnoteStyle.GLOBAL
             and (self.force_global or self.auto_global)
         )
         self._build_style_mappings(run_llm=run_llm)
@@ -387,8 +454,7 @@ class FootnoteManager:
         """
         Get the HTML filename for a markdown file stem.
 
-        Uses the explicit mapping first, then falls back to ChapterIdentity parsing,
-        then to simple string replacement.
+        Uses the explicit physical-to-output address index.
 
         Args:
             markdown_stem: The markdown file stem (e.g., "chapter_25.part1.part1")
@@ -396,17 +462,7 @@ class FootnoteManager:
         Returns:
             HTML filename (e.g., "chapter_25_part1.html")
         """
-        # Try explicit mapping first (for nested parts)
-        if markdown_stem in self._html_filename_mapping:
-            return self._html_filename_mapping[markdown_stem]
-
-        # Try ChapterIdentity parsing
-        identity = ChapterIdentity.parse(markdown_stem)
-        if identity:
-            return identity.html_name
-
-        # Fallback: simple replacement (may be wrong for nested parts)
-        return f"{markdown_stem.replace('.part', '_part')}.html"
+        return self.content_index.html_for_source(markdown_stem)
 
     def _chapter_sort_key(self, chapter_name: str) -> tuple:
         """
@@ -479,7 +535,7 @@ class FootnoteManager:
                 line_num=line_num,
                 occurrence_in_file=occurrence_in_file,
             )
-            fn_id = f"fn:{key}:{occurrence_num}"
+            fn_id = self._footnote_definition_id(key, occurrence_num)
             backref_html = self._local_definition_backref_html(
                 local_mapping,
                 key,
@@ -487,9 +543,9 @@ class FootnoteManager:
             )
         else:
             if occurrence_in_file and occurrence_in_file > 1:
-                fn_id = f"fn:{key}:{occurrence_in_file}"
+                fn_id = self._footnote_definition_id(key, occurrence_in_file)
             else:
-                fn_id = f"fn:{key}"
+                fn_id = self._footnote_definition_id(key)
             backref_html = ""
             ref_occurrence = occurrence_in_file if occurrence_in_file is not None else 1
             matching_refs = [
@@ -569,10 +625,26 @@ class FootnoteManager:
             )
 
         if section_occurrence is not None:
-            section_idx, occurrence_num = section_occurrence
-            fn_id = f"fn:{key}:{occurrence_num}"
-            backref_html = self._section_definition_backref_html(section_idx, key, occurrence_num)
+            scope_unit_id, occurrence_num = section_occurrence
+            fn_id = self._section_definition_id(scope_unit_id, key, occurrence_num)
+            backref_html = self._section_definition_backref_html(
+                scope_unit_id,
+                key,
+                occurrence_num,
+            )
             return self._definition_html(fn_id, key, content, backref_html)
+
+        # Once semantic Notes sections are available, an unassigned definition
+        # must not reuse a book-global anchor. It is intentionally left orphaned
+        # with a physical-source-scoped ID.
+        if self.chapter_to_section:
+            occurrence_marker = occurrence_in_file or 1
+            fn_id = self._footnote_definition_id(
+                key,
+                occurrence_marker,
+                scope_unit_id=f"orphan-{source_chapter}",
+            )
+            return self._definition_html(fn_id, key, content, "")
 
         occurrence_num = None
         if occurrence_in_file is not None:
@@ -587,31 +659,60 @@ class FootnoteManager:
         if occurrence_num is None:
             occurrence_num = 1
 
-        return self._definition_html(f"fn:{key}:{occurrence_num}", key, content, "")
+        fn_id = self._footnote_definition_id(key, occurrence_num)
+        return self._definition_html(fn_id, key, content, "")
 
-    def _section_definition_backref_html(self, section_idx: int, key: str, occurrence_num: int) -> str:
-        if section_idx >= len(self.notes_sections):
+    def _section_definition_id(self, scope_unit_id: str, key: str, occurrence_num: int) -> str:
+        return self._footnote_definition_id(key, occurrence_num, scope_unit_id)
+
+    def _section_reference_id(self, scope_unit_id: str, key: str, occurrence_num: int) -> str:
+        return f"fnref-{scope_unit_id}-{key}-{occurrence_num}"
+
+    def _footnote_definition_id(
+        self,
+        key: str,
+        occurrence_num: Optional[int] = None,
+        scope_unit_id: Optional[str] = None,
+    ) -> str:
+        """Encode one XML-safe definition anchor from semantic components."""
+        components = ["fn"]
+        if scope_unit_id:
+            components.append(scope_unit_id)
+        components.append(key)
+        if occurrence_num is not None:
+            components.append(str(occurrence_num))
+        return "-".join(components)
+
+    def _section_definition_backref_html(
+        self,
+        scope_unit_id: str,
+        key: str,
+        occurrence_num: int,
+    ) -> str:
+        ref_file = self._reference_chapter_for_scope_occurrence(
+            key,
+            scope_unit_id,
+            occurrence_num,
+        )
+        if not ref_file:
             return ""
 
-        ref_unit_id = self.notes_sections[section_idx].matched_unit_id
-        if not ref_unit_id:
-            return ""
-
-        fnref_id = f"fnref-{ref_unit_id}-{key}-{occurrence_num}"
-        ref_file = self._reference_chapter_for_base_occurrence(key, ref_unit_id, occurrence_num)
-        if ref_file:
-            backref_link = f"{self.get_html_filename(ref_file)}#{fnref_id}"
-        elif ref_unit_id in self.mapper.local_chapter_groups and self.mapper.local_chapter_groups[ref_unit_id]:
-            first_part = self.mapper.local_chapter_groups[ref_unit_id][0]
-            backref_link = f"{self.get_html_filename(first_part)}#{fnref_id}"
-        else:
-            backref_link = f"{self.get_html_filename(ref_unit_id)}#{fnref_id}"
+        fnref_id = self._section_reference_id(scope_unit_id, key, occurrence_num)
+        backref_link = f"{self.get_html_filename(ref_file)}#{fnref_id}"
         return self._backref_html(backref_link, key)
 
     def _definition_html(self, fn_id: str, key: str, content: str, backref_html: str) -> str:
+        def escape_unknown_tag(match: re.Match) -> str:
+            token = match.group(0)
+            tag_match = re.match(r"</?\s*([A-Za-z][A-Za-z0-9]*)", token)
+            if tag_match and tag_match.group(1).lower() in _ALLOWED_DEFINITION_HTML:
+                return token
+            return html.escape(token, quote=False)
+
+        safe_content = re.sub(r"<[^<>]*>", escape_unknown_tag, content)
         return (
             f'<div class="footnote-def" id="{fn_id}">\n'
-            f'<p><strong>[{key}]:</strong> {content}{backref_html}</p>\n'
+            f'<p><strong>[{key}]:</strong> {safe_content}{backref_html}</p>\n'
             f'</div>'
         )
 
@@ -632,20 +733,19 @@ class FootnoteManager:
             return f"fnref-{source_chapter}-{key}-{occurrence_marker}"
         return f"fnref-{source_chapter}-{key}"
 
-    def _base_chapter_for_reference(self, source_chapter: str) -> str:
-        return strip_part_suffix(source_chapter)
-
-    def _reference_occurrence_for_base(
+    def _reference_occurrence_for_scope(
         self,
         key: str,
-        base_chapter: str,
+        scope_unit_id: str,
         source_chapter: str,
         occurrence_in_file: Optional[int] = None,
         line_num: Optional[int] = None,
     ) -> Optional[int]:
+        semantic_scope_ids = set(self.chapter_to_section)
         refs = [
             ref for ref in self.scanner.references.get(key, [])
-            if self._base_chapter_for_reference(ref.chapter) == base_chapter
+            if self.content_index.nearest_scope(ref.chapter, semantic_scope_ids)
+            == scope_unit_id
         ]
         refs.sort(key=lambda ref: (self._chapter_sort_key(ref.chapter), ref.line_num))
 
@@ -660,15 +760,17 @@ class FootnoteManager:
                 return occurrence
         return None
 
-    def _reference_chapter_for_base_occurrence(
+    def _reference_chapter_for_scope_occurrence(
         self,
         key: str,
-        base_chapter: str,
+        scope_unit_id: str,
         occurrence_num: int,
     ) -> Optional[str]:
+        semantic_scope_ids = set(self.chapter_to_section)
         refs = [
             ref for ref in self.scanner.references.get(key, [])
-            if self._base_chapter_for_reference(ref.chapter) == base_chapter
+            if self.content_index.nearest_scope(ref.chapter, semantic_scope_ids)
+            == scope_unit_id
         ]
         refs.sort(key=lambda ref: (self._chapter_sort_key(ref.chapter), ref.line_num))
         if 1 <= occurrence_num <= len(refs):
@@ -699,50 +801,58 @@ class FootnoteManager:
             key = page_note_match.group(2)
 
         def unlinked_reference() -> str:
-            logger.warning(f"Footnote '{original_key}' referenced in {source_chapter} but not defined")
+            logger.warning(
+                f"Footnote '{original_key}' in {source_chapter} could not be "
+                "matched safely within its structural scope"
+            )
             fnref_id = self._fnref_id(source_chapter, original_key, occurrence_in_file)
             return f'<sup id="{fnref_id}">[{original_key}]</sup>'
 
         if self.style == FootnoteStyle.LOCAL:
             base_chapter = self.get_local_group_id(source_chapter)
-            if ChapterIdentity.parse(base_chapter):
+            # Check if this is a structural multi-file scope.
+            if (
+                base_chapter in self.mapper.local_occurrence_mapping
+                and len(self.mapper.local_chapter_groups.get(base_chapter, [])) > 1
+            ):
+                chapter_mapping = self.mapper.local_occurrence_mapping[base_chapter]
+                occurrence_num = None
+                if occurrence_in_file is not None:
+                    occurrence_num = chapter_mapping['reference_occurrence_in_file'].get(
+                        (key, source_chapter, occurrence_in_file)
+                    )
+                if occurrence_num is None and occurrence_in_file is None and line_num is not None:
+                    occurrence_num = chapter_mapping['reference_positions'].get(
+                        (key, source_chapter, line_num)
+                    )
+                if occurrence_num is None and occurrence_in_file is None:
+                    occurrence_num = chapter_mapping['reference_occurrence_count'].get(
+                        (key, source_chapter)
+                    )
 
-                # Check if this is a multi-part chapter with local mappings
-                if base_chapter in self.mapper.local_occurrence_mapping and len(self.mapper.local_chapter_groups.get(base_chapter, [])) > 1:
-                    # Multi-part chapter - use occurrence-based mapping
-                    chapter_mapping = self.mapper.local_occurrence_mapping[base_chapter]
-                    occurrence_num = None
-                    if occurrence_in_file is not None and 'reference_occurrence_in_file' in chapter_mapping:
-                        occurrence_num = chapter_mapping['reference_occurrence_in_file'].get(
-                            (key, source_chapter, occurrence_in_file)
+                if occurrence_num and (key, occurrence_num) in chapter_mapping['definition_by_occurrence']:
+                    definition = chapter_mapping['definition_by_occurrence'][(key, occurrence_num)]
+                    target_chapter = definition.chapter
+                    fnref_marker = occurrence_in_file if occurrence_in_file is not None else occurrence_num
+                    fnref_id = self._fnref_id(source_chapter, key, fnref_marker)
+                    source_html = self.get_html_filename(source_chapter)
+
+                    if target_chapter == source_chapter:
+                        fn_id = self._footnote_definition_id(key, occurrence_num)
+                        return (
+                            f'<sup id="{fnref_id}"><a class="footnote-ref" '
+                            f'href="{source_html}#{fn_id}">[{key}]</a></sup>'
                         )
-                    if occurrence_num is None and occurrence_in_file is None and line_num is not None and 'reference_positions' in chapter_mapping:
-                        occurrence_num = occurrence_num or chapter_mapping['reference_positions'].get((key, source_chapter, line_num))
-                    if occurrence_num is None and occurrence_in_file is None:
-                        occurrence_num = chapter_mapping['reference_occurrence_count'].get((key, source_chapter))
 
-                    if occurrence_num and (key, occurrence_num) in chapter_mapping['definition_by_occurrence']:
-                        definition = chapter_mapping['definition_by_occurrence'][(key, occurrence_num)]
-                        target_chapter = definition.chapter
-                        fnref_marker = occurrence_in_file if occurrence_in_file is not None else occurrence_num
-
-                        if target_chapter == source_chapter:
-                            # Same file, use local anchor with unique ID
-                            fnref_id = self._fnref_id(source_chapter, key, fnref_marker)
-                            source_html = self.get_html_filename(source_chapter)
-                            return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#fn:{key}:{occurrence_num}">[{key}]</a></sup>'
-                        else:
-                            # Cross-part reference within the same chapter
-                            fn_id = f"fn:{key}:{occurrence_num}"
-                            fnref_id = self._fnref_id(source_chapter, key, fnref_marker)
-                            html_target = self.get_html_filename(target_chapter)
-                            return (
-                                f'<sup id="{fnref_id}">'
-                                f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{key}]</a>'
-                                f'</sup>'
-                            )
-                    if occurrence_num:
-                        return unlinked_reference()
+                    fn_id = self._footnote_definition_id(key, occurrence_num)
+                    html_target = self.get_html_filename(target_chapter)
+                    return (
+                        f'<sup id="{fnref_id}">'
+                        f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{key}]</a>'
+                        f'</sup>'
+                    )
+                if occurrence_num:
+                    return unlinked_reference()
 
             # Single file chapter or no multi-part mapping
             definitions_in_source = [
@@ -754,52 +864,54 @@ class FootnoteManager:
             if not (1 <= target_occurrence <= len(definitions_in_source)):
                 return unlinked_reference()
             fnref_id = self._fnref_id(source_chapter, key, occurrence_in_file)
-            fn_id = f"fn:{key}" if target_occurrence == 1 else f"fn:{key}:{target_occurrence}"
+            fn_id = self._footnote_definition_id(
+                key,
+                None if target_occurrence == 1 else target_occurrence,
+            )
             source_html = self.get_html_filename(source_chapter)
             return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{source_html}#{fn_id}">[{key}]</a></sup>'
 
-        # Global style: try section-based mapping first, then fall back to occurrence mapping
-
-        # Try section-based mapping if available
+        # Semantic Notes scopes are authoritative when available.
         if self.notes_sections and self.chapter_to_section:
-            base_chapter = self._base_chapter_for_reference(source_chapter)
-
-            if base_chapter in self.chapter_to_section:
-                section = self.chapter_to_section[base_chapter]
-                section_idx = self.notes_sections.index(section)
-                occurrence = self._reference_occurrence_for_base(
+            scope_unit_id = self.content_index.nearest_scope(
+                source_chapter,
+                set(self.chapter_to_section),
+            )
+            if scope_unit_id:
+                occurrence = self._reference_occurrence_for_scope(
                     key,
-                    base_chapter,
+                    scope_unit_id,
                     source_chapter,
                     occurrence_in_file=occurrence_in_file,
                     line_num=line_num,
                 )
 
-                lookup_key = (section_idx, key, occurrence)
+                lookup_key = (scope_unit_id, key, occurrence)
                 if occurrence and lookup_key in self.mapper.section_definition_by_occurrence:
                     definition = self.mapper.section_definition_by_occurrence[lookup_key]
                     target_chapter = definition.chapter
-
-                    # Generate HTML link
-                    # Use base_chapter (unit_id) for fnref_id to match the backref in definition
-                    fnref_id = f"fnref-{base_chapter}-{key}-{occurrence}"
+                    fnref_id = self._section_reference_id(
+                        scope_unit_id,
+                        key,
+                        occurrence,
+                    )
                     html_target = self.get_html_filename(target_chapter)
-
-                    # Use occurrence number for the anchor
-                    fn_id = f"fn:{key}:{occurrence}"
+                    fn_id = self._section_definition_id(
+                        scope_unit_id,
+                        key,
+                        occurrence,
+                    )
 
                     return (
                         f'<sup id="{fnref_id}">'
                         f'<a class="footnote-ref" href="{html_target}#{fn_id}">[{original_key}]</a>'
                         f'</sup>'
                     )
-                elif occurrence:
-                    return unlinked_reference()
-                else:
-                    # Section mapping exists but definition not found - fall through to global mapping
-                    pass
+            # A section model exists, so crossing into another section via the
+            # book-global occurrence list would create a plausible but wrong link.
+            return unlinked_reference()
 
-        # Fall back to global occurrence-based mapping
+        # Books without a usable section model retain occurrence-based mapping.
         if key in self.scanner.definitions:
             # Use occurrence-based mapping if available
             occurrence_num = None
@@ -829,10 +941,14 @@ class FootnoteManager:
                 fnref_id = self._fnref_id(source_chapter, original_key, occurrence_in_file)
                 html_target = self.get_html_filename(source_chapter)
                 occ_num = occurrence_num if occurrence_num else 1
-                return f'<sup id="{fnref_id}"><a class="footnote-ref" href="{html_target}#fn:{key}:{occ_num}">[{display_key}]</a></sup>'
+                fn_id = self._footnote_definition_id(key, occ_num)
+                return (
+                    f'<sup id="{fnref_id}"><a class="footnote-ref" '
+                    f'href="{html_target}#{fn_id}">[{display_key}]</a></sup>'
+                )
             else:
                 # Cross-file reference
-                fn_id = f"fn:{key}:{occurrence_num}"
+                fn_id = self._footnote_definition_id(key, occurrence_num)
 
                 fnref_id = self._fnref_id(source_chapter, original_key, occurrence_in_file)
                 html_target = self.get_html_filename(target_chapter)

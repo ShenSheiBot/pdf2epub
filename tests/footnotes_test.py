@@ -1,775 +1,452 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from pdf2epub.build_epub import process_chapter_content
-from pdf2epub.epub.footnotes import FootnoteManager, FootnoteStyle
-import pdf2epub.epub.footnotes.manager as manager_module
-from pdf2epub.markdown_to_html import convert_file, convert_markdown_to_html
+from pdf2epub.epub.footnotes import (
+    FootnoteGraphError,
+    FootnoteManager,
+    FootnoteStyle,
+    inspect_footnote_graph,
+    validate_footnote_graph,
+)
+from pdf2epub.epub.footnotes.content_index import ContentAddressIndex
+from pdf2epub.markdown_to_html import convert_markdown_to_html
 
 
-def test_local_footnotes_resolve_across_refined_sibling_units(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.1.md").write_text(
-        "Early section text with a note [^1].\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_1.2.md").write_text(
-        "Final section text with its own note [^2].\n\n"
-        "### Notes\n\n"
-        "[^1]: Note for the early section.\n\n"
-        "[^2]: Note for the final section.\n",
-        encoding="utf-8",
-    )
+def _entry(unit_id: str, *part_files: Path, children=None, entry_type=None) -> dict:
+    result = {"unit_id": unit_id}
+    if part_files:
+        result["file_path"] = part_files[0]
+        result["part_files"] = list(part_files)
+    if children is not None:
+        result["children"] = children
+    if entry_type:
+        result["type"] = entry_type
+    return result
 
-    manager = FootnoteManager(tmp_path)
-    assert manager.get_style() == FootnoteStyle.LOCAL
 
-    manager.configure_from_structure(
-        [
+def _render(structure: list[dict], manager: FootnoteManager) -> dict[str, str]:
+    html_files: dict[str, str] = {}
+
+    def walk(entries: list[dict]) -> None:
+        for entry in entries:
+            part_files = entry.get("part_files") or []
+            for part_index, part_file in enumerate(part_files, 1):
+                content = Path(part_file).read_text(encoding="utf-8")
+                processed = process_chapter_content(
+                    entry.get("title", entry["unit_id"]),
+                    entry.get("level", 1),
+                    content,
+                    is_first_part=(part_index == 1),
+                )
+                html = convert_markdown_to_html(
+                    processed,
+                    "Book",
+                    standalone=False,
+                    footnote_manager=manager,
+                    source_chapter=Path(part_file).stem,
+                )
+                html_name = (
+                    f"{entry['unit_id']}_part{part_index}.html"
+                    if len(part_files) > 1
+                    else f"{entry['unit_id']}.html"
+                )
+                html_files[html_name] = html
+            walk(entry.get("children", []))
+
+    walk(structure)
+    return html_files
+
+
+def _write_section_cache(markdown_dir: Path, matches: list[dict]) -> None:
+    book_dir = markdown_dir.parent.parent
+    (book_dir / "toc_tree.json").write_text(
+        json.dumps(
             {
-                "unit_id": "chapter_1",
-                "children": [
-                    {
-                        "unit_id": "chapter_1.1",
-                        "file_path": tmp_path / "chapter_1.1.md",
-                        "part_files": [tmp_path / "chapter_1.1.md"],
-                    },
-                    {
-                        "unit_id": "chapter_1.2",
-                        "file_path": tmp_path / "chapter_1.2.md",
-                        "part_files": [tmp_path / "chapter_1.2.md"],
-                    },
-                ],
+                "chapters": [
+                    {"title": "Body one"},
+                    {"title": "Body two"},
+                    {"title": "Notes", "type": "notes"},
+                ]
             }
-        ]
-    )
-
-    early_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.1",
-    )
-    final_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.2.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.2",
-    )
-
-    assert 'href="chapter_1.2.html#fn:1:1"' in early_html
-    assert 'id="fn:1:1"' in final_html
-    assert 'href="chapter_1.2.html#fn:2:1"' in final_html
-    assert 'id="fn:2:1"' in final_html
-
-
-def test_local_footnotes_use_occurrence_when_build_inserts_heading(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.part1.md").write_text(
-        "First repeated note [^1].\n\nSecond repeated note [^1].\n\n"
-        "Local note keeps this chapter in local mode [^9].\n\n"
-        "[^9]: Local definition.\n",
+        ),
         encoding="utf-8",
     )
-    (tmp_path / "chapter_1.part2.md").write_text(
+    (markdown_dir.parent / "footnote_section_matches.json").write_text(
+        json.dumps(matches, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_content_address_index_uses_structure_for_leaf_ancestry_and_html_names(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "chapter_9.part3.part1.md"
+    second = tmp_path / "chapter_9.part3.part2.md"
+    structure = [
+        _entry(
+            "chapter_1",
+            children=[
+                _entry(
+                    "chapter_1.1",
+                    children=[_entry("chapter_1.1.1", first, second)],
+                )
+            ],
+        )
+    ]
+
+    index = ContentAddressIndex.from_structure(structure)
+
+    assert index.ancestry_for_source(first.stem) == (
+        "chapter_1",
+        "chapter_1.1",
+        "chapter_1.1.1",
+    )
+    assert index.nearest_scope(first.stem, {"chapter_1", "chapter_1.1"}) == "chapter_1.1"
+    assert index.html_for_source(first.stem) == "chapter_1.1.1_part1.html"
+    assert index.html_for_source(second.stem) == "chapter_1.1.1_part2.html"
+
+
+def test_structure_limits_scanning_to_files_that_will_be_built(tmp_path: Path) -> None:
+    included = tmp_path / "chapter_1.md"
+    stale = tmp_path / "chapter_99.md"
+    included.write_text("Body [^1].\n\n[^1]: Definition.\n", encoding="utf-8")
+    stale.write_text("Stale marker [^99].\n", encoding="utf-8")
+    structure = [_entry("chapter_1", included)]
+
+    manager = FootnoteManager(tmp_path, epub_structure=structure)
+
+    assert "1" in manager.references
+    assert "99" not in manager.references
+
+
+def test_local_notes_cross_refined_siblings_form_a_valid_graph(tmp_path: Path) -> None:
+    early = tmp_path / "chapter_1.1.md"
+    late = tmp_path / "chapter_1.2.md"
+    early.write_text("Early note [^1].\n", encoding="utf-8")
+    late.write_text(
+        "Late note [^2].\n\n[^1]: Early definition.\n\n[^2]: Late definition.\n",
+        encoding="utf-8",
+    )
+    structure = [
+        _entry(
+            "chapter_1",
+            children=[_entry("chapter_1.1", early), _entry("chapter_1.2", late)],
+        )
+    ]
+
+    manager = FootnoteManager(tmp_path, epub_structure=structure)
+    html_files = _render(structure, manager)
+    report = validate_footnote_graph(html_files)
+
+    assert manager.get_style() == FootnoteStyle.LOCAL
+    assert manager.get_local_group_id(early.stem) == "chapter_1"
+    assert report["forward_hrefs"] == 2
+    assert report["backref_hrefs"] == 2
+
+
+def test_unbalanced_local_occurrences_degrade_to_visible_unlinked_refs(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "chapter_1.part1.md"
+    second = tmp_path / "chapter_1.part2.md"
+    first.write_text("One [^1]. Two [^1].\n", encoding="utf-8")
+    second.write_text("[^1]: Only one definition.\n", encoding="utf-8")
+    structure = [_entry("chapter_1", first, second)]
+
+    manager = FootnoteManager(tmp_path, epub_structure=structure)
+    report = validate_footnote_graph(_render(structure, manager))
+
+    assert report["forward_hrefs"] == 1
+    assert report["unlinked_sup_count"] == 1
+
+
+def test_global_occurrence_mapping_without_semantic_sections_is_valid(
+    tmp_path: Path,
+) -> None:
+    body = tmp_path / "chapter_1.md"
+    notes = tmp_path / "chapter_2.md"
+    body.write_text("One [^1]. Two [^1].\n", encoding="utf-8")
+    notes.write_text(
         "[^1]: First definition.\n\n[^1]: Second definition.\n",
         encoding="utf-8",
     )
+    structure = [_entry("chapter_1", body), _entry("chapter_2", notes)]
 
-    manager = FootnoteManager(tmp_path)
-    manager.configure_from_structure(
+    manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
+    report = validate_footnote_graph(_render(structure, manager))
+
+    assert manager.notes_sections == []
+    assert report["forward_hrefs"] == 2
+    assert report["backref_hrefs"] == 0
+
+
+def test_repeated_notes_fragments_merge_into_hierarchical_semantic_scope(
+    tmp_path: Path,
+) -> None:
+    markdown_dir = tmp_path / "translated" / "validated"
+    markdown_dir.mkdir(parents=True)
+    body_a = markdown_dir / "chapter_1.1.md"
+    body_b = markdown_dir / "chapter_1.2.md"
+    notes_a = markdown_dir / "chapter_3.part10.md"
+    notes_b = markdown_dir / "chapter_3.part2.md"
+    body_a.write_text("First [^1].\n", encoding="utf-8")
+    body_b.write_text("Second [^2]. False OCR [^3].\n", encoding="utf-8")
+    notes_a.write_text("## Chapter One\n\n[^1]: First.\n", encoding="utf-8")
+    notes_b.write_text("### False Heading\n\n[^2]: Second.\n", encoding="utf-8")
+    structure = [
+        _entry(
+            "chapter_1",
+            children=[_entry("chapter_1.1", body_a), _entry("chapter_1.2", body_b)],
+        ),
+        _entry("chapter_3", notes_a, notes_b, entry_type="notes"),
+    ]
+    _write_section_cache(
+        markdown_dir,
         [
-            {
-                "unit_id": "chapter_1",
-                "file_path": tmp_path / "chapter_1.md",
-                "part_files": [
-                    tmp_path / "chapter_1.part1.md",
-                    tmp_path / "chapter_1.part2.md",
-                ],
-            }
-        ]
+            {"header": "## Chapter One", "unit_id": "chapter_1"},
+            {"header": "### False Heading", "unit_id": "chapter_1"},
+        ],
     )
 
-    first_part = process_chapter_content(
-        "Inserted Title",
-        1,
-        (tmp_path / "chapter_1.part1.md").read_text(encoding="utf-8"),
-        is_first_part=True,
+    manager = FootnoteManager(
+        markdown_dir,
+        auto_global=True,
+        epub_structure=structure,
     )
-    second_part = process_chapter_content(
-        "Inserted Title",
-        1,
-        (tmp_path / "chapter_1.part2.md").read_text(encoding="utf-8"),
-        is_first_part=False,
-    )
+    report = validate_footnote_graph(_render(structure, manager))
 
-    first_html = convert_markdown_to_html(
-        first_part,
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part1",
-    )
-    second_html = convert_markdown_to_html(
-        second_part,
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part2",
-    )
-
-    assert 'href="chapter_1_part2.html#fn:1:1"' in first_html
-    assert 'href="chapter_1_part2.html#fn:1:2"' in first_html
-    assert 'id="fn:1:1"' in second_html
-    assert 'id="fn:1:2"' in second_html
-    assert 'id="fnref-chapter_1.part1-1"' in first_html
-    assert 'id="fnref-chapter_1.part1-1-2"' in first_html
-    assert 'href="chapter_1_part1.html#fnref-chapter_1.part1-1-2"' in second_html
+    assert len(manager.notes_sections) == 1
+    assert len(manager.notes_sections[0].definitions) == 2
+    assert report["forward_hrefs"] == 2
+    assert report["backref_hrefs"] == 2
+    assert report["unlinked_sup_count"] == 1
 
 
-def test_local_split_part_linked_and_unlinked_repeated_refs_have_distinct_ids(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.part1.md").write_text(
-        "Earlier part uses the same key [^1].\n\n"
-        "[^9]: Local-only definition keeps this fixture in local mode.\n",
+def test_semantic_scopes_prevent_reset_keys_from_colliding_or_cross_linking(
+    tmp_path: Path,
+) -> None:
+    markdown_dir = tmp_path / "translated" / "validated"
+    markdown_dir.mkdir(parents=True)
+    body_one = markdown_dir / "chapter_1.md"
+    body_two = markdown_dir / "chapter_2.md"
+    notes = markdown_dir / "chapter_3.md"
+    body_one.write_text("Real [^1]. Extra [^1].\n", encoding="utf-8")
+    body_two.write_text("Other chapter [^1].\n", encoding="utf-8")
+    notes.write_text(
+        "## One\n\n[^1]: Definition one.\n\n"
+        "## Two\n\n[^1]: Definition two.\n",
         encoding="utf-8",
     )
-    (tmp_path / "chapter_1.part2.md").write_text(
-        "This part has a linkable repeat [^1].\n\n"
-        "This part has an unlinked repeat [^1].\n\n"
-        "[^9]: Local-only definition keeps this fixture in local mode.\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_1.part3.md").write_text(
-        "[^1]: First definition.\n\n"
-        "[^1]: Second definition.\n",
-        encoding="utf-8",
-    )
-
     structure = [
-        {
-            "unit_id": "chapter_1",
-            "file_path": tmp_path / "chapter_1.md",
-            "part_files": [
-                tmp_path / "chapter_1.part1.md",
-                tmp_path / "chapter_1.part2.md",
-                tmp_path / "chapter_1.part3.md",
-            ],
-        }
+        _entry("chapter_1", body_one),
+        _entry("chapter_2", body_two),
+        _entry("chapter_3", notes, entry_type="notes"),
     ]
-    manager = FootnoteManager(tmp_path, epub_structure=structure)
-    manager.configure_from_structure(structure)
-
-    second_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.part2.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part2",
-    )
-    third_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.part3.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part3",
+    _write_section_cache(
+        markdown_dir,
+        [
+            {"header": "## One", "unit_id": "chapter_1"},
+            {"header": "## Two", "unit_id": "chapter_2"},
+        ],
     )
 
-    assert 'id="fnref-chapter_1.part2-1"' in second_html
-    assert 'id="fnref-chapter_1.part2-1-2"' in second_html
-    assert second_html.count('id="fnref-chapter_1.part2-1-2"') == 1
-    assert 'href="chapter_1_part3.html#fn:1:2"' in second_html
-    assert '<sup id="fnref-chapter_1.part2-1-2">[1]</sup>' in second_html
-    assert 'href="chapter_1_part2.html#fnref-chapter_1.part2-1"' in third_html
+    manager = FootnoteManager(
+        markdown_dir,
+        auto_global=True,
+        epub_structure=structure,
+    )
+    html_files = _render(structure, manager)
+    report = validate_footnote_graph(html_files)
+
+    assert "fn-chapter_1-1-1" in html_files["chapter_3.html"]
+    assert "fn-chapter_2-1-1" in html_files["chapter_3.html"]
+    assert report["forward_hrefs"] == 2
+    assert report["backref_hrefs"] == 2
+    assert report["unlinked_sup_count"] == 1
 
 
-def test_global_notes_use_occurrence_anchor_for_repeated_keys(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text("First chapter note [^1].\n", encoding="utf-8")
-    (tmp_path / "chapter_2.md").write_text("Second chapter note [^1].\n", encoding="utf-8")
-    (tmp_path / "chapter_3.md").write_text(
-        "[^1]: First chapter definition.\n\n[^1]: Second chapter definition.\n",
+def test_resumed_semantic_scope_keeps_physical_definition_occurrences_aligned(
+    tmp_path: Path,
+) -> None:
+    markdown_dir = tmp_path / "translated" / "validated"
+    markdown_dir.mkdir(parents=True)
+    body_one = markdown_dir / "chapter_1.md"
+    body_two = markdown_dir / "chapter_2.md"
+    notes = markdown_dir / "chapter_3.md"
+    body_one.write_text("First [^1]. Resumed [^1].\n", encoding="utf-8")
+    body_two.write_text("Middle [^1].\n", encoding="utf-8")
+    notes.write_text(
+        "## One\n\n[^1]: One first.\n\n"
+        "## Two\n\n[^1]: Two.\n\n"
+        "### One continued\n\n[^1]: One second.\n",
         encoding="utf-8",
     )
-
     structure = [
-        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
-        {"unit_id": "chapter_2", "file_path": tmp_path / "chapter_2.md", "part_files": [tmp_path / "chapter_2.md"]},
-        {"unit_id": "chapter_3", "file_path": tmp_path / "chapter_3.md", "part_files": [tmp_path / "chapter_3.md"]},
+        _entry("chapter_1", body_one),
+        _entry("chapter_2", body_two),
+        _entry("chapter_3", notes, entry_type="notes"),
     ]
+    _write_section_cache(
+        markdown_dir,
+        [
+            {"header": "## One", "unit_id": "chapter_1"},
+            {"header": "## Two", "unit_id": "chapter_2"},
+            {"header": "### One continued", "unit_id": "chapter_1"},
+        ],
+    )
+
+    manager = FootnoteManager(
+        markdown_dir,
+        auto_global=True,
+        epub_structure=structure,
+    )
+    report = validate_footnote_graph(_render(structure, manager))
+
+    assert report["forward_hrefs"] == 3
+    assert report["backref_hrefs"] == 3
+    assert report["duplicate_footnote_id_count"] == 0
+
+
+def test_no_colon_definitions_are_limited_to_structural_notes_scope(
+    tmp_path: Path,
+) -> None:
+    body = tmp_path / "chapter_1.md"
+    notes = tmp_path / "chapter_2.md"
+    unrelated = tmp_path / "chapter_3.md"
+    body.write_text("Body [^1].\n", encoding="utf-8")
+    notes.write_text("[^1] Legacy definition.\n", encoding="utf-8")
+    unrelated.write_text("[^2] This remains a reference.\n", encoding="utf-8")
+    structure = [
+        _entry("chapter_1", body),
+        _entry("chapter_2", notes, entry_type="notes"),
+        _entry("chapter_3", unrelated),
+    ]
+
     manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
-    manager.configure_from_structure(structure)
-    assert manager.get_style() == FootnoteStyle.GLOBAL
 
-    first_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-    second_html = convert_markdown_to_html(
-        (tmp_path / "chapter_2.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_2",
-    )
-    notes_html = convert_markdown_to_html(
-        (tmp_path / "chapter_3.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_3",
-    )
-
-    assert 'href="chapter_3.html#fn:1:1"' in first_html
-    assert 'href="chapter_3.html#fn:1:2"' in second_html
-    assert 'id="fn:1:1"' in notes_html
-    assert 'id="fn:1:2"' in notes_html
-
-
-def test_global_notes_keep_definitions_after_unknown_page_placeholder(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "First note [^1]. Second note [^2].\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_2.md").write_text(
-        "[^1]: See above p. $$$.\n"
-        "[^2]: Definition after placeholder.\n",
-        encoding="utf-8",
-    )
-
-    structure = [
-        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
-        {"unit_id": "chapter_2", "file_path": tmp_path / "chapter_2.md", "part_files": [tmp_path / "chapter_2.md"]},
-    ]
-    manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
-    manager.configure_from_structure(structure)
-
-    text_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-    notes_html = convert_markdown_to_html(
-        (tmp_path / "chapter_2.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_2",
-    )
-
-    assert 'href="chapter_2.html#fn:1:1"' in text_html
-    assert 'href="chapter_2.html#fn:2:1"' in text_html
-    assert 'id="fn:1:1"' in notes_html
-    assert 'id="fn:2:1"' in notes_html
-    assert "$$$" in notes_html
-
-
-def test_no_colon_footnote_definitions_only_in_notes_chapters(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "Body note [^1].\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_2.1.md").write_text(
-        "[^1] Legacy notes definition without colon.\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_3.md").write_text(
-        "[^2] Body-leading marker is still a reference.\n",
-        encoding="utf-8",
-    )
-
-    structure = [
-        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
-        {
-            "unit_id": "chapter_2",
-            "type": "notes",
-            "children": [
-                {
-                    "unit_id": "chapter_2.1",
-                    "file_path": tmp_path / "chapter_2.1.md",
-                    "part_files": [tmp_path / "chapter_2.1.md"],
-                },
-            ],
-        },
-        {"unit_id": "chapter_3", "file_path": tmp_path / "chapter_3.md", "part_files": [tmp_path / "chapter_3.md"]},
-    ]
-    manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
-    manager.configure_from_structure(structure)
-
-    assert "chapter_2.1" in manager.no_colon_definition_chapters
-    assert "chapter_2.1" in manager.primary_definition_chapters
-    assert "chapter_3" not in manager.no_colon_definition_chapters
-    assert manager.references["1"][0].chapter == "chapter_1"
-    assert manager.definitions["1"][0].chapter == "chapter_2.1"
-    assert "2" in manager.references
+    assert manager.definitions["1"][0].chapter == notes.stem
     assert "2" not in manager.definitions
-
-    body_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-    notes_html = convert_markdown_to_html(
-        (tmp_path / "chapter_2.1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_2.1",
-    )
-    body_marker_html = convert_markdown_to_html(
-        (tmp_path / "chapter_3.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_3",
-    )
-
-    assert 'href="chapter_2.1.html#fn:1:1"' in body_html
-    assert 'id="fn:1:1"' in notes_html
-    assert '<strong>[1]:</strong> Legacy notes definition without colon.' in notes_html
-    assert '<sup id="fnref-chapter_3-2">[2]</sup>' in body_marker_html
+    assert manager.references["2"][0].chapter == unrelated.stem
 
 
-def test_local_orphan_definition_does_not_create_broken_backref(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "Referenced note [^1].\n\n"
-        "[^1]: Referenced definition.\n"
-        "[^2]: Definition with no text reference.\n",
-        encoding="utf-8",
-    )
+def test_page_note_keys_preserve_display_while_using_normalized_definition(
+    tmp_path: Path,
+) -> None:
+    body = tmp_path / "chapter_1.md"
+    notes = tmp_path / "chapter_2.md"
+    body.write_text("Page note [^197n67].\n", encoding="utf-8")
+    notes.write_text("[^67]: Definition.\n", encoding="utf-8")
+    structure = [_entry("chapter_1", body), _entry("chapter_2", notes)]
 
-    manager = FootnoteManager(tmp_path)
-    html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-
-    assert 'href="chapter_1.html#fnref-chapter_1-1"' in html
-    assert 'id="fn:2"' in html
-    assert 'href="chapter_1.html#fnref-chapter_1-2"' not in html
-
-
-def test_local_single_file_reference_and_definition_ids_are_consistent(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "Body note [^1].\n\n"
-        "[^1]: Local definition.\n",
-        encoding="utf-8",
-    )
-
-    manager = FootnoteManager(tmp_path)
-    direct_ref = manager.get_footnote_html(
-        "1",
-        "chapter_1",
-        line_num=1,
-        occurrence_in_file=1,
-    )
-    html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-
-    assert 'href="chapter_1.html#fn:1"' in direct_ref
-    assert 'href="chapter_1.html#fn:1"' in html
-    assert 'id="fn:1"' in html
-    assert "#fn:1:1" not in html
-
-
-def test_local_single_file_repeated_key_links_by_file_occurrence(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "First repeated note [^1]. Second repeated note [^1].\n\n"
-        "[^1]: First definition.\n\n"
-        "[^1]: Second definition.\n",
-        encoding="utf-8",
-    )
-
-    manager = FootnoteManager(tmp_path)
-    html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-
-    assert 'id="fnref-chapter_1-1"' in html
-    assert 'id="fnref-chapter_1-1-2"' in html
-    assert 'href="chapter_1.html#fn:1"' in html
-    assert 'href="chapter_1.html#fn:1:2"' in html
-    assert 'id="fn:1"' in html
-    assert 'id="fn:1:2"' in html
-    assert 'href="chapter_1.html#fnref-chapter_1-1"' in html
-    assert 'href="chapter_1.html#fnref-chapter_1-1-2"' in html
-
-
-def test_global_repeated_key_in_same_file_uses_file_occurrence(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "First note [^1]. Second note [^1].\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_2.md").write_text(
-        "[^1]: First definition.\n\n"
-        "[^1]: Second definition.\n",
-        encoding="utf-8",
-    )
-
-    structure = [
-        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
-        {"unit_id": "chapter_2", "file_path": tmp_path / "chapter_2.md", "part_files": [tmp_path / "chapter_2.md"]},
-    ]
     manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
-    manager.configure_from_structure(structure)
+    html_files = _render(structure, manager)
+    report = validate_footnote_graph(html_files)
 
-    text_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-    notes_html = convert_markdown_to_html(
-        (tmp_path / "chapter_2.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_2",
-    )
-
-    assert 'href="chapter_2.html#fn:1:1"' in text_html
-    assert 'href="chapter_2.html#fn:1:2"' in text_html
-    assert 'id="fnref-chapter_1-1"' in text_html
-    assert 'id="fnref-chapter_1-1-2"' in text_html
-    assert 'id="fn:1:1"' in notes_html
-    assert 'id="fn:1:2"' in notes_html
+    assert "[197n67]" in html_files["chapter_1.html"]
+    assert report["forward_hrefs"] == 1
 
 
-def test_page_note_reference_displays_original_key_and_links_normalized_key(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "Page-note style reference [^197n67].\n",
+def test_replaced_source_heading_markers_do_not_create_phantom_backlinks(
+    tmp_path: Path,
+) -> None:
+    body = tmp_path / "chapter_1.part1.md"
+    notes = tmp_path / "chapter_1.part2.md"
+    body.write_text(
+        "# Raw title [^1] [^2]\n\n"
+        "Body [^1]. Local [^9].\n\n[^9]: Local definition.\n",
         encoding="utf-8",
     )
-    (tmp_path / "chapter_2.md").write_text(
-        "[^67]: Page note definition.\n",
+    notes.write_text(
+        "[^1]: Body definition.\n\n[^2]: Replaced-heading definition.\n",
         encoding="utf-8",
     )
-
-    structure = [
-        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
-        {"unit_id": "chapter_2", "file_path": tmp_path / "chapter_2.md", "part_files": [tmp_path / "chapter_2.md"]},
-    ]
-    manager = FootnoteManager(tmp_path, auto_global=True, epub_structure=structure)
-    manager.configure_from_structure(structure)
-
-    text_html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-    notes_html = convert_markdown_to_html(
-        (tmp_path / "chapter_2.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_2",
-    )
-
-    assert 'href="chapter_2.html#fn:67:1"' in text_html
-    assert "[197n67]" in text_html
-    assert 'id="fn:67:1"' in notes_html
-
-
-def test_replaced_first_heading_reference_does_not_shift_local_occurrence(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.part1.md").write_text(
-        "# Raw title note [^1] [^2]\n\n"
-        "Body note still exists [^1].\n\n"
-        "Local note keeps this in local mode [^9].\n\n"
-        "[^9]: Local definition.\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_1.part2.md").write_text(
-        "[^1]: Body definition.\n"
-        "[^2]: Heading-only definition.\n",
-        encoding="utf-8",
-    )
-
     structure = [
         {
-            "unit_id": "chapter_1",
-            "title": "TOC Title",
+            **_entry("chapter_1", body, notes),
+            "title": "TOC title",
             "level": 1,
-            "file_path": tmp_path / "chapter_1.part1.md",
-            "part_files": [
-                tmp_path / "chapter_1.part1.md",
-                tmp_path / "chapter_1.part2.md",
-            ],
         }
     ]
+
     manager = FootnoteManager(tmp_path, epub_structure=structure)
-    manager.configure_from_structure(structure)
+    report = validate_footnote_graph(_render(structure, manager))
 
-    first_part = process_chapter_content(
-        "TOC Title",
-        1,
-        (tmp_path / "chapter_1.part1.md").read_text(encoding="utf-8"),
-        is_first_part=True,
-    )
-    second_part = process_chapter_content(
-        "TOC Title",
-        1,
-        (tmp_path / "chapter_1.part2.md").read_text(encoding="utf-8"),
-        is_first_part=False,
-    )
-
-    first_html = convert_markdown_to_html(
-        first_part,
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part1",
-    )
-    second_html = convert_markdown_to_html(
-        second_part,
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part2",
-    )
-
-    assert 'href="chapter_1_part2.html#fn:1:1"' in first_html
-    assert 'id="fn:1:1"' in second_html
-    assert 'href="chapter_1_part1.html#fnref-chapter_1.part1-1"' in second_html
-    assert 'href="chapter_1_part1.html#fnref-chapter_1.part1-2"' not in second_html
+    assert report["forward_hrefs"] == 2
+    assert report["backref_hrefs"] == 2
+    assert report["unlinked_sup_count"] == 0
 
 
-def test_late_structure_config_suppresses_replaced_heading_reference(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.part1.md").write_text(
-        "# Raw title note [^1] [^2]\n\n"
-        "Body note still exists [^1].\n\n"
-        "Local note keeps this in local mode [^9].\n\n"
-        "[^9]: Local definition.\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_1.part2.md").write_text(
-        "[^1]: Body definition.\n"
-        "[^2]: Heading-only definition.\n",
-        encoding="utf-8",
-    )
-
-    structure = [
-        {
-            "unit_id": "chapter_1",
-            "title": "TOC Title",
-            "level": 1,
-            "file_path": tmp_path / "chapter_1.part1.md",
-            "part_files": [
-                tmp_path / "chapter_1.part1.md",
-                tmp_path / "chapter_1.part2.md",
-            ],
-        }
-    ]
-    manager = FootnoteManager(tmp_path)
-    manager.configure_from_structure(structure)
-
-    first_part = process_chapter_content(
-        "TOC Title",
-        1,
-        (tmp_path / "chapter_1.part1.md").read_text(encoding="utf-8"),
-        is_first_part=True,
-    )
-    second_part = process_chapter_content(
-        "TOC Title",
-        1,
-        (tmp_path / "chapter_1.part2.md").read_text(encoding="utf-8"),
-        is_first_part=False,
-    )
-
-    first_html = convert_markdown_to_html(
-        first_part,
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part1",
-    )
-    second_html = convert_markdown_to_html(
-        second_part,
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1.part2",
-    )
-
-    assert 'href="chapter_1_part2.html#fn:1:1"' in first_html
-    assert 'id="fn:1:1"' in second_html
-    assert 'href="chapter_1_part1.html#fnref-chapter_1.part1-1"' in second_html
-    assert 'href="chapter_1_part1.html#fnref-chapter_1.part1-2"' not in second_html
-
-
-def test_configure_from_structure_rescans_current_markdown(tmp_path: Path) -> None:
+def test_definition_text_markers_are_not_scanned_as_body_references(
+    tmp_path: Path,
+) -> None:
     chapter = tmp_path / "chapter_1.md"
     chapter.write_text(
-        "Referenced note [^1].\n\n"
-        "[^1]: Definition.\n",
+        "Body [^1].\n\n"
+        "[^1]: *Styled* $\\frac{x}{y}$ mentions literal [^2] and <Book>.\n\n"
+        "[^2]: Orphan definition.\n",
         encoding="utf-8",
     )
-    structure = [
-        {"unit_id": "chapter_1", "file_path": chapter, "part_files": [chapter]},
-    ]
+    structure = [_entry("chapter_1", chapter)]
+
     manager = FootnoteManager(tmp_path, epub_structure=structure)
+    html_files = _render(structure, manager)
+    report = validate_footnote_graph(html_files)
 
-    chapter.write_text(
-        "Reference was removed by cleanup.\n\n"
-        "[^1]: Definition.\n",
-        encoding="utf-8",
-    )
-    manager.configure_from_structure(structure)
-
-    html = convert_markdown_to_html(
-        chapter.read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
-    )
-
-    assert 'id="fn:1"' in html
-    assert 'footnote-backref' not in html
-
-
-def test_configure_from_structure_clears_stale_section_matcher_state(tmp_path: Path) -> None:
-    chapter = tmp_path / "chapter_1.md"
-    chapter.write_text(
-        "Referenced note [^1].\n\n"
-        "[^1]: Definition.\n",
-        encoding="utf-8",
-    )
-    structure = [
-        {"unit_id": "chapter_1", "file_path": chapter, "part_files": [chapter]},
-    ]
-    manager = FootnoteManager(tmp_path, epub_structure=structure)
-
-    class StaleMatcher:
-        notes_sections = [object()]
-        chapter_to_section = {"chapter_1": object()}
-
-    manager.llm_matcher = StaleMatcher()
-    manager.mapper.section_definition_by_occurrence[(0, "1", 1)] = object()
-    manager.mapper.section_definition_occurrence_by_line[("1", "chapter_1", 1)] = (0, 1)
-    manager.mapper.section_definition_occurrence_in_file[("1", "chapter_1", 1)] = (0, 1)
-
-    manager.configure_from_structure(structure)
-
-    assert manager.llm_matcher is None
-    assert manager.mapper.section_definition_by_occurrence == {}
-    assert manager.mapper.section_definition_occurrence_by_line == {}
-    assert manager.mapper.section_definition_occurrence_in_file == {}
-
-
-def test_configure_from_structure_rebuilds_llm_matcher_when_enabled(tmp_path: Path, monkeypatch) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "Referenced global note [^1].\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "chapter_2.md").write_text(
-        "[^1]: Global definition.\n",
-        encoding="utf-8",
-    )
-    structure = [
-        {"unit_id": "chapter_1", "file_path": tmp_path / "chapter_1.md", "part_files": [tmp_path / "chapter_1.md"]},
-        {"unit_id": "chapter_2", "file_path": tmp_path / "chapter_2.md", "part_files": [tmp_path / "chapter_2.md"]},
-    ]
-
-    class FakeMatcher:
-        created = 0
-
-        def __init__(self, markdown_dir, config):
-            FakeMatcher.created += 1
-            self.markdown_dir = markdown_dir
-            self.config = config
-            self.notes_sections = []
-            self.chapter_to_section = {}
-
-        def load_toc_tree(self):
-            return True
-
-        def match_sections(self, primary_definition_chapters):
-            return False
-
-    monkeypatch.setattr(manager_module, "LLMSectionMatcher", FakeMatcher)
-    manager = FootnoteManager(tmp_path, auto_global=True, config={"provider": "fake"}, epub_structure=structure)
-    created_after_init = FakeMatcher.created
-
-    manager.llm_matcher = None
-    manager.configure_from_structure(structure)
-
-    assert FakeMatcher.created == created_after_init + 1
-    assert isinstance(manager.llm_matcher, FakeMatcher)
-
-
-def test_definition_text_marker_is_not_counted_as_body_reference(tmp_path: Path) -> None:
-    (tmp_path / "chapter_1.md").write_text(
-        "Body note [^1].\n\n"
-        "[^1]: This definition mentions literal [^2].\n"
-        "[^2]: Definition with no body reference.\n",
-        encoding="utf-8",
-    )
-
-    manager = FootnoteManager(tmp_path)
     assert "2" not in manager.references
+    assert "<em>Styled</em>" in html_files["chapter_1.html"]
+    assert "<math" in html_files["chapter_1.html"]
+    assert "<mfrac>" in html_files["chapter_1.html"]
+    assert "&lt;Book&gt;" in html_files["chapter_1.html"]
+    assert report["forward_hrefs"] == 1
+    assert report["backref_hrefs"] == 1
 
-    html = convert_markdown_to_html(
-        (tmp_path / "chapter_1.md").read_text(encoding="utf-8"),
-        "Book",
-        standalone=False,
-        footnote_manager=manager,
-        source_chapter="chapter_1",
+
+def test_reconfiguration_rescans_markdown_and_rebuilds_structural_state(
+    tmp_path: Path,
+) -> None:
+    chapter = tmp_path / "chapter_1.md"
+    chapter.write_text("Body [^1].\n\n[^1]: Definition.\n", encoding="utf-8")
+    structure = [_entry("chapter_1", chapter)]
+    manager = FootnoteManager(tmp_path, epub_structure=structure)
+
+    chapter.write_text("[^1]: Definition without a reference.\n", encoding="utf-8")
+    manager.configure_from_structure(structure)
+    report = validate_footnote_graph(_render(structure, manager))
+
+    assert manager.references == {}
+    assert report["backref_hrefs"] == 0
+
+
+@pytest.mark.parametrize(
+    "html_files",
+    [
+        {
+            "one.html": '<sup id="fnref-one-1"><a href="two.html#fn-1">[1]</a></sup>',
+            "two.html": "<p>No target</p>",
+        },
+        {
+            "one.html": '<div id="fn-1"></div><div id="fn-1"></div>',
+        },
+        {
+            "one.html": '<div id="fn:legacy"></div>',
+        },
+    ],
+)
+def test_graph_validator_rejects_broken_targets_and_duplicate_ids(
+    html_files: dict[str, str],
+) -> None:
+    with pytest.raises(FootnoteGraphError):
+        validate_footnote_graph(html_files)
+
+
+def test_graph_inspection_allows_explicit_unlinked_reference() -> None:
+    report = inspect_footnote_graph(
+        {"one.html": '<p><sup id="fnref-one-1">[1]</sup></p>'}
     )
 
-    assert 'href="chapter_1.html#fnref-chapter_1-1"' in html
-    assert 'href="chapter_1.html#fnref-chapter_1-2"' not in html
-
-
-def test_markdown_without_footnotes_does_not_require_manager() -> None:
-    html = convert_markdown_to_html(
-        "Plain paragraph without notes.",
-        "Book",
-        standalone=False,
-    )
-
-    assert "Plain paragraph without notes." in html
-
-
-def test_markdown_footnotes_require_manager() -> None:
-    with pytest.raises(ValueError, match="Footnote markdown requires FootnoteManager"):
-        convert_markdown_to_html(
-            "Body note [^1].\n\n[^1]: Definition.\n",
-            "Book",
-            standalone=False,
-        )
-
-
-def test_convert_file_uses_manager_for_footnotes(tmp_path: Path) -> None:
-    input_path = tmp_path / "chapter_1.md"
-    output_path = tmp_path / "chapter_1.html"
-    input_path.write_text(
-        "Body note [^1].\n\n[^1]: Definition.\n",
-        encoding="utf-8",
-    )
-
-    assert convert_file(input_path, output_path, standalone=False)
-    html = output_path.read_text(encoding="utf-8")
-
-    assert 'id="fnref-chapter_1-1"' in html
-    assert 'href="chapter_1.html#fnref-chapter_1-1"' in html
+    assert report["unlinked_sup_count"] == 1
+    assert report["forward_broken_count"] == 0
+    assert report["backref_broken_count"] == 0

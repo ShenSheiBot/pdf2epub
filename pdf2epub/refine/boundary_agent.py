@@ -7,6 +7,7 @@ Supports recursive verification of nested TOC structures.
 
 import json
 import asyncio
+import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -66,7 +67,10 @@ def get_model_and_limits(runtime_config: Optional[dict[str, Any]] = None):
         )
         if provider_type == 'anthropic':
             provider = AnthropicProvider(
-                api_key=provider_config.get('api_key'),
+                api_key=(
+                    os.environ.get('ANTHROPIC_API_KEY')
+                    or provider_config.get('api_key')
+                ),
                 base_url=provider_config.get('base_url'),
             )
             model = AnthropicModel(model_name, provider=provider)
@@ -104,7 +108,7 @@ def get_model_and_limits(runtime_config: Optional[dict[str, Any]] = None):
     if 'anthropic' in providers:
         p = providers['anthropic']
         provider = AnthropicProvider(
-            api_key=p.get('api_key'),
+            api_key=os.environ.get('ANTHROPIC_API_KEY') or p.get('api_key'),
             base_url=p.get('base_url'),
         )
         model_name = 'claude-haiku-4-5-20251001'

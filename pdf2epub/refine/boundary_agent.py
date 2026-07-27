@@ -22,6 +22,7 @@ from loguru import logger
 import yaml
 import tiktoken
 
+from .agent_model import build_openai_agent_model
 from .toc_tree import TOCNode
 
 # Initialize tokenizer
@@ -75,11 +76,7 @@ def get_model_and_limits(runtime_config: Optional[dict[str, Any]] = None):
             )
             model = AnthropicModel(model_name, provider=provider)
         elif provider_type == 'openai':
-            provider = OpenAIProvider(
-                api_key=provider_config.get('api_key'),
-                base_url=provider_config.get('base_url'),
-            )
-            model = OpenAIChatModel(model_name, provider=provider)
+            model = build_openai_agent_model(model_name, provider_config)
         elif provider_type == 'google':
             from google.genai import Client
             from google.genai.types import HttpOptions

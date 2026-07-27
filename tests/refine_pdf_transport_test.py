@@ -476,6 +476,44 @@ def test_boundary_agent_honors_explicit_refine_agent(monkeypatch):
     assert observed["provider"][1]["api_key"] == "explicit-key"
 
 
+def test_official_deepseek_refine_agents_use_deepseek_capability_profile():
+    from pydantic_ai.profiles.openai import OpenAIModelProfile
+
+    runtime_config = {
+        "credentials": {
+            "providers": {
+                "repair": {
+                    "type": "openai",
+                    "api_key": "test-key",
+                    "base_url": "https://api.deepseek.com/v1",
+                }
+            }
+        },
+        "refine": {
+            "agent": {
+                "provider": "repair",
+                "model": "deepseek-v4-flash",
+            }
+        },
+    }
+
+    adaptive_call = AdaptivePdfCall(
+        client=object(),
+        model="structure-model",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        runtime_config=runtime_config,
+    )
+    adaptive_model = adaptive_call._get_agent_model()
+    boundary_model, _, _ = boundary_agent.get_model_and_limits(runtime_config)
+
+    for model in (adaptive_model, boundary_model):
+        profile = OpenAIModelProfile.from_profile(model.profile)
+        assert profile.openai_supports_tool_choice_required is False
+        assert profile.openai_chat_thinking_field == "reasoning_content"
+        assert profile.openai_chat_send_back_thinking_parts == "field"
+
+
 def test_anthropic_refine_agent_prefers_process_api_key(monkeypatch):
     observed = {}
     monkeypatch.setenv("ANTHROPIC_API_KEY", "process-key")

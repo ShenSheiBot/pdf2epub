@@ -776,14 +776,9 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                 logger.info(f"[agent-model] Using explicit Anthropic {model_name}")
                 return AnthropicModel(model_name, provider=provider)
             if provider_type == 'openai':
-                from pydantic_ai.models.openai import OpenAIChatModel
-                from pydantic_ai.providers.openai import OpenAIProvider
-                provider = OpenAIProvider(
-                    api_key=p.get('api_key'),
-                    base_url=p.get('base_url'),
-                )
+                from .agent_model import build_openai_agent_model
                 logger.info(f"[agent-model] Using explicit OpenAI-compat {model_name}")
-                return OpenAIChatModel(model_name, provider=provider)
+                return build_openai_agent_model(model_name, p)
             if provider_type == 'google':
                 from pydantic_ai.models.google import GoogleModel
                 from pydantic_ai.providers.google import GoogleProvider

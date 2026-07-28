@@ -129,6 +129,13 @@ class ContentConverter:
                         ):
                             current_title = stripped[level + 1 :].strip()
 
+                            # Symbol-only headings are section dividers, not titles.
+                            # Repeated dividers such as ``## *`` must remain in place.
+                            if not any(char.isalnum() for char in current_title):
+                                new_lines.append(current_line)
+                                i += 1
+                                continue
+
                             # Look ahead for consecutive headings at the same level with same title
                             j = i + 1
                             duplicates_found = []

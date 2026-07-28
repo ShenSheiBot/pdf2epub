@@ -297,10 +297,15 @@ class BookStructure(Frozen, frozen=True):
         if not content:
             return True
 
+        has_markdown_image = bool(re.search(r'!\[.*?\]\(.*?\)', content))
+        has_html_image = bool(re.search(r'<img[^>]*>', content, flags=re.IGNORECASE))
+        if not (has_markdown_image or has_html_image):
+            return False
+
         # Remove markdown images
         text_only = re.sub(r'!\[.*?\]\(.*?\)', '', content)
         # Remove HTML images
-        text_only = re.sub(r'<img[^>]*>', '', text_only)
+        text_only = re.sub(r'<img[^>]*>', '', text_only, flags=re.IGNORECASE)
         # Remove whitespace
         text_only = text_only.strip()
 
@@ -351,5 +356,4 @@ class BookStructure(Frozen, frozen=True):
     def get_toc(self) -> Optional[Dict]:
         """Get table of contents structure."""
         return self._toc
-
 

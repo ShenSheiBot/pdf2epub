@@ -787,7 +787,11 @@ class Executor:
                 # When threshold=0, always use batch if any units (for testing)
                 batch_threshold = max(1, self._online_fallback_threshold)
                 if batch_queue:
-                    if len(batch_queue) >= batch_threshold:
+                    has_batch_only_unit = any(
+                        not unit_states[uid].has_online_available()
+                        for uid in batch_queue
+                    )
+                    if len(batch_queue) >= batch_threshold or has_batch_only_unit:
                         # Submit as mega unit
                         in_progress.update(batch_queue)
                         future = pool.submit(
@@ -801,7 +805,7 @@ class Executor:
                         )
                         batch_futures[future] = batch_queue
                     else:
-                        # Too few: remove batch entries, force online
+                        # Too few and every unit has an online fallback.
                         for uid in batch_queue:
                             unit_states[uid].remove_batch_entries()
                             in_progress.add(uid)

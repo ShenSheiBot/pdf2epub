@@ -565,6 +565,33 @@ def _batch_executor(tmp_path: Path, client, saver=None):
     )
 
 
+def test_small_batch_still_submits_when_no_online_model_exists(tmp_path: Path):
+    client = _CompletedBatchClient()
+    executor = Executor(
+        llm_client=object(),
+        model_chain=[
+            ChainEntry(provider="vertex", model="flash", mode="batch")
+        ],
+        processor=_AcceptingProcessor(),
+        hooks=_AcceptingHooks(),
+        batch_client=client,
+        batch_state_dir=tmp_path,
+        online_fallback_threshold=3,
+        batch_poll_interval=0,
+    )
+    unit = WorkUnit(
+        id="chapter_1",
+        file_key="chapter_1",
+        content="source",
+    )
+
+    result = executor.execute([unit])
+
+    assert client.submissions == 1
+    assert result.completed == {"chapter_1"}
+    assert result.results == {"chapter_1": "translated"}
+
+
 def test_batch_save_failure_retains_remote_job_and_state(tmp_path: Path):
     class Attempt:
         def __enter__(self):

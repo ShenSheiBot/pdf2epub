@@ -2,7 +2,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree as ET
 
-from pdf2epub.build_epub import generate_hierarchical_toc_ncx
+from pdf2epub.build_epub import (
+    generate_hierarchical_toc_html,
+    generate_hierarchical_toc_ncx,
+)
 from pdf2epub.epub.builder import EpubBuilder
 
 
@@ -33,6 +36,47 @@ def test_ncx_and_opf_share_publication_identifier(tmp_path: Path) -> None:
         ".//{http://purl.org/dc/elements/1.1/}identifier"
     ).text
     assert ncx_uid == opf_uid == builder.uid
+
+
+def test_hierarchical_toc_uses_reader_language_label(tmp_path: Path) -> None:
+    ncx_path = tmp_path / "toc.ncx"
+    html_path = tmp_path / "toc.html"
+
+    assert generate_hierarchical_toc_ncx(
+        [],
+        "测试书名",
+        ncx_path,
+        language="zh",
+    )
+    assert generate_hierarchical_toc_html(
+        [],
+        "测试书名",
+        html_path,
+        language="zh",
+    )
+
+    assert "<text>目录</text>" in ncx_path.read_text()
+    html = html_path.read_text()
+    assert "<title>目录</title>" in html
+    assert "<h1>目录</h1>" in html
+    assert "Table of Contents" not in html
+
+
+def test_epub_builder_uses_reader_language_label(tmp_path: Path) -> None:
+    builder = EpubBuilder(
+        SimpleNamespace(
+            book_title="测试书名",
+            author="测试作者",
+            language="zh",
+        )
+    )
+    ncx_path = tmp_path / "toc.ncx"
+    html_path = tmp_path / "toc.html"
+
+    assert builder.create_toc_ncx({"chapters": []}, ncx_path)
+    assert builder.create_toc_html({"chapters": []}, html_path)
+    assert "<text>目录</text>" in ncx_path.read_text()
+    assert "<title>目录</title>" in html_path.read_text()
 
 
 def test_hierarchical_ncx_reuses_play_order_for_same_target(

@@ -44,6 +44,16 @@ def _calculate_structure_depth(structure: Dict[str, Any]) -> int:
     return get_depth(chapters, 1)
 
 
+def localized_toc_label(language: str) -> str:
+    """Return the reader-facing table-of-contents label."""
+    normalized = (language or "en").lower().replace("_", "-")
+    if normalized == "chinese" or normalized.startswith("zh"):
+        return "目录"
+    if normalized == "japanese" or normalized.startswith("ja"):
+        return "目次"
+    return "Table of Contents"
+
+
 class EpubBuilder:
     """Handles creation of all EPUB structural files and final packaging."""
 
@@ -165,6 +175,8 @@ a { text-decoration: none; }
         try:
             # Calculate actual depth from structure (+1 for TOC entry)
             toc_depth = _calculate_structure_depth(structure) + 1
+            language = getattr(self.config, "language", "en")
+            toc_label = localized_toc_label(language)
 
             # Start NCX document
             ncx = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -186,7 +198,7 @@ a { text-decoration: none; }
             play_order = 1
             ncx += f"""        <navPoint id="navpoint-toc" playOrder="{play_order}">
             <navLabel>
-                <text>Table of Contents</text>
+                <text>{html.escape(toc_label)}</text>
             </navLabel>
             <content src="text/toc.html"/>
         </navPoint>
@@ -280,18 +292,19 @@ a { text-decoration: none; }
             # Get the language from config
             language = self.config.language if hasattr(self.config, 'language') else 'en'
             lang_class = f"lang-{language}"
+            toc_label = localized_toc_label(language)
             
             toc_html = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}" lang="{language}">
 <head>
-    <title>Table of Contents</title>
+    <title>{html.escape(toc_label)}</title>
     <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
 </head>
 <body class="{lang_class}">
     <div class="toc">
-        <h1>Table of Contents</h1>
+        <h1>{html.escape(toc_label)}</h1>
         <ul>
 """
             

@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from loguru import logger
 
-from .epub.builder import EpubBuilder
+from .epub.builder import EpubBuilder, localized_toc_label
 from .epub.converter import ContentConverter
 from .utils.unit_id import generate_unit_id
 from .utils.pdf_utils import extract_cover_image
@@ -541,6 +541,7 @@ def generate_hierarchical_toc_ncx(
     book_title: str,
     output_path: Path,
     uid: Optional[str] = None,
+    language: str = "en",
 ) -> bool:
     """
     Generate NCX TOC with unlimited hierarchy levels.
@@ -557,6 +558,7 @@ def generate_hierarchical_toc_ncx(
     import uuid
 
     uid = uid or str(uuid.uuid4())
+    toc_label = localized_toc_label(language)
 
     # Calculate actual depth from structure (+1 for TOC entry)
     toc_depth = calculate_tree_depth(structure) + 1
@@ -576,7 +578,7 @@ def generate_hierarchical_toc_ncx(
     <navMap>
         <navPoint id="navpoint-toc" playOrder="1">
             <navLabel>
-                <text>Table of Contents</text>
+                <text>{html.escape(toc_label)}</text>
             </navLabel>
             <content src="text/toc.html"/>
         </navPoint>
@@ -689,18 +691,19 @@ def generate_hierarchical_toc_html(
     import html
 
     lang_class = f"lang-{language}"
+    toc_label = localized_toc_label(language)
 
     toc_html = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}" lang="{language}">
 <head>
-    <title>Table of Contents</title>
+    <title>{html.escape(toc_label)}</title>
     <link rel="stylesheet" type="text/css" href="../stylesheet.css"/>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
 </head>
 <body class="{lang_class}">
     <div class="toc">
-        <h1>Table of Contents</h1>
+        <h1>{html.escape(toc_label)}</h1>
 """
 
     def render_entry(entry: Dict, level: int = 0, parent_href: str = "toc.html") -> str:
@@ -943,6 +946,7 @@ def build_epub(config: BuildEpubConfig) -> Path:
         config.book_title,
         epub_dir / "toc.ncx",
         uid=builder.uid,
+        language=language,
     )
     generate_hierarchical_toc_html(epub_structure, config.book_title, epub_dir / "text" / "toc.html", language)
 

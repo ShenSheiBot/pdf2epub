@@ -669,6 +669,209 @@ def test_explicit_refine_agent_beats_legacy_anthropic_default(monkeypatch):
     assert observed["provider"][1]["api_key"] == "explicit-key"
 
 
+def test_codex_refine_agent_resolves_local_provider(monkeypatch):
+    import pydantic_ai.models.openai
+    import pydantic_ai.providers.openai
+
+    observed = []
+    monkeypatch.setattr(
+        "pdf2epub.core.whole.model_factory._load_codex_openai_provider",
+        lambda config: {
+            "api_key": "resolved-key",
+            "base_url": "https://codex.example/v1",
+        },
+    )
+    monkeypatch.setattr(
+        pydantic_ai.providers.openai,
+        "OpenAIProvider",
+        lambda **kwargs: ("provider", kwargs),
+    )
+
+    def fake_model(model_name, provider):
+        observed.append((model_name, provider))
+        return "codex-agent"
+
+    monkeypatch.setattr(
+        pydantic_ai.models.openai,
+        "OpenAIChatModel",
+        fake_model,
+    )
+    runtime_config = {
+        "credentials": {
+            "providers": {
+                "codex": {
+                    "type": "codex",
+                }
+            }
+        },
+        "refine": {
+            "agent": {
+                "provider": "codex",
+                "model": "gpt-5.6-luna",
+            }
+        },
+    }
+
+    call = AdaptivePdfCall(
+        client=object(),
+        model="structure-model",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        runtime_config=runtime_config,
+    )
+    assert call._get_agent_model() == "codex-agent"
+
+    model, model_name, _ = boundary_agent.get_model_and_limits(runtime_config)
+    assert model == "codex-agent"
+    assert model_name == "gpt-5.6-luna"
+    assert len(observed) == 2
+    for _, provider in observed:
+        assert provider[1]["api_key"] == "resolved-key"
+        assert provider[1]["base_url"] == "https://codex.example/v1"
+
+
+def test_merge_agent_can_upgrade_without_changing_batch_agent(monkeypatch):
+    call = AdaptivePdfCall(
+        client=object(),
+        model="structure-model",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        runtime_config={
+            "credentials": {
+                "providers": {
+                    "batch": {"type": "anthropic", "api_key": "batch-key"},
+                    "merge": {"type": "codex"},
+                }
+            },
+            "refine": {
+                "agent": {
+                    "provider": "batch",
+                    "model": "batch-model",
+                },
+                "merge_agent": {
+                    "provider": "merge",
+                    "model": "merge-model",
+                },
+            },
+        },
+    )
+    observed = []
+
+    def fake_builder(model_name, provider_config):
+        observed.append((model_name, provider_config["type"]))
+        return model_name
+
+    monkeypatch.setattr(
+        "pdf2epub.refine.agent_model.build_openai_agent_model",
+        fake_builder,
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.models.anthropic.AnthropicModel",
+        lambda model_name, provider: model_name,
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.providers.anthropic.AnthropicProvider",
+        lambda **kwargs: kwargs,
+    )
+
+    assert call._get_agent_model() == "batch-model"
+    assert call._get_merge_agent_model() == "merge-model"
+    assert observed == [("merge-model", "codex")]
+
+
+def test_merge_generator_can_use_codex_route(monkeypatch):
+    observed = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            observed.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"chapters": []}')
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        "pdf2epub.core.whole.model_factory._load_codex_openai_provider",
+        lambda config: {
+            "api_key": "resolved-key",
+            "base_url": "https://codex.example/v1",
+        },
+    )
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda **kwargs: SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        ),
+    )
+    call = AdaptivePdfCall(
+        client=object(),
+        model="structure-model",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        runtime_config={
+            "credentials": {
+                "providers": {
+                    "codex": {"type": "codex"},
+                }
+            },
+            "refine": {
+                "merge_generator": {
+                    "provider": "codex",
+                    "model": "gpt-5.6-luna",
+                }
+            },
+        },
+    )
+
+    generate = call._build_merge_generate_fn(
+        "MERGE PROMPT",
+        LLMGenerateConfig(),
+        "merge",
+    )
+    assert generate() == '{"chapters": []}'
+    assert generate('{"chapters": [') == '{"chapters": []}'
+    assert observed[0]["model"] == "gpt-5.6-luna"
+    assert observed[0]["messages"] == [
+        {"role": "user", "content": "MERGE PROMPT"}
+    ]
+    assert observed[1]["messages"][1]["role"] == "assistant"
+
+
+def test_merge_generator_rejects_non_openai_provider():
+    call = AdaptivePdfCall(
+        client=object(),
+        model="structure-model",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        runtime_config={
+            "credentials": {
+                "providers": {
+                    "anthropic": {
+                        "type": "anthropic",
+                        "api_key": "test-key",
+                    },
+                }
+            },
+            "refine": {
+                "merge_generator": {
+                    "provider": "anthropic",
+                    "model": "claude-test",
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="OpenAI-compatible or Codex"):
+        call._build_merge_generate_fn(
+            "MERGE PROMPT",
+            LLMGenerateConfig(),
+            "merge",
+        )
+
+
 def test_invalid_merge_fails_closed_after_configured_retries(monkeypatch):
     class InvalidMergeCall(AdaptivePdfCall):
         operation_name = "test merge"
@@ -1304,6 +1507,48 @@ def test_structure_validation_rejects_bool_pages_and_child_escape():
         "escapes parent" in issue
         for issue in containment_issues
     )
+
+
+def test_containment_fix_keeps_single_page_boundary_siblings():
+    chapters = [
+        {
+            "title": "Container",
+            "start_page": 100,
+            "end_page": 200,
+            "level": 1,
+            "children": [],
+        },
+        {
+            "title": "Shared start",
+            "start_page": 100,
+            "end_page": 100,
+            "level": 1,
+        },
+        {
+            "title": "Strictly inside",
+            "start_page": 150,
+            "end_page": 150,
+            "level": 1,
+        },
+        {
+            "title": "Shared end",
+            "start_page": 200,
+            "end_page": 200,
+            "level": 1,
+        },
+    ]
+
+    StructureAnalyzer._fix_containment_overlaps(chapters)
+
+    assert [chapter["title"] for chapter in chapters] == [
+        "Container",
+        "Shared start",
+        "Shared end",
+    ]
+    assert [
+        chapter["title"]
+        for chapter in chapters[0]["children"]
+    ] == ["Strictly inside"]
 
 
 def test_merge_retry_receives_validator_feedback(monkeypatch):

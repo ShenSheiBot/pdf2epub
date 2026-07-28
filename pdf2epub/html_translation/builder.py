@@ -28,6 +28,14 @@ from ..utils.common import parse_llm_json
 PART_FILE_RE = re.compile(r'^(.+)\.part(\d+)\.md$')
 
 
+def _has_local_tag(element: Any, local_name: str) -> bool:
+    """Return whether an XML element has the requested local tag name."""
+    tag = getattr(element, "tag", None)
+    return isinstance(tag, str) and (
+        tag == local_name or tag.endswith(f"}}{local_name}")
+    )
+
+
 def _make_json_safe(obj: Any) -> Any:
     """Convert nested compressor metadata to JSON-serializable values."""
     from collections.abc import Iterable, Mapping
@@ -391,7 +399,7 @@ class HTMLEpubBuilder:
             if rootfile is None:
                 # Try without namespace
                 for elem in root.iter():
-                    if elem.tag.endswith('}rootfile') or elem.tag == 'rootfile':
+                    if _has_local_tag(elem, 'rootfile'):
                         rootfile = elem
                         break
 
@@ -434,7 +442,7 @@ class HTMLEpubBuilder:
             if manifest is None:
                 # Try without namespace
                 for elem in root.iter():
-                    if elem.tag.endswith('}manifest') or elem.tag == 'manifest':
+                    if _has_local_tag(elem, 'manifest'):
                         manifest = elem
                         break
 
@@ -444,7 +452,7 @@ class HTMLEpubBuilder:
 
             # Search all items in manifest
             for item in manifest:
-                if not (item.tag.endswith('}item') or item.tag == 'item'):
+                if not _has_local_tag(item, 'item'):
                     continue
 
                 media_type = item.get('media-type', '')
@@ -473,7 +481,7 @@ class HTMLEpubBuilder:
                 spine = root.find('.//opf:spine', ns)
                 if spine is None:
                     for elem in root.iter():
-                        if elem.tag.endswith('}spine') or elem.tag == 'spine':
+                        if _has_local_tag(elem, 'spine'):
                             spine = elem
                             break
 
@@ -530,7 +538,7 @@ class HTMLEpubBuilder:
                 if title_elem is None:
                     # Try without namespace (some EPUBs don't use namespaces properly)
                     for elem in root.iter():
-                        if elem.tag.endswith('}title') or elem.tag == 'title':
+                        if _has_local_tag(elem, 'title'):
                             title_elem = elem
                             break
 
@@ -545,7 +553,7 @@ class HTMLEpubBuilder:
                 lang_elem = root.find('.//dc:language', namespaces)
                 if lang_elem is None:
                     for elem in root.iter():
-                        if elem.tag.endswith('}language') or elem.tag == 'language':
+                        if _has_local_tag(elem, 'language'):
                             lang_elem = elem
                             break
 
@@ -562,7 +570,7 @@ class HTMLEpubBuilder:
                 if not creator_elems:
                     creator_elems = [
                         e for e in root.iter()
-                        if e.tag.endswith('}creator') or e.tag == 'creator'
+                        if _has_local_tag(e, 'creator')
                     ]
 
                 if creator_elems:
@@ -582,8 +590,7 @@ class HTMLEpubBuilder:
                         target = f'#{creator_id}'
                         return [
                             e for e in root.iter()
-                            if isinstance(e.tag, str)
-                            and (e.tag.endswith('}meta') or e.tag == 'meta')
+                            if _has_local_tag(e, 'meta')
                             and e.get('refines') == target
                         ]
 
@@ -613,7 +620,7 @@ class HTMLEpubBuilder:
                 desc_elem = root.find('.//dc:description', namespaces)
                 if desc_elem is None:
                     for e in root.iter():
-                        if e.tag.endswith('}description') or e.tag == 'description':
+                        if _has_local_tag(e, 'description'):
                             desc_elem = e
                             break
                 if desc_elem is not None:
@@ -625,7 +632,7 @@ class HTMLEpubBuilder:
                 pub_elem = root.find('.//dc:publisher', namespaces)
                 if pub_elem is None:
                     for e in root.iter():
-                        if e.tag.endswith('}publisher') or e.tag == 'publisher':
+                        if _has_local_tag(e, 'publisher'):
                             pub_elem = e
                             break
                 if pub_elem is not None:
@@ -637,7 +644,7 @@ class HTMLEpubBuilder:
                 rights_elem = root.find('.//dc:rights', namespaces)
                 if rights_elem is None:
                     for e in root.iter():
-                        if e.tag.endswith('}rights') or e.tag == 'rights':
+                        if _has_local_tag(e, 'rights'):
                             rights_elem = e
                             break
                 if rights_elem is not None:
@@ -647,7 +654,7 @@ class HTMLEpubBuilder:
             # Update calibre:title_sort
             if metadata.get('translated_title_sort'):
                 for elem in root.iter():
-                    if elem.tag == 'meta' or ('}' in elem.tag and elem.tag.endswith('}meta')):
+                    if _has_local_tag(elem, 'meta'):
                         if elem.get('name') == 'calibre:title_sort':
                             elem.set('content', metadata['translated_title_sort'])
                             logger.debug(f"Updated title_sort: {metadata['translated_title_sort']}")
@@ -740,9 +747,12 @@ class HTMLEpubBuilder:
                 if doc_title is None:
                     # Try without namespace
                     for elem in root.iter():
-                        if elem.tag.endswith('}text') or elem.tag == 'text':
+                        if _has_local_tag(elem, 'text'):
                             parent = elem.getparent() if hasattr(elem, 'getparent') else None
-                            if parent is not None and (parent.tag.endswith('}docTitle') or parent.tag == 'docTitle'):
+                            if (
+                                parent is not None
+                                and _has_local_tag(parent, 'docTitle')
+                            ):
                                 doc_title = elem
                                 break
                 if doc_title is not None:
@@ -751,11 +761,11 @@ class HTMLEpubBuilder:
             # Update navPoints
             updated_count = 0
             for nav_point in root.iter():
-                if nav_point.tag.endswith('}navPoint') or nav_point.tag == 'navPoint':
+                if _has_local_tag(nav_point, 'navPoint'):
                     # Find content src
                     content = None
                     for child in nav_point:
-                        if child.tag.endswith('}content') or child.tag == 'content':
+                        if _has_local_tag(child, 'content'):
                             content = child
                             break
 
@@ -766,9 +776,9 @@ class HTMLEpubBuilder:
                         if translated:
                             # Find navLabel/text and update
                             for child in nav_point:
-                                if child.tag.endswith('}navLabel') or child.tag == 'navLabel':
+                                if _has_local_tag(child, 'navLabel'):
                                     for text_elem in child:
-                                        if text_elem.tag.endswith('}text') or text_elem.tag == 'text':
+                                        if _has_local_tag(text_elem, 'text'):
                                             text_elem.text = translated
                                             updated_count += 1
                                             break

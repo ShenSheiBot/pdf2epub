@@ -268,7 +268,7 @@ blockquote {
 
 /* Large decorative quote mark */
 blockquote::before {
-    content: """;
+    content: "“";
     position: absolute;
     left: -0.6em;
     top: -0.2em;

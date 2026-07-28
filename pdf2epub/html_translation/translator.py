@@ -368,7 +368,8 @@ class HTMLTranslateProcessor:
             if provider_name in providers:
                 p = providers[provider_name]
                 if p.get('type') == 'google':
-                    from pydantic_ai.models.google import GoogleModel, GoogleProvider
+                    from pydantic_ai.models.google import GoogleModel
+                    from pydantic_ai.providers.google import GoogleProvider
                     from google.genai import Client
                     from google.genai.types import HttpOptions
                     client = Client(

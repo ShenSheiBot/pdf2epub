@@ -299,29 +299,49 @@ class GeminiClient:
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str],
         base_url: Optional[str] = None,
         vertexai: bool = False,
         extra_headers: Optional[Dict[str, str]] = None,
         num_retries: int = 3,
-        max_backoff_seconds: int = 30
+        max_backoff_seconds: int = 30,
+        project: Optional[str] = None,
+        location: Optional[str] = None,
     ):
         """Initialize Gemini client.
 
         Args:
             api_key: Gemini API key
             base_url: Custom API endpoint (e.g., 'google.shenshei.fans')
-            vertexai: Use Vertex AI express mode (official, not via proxy)
+            vertexai: Use Vertex AI (official, not via proxy)
             extra_headers: Extra HTTP headers (e.g., {'X-Use-Vertex': 'true'} for proxy)
             num_retries: Number of retries for transient errors
             max_backoff_seconds: Maximum backoff time between retries
+            project: Google Cloud project for ADC-backed Vertex AI
+            location: Vertex AI location for ADC-backed Vertex AI
         """
         from google import genai
 
         if vertexai and not base_url:
-            # Official Vertex AI express mode
-            self.client = genai.Client(vertexai=True, api_key=api_key)
+            if api_key:
+                # Official Vertex AI express mode.
+                self.client = genai.Client(vertexai=True, api_key=api_key)
+            elif project and location:
+                # Official Vertex AI using process-scoped ADC credentials.
+                self.client = genai.Client(
+                    vertexai=True,
+                    project=project,
+                    location=location,
+                )
+            else:
+                raise ValueError(
+                    "Vertex AI requires either an API key for express mode "
+                    "or both project and location for ADC authentication"
+                )
         else:
+            if not api_key:
+                raise ValueError("Gemini API key is required outside Vertex AI ADC mode")
+
             # Build http_options for proxy or default
             http_options = {}
             if base_url:
@@ -1054,24 +1074,39 @@ def create_gemini_client_from_config(
 
     # Get provider settings - only fallback to legacy if provider not found
     if provider_config:
+        provider_type = provider_config.get("type", "google")
         api_key = provider_config.get("api_key")
         base_url = provider_config.get("base_url")
         vertexai = provider_config.get("vertexai", False)
+        project = provider_config.get("project")
+        location = provider_config.get("location")
         extra_headers = provider_config.get("extra_headers")
     else:
         # Legacy fallback for backward compatibility
+        provider_type = "google"
         api_key = config.get("google_api_key")
         base_url = config.get("google_base_url")
         vertexai = False
+        project = None
+        location = None
         extra_headers = None
 
-    if not api_key:
+    uses_adc_vertex = bool(
+        provider_type == "google"
+        and vertexai
+        and not base_url
+        and project
+        and location
+    )
+    if not api_key and not uses_adc_vertex:
         raise ValueError(f"API key not found for provider '{provider_name}'")
 
     return GeminiClient(
         api_key=api_key,
         base_url=base_url,
         vertexai=vertexai,
+        project=project,
+        location=location,
         extra_headers=extra_headers,
         num_retries=num_retries,
         max_backoff_seconds=max_backoff_seconds

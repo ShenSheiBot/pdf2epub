@@ -21,7 +21,7 @@ import yaml
 from pathlib import Path
 from google.genai.types import Part
 from .utils.common import parse_llm_json
-from .utils.network_utils import GeminiClient
+from .utils.network_utils import GeminiClient, create_gemini_client_from_config
 from .utils.pdf_utils import add_page_number_patches, preprocess_pdf
 import argparse
 from loguru import logger
@@ -36,6 +36,13 @@ def load_config(config_path="config.yaml"):
     with open(config_path, "r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
     return config
+
+
+def create_breakdown_client(config) -> GeminiClient:
+    """Create the configured Gemini client, including Vertex ADC providers."""
+    breakdown_config = config.get("breakdown", {})
+    provider_name = breakdown_config.get("provider", "gemini")
+    return create_gemini_client_from_config(config, provider_name)
 
 
 def analyze_pdf_structure(client: GeminiClient, pdf_path, book_title, config):
@@ -230,17 +237,6 @@ def main():
     # Load configuration
     config = load_config(args.config)
 
-    # Get provider config for breakdown
-    breakdown_config = config.get("breakdown", {})
-    provider_name = breakdown_config.get("provider", "gemini")
-    providers = config.get("credentials", {}).get("providers", {})
-    provider_config = providers.get(provider_name, {})
-
-    api_key = provider_config.get("api_key") or config.get("google_api_key")
-    base_url = provider_config.get("base_url") or config.get("google_base_url")
-    vertexai = provider_config.get("vertexai", False)
-    extra_headers = provider_config.get("extra_headers")
-    
     # Get input PDF path
     input_pdf = Path(args.input)
     
@@ -255,17 +251,8 @@ def main():
     output_dir = Path("output") / Path(book_title)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if API key exists
-    if not api_key:
-        raise ValueError("Google API key not found in config.yaml")
-
     # Setup Gemini API
-    client = GeminiClient(
-        api_key=api_key,
-        base_url=base_url,
-        vertexai=vertexai,
-        extra_headers=extra_headers
-    )
+    client = create_breakdown_client(config)
 
     # Preprocess and get the PDF path to use
     processed_pdf = preprocess_pdf(input_pdf, output_dir)

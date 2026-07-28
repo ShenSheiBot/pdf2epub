@@ -736,12 +736,14 @@ Look at the PDF pages carefully to verify page numbers are correct."""
         )
         tmp_path.replace(cache_path)
 
-    def _get_agent_model(self):
+    def _get_configured_agent_model(self, config_key: str):
         """
         Get a pydantic-ai Model for the JSON repair agent.
 
-        Priority: explicit refine.agent > legacy Anthropic Haiku default >
-        legacy Poe fallback.
+        ``config_key`` lets merge repair use an explicitly stronger model
+        without invalidating or rerunning already accepted PDF batches.
+        Priority: explicit refine.<config_key> > explicit refine.agent >
+        legacy Anthropic Haiku default > legacy Poe fallback.
         """
         config = self._runtime_config
         providers = config.get('credentials', {}).get('providers', {})
@@ -749,7 +751,11 @@ Look at the PDF pages carefully to verify page numbers are correct."""
         # Explicit selection must win even when legacy provider credentials
         # are also present. Otherwise a requested model upgrade is silently
         # ignored merely because an Anthropic key exists in the same config.
-        agent_cfg = config.get('refine', {}).get('agent', {})
+        refine_cfg = config.get('refine', {})
+        agent_cfg = (
+            refine_cfg.get(config_key, {})
+            or refine_cfg.get('agent', {})
+        )
         if agent_cfg:
             provider_name = agent_cfg.get('provider')
             model_name = agent_cfg.get('model')
@@ -775,9 +781,11 @@ Look at the PDF pages carefully to verify page numbers are correct."""
                 )
                 logger.info(f"[agent-model] Using explicit Anthropic {model_name}")
                 return AnthropicModel(model_name, provider=provider)
-            if provider_type == 'openai':
+            if provider_type in {'openai', 'codex'}:
                 from .agent_model import build_openai_agent_model
-                logger.info(f"[agent-model] Using explicit OpenAI-compat {model_name}")
+                logger.info(
+                    f"[agent-model] Using explicit {provider_type} {model_name}"
+                )
                 return build_openai_agent_model(model_name, p)
             if provider_type == 'google':
                 from pydantic_ai.models.google import GoogleModel
@@ -825,6 +833,17 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             "No suitable provider found for agent model. "
             "Need 'anthropic' or 'poe' in credentials.providers."
         )
+
+    def _get_agent_model(self):
+        """Return the normal per-batch JSON repair model."""
+        return self._get_configured_agent_model('agent')
+
+    def _get_merge_agent_model(self):
+        """Return a merge-only repair model when explicitly configured."""
+        refine_cfg = self._runtime_config.get('refine', {})
+        if refine_cfg.get('merge_agent'):
+            return self._get_configured_agent_model('merge_agent')
+        return self._get_agent_model()
 
     def _build_generate_fn(self, prompt, pdf_data, config, op_name):
         """
@@ -909,6 +928,68 @@ validator identified as unsupported or overlapping.
 
     def _build_merge_generate_fn(self, prompt, config, op_name):
         """Build a generate_fn for merge (text-only, no PDF)."""
+        generator_cfg = (
+            self._runtime_config.get('refine', {}).get('merge_generator', {})
+        )
+        if generator_cfg:
+            provider_name = generator_cfg.get('provider')
+            model_name = generator_cfg.get('model')
+            providers = (
+                self._runtime_config.get('credentials', {}).get('providers', {})
+            )
+            if not provider_name or not model_name:
+                raise ValueError(
+                    "refine.merge_generator requires both provider and model"
+                )
+            if provider_name not in providers:
+                raise ValueError(
+                    f"refine.merge_generator provider {provider_name!r} "
+                    "is not configured"
+                )
+
+            provider_config = dict(providers[provider_name])
+            provider_type = provider_config.get('type', 'openai')
+            if provider_type == 'codex':
+                from pdf2epub.core.whole.model_factory import (
+                    _load_codex_openai_provider,
+                )
+
+                provider_config = _load_codex_openai_provider(provider_config)
+            elif provider_type != 'openai':
+                raise ValueError(
+                    "refine.merge_generator supports only OpenAI-compatible "
+                    f"or Codex providers, got {provider_type!r}"
+                )
+
+            from openai import OpenAI
+
+            client = OpenAI(
+                api_key=provider_config.get('api_key'),
+                base_url=provider_config.get('base_url'),
+                timeout=600,
+            )
+
+            def generate_fn(prefix=None):
+                messages = [{'role': 'user', 'content': prompt}]
+                if prefix:
+                    messages.extend([
+                        {'role': 'assistant', 'content': prefix},
+                        {
+                            'role': 'user',
+                            'content': (
+                                "Continue exactly after the existing JSON "
+                                "prefix. Output only the remaining JSON."
+                            ),
+                        },
+                    ])
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                )
+                return response.choices[0].message.content or ""
+
+            return generate_fn
+
         def generate_fn(prefix=None):
             return self._pdf_transport.generate_text(
                 model=self.model,
@@ -965,7 +1046,7 @@ validator identified as unsupported or overlapping.
                 response_text = run_agent_loop_sync(
                     generate_fn=generate_fn,
                     system_prompt=JSON_REFINE_PROMPT,
-                    agent_model=self._get_agent_model(),
+                    agent_model=self._get_merge_agent_model(),
                     max_continuations=max_continuations,
                     request_limit=request_limit,
                     artifacts_dir=merge_attempt_artifacts,

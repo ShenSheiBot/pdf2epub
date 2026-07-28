@@ -21,6 +21,11 @@ def build_openai_agent_model(
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
+    if provider_config.get("type") == "codex":
+        from pdf2epub.core.whole.model_factory import _load_codex_openai_provider
+
+        provider_config = _load_codex_openai_provider(dict(provider_config))
+
     base_url = provider_config.get("base_url")
     provider = OpenAIProvider(
         api_key=provider_config.get("api_key"),

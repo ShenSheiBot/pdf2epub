@@ -57,6 +57,8 @@ class EpubBuilder:
         """
         self.config = config
         self.converter = converter
+        # The NCX and OPF must identify the same publication.
+        self.uid = str(uuid.uuid4())
     
     def create_cover_html(self, cover_image_filename: str, output_path: Path) -> bool:
         """
@@ -161,9 +163,6 @@ a { text-decoration: none; }
             True if successful
         """
         try:
-            # Generate unique ID
-            uid = str(uuid.uuid4())
-
             # Calculate actual depth from structure (+1 for TOC entry)
             toc_depth = _calculate_structure_depth(structure) + 1
 
@@ -172,7 +171,7 @@ a { text-decoration: none; }
 <!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
     <head>
-        <meta name="dtb:uid" content="{uid}"/>
+        <meta name="dtb:uid" content="{self.uid}"/>
         <meta name="dtb:depth" content="{toc_depth}"/>
         <meta name="dtb:totalPageCount" content="0"/>
         <meta name="dtb:maxPageNumber" content="0"/>
@@ -428,9 +427,6 @@ a { text-decoration: none; }
             True if successful
         """
         try:
-            # Generate unique ID
-            uid = str(uuid.uuid4())
-            
             # Get current date
             date = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
             
@@ -441,7 +437,7 @@ a { text-decoration: none; }
         <dc:title>{html.escape(self.config.book_title or "Unknown")}</dc:title>
         <dc:creator opf:role="aut">{html.escape(self.config.author or "Unknown")}</dc:creator>
         <dc:language>{self.config.language}</dc:language>
-        <dc:identifier id="BookId" opf:scheme="UUID">{uid}</dc:identifier>
+        <dc:identifier id="BookId" opf:scheme="UUID">{self.uid}</dc:identifier>
         <dc:date>{date}</dc:date>
         <meta name="generator" content="PDF2EPUB v3"/>
         {f'<meta name="cover" content="cover-image"/>' if cover_image else ''}

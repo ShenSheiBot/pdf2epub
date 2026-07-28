@@ -146,8 +146,18 @@ class LLMClient:
         provider_type = provider_config.get("type", self._infer_provider_type(provider_name))
         api_key = provider_config.get("api_key")
         base_url = provider_config.get("base_url")
+        vertexai = provider_config.get("vertexai", False)
+        project = provider_config.get("project")
+        location = provider_config.get("location")
 
-        if not api_key:
+        uses_adc_vertex = bool(
+            provider_type == "google"
+            and vertexai
+            and not base_url
+            and project
+            and location
+        )
+        if not api_key and not uses_adc_vertex:
             logger.warning(f"No API key found for provider '{provider_name}'")
             return None
 
@@ -155,7 +165,9 @@ class LLMClient:
             return GeminiClient(
                 api_key=api_key,
                 base_url=base_url,
-                vertexai=provider_config.get("vertexai", False),
+                vertexai=vertexai,
+                project=project,
+                location=location,
                 extra_headers=provider_config.get("extra_headers"),
                 num_retries=self._num_retries,
                 max_backoff_seconds=self._max_backoff_seconds

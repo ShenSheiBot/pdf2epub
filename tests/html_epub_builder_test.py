@@ -6,6 +6,7 @@ from lxml import etree
 
 from pdf2epub.html_translation import builder as builder_module
 from pdf2epub.html_translation.builder import BuildConfig, HTMLEpubBuilder
+from pdf2epub.html_translation.translator import HTMLTranslateProcessor
 
 
 OPF_NS = "http://www.idpf.org/2007/opf"
@@ -132,6 +133,8 @@ def test_update_epub3_creators_updates_and_removes_refinements(
     <meta refines="#creator-2" property="role" scheme="marc:relators">aut</meta>
     <meta refines="#creator-2" property="file-as">Beta, B</meta>
     <meta property="dcterms:modified">2026-01-01T00:00:00Z</meta>
+    <!-- Converter metadata comments are valid OPF children. -->
+    <meta name="calibre:title_sort" content="Original title"/>
   </metadata>
   <manifest/>
   <spine/>
@@ -147,6 +150,7 @@ def test_update_epub3_creators_updates_and_removes_refinements(
             "target_language_code": "zh",
             "translated_author": "作者一, 作者二",
             "translated_author_file_as": "作者一, 作者二",
+            "translated_title_sort": "Translated title",
         },
     )
 
@@ -168,6 +172,9 @@ def test_update_epub3_creators_updates_and_removes_refinements(
         "role": "aut",
         "file-as": "作者一, 作者二",
     }
+    title_sort = root.find(".//opf:meta[@name='calibre:title_sort']", namespaces)
+    assert title_sort is not None
+    assert title_sort.get("content") == "Translated title"
 
 
 def test_epubcheck_warn_mode_keeps_failed_build(
@@ -224,3 +231,50 @@ def test_epubcheck_strict_mode_requires_executable(
 
     with pytest.raises(RuntimeError, match="not installed"):
         builder._validate_output_epub()
+
+
+def test_html_translator_google_agent_uses_provider_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import google.genai
+    import pydantic_ai.models.google
+    import pydantic_ai.providers.google
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        google.genai,
+        "Client",
+        lambda **kwargs: ("client", kwargs),
+    )
+    monkeypatch.setattr(
+        pydantic_ai.providers.google,
+        "GoogleProvider",
+        lambda **kwargs: ("provider", kwargs),
+    )
+    monkeypatch.setattr(
+        pydantic_ai.models.google,
+        "GoogleModel",
+        lambda model_name, provider: ("model", model_name, provider),
+    )
+
+    processor = HTMLTranslateProcessor(
+        config={
+            "credentials": {
+                "providers": {
+                    "gemini": {
+                        "type": "google",
+                        "api_key": "test-key",
+                        "base_url": "https://example.invalid",
+                    }
+                }
+            },
+            "html_translation": {"agent_model": "gemini-test"},
+        },
+        book_title="Test Book",
+    )
+
+    model = processor._get_agent_model()
+
+    assert model[0:2] == ("model", "gemini-test")
+    assert model[2][0] == "provider"

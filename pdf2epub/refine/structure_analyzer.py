@@ -875,7 +875,20 @@ Return ONLY the cleaned text, nothing else.
                     s_start = sibling.get('start_page', 0)
                     s_end = sibling.get('end_page', 0)
 
-                    if s_start >= c_start and s_end <= c_end:
+                    sibling_is_boundary_point = (
+                        s_start == s_end
+                        and s_start in {c_start, c_end}
+                    )
+                    container_is_boundary_point = (
+                        c_start == c_end
+                        and c_start in {s_start, s_end}
+                    )
+
+                    if (
+                        s_start >= c_start
+                        and s_end <= c_end
+                        and not sibling_is_boundary_point
+                    ):
                         # sibling fully contained in container → reparent
                         moved = chapters.pop(j)
                         container.setdefault('children', []).append(moved)
@@ -884,7 +897,11 @@ Return ONLY the cleaned text, nothing else.
                             f"as child of '{container.get('title', '')[:50]}' (p{c_start}-{c_end})"
                         )
                         changed = True
-                    elif c_start >= s_start and c_end <= s_end:
+                    elif (
+                        c_start >= s_start
+                        and c_end <= s_end
+                        and not container_is_boundary_point
+                    ):
                         # container fully contained in sibling → swap roles
                         moved = chapters.pop(i)
                         sibling.setdefault('children', []).append(moved)

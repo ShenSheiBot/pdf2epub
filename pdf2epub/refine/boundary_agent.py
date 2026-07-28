@@ -75,7 +75,7 @@ def get_model_and_limits(runtime_config: Optional[dict[str, Any]] = None):
                 base_url=provider_config.get('base_url'),
             )
             model = AnthropicModel(model_name, provider=provider)
-        elif provider_type == 'openai':
+        elif provider_type in {'openai', 'codex'}:
             model = build_openai_agent_model(model_name, provider_config)
         elif provider_type == 'google':
             from google.genai import Client

@@ -539,7 +539,8 @@ def build_epub_structure(
 def generate_hierarchical_toc_ncx(
     structure: List[Dict],
     book_title: str,
-    output_path: Path
+    output_path: Path,
+    uid: Optional[str] = None,
 ) -> bool:
     """
     Generate NCX TOC with unlimited hierarchy levels.
@@ -555,7 +556,7 @@ def generate_hierarchical_toc_ncx(
     import html
     import uuid
 
-    uid = str(uuid.uuid4())
+    uid = uid or str(uuid.uuid4())
 
     # Calculate actual depth from structure (+1 for TOC entry)
     toc_depth = calculate_tree_depth(structure) + 1
@@ -581,15 +582,14 @@ def generate_hierarchical_toc_ncx(
         </navPoint>
 """
 
-    play_order = [2]  # Use list for mutable counter
+    nav_counter = [2]
+    next_play_order = [2]
+    href_play_orders = {"text/toc.html": 1}
 
     def render_entry(entry: Dict, indent: int = 2, parent_href: str = "text/toc.html") -> str:
         """Recursively render a nav entry and its children."""
-        nonlocal play_order
         result = ""
         spaces = "    " * indent
-
-        nav_id = f"navpoint-{play_order[0]}"
         title = html.escape(entry['title'])
 
         # Determine the href
@@ -609,13 +609,19 @@ def generate_hierarchical_toc_ncx(
             # No file, link to first child with file, or parent's file
             href = find_first_child_href(entry, parent_href)
 
-        result += f"""{spaces}<navPoint id="{nav_id}" playOrder="{play_order[0]}">
+        nav_id = f"navpoint-{nav_counter[0]}"
+        nav_counter[0] += 1
+        if href not in href_play_orders:
+            href_play_orders[href] = next_play_order[0]
+            next_play_order[0] += 1
+        play_order = href_play_orders[href]
+
+        result += f"""{spaces}<navPoint id="{nav_id}" playOrder="{play_order}">
 {spaces}    <navLabel>
 {spaces}        <text>{title}</text>
 {spaces}    </navLabel>
 {spaces}    <content src="{href}"/>
 """
-        play_order[0] += 1
 
         # Render children, passing current href as parent
         if 'children' in entry:
@@ -932,7 +938,12 @@ def build_epub(config: BuildEpubConfig) -> Path:
     builder.create_stylesheet(epub_dir / "stylesheet.css")
 
     # Generate hierarchical TOC
-    generate_hierarchical_toc_ncx(epub_structure, config.book_title, epub_dir / "toc.ncx")
+    generate_hierarchical_toc_ncx(
+        epub_structure,
+        config.book_title,
+        epub_dir / "toc.ncx",
+        uid=builder.uid,
+    )
     generate_hierarchical_toc_html(epub_structure, config.book_title, epub_dir / "text" / "toc.html", language)
 
     # Process and convert chapters

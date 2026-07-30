@@ -1173,6 +1173,167 @@ def test_direct_merge_validator_requires_observed_source_page_claims():
     )
 
 
+def test_direct_merge_allows_supported_reparent_and_observed_sibling_cut():
+    call = DirectAnalysisCall(
+        client=object(),
+        model="test",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        book_title="Test",
+    )
+    source = [
+        {
+            "chapters": [
+                {
+                    "title": "Human, All Too Human?",
+                    "start_page": 92,
+                    "end_page": 151,
+                    "children": [
+                        {
+                            "title": "Before 1914",
+                            "start_page": 108,
+                            "end_page": 111,
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "chapters": [
+                {
+                    "title": "Love of Labour?",
+                    "start_page": 106,
+                    "end_page": 154,
+                    "children": [
+                        {
+                            "title": "Before 1914",
+                            "start_page": 109,
+                            "end_page": 111,
+                        }
+                    ],
+                }
+            ]
+        },
+    ]
+    observed = [
+        list(range(4, 152)),
+        list(range(106, 219)),
+    ]
+    merged = {
+        "chapters": [
+            {
+                "title": "Human, All Too Human?",
+                "start_page": 92,
+                "end_page": 105,
+                "children": [],
+            },
+            {
+                "title": "Love of Labour?",
+                "start_page": 106,
+                "end_page": 154,
+                "children": [
+                    {
+                        "title": "Before 1914",
+                        "start_page": 109,
+                        "end_page": 111,
+                    }
+                ],
+            },
+        ]
+    }
+
+    assert call.get_merge_validation_issues(merged, source) == []
+    assert call.get_merge_evidence_issues(
+        merged,
+        source,
+        observed,
+    ) == []
+
+    merged["chapters"][0]["end_page"] = 104
+    assert call.get_merge_evidence_issues(
+        merged,
+        source,
+        observed,
+    )
+
+
+def test_direct_merge_does_not_collapse_same_title_across_parent_paths():
+    call = DirectAnalysisCall(
+        client=object(),
+        model="test",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        book_title="Test",
+    )
+    source = [
+        {
+            "chapters": [
+                {
+                    "title": "Part A",
+                    "start_page": 1,
+                    "end_page": 80,
+                    "children": [
+                        {
+                            "title": "Introduction",
+                            "start_page": 10,
+                            "end_page": 80,
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "chapters": [
+                {
+                    "title": "Part B",
+                    "start_page": 60,
+                    "end_page": 100,
+                    "children": [
+                        {
+                            "title": "Introduction",
+                            "start_page": 60,
+                            "end_page": 70,
+                        }
+                    ],
+                }
+            ]
+        },
+    ]
+    collapsed = {
+        "chapters": [
+            {
+                "title": "Part A",
+                "start_page": 1,
+                "end_page": 80,
+                "children": [],
+            },
+            {
+                "title": "Part B",
+                "start_page": 60,
+                "end_page": 100,
+                "children": [
+                    {
+                        "title": "Introduction",
+                        "start_page": 60,
+                        "end_page": 70,
+                    }
+                ],
+            },
+        ]
+    }
+
+    issues = call.get_merge_evidence_issues(
+        collapsed,
+        source,
+        [list(range(1, 81)), list(range(60, 101))],
+    )
+
+    assert any(
+        "2 distinct physical occurrence(s)" in issue
+        for issue in issues
+    )
+
+
 def test_direct_merge_validator_preserves_counts_and_parent_paths():
     call = DirectAnalysisCall(
         client=object(),

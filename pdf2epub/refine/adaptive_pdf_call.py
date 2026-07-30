@@ -1670,9 +1670,12 @@ Rules:
    relevant heading and its surrounding pages.
 5. Preserve the hierarchical structure (children nested under parents).
 6. Chapters must be ordered by start_page and must not overlap as siblings.
-7. Do NOT invent chapters or page numbers. If no candidate has visual
-   page-range support for a required bound, return null for that bound rather
-   than guessing; the caller will fail closed and request a new analysis.
+7. Do NOT invent chapters or page numbers. One deterministic boundary repair
+   is allowed: when a source-supported later sibling heading starts inside an
+   earlier batch's overextended chapter range, end the previous sibling at the
+   page immediately before that heading. If no candidate or such adjacent
+   heading supports a required bound, return null rather than guessing; the
+   caller will fail closed and request a new analysis.
 
 Batch results:
 {chr(10).join(batch_summaries)}
@@ -1800,7 +1803,9 @@ Return a single JSON object:
             ]
 
         source_occurrences = defaultdict(list)
-        for result, observed_pages in zip(original_results, batch_pages):
+        for batch_index, (result, observed_pages) in enumerate(
+            zip(original_results, batch_pages)
+        ):
             chapters = result if isinstance(result, list) else result.get(
                 'chapters',
                 [],
@@ -1829,8 +1834,10 @@ Return a single JSON object:
                     # A TOC-derived/global claim wholly outside this batch is
                     # not physical evidence for an occurrence.
                     continue
-                source_occurrences[node_path].append(
+                source_occurrences[node_path[-1]].append(
                     {
+                        'path': node_path,
+                        'batch_index': batch_index,
                         'raw_interval': (start, end),
                         'evidence_pages': evidence_pages,
                         'supported_starts': (
@@ -1842,11 +1849,39 @@ Return a single JSON object:
                     }
                 )
 
-        # The same physical chapter can be reported by multiple overlapping
-        # batches. Collapse source intervals only when they overlap; disjoint
-        # intervals with the same structural path remain distinct occurrences.
-        components_by_path = {}
-        for node_path, occurrences in source_occurrences.items():
+        # Hierarchy is a merge decision, not node identity. Match occurrences
+        # by normalized title and physical overlap, then retain every
+        # source-supported path as evidence for the merged parent choice.
+        # Distinct occurrences with the same title remain separate.
+        components_by_title = {}
+
+        def is_same_physical_occurrence(component, occurrence):
+            if occurrence['path'] in component['paths']:
+                return True
+            if (
+                component['supported_starts']
+                & occurrence['supported_starts']
+            ):
+                return True
+
+            start, end = occurrence['raw_interval']
+            occurrence_length = end - start + 1
+            for other_start, other_end in component['raw_intervals']:
+                overlap = (
+                    min(end, other_end)
+                    - max(start, other_start)
+                    + 1
+                )
+                other_length = other_end - other_start + 1
+                if (
+                    overlap > 0
+                    and overlap * 2
+                    >= max(occurrence_length, other_length)
+                ):
+                    return True
+            return False
+
+        for title_key, occurrences in source_occurrences.items():
             components = []
             for occurrence in sorted(
                 occurrences,
@@ -1859,15 +1894,27 @@ Return a single JSON object:
                     index
                     for index, component in enumerate(components)
                     if (
-                        component['evidence_pages']
-                        & occurrence['evidence_pages']
-                        or occurrence['raw_interval']
-                        in component['raw_intervals']
+                        occurrence['batch_index']
+                        not in component['batch_indexes']
+                        and (
+                            component['evidence_pages']
+                            & occurrence['evidence_pages']
+                            or occurrence['raw_interval']
+                            in component['raw_intervals']
+                        )
+                        and is_same_physical_occurrence(
+                            component,
+                            occurrence,
+                        )
                     )
                 ]
                 if not overlapping:
                     components.append(
                         {
+                            'paths': {occurrence['path']},
+                            'batch_indexes': {
+                                occurrence['batch_index']
+                            },
                             'evidence_pages': set(
                                 occurrence['evidence_pages']
                             ),
@@ -1885,6 +1932,10 @@ Return a single JSON object:
                     continue
 
                 primary = components[overlapping[0]]
+                primary['paths'].add(occurrence['path'])
+                primary['batch_indexes'].add(
+                    occurrence['batch_index']
+                )
                 primary['evidence_pages'].update(
                     occurrence['evidence_pages']
                 )
@@ -1898,7 +1949,19 @@ Return a single JSON object:
                     occurrence['supported_ends']
                 )
                 for index in reversed(overlapping[1:]):
-                    other = components.pop(index)
+                    other = components[index]
+                    if not primary['batch_indexes'].isdisjoint(
+                        other['batch_indexes']
+                    ):
+                        # One batch cannot provide two observations of the
+                        # same physical occurrence. Keep ambiguous repeated
+                        # titles separate rather than silently collapsing them.
+                        continue
+                    components.pop(index)
+                    primary['paths'].update(other['paths'])
+                    primary['batch_indexes'].update(
+                        other['batch_indexes']
+                    )
                     primary['evidence_pages'].update(
                         other['evidence_pages']
                     )
@@ -1911,7 +1974,7 @@ Return a single JSON object:
                     primary['supported_ends'].update(
                         other['supported_ends']
                     )
-            components_by_path[node_path] = components
+            components_by_title[title_key] = components
 
         merged_chapters = (
             merged
@@ -1919,54 +1982,99 @@ Return a single JSON object:
             else merged.get('chapters', [])
         )
         merged_occurrences = defaultdict(list)
-        for node_path, chapter in _iter_chapter_paths(merged_chapters):
-            start = chapter.get('start_page')
-            end = chapter.get('end_page')
-            if (
-                all(node_path)
-                and isinstance(start, int)
-                and not isinstance(start, bool)
-                and isinstance(end, int)
-                and not isinstance(end, bool)
-            ):
-                merged_occurrences[node_path].append(
-                    {
+        merged_nodes = []
+
+        def collect_merged_nodes(chapters, parent_path=()):
+            siblings = []
+            for chapter in chapters:
+                if not isinstance(chapter, dict):
+                    continue
+                title_key = _chapter_title_key(chapter.get('title'))
+                node_path = (*parent_path, title_key)
+                start = chapter.get('start_page')
+                end = chapter.get('end_page')
+                if (
+                    all(node_path)
+                    and isinstance(start, int)
+                    and not isinstance(start, bool)
+                    and isinstance(end, int)
+                    and not isinstance(end, bool)
+                ):
+                    node = {
+                        'path': node_path,
+                        'title_key': title_key,
                         'start': start,
                         'end': end,
                         'title': chapter.get('title', ''),
+                        'derived_end_from': None,
                     }
+                    siblings.append(node)
+                    merged_nodes.append(node)
+                    merged_occurrences[title_key].append(node)
+
+                children = chapter.get('children', [])
+                if isinstance(children, list):
+                    collect_merged_nodes(children, node_path)
+
+            for node, next_node in zip(siblings, siblings[1:]):
+                next_start_supported = any(
+                    next_node['path'] in component['paths']
+                    and next_node['start']
+                    in component['supported_starts']
+                    for component in components_by_title.get(
+                        next_node['title_key'],
+                        [],
+                    )
                 )
+                if (
+                    next_start_supported
+                    and node['end'] == next_node['start'] - 1
+                ):
+                    node['derived_end_from'] = next_node['start']
+
+        collect_merged_nodes(merged_chapters)
 
         issues = []
-        for node_path, components in components_by_path.items():
-            merged_nodes = merged_occurrences.get(node_path, [])
-            if len(merged_nodes) != len(components):
+        for title_key, components in components_by_title.items():
+            title_nodes = merged_occurrences.get(title_key, [])
+            if len(title_nodes) != len(components):
                 issues.append(
-                    f"Merge has {len(merged_nodes)} occurrence(s) for "
-                    f"path {node_path!r}; source evidence has "
+                    f"Merge has {len(title_nodes)} occurrence(s) for "
+                    f"title {title_key!r}; source evidence has "
                     f"{len(components)} distinct physical occurrence(s)"
                 )
                 continue
 
             candidates = []
-            for merged_node in merged_nodes:
+            for merged_node in title_nodes:
                 candidates.append(
                     [
                         index
                         for index, component in enumerate(components)
                         if (
-                            merged_node['start']
+                            merged_node['path'] in component['paths']
+                            and merged_node['start']
                             in component['supported_starts']
-                            and merged_node['end']
-                            in component['supported_ends']
+                            and (
+                                merged_node['end']
+                                in component['supported_ends']
+                                or (
+                                    merged_node['derived_end_from']
+                                    is not None
+                                    and merged_node['end']
+                                    in component['evidence_pages']
+                                    and merged_node['derived_end_from']
+                                    in component['evidence_pages']
+                                )
+                            )
                         )
                     ]
                 )
             if any(not candidate_set for candidate_set in candidates):
                 issues.append(
-                    f"Merge combined unsupported bounds for path "
-                    f"{node_path!r}; each occurrence must take start/end "
-                    "claims from one overlapping source-evidence component"
+                    f"Merge used an unsupported path or bounds for title "
+                    f"{title_key!r}; each occurrence must match one physical "
+                    "source-evidence component"
                 )
                 continue
 
@@ -1987,17 +2095,24 @@ Return a single JSON object:
 
             if not all(
                 assign(node_index, set())
-                for node_index in range(len(merged_nodes))
+                for node_index in range(len(title_nodes))
             ):
                 issues.append(
                     f"Merge occurrence mapping is ambiguous or duplicated for "
-                    f"path {node_path!r}"
+                    f"title {title_key!r}"
                 )
 
-        for node_path in merged_occurrences:
-            if node_path not in components_by_path:
+        for node in merged_nodes:
+            if not any(
+                node['path'] in component['paths']
+                for component in components_by_title.get(
+                    node['title_key'],
+                    [],
+                )
+            ):
                 issues.append(
-                    f"Merge path {node_path!r} has no source occurrence evidence"
+                    f"Merge path {node['path']!r} has no source occurrence "
+                    "evidence"
                 )
             if len(issues) >= 20:
                 return issues

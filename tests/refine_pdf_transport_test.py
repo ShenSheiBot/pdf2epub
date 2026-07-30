@@ -1192,7 +1192,17 @@ def test_direct_merge_allows_supported_reparent_and_observed_sibling_cut():
                         {
                             "title": "Before 1914",
                             "start_page": 108,
-                            "end_page": 111,
+                            "end_page": 116,
+                        },
+                        {
+                            "title": "The Contradiction",
+                            "start_page": 138,
+                            "end_page": 141,
+                        },
+                        {
+                            "title": "Never Ask Theory",
+                            "start_page": 144,
+                            "end_page": 147,
                         }
                     ],
                 }
@@ -1209,6 +1219,16 @@ def test_direct_merge_allows_supported_reparent_and_observed_sibling_cut():
                             "title": "Before 1914",
                             "start_page": 109,
                             "end_page": 111,
+                        },
+                        {
+                            "title": "What's New",
+                            "start_page": 136,
+                            "end_page": 139,
+                        },
+                        {
+                            "title": "The Contradiction",
+                            "start_page": 139,
+                            "end_page": 142,
                         }
                     ],
                 }
@@ -1236,6 +1256,21 @@ def test_direct_merge_allows_supported_reparent_and_observed_sibling_cut():
                         "title": "Before 1914",
                         "start_page": 109,
                         "end_page": 111,
+                    },
+                    {
+                        "title": "What's New",
+                        "start_page": 136,
+                        "end_page": 138,
+                    },
+                    {
+                        "title": "The Contradiction",
+                        "start_page": 138,
+                        "end_page": 141,
+                    },
+                    {
+                        "title": "Never Ask Theory",
+                        "start_page": 144,
+                        "end_page": 147,
                     }
                 ],
             },
@@ -1326,6 +1361,83 @@ def test_direct_merge_does_not_collapse_same_title_across_parent_paths():
         collapsed,
         source,
         [list(range(1, 81)), list(range(60, 101))],
+    )
+
+    assert any(
+        "2 distinct physical occurrence(s)" in issue
+        for issue in issues
+    )
+
+
+def test_direct_merge_heading_tolerance_requires_physical_overlap():
+    call = DirectAnalysisCall(
+        client=object(),
+        model="test",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        book_title="Test",
+    )
+    source = [
+        {
+            "chapters": [
+                {
+                    "title": "Part A",
+                    "start_page": 1,
+                    "end_page": 10,
+                    "children": [
+                        {
+                            "title": "Refrain",
+                            "start_page": 10,
+                            "end_page": 10,
+                        }
+                    ],
+                }
+            ]
+        },
+        {
+            "chapters": [
+                {
+                    "title": "Part B",
+                    "start_page": 12,
+                    "end_page": 20,
+                    "children": [
+                        {
+                            "title": "Refrain",
+                            "start_page": 12,
+                            "end_page": 12,
+                        }
+                    ],
+                }
+            ]
+        },
+    ]
+    collapsed = {
+        "chapters": [
+            {
+                "title": "Part A",
+                "start_page": 1,
+                "end_page": 10,
+                "children": [
+                    {
+                        "title": "Refrain",
+                        "start_page": 10,
+                        "end_page": 10,
+                    }
+                ],
+            },
+            {
+                "title": "Part B",
+                "start_page": 12,
+                "end_page": 20,
+                "children": [],
+            },
+        ]
+    }
+
+    issues = call.get_merge_evidence_issues(
+        collapsed,
+        source,
+        [list(range(1, 11)), list(range(12, 21))],
     )
 
     assert any(

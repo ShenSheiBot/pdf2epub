@@ -460,6 +460,9 @@ def _chapter_title_key(title: Any) -> str:
     return re.sub(r"[^\w]+", "", title.casefold(), flags=re.UNICODE)
 
 
+_MERGE_HEADING_PAGE_TOLERANCE = 2
+
+
 # ---------------------------------------------------------------------------
 # Base class for adaptive PDF→LLM calls
 # ---------------------------------------------------------------------------
@@ -1672,10 +1675,11 @@ Rules:
 6. Chapters must be ordered by start_page and must not overlap as siblings.
 7. Do NOT invent chapters or page numbers. One deterministic boundary repair
    is allowed: when a source-supported later sibling heading starts inside an
-   earlier batch's overextended chapter range, end the previous sibling at the
-   page immediately before that heading. If no candidate or such adjacent
-   heading supports a required bound, return null rather than guessing; the
-   caller will fail closed and request a new analysis.
+   earlier batch's overextended chapter range, end the previous sibling either
+   immediately before that heading or on the shared heading page when source
+   ranges treat the transition page as belonging to both siblings. If no
+   candidate or such adjacent heading supports a required bound, return null
+   rather than guessing; the caller will fail closed and request a new analysis.
 
 Batch results:
 {chr(10).join(batch_summaries)}
@@ -1731,6 +1735,7 @@ Return a single JSON object:
 
         expected_title_counts: Counter[str] = Counter()
         allowed_paths: set[Tuple[str, ...]] = set()
+        source_ranges_by_path = defaultdict(list)
         for r in original_results:
             chapters = r if isinstance(r, list) else r.get('chapters', [])
             batch_title_counts = Counter(
@@ -1748,6 +1753,19 @@ Return a single JSON object:
                 for path, _chapter in _iter_chapter_paths(chapters)
                 if all(path)
             )
+            for path, chapter in _iter_chapter_paths(chapters):
+                start = chapter.get('start_page')
+                end = chapter.get('end_page')
+                if (
+                    all(path)
+                    and isinstance(start, int)
+                    and not isinstance(start, bool)
+                    and isinstance(end, int)
+                    and not isinstance(end, bool)
+                    and start >= 1
+                    and end >= start
+                ):
+                    source_ranges_by_path[path].append((start, end))
 
         merged_path_nodes = list(_iter_chapter_paths(merged_chapters))
         merged_title_counts = Counter(
@@ -1763,10 +1781,36 @@ Return a single JSON object:
             for title_key, expected_count in expected_title_counts.items()
             if merged_title_counts[title_key] < expected_count
         )
+
+        def path_has_source_parent_support(path, chapter):
+            if path in allowed_paths:
+                return True
+            if (
+                len(path) < 2
+                or path[-1] not in expected_title_counts
+            ):
+                return False
+            start = chapter.get('start_page')
+            end = chapter.get('end_page')
+            if not (
+                isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and end >= start
+            ):
+                return False
+            return any(
+                parent_start <= start and end <= parent_end
+                for parent_start, parent_end
+                in source_ranges_by_path.get(path[:-1], [])
+            )
+
         unexpected_paths = [
             path
-            for path, _chapter in merged_path_nodes
-            if all(path) and path not in allowed_paths
+            for path, chapter in merged_path_nodes
+            if all(path)
+            and not path_has_source_parent_support(path, chapter)
         ]
         structural_issues = validate_chapter_structure(merged_chapters)
         return [
@@ -1803,6 +1847,7 @@ Return a single JSON object:
             ]
 
         source_occurrences = defaultdict(list)
+        source_path_evidence = defaultdict(list)
         for batch_index, (result, observed_pages) in enumerate(
             zip(original_results, batch_pages)
         ):
@@ -1834,20 +1879,21 @@ Return a single JSON object:
                     # A TOC-derived/global claim wholly outside this batch is
                     # not physical evidence for an occurrence.
                     continue
-                source_occurrences[node_path[-1]].append(
-                    {
-                        'path': node_path,
-                        'batch_index': batch_index,
-                        'raw_interval': (start, end),
-                        'evidence_pages': evidence_pages,
-                        'supported_starts': (
-                            {start} if start in observed else set()
-                        ),
-                        'supported_ends': (
-                            {end} if end in observed else set()
-                        ),
-                    }
-                )
+                occurrence = {
+                    'path': node_path,
+                    'batch_index': batch_index,
+                    'raw_interval': (start, end),
+                    'observed_pages': observed,
+                    'evidence_pages': evidence_pages,
+                    'supported_starts': (
+                        {start} if start in observed else set()
+                    ),
+                    'supported_ends': (
+                        {end} if end in observed else set()
+                    ),
+                }
+                source_occurrences[node_path[-1]].append(occurrence)
+                source_path_evidence[node_path].append(occurrence)
 
         # Hierarchy is a merge decision, not node identity. Match occurrences
         # by normalized title and physical overlap, then retain every
@@ -1858,9 +1904,14 @@ Return a single JSON object:
         def is_same_physical_occurrence(component, occurrence):
             if occurrence['path'] in component['paths']:
                 return True
-            if (
-                component['supported_starts']
-                & occurrence['supported_starts']
+            if any(
+                abs(component_start - occurrence_start)
+                <= _MERGE_HEADING_PAGE_TOLERANCE
+                for component_start in component['supported_starts']
+                for occurrence_start in occurrence['supported_starts']
+            ) and (
+                component['evidence_pages']
+                & occurrence['evidence_pages']
             ):
                 return True
 
@@ -1984,6 +2035,29 @@ Return a single JSON object:
         merged_occurrences = defaultdict(list)
         merged_nodes = []
 
+        def path_has_observed_parent_support(node, component):
+            if node['path'] in component['paths']:
+                return True
+            parent_path = node['path'][:-1]
+            if not parent_path:
+                return False
+
+            for parent in source_path_evidence.get(parent_path, []):
+                parent_start, parent_end = parent['raw_interval']
+                if (
+                    parent_start <= node['start']
+                    and node['end'] <= parent_end
+                    and all(
+                        page in parent['observed_pages']
+                        for page in range(
+                            node['start'],
+                            node['end'] + 1,
+                        )
+                    )
+                ):
+                    return True
+            return False
+
         def collect_merged_nodes(chapters, parent_path=()):
             siblings = []
             for chapter in chapters:
@@ -2028,7 +2102,10 @@ Return a single JSON object:
                 )
                 if (
                     next_start_supported
-                    and node['end'] == next_node['start'] - 1
+                    and node['end'] in (
+                        next_node['start'] - 1,
+                        next_node['start'],
+                    )
                 ):
                     node['derived_end_from'] = next_node['start']
 
@@ -2052,7 +2129,10 @@ Return a single JSON object:
                         index
                         for index, component in enumerate(components)
                         if (
-                            merged_node['path'] in component['paths']
+                            path_has_observed_parent_support(
+                                merged_node,
+                                component,
+                            )
                             and merged_node['start']
                             in component['supported_starts']
                             and (
@@ -2104,7 +2184,7 @@ Return a single JSON object:
 
         for node in merged_nodes:
             if not any(
-                node['path'] in component['paths']
+                path_has_observed_parent_support(node, component)
                 for component in components_by_title.get(
                     node['title_key'],
                     [],

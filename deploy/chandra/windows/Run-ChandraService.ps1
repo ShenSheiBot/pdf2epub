@@ -11,6 +11,7 @@ $Python = Join-Path $ServiceRoot '.venv\Scripts\python.exe'
 $PowerScript = 'C:\ProgramData\Chandra\Set-RTX3090PowerLimit.ps1'
 $LogRoot = 'C:\ProgramData\Chandra\logs'
 $PidPath = 'C:\ProgramData\Chandra\chandra-vllm.pid'
+$TreePath = 'C:\ProgramData\Chandra\chandra-process-tree.json'
 $NvidiaSmi = 'C:\Windows\System32\nvidia-smi.exe'
 $GpuUuid = $env:CHANDRA_GPU_UUID
 $DesiredPowerWatts = if ($env:CHANDRA_POWER_LIMIT_W) {
@@ -47,6 +48,88 @@ function Get-ChandraProcesses {
     })
 }
 
+function Get-ManagedProcessTree([int[]]$RootProcessIds) {
+    $all = @(Get-CimInstance Win32_Process)
+    $children = @{}
+    foreach ($process in $all) {
+        $parentId = [int]$process.ParentProcessId
+        if (-not $children.ContainsKey($parentId)) {
+            $children[$parentId] = @()
+        }
+        $children[$parentId] += $process
+    }
+    $byId = @{}
+    foreach ($process in $all) {
+        $byId[[int]$process.ProcessId] = $process
+    }
+    $queue = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($rootId in $RootProcessIds) {
+        $queue.Enqueue([pscustomobject]@{ ProcessId = $rootId; Depth = 0 })
+    }
+    $seen = @{}
+    $result = @()
+    while ($queue.Count -gt 0) {
+        $item = $queue.Dequeue()
+        $processId = [int]$item.ProcessId
+        if ($seen.ContainsKey($processId) -or -not $byId.ContainsKey($processId)) {
+            continue
+        }
+        $seen[$processId] = $true
+        $process = $byId[$processId]
+        $isManagedPython = $process.Name -eq 'python.exe' -and (
+            $process.CommandLine -like '*vllm.entrypoints.cli.main serve datalab-to/chandra-ocr-2*' -or
+            $process.CommandLine -like '*multiprocessing.spawn*spawn_main*'
+        )
+        if (-not $isManagedPython) {
+            continue
+        }
+        $result += [pscustomobject]@{
+            ProcessId = $processId
+            ParentProcessId = [int]$process.ParentProcessId
+            Depth = [int]$item.Depth
+            CreationTicksUtc = $process.CreationDate.ToUniversalTime().Ticks
+            ExecutablePath = $process.ExecutablePath
+            CommandLine = $process.CommandLine
+        }
+        foreach ($child in @($children[$processId])) {
+            $queue.Enqueue([pscustomobject]@{
+                ProcessId = [int]$child.ProcessId
+                Depth = [int]$item.Depth + 1
+            })
+        }
+    }
+    return @($result)
+}
+
+function Save-ManagedProcessTree([object[]]$Processes) {
+    if ($Processes.Count -eq 0) {
+        throw 'Refusing to replace the Chandra process record with an empty tree'
+    }
+    $temporary = "$TreePath.new"
+    $Processes | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $TreePath -Force
+}
+
+function Stop-RecordedProcessTree([object[]]$Processes) {
+    foreach ($record in @($Processes | Sort-Object Depth -Descending)) {
+        $processId = [int]$record.ProcessId
+        if ($processId -le 4) {
+            throw "Refusing invalid recorded process id $processId"
+        }
+        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+        if ($null -eq $current) {
+            continue
+        }
+        if ($current.CreationDate.ToUniversalTime().Ticks -ne [long]$record.CreationTicksUtc -or
+            $current.ExecutablePath -ne [string]$record.ExecutablePath -or
+            $current.CommandLine -ne [string]$record.CommandLine) {
+            throw "Refusing PID $processId because it no longer matches the recorded Chandra process"
+        }
+        Stop-Process -Id $processId -Force
+    }
+    Remove-Item -LiteralPath $TreePath -Force -ErrorAction SilentlyContinue
+}
+
 function Stop-ValidatedProcessTree([int]$ProcessId) {
     if ($ProcessId -le 4) {
         throw "Refusing invalid Chandra process id $ProcessId"
@@ -67,6 +150,7 @@ New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
 
 while ($true) {
 try {
+$managedTree = @()
 if ([string]::IsNullOrWhiteSpace($GpuUuid)) {
     throw 'CHANDRA_GPU_UUID must identify the dedicated GPU'
 }
@@ -93,9 +177,21 @@ if ($existing.Count -gt 0) {
     if (-not (Test-Health)) {
         throw "Found existing Chandra processes but port $Port is not healthy; refusing a duplicate start"
     }
+    $existingIds = @($existing.ProcessId)
+    $rootIds = @($existing | Where-Object { $_.ParentProcessId -notin $existingIds } | ForEach-Object ProcessId)
+    if ($rootIds.Count -ne 1) {
+        throw "Expected exactly one Chandra root while adopting; found $($rootIds.Count)"
+    }
+    $managedTree = Get-ManagedProcessTree $rootIds
+    Save-ManagedProcessTree $managedTree
+    Set-Content -LiteralPath $PidPath -Value $rootIds[0] -Encoding ASCII
     Write-ServiceLog "ADOPT healthy existing_pids=$($existing.ProcessId -join ',')"
 }
 else {
+    if (Test-Path -LiteralPath $TreePath -PathType Leaf) {
+        $recordedTree = @(Get-Content -LiteralPath $TreePath -Raw | ConvertFrom-Json)
+        Stop-RecordedProcessTree $recordedTree
+    }
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
     if ($listener) {
         throw "Port $Port is already owned by PID $($listener.OwningProcess), not Chandra"
@@ -152,6 +248,8 @@ else {
         Start-Sleep -Seconds 5
         $child.Refresh()
     }
+    $managedTree = Get-ManagedProcessTree @($child.Id)
+    Save-ManagedProcessTree $managedTree
     Write-ServiceLog "READY root_pid=$($child.Id) url='$HealthUrl'"
 }
 
@@ -160,6 +258,15 @@ while ($true) {
     Start-Sleep -Seconds 30
     if (Test-Health) {
         $consecutiveFailures = 0
+        $current = Get-ChandraProcesses
+        $currentIds = @($current.ProcessId)
+        $rootIds = @($current | Where-Object { $_.ParentProcessId -notin $currentIds } | ForEach-Object ProcessId)
+        if ($rootIds.Count -ne 1) {
+            throw "Expected exactly one healthy Chandra root; found $($rootIds.Count)"
+        }
+        $managedTree = Get-ManagedProcessTree $rootIds
+        Save-ManagedProcessTree $managedTree
+        Set-Content -LiteralPath $PidPath -Value $rootIds[0] -Encoding ASCII
         continue
     }
     $consecutiveFailures++
@@ -178,6 +285,10 @@ catch {
     $failure = $_.Exception.Message.Replace("`r", ' ').Replace("`n", ' ')
     Write-ServiceLog "RESTART_PENDING reason='$failure' delay_seconds=60"
     try {
+        if ($managedTree.Count -eq 0 -and (Test-Path -LiteralPath $TreePath -PathType Leaf)) {
+            $managedTree = @(Get-Content -LiteralPath $TreePath -Raw | ConvertFrom-Json)
+        }
+        Stop-RecordedProcessTree $managedTree
         $managed = Get-ChandraProcesses
         foreach ($process in $managed) {
             Stop-ValidatedProcessTree $process.ProcessId

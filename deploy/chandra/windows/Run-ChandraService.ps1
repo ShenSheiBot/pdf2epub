@@ -1,0 +1,192 @@
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+
+$ServiceRoot = $env:CHANDRA_SERVICE_ROOT
+if ([string]::IsNullOrWhiteSpace($ServiceRoot)) {
+    throw 'CHANDRA_SERVICE_ROOT must point to the native Windows vLLM environment'
+}
+$Python = Join-Path $ServiceRoot '.venv\Scripts\python.exe'
+$PowerScript = 'C:\ProgramData\Chandra\Set-RTX3090PowerLimit.ps1'
+$LogRoot = 'C:\ProgramData\Chandra\logs'
+$PidPath = 'C:\ProgramData\Chandra\chandra-vllm.pid'
+$NvidiaSmi = 'C:\Windows\System32\nvidia-smi.exe'
+$GpuUuid = $env:CHANDRA_GPU_UUID
+$DesiredPowerWatts = if ($env:CHANDRA_POWER_LIMIT_W) {
+    [double]$env:CHANDRA_POWER_LIMIT_W
+} else {
+    275.0
+}
+$Model = 'datalab-to/chandra-ocr-2'
+$Revision = 'af93b47dba1b47b6640c86ccf487ed2260ab9a09'
+$Port = 8100
+$HealthUrl = "http://127.0.0.1:$Port/health"
+
+function Write-ServiceLog([string]$Message) {
+    $timestamp = Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'
+    Add-Content -LiteralPath (Join-Path $LogRoot 'service.log') -Value "$timestamp $Message" -Encoding UTF8
+}
+
+function Test-Health {
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 5
+        return $response.StatusCode -eq 200
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-ChandraProcesses {
+    return @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -eq 'python.exe' -and
+        $_.CommandLine -like '*vllm.entrypoints.cli.main serve datalab-to/chandra-ocr-2*' -and
+        $_.CommandLine -like '*--served-model-name chandra*' -and
+        $_.CommandLine -like '*--port 8100*'
+    })
+}
+
+function Stop-ValidatedProcessTree([int]$ProcessId) {
+    if ($ProcessId -le 4) {
+        throw "Refusing invalid Chandra process id $ProcessId"
+    }
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        return
+    }
+    if ($process.Name -ne 'python.exe' -or
+        $process.CommandLine -notlike '*vllm.entrypoints.cli.main serve datalab-to/chandra-ocr-2*' -or
+        $process.CommandLine -notlike '*--port 8100*') {
+        throw "Refusing to stop PID $ProcessId because its command line is not the managed Chandra service"
+    }
+    & C:\Windows\System32\taskkill.exe /PID $ProcessId /T /F | Out-Null
+}
+
+New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
+
+while ($true) {
+try {
+if ([string]::IsNullOrWhiteSpace($GpuUuid)) {
+    throw 'CHANDRA_GPU_UUID must identify the dedicated GPU'
+}
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    throw "Chandra Python is missing: $Python"
+}
+if (-not (Test-Path -LiteralPath $PowerScript -PathType Leaf)) {
+    throw "RTX 3090 power-limit script is missing: $PowerScript"
+}
+
+& C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe `
+    -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PowerScript
+if ($LASTEXITCODE -ne 0) {
+    throw "RTX 3090 power-limit script exited with $LASTEXITCODE"
+}
+$powerLimit = [double]((& $NvidiaSmi -i $GpuUuid `
+    --query-gpu=power.limit --format=csv,noheader,nounits).Trim())
+if ([math]::Abs($powerLimit - $DesiredPowerWatts) -gt 0.1) {
+    throw "RTX 3090 power limit is $powerLimit W instead of $DesiredPowerWatts W"
+}
+
+$existing = Get-ChandraProcesses
+if ($existing.Count -gt 0) {
+    if (-not (Test-Health)) {
+        throw "Found existing Chandra processes but port $Port is not healthy; refusing a duplicate start"
+    }
+    Write-ServiceLog "ADOPT healthy existing_pids=$($existing.ProcessId -join ',')"
+}
+else {
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($listener) {
+        throw "Port $Port is already owned by PID $($listener.OwningProcess), not Chandra"
+    }
+
+    $cudaRoot = Join-Path $ServiceRoot '.venv\Lib\site-packages\nvidia\cu13'
+    Remove-Item Env:CUDA_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:CUDA_LIB_PATH -ErrorAction SilentlyContinue
+    $env:CUDA_HOME = $cudaRoot
+    $env:VLLM_USE_FLASHINFER_SAMPLER = '0'
+    $env:PYTHONUTF8 = '1'
+    $cacheRoot = if ($env:CHANDRA_CACHE_ROOT) {
+        $env:CHANDRA_CACHE_ROOT
+    } else {
+        Join-Path $ServiceRoot 'cache'
+    }
+    $env:HF_HOME = Join-Path $cacheRoot 'huggingface'
+    $env:VLLM_CACHE_ROOT = Join-Path $cacheRoot 'vllm'
+    $env:HF_HUB_OFFLINE = '1'
+    $env:TRANSFORMERS_OFFLINE = '1'
+    $env:PATH = "$(Join-Path $ServiceRoot '.venv\Scripts');$(Join-Path $ServiceRoot '.venv\Lib\site-packages\torch\lib');$(Join-Path $cudaRoot 'bin\x86_64');$(Join-Path $cudaRoot 'bin');$env:PATH"
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $stdout = Join-Path $LogRoot "vllm-$stamp.stdout.log"
+    $stderr = Join-Path $LogRoot "vllm-$stamp.stderr.log"
+    $arguments = @(
+        '-m', 'vllm.entrypoints.cli.main', 'serve', $Model,
+        '--revision', $Revision,
+        '--host', '0.0.0.0',
+        '--port', "$Port",
+        '--served-model-name', 'chandra',
+        '--dtype', 'bfloat16',
+        '--max-model-len', '18000',
+        '--max-num-seqs', '8',
+        '--max-num-batched-tokens', '2048',
+        '--gpu-memory-utilization', '0.70',
+        '--disable-log-stats'
+    )
+    $child = Start-Process -FilePath $Python -ArgumentList $arguments `
+        -WorkingDirectory $ServiceRoot -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr -PassThru
+    Set-Content -LiteralPath $PidPath -Value $child.Id -Encoding ASCII
+    Write-ServiceLog "START root_pid=$($child.Id) stdout='$stdout' stderr='$stderr' power_limit_w=$powerLimit"
+
+    $startupDeadline = (Get-Date).AddMinutes(8)
+    while (-not (Test-Health)) {
+        if ($child.HasExited) {
+            throw "Chandra exited during startup with code $($child.ExitCode); see $stderr"
+        }
+        if ((Get-Date) -ge $startupDeadline) {
+            Stop-ValidatedProcessTree $child.Id
+            throw "Chandra did not become healthy within eight minutes; see $stderr"
+        }
+        Start-Sleep -Seconds 5
+        $child.Refresh()
+    }
+    Write-ServiceLog "READY root_pid=$($child.Id) url='$HealthUrl'"
+}
+
+$consecutiveFailures = 0
+while ($true) {
+    Start-Sleep -Seconds 30
+    if (Test-Health) {
+        $consecutiveFailures = 0
+        continue
+    }
+    $consecutiveFailures++
+    Write-ServiceLog "UNHEALTHY consecutive_failures=$consecutiveFailures"
+    if ($consecutiveFailures -lt 3) {
+        continue
+    }
+    $managed = Get-ChandraProcesses
+    foreach ($process in $managed) {
+        Stop-ValidatedProcessTree $process.ProcessId
+    }
+    throw "Chandra failed three consecutive health checks"
+}
+}
+catch {
+    $failure = $_.Exception.Message.Replace("`r", ' ').Replace("`n", ' ')
+    Write-ServiceLog "RESTART_PENDING reason='$failure' delay_seconds=60"
+    try {
+        $managed = Get-ChandraProcesses
+        foreach ($process in $managed) {
+            Stop-ValidatedProcessTree $process.ProcessId
+        }
+    }
+    catch {
+        $cleanupFailure = $_.Exception.Message.Replace("`r", ' ').Replace("`n", ' ')
+        Write-ServiceLog "CLEANUP_FAILED reason='$cleanupFailure'"
+    }
+    Start-Sleep -Seconds 60
+}
+}

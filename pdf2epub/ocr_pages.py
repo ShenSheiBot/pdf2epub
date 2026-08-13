@@ -15,6 +15,8 @@ Supports multiple backends:
 import json
 import argparse
 import fitz  # PyMuPDF
+import os
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 from google.oauth2 import service_account
@@ -23,6 +25,7 @@ from loguru import logger
 from .utils.logging_config import configure_logging
 from .utils.common import load_config
 from .ocr_backends import ocr_pdf_chunk_mistral, ocr_pdf_chunk_vertex, ocr_pdf_chunk_vllm
+from .ocr.artifacts import OCRPageResult
 
 # Configure logger
 logger = configure_logging()
@@ -67,7 +70,8 @@ def ocr_pdf_chunk(
     """OCR a PDF chunk using selected backend.
 
     Routes to the appropriate backend based on configuration.
-    Supports: vertex, mistral, vllm, azure, vision
+    Supports legacy tuple backends: vertex, mistral, vllm, azure, vision.
+    Chandra uses :func:`ocr_pdf_page` because it returns richer page artifacts.
 
     Args:
         pdf_bytes: PDF content as bytes
@@ -238,7 +242,106 @@ def ocr_pdf_chunk(
         return markdown, illustrations, updated_counter
 
     else:
-        raise ValueError(f"Unknown OCR backend: {backend}. Supported: vertex, mistral, vllm, azure, vision")
+        raise ValueError(f"Unknown OCR backend: {backend}. Supported: vertex, mistral, vllm, azure, vision, chandra")
+
+
+def ocr_pdf_page(
+    pdf_bytes: bytes,
+    session=None,
+    project_id: str = None,
+    location: str = None,
+    chunk_info: str = "",
+    images_dir: Path = None,
+    page_number: int = 1,
+    image_counter: int = 0,
+    max_retries: int = 5,
+    initial_backoff: float = 4.0,
+    backend: str = "vertex",
+    api_key: str = None,
+    base_url: str = None,
+    config: Dict = None,
+) -> OCRPageResult:
+    """OCR one page while retaining every representation a backend exposes."""
+    if backend == "chandra":
+        if config is None:
+            raise ValueError("config is required for chandra backend")
+        from .ocr.backends.chandra import process_pdf_page
+
+        return process_pdf_page(
+            pdf_bytes,
+            config,
+            page_number=page_number,
+            images_dir=images_dir,
+            image_counter=image_counter,
+        )
+
+    legacy_result = ocr_pdf_chunk(
+        pdf_bytes=pdf_bytes,
+        session=session,
+        project_id=project_id,
+        location=location,
+        chunk_info=chunk_info,
+        images_dir=images_dir,
+        page_number=page_number,
+        image_counter=image_counter,
+        max_retries=max_retries,
+        initial_backoff=initial_backoff,
+        backend=backend,
+        api_key=api_key,
+        base_url=base_url,
+        config=config,
+    )
+    return OCRPageResult.from_legacy_tuple(legacy_result, backend=backend)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def save_page_artifacts(result: OCRPageResult, pages_dir: Path, page_number: int) -> Path:
+    """Persist rich artifacts, writing Markdown last as the completion marker."""
+    stem = f"page_{page_number:03d}"
+    markdown_path = pages_dir / f"{stem}.md"
+    html_path = pages_dir / f"{stem}.html"
+    raw_html_path = pages_dir / f"{stem}.raw.html"
+    sidecar_path = pages_dir / f"{stem}.ocr.json"
+
+    if result.raw_html is not None:
+        _atomic_write_text(raw_html_path, result.raw_html)
+    if result.html is not None:
+        _atomic_write_text(html_path, result.html)
+
+    sidecar = {
+        "schema_version": 1,
+        "page_number": page_number,
+        "backend": result.backend,
+        "model": result.model,
+        "model_revision": result.model_revision,
+        "page_box": result.page_box,
+        "model_input_size": result.model_input_size,
+        "token_count": result.token_count,
+        "formats": {
+            "markdown": markdown_path.name,
+            "html": html_path.name if result.html is not None else None,
+            "raw_html": raw_html_path.name if result.raw_html is not None else None,
+        },
+        "raw_html": result.raw_html,
+        "blocks": result.blocks,
+        "assets": result.assets,
+    }
+    _atomic_write_text(sidecar_path, json.dumps(sidecar, ensure_ascii=False, indent=2))
+    _atomic_write_text(markdown_path, result.markdown)
+    return markdown_path
 
 
 def count_tokens(text: str) -> int:
@@ -407,7 +510,7 @@ def ocr_full_book_pagewise(
                 chunk_info = f"Page {page_num}"
 
                 # Use page_num as image counter base to avoid conflicts
-                markdown, images, img_count = ocr_pdf_chunk(
+                page_result = ocr_pdf_page(
                     pdf_bytes,
                     session,
                     project_id,
@@ -426,8 +529,7 @@ def ocr_full_book_pagewise(
 
                 return {
                     'page_num': page_num,
-                    'markdown': markdown,
-                    'images': images,
+                    'page_result': page_result,
                     'success': True,
                     'error': None
                 }
@@ -435,8 +537,7 @@ def ocr_full_book_pagewise(
                 import traceback
                 return {
                     'page_num': page_num,
-                    'markdown': None,
-                    'images': None,
+                    'page_result': None,
                     'success': False,
                     'error': str(e),
                     'traceback': traceback.format_exc()
@@ -453,18 +554,29 @@ def ocr_full_book_pagewise(
                 page_file = pages_dir / f"page_{page_num:03d}.md"
 
                 if result['success']:
-                    # Save page markdown
-                    with open(page_file, 'w', encoding='utf-8') as f:
-                        f.write(result['markdown'])
+                    page_result = result['page_result']
+                    save_page_artifacts(page_result, pages_dir, page_num)
 
                     # Count tokens
-                    token_count = count_tokens(result['markdown'])
+                    token_count = (
+                        page_result.token_count
+                        if page_result.token_count is not None
+                        else count_tokens(page_result.markdown)
+                    )
 
                     # Update stats
                     page_stats[str(page_num)] = {
                         'tokens': token_count,
                         'file': str(page_file.relative_to(output_dir)),
-                        'char_count': len(result['markdown'])
+                        'char_count': len(page_result.markdown),
+                        'html_file': (
+                            str((pages_dir / f"page_{page_num:03d}.html").relative_to(output_dir))
+                            if page_result.html is not None
+                            else None
+                        ),
+                        'artifact_file': str(
+                            (pages_dir / f"page_{page_num:03d}.ocr.json").relative_to(output_dir)
+                        ),
                     }
 
                     # Update progress
@@ -593,8 +705,11 @@ def main():
         # Client will be initialized lazily in ocr_pdf_chunk
         logger.info("Using Google Cloud Vision backend")
 
+    elif ocr_backend == "chandra":
+        logger.info("Using Chandra OCR service")
+
     else:
-        raise ValueError(f"Unknown OCR backend: {ocr_backend}. Supported: vertex, mistral, vllm, azure, vision")
+        raise ValueError(f"Unknown OCR backend: {ocr_backend}. Supported: vertex, mistral, vllm, azure, vision, chandra")
 
     # Determine PDF path
     if args.input:

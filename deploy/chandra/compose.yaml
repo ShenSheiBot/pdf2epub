@@ -1,0 +1,59 @@
+name: pdf2epub-chandra
+
+services:
+  chandra:
+    image: vllm/vllm-openai:v0.17.0
+    restart: always
+    gpus: all
+    ipc: host
+    ports:
+      - "${CHANDRA_BIND_ADDRESS:-127.0.0.1}:${CHANDRA_PORT:-8100}:8000"
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+      - vllm-cache:/root/.cache/vllm
+    environment:
+      # Production starts must be independent of Hugging Face/Xet availability.
+      # Run one online start to populate the pinned snapshot before enabling
+      # this Compose service on a new machine.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command:
+      - --model
+      - datalab-to/chandra-ocr-2
+      - --revision
+      - af93b47dba1b47b6640c86ccf487ed2260ab9a09
+      - --no-enforce-eager
+      - --max-num-seqs
+      - "16"
+      - --dtype
+      - bfloat16
+      - --max-model-len
+      - "18000"
+      - --max_num_batched_tokens
+      - "2048"
+      - --gpu-memory-utilization
+      - "0.85"
+      - --enable-prefix-caching
+      - --mm-processor-kwargs
+      - '{"min_pixels":3136,"max_pixels":6291456}'
+      - --served-model-name
+      - chandra
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=5).read()"
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 8m
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+volumes:
+  huggingface-cache:
+  vllm-cache:

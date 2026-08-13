@@ -136,7 +136,11 @@ def ocr_pages_command(args):
     # Get OCR settings from config
     ocr_config = config.get('ocr', {})
     backend = ocr_config.get('backend', 'mistral')
-    max_workers = args.max_workers or ocr_config.get('vision', {}).get('max_workers', 5)
+    backend_config = ocr_config.get('backends', {}).get(backend, {})
+    max_workers = args.max_workers or backend_config.get(
+        'max_workers',
+        ocr_config.get('vision', {}).get('max_workers', 5),
+    )
 
     # Get credentials
     credentials = config.get('credentials', {}).get('providers', {})

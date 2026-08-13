@@ -55,7 +55,7 @@ credentials:
 # OCR Configuration
 # =================
 ocr:
-  backend: vision  # Options: 'vertex', 'mistral', 'vllm', 'azure', 'vision'
+  backend: vision  # Options: 'chandra', 'vertex', 'mistral', 'vllm', 'azure', 'vision'
   furigana_mode: attach  # Options: 'attach' or 'delete'
 
   max_retries: 5
@@ -66,6 +66,18 @@ ocr:
     vision:
       max_retries: 3
       initial_backoff: 2.0
+    # Chandra runs as one persistent vLLM service per 24 GB GPU. The server
+    # performs continuous batching; four client requests gave the best
+    # throughput/latency tradeoff on mixed book pages.
+    chandra:
+      base_url: http://127.0.0.1:8100/v1
+      model: chandra
+      model_revision: af93b47dba1b47b6640c86ccf487ed2260ab9a09
+      max_workers: 4
+      max_output_tokens: 12384
+      dpi: 192
+      min_dimension: 1024
+      include_headers_footers: false
 
   # Vision API settings (for 'vision' backend)
   vision:

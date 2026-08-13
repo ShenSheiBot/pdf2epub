@@ -23,7 +23,7 @@
 
 适用于 PDF 扫描件转换：
 
-1. **ocr-pages**：逐页进行 OCR，使用多模态 LLM 将每页转换成带有插图的 markdown
+1. **ocr-pages**：逐页进行 OCR，保存 Markdown、HTML 和可审计的原始版式信息
 2. **refine**：智能分析 TOC 结构，验证章节边界，生成精确的 toc_tree.json（支持无限层级嵌套）
 3. **polish**：使用 LLM 建立正确的链接跳转，消除 OCR 错误、页眉页脚等
 4. **translate**：（可选）使用 LLM 翻译成目标语言
@@ -104,17 +104,24 @@ LLM。只有候选译文无法编译时才调用 whole-mode repair agent；修�
 
 ### OCR后端支持
 
-本项目支持三种OCR后端用于日语纵排文本识别：
+本项目支持以下 OCR 后端。对于日语纵排、英语、复杂表格和混合版型，当前
+推荐使用 Chandra 2；传统后端继续保留用于兼容和对照。
 
-#### 1. **Azure Document Intelligence** (`azure`)
-- 效果最佳，支持振假名(furigana)检测和重组，基本保证准确
+#### 1. **Chandra 2** (`chandra`)
+- 通过本地 vLLM 服务运行，单张 24 GB NVIDIA GPU 即可
+- 同时保存 Markdown、保留 bbox/label 的 HTML、原始 HTML、ordered blocks 和裁图
+- 支持日语纵排、英语、表格、公式、脚注、页眉页脚和混合版型
+- 服务部署与重启说明见 [`deploy/chandra`](deploy/chandra/README.md)
+
+#### 2. **Azure Document Intelligence** (`azure`)
+- 支持振假名(furigana)检测和重组
 - 需要Azure账户和API密钥
 
-#### 2. **Google Cloud Vision** (`vision`)
-- 效果次佳，正文偶有漏字，振假名偶有错漏
+#### 3. **Google Cloud Vision** (`vision`)
+- 正文偶有漏字，振假名偶有错漏
 - 需要Google Cloud账户和服务账户密钥
 
-#### 3. **Vision Language Models** (`vllm`)
+#### 4. **通用 Vision Language Models** (`vllm`)
 - Gemini 识别效果较佳，但经常“自由发挥”，添加不存在的振假名，且审核严格，不推荐
 - Anthropic 识别效果较差，虽然审核宽松，更不推荐
 - VLLM 整体识别速度缓慢且费用较高，胜在输出文本连贯，但仍不能完全摆脱后处理需求，故整体仅作为备用方案
@@ -177,7 +184,7 @@ credentials:
       base_url: https://your-responses-compatible-endpoint.example/v1
 
 ocr:
-  backend: azure  # azure / vision / vllm
+  backend: chandra  # chandra / azure / vision / vllm
 
 translation:
   source_language: Japanese

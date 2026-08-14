@@ -1160,6 +1160,96 @@ def test_vertex_batch_refreshes_the_explicit_json_only(
     assert len(refreshed) == 1
 
 
+def test_vertex_batch_freezes_explicit_credentials_for_the_process(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import google.auth
+
+    credential_file = tmp_path / "vertex.json"
+    credential_file.write_text("first", encoding="utf-8")
+    monkeypatch.setenv(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        str(credential_file),
+    )
+
+    loaded_credentials = []
+
+    class Credentials:
+        def refresh(self, _request):
+            return None
+
+    def load_credentials(filename, scopes):
+        assert filename == str(credential_file)
+        assert scopes == [
+            "https://www.googleapis.com/auth/cloud-platform"
+        ]
+        credentials = Credentials()
+        loaded_credentials.append(credentials)
+        return credentials, "ignored-project"
+
+    monkeypatch.setattr(
+        google.auth,
+        "load_credentials_from_file",
+        load_credentials,
+    )
+
+    first = VertexBatchClient(project="project", model="model")
+    credential_file.write_text("replacement-is-longer", encoding="utf-8")
+    second = VertexBatchClient(project="project", model="model")
+
+    assert len(loaded_credentials) == 1
+    assert first._credentials is loaded_credentials[0]
+    assert second._credentials is loaded_credentials[0]
+
+
+def test_vertex_and_storage_clients_receive_the_explicit_credentials(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import google.auth
+    from google import genai
+    from google.cloud import storage
+
+    credential_file = tmp_path / "vertex.json"
+    credential_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        str(credential_file),
+    )
+
+    class Credentials:
+        def refresh(self, _request):
+            return None
+
+    credentials = Credentials()
+    monkeypatch.setattr(
+        google.auth,
+        "load_credentials_from_file",
+        lambda *_args, **_kwargs: (credentials, "ignored-project"),
+    )
+
+    vertex_calls = []
+    storage_calls = []
+    monkeypatch.setattr(
+        genai,
+        "Client",
+        lambda **kwargs: vertex_calls.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        storage,
+        "Client",
+        lambda **kwargs: storage_calls.append(kwargs) or object(),
+    )
+
+    client = VertexBatchClient(project="project", model="model")
+    client._get_client()
+    client._get_storage_client()
+
+    assert vertex_calls[0]["credentials"] is credentials
+    assert storage_calls[0]["credentials"] is credentials
+
+
 class FakeSingleBatchClient:
     def __init__(self, response_text: str):
         self.response_text = response_text

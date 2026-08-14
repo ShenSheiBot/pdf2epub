@@ -31,6 +31,33 @@ from .page_merger import PageMerger
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
 
+def _insert_toc_chapter(toc_tree: List[TOCNode], toc_info: Dict) -> TOCNode:
+    """Insert an authoritative TOC range without letting body nodes start in it."""
+    toc_chapter = TOCNode(
+        title="Table of Contents",
+        level=1,
+        start_page=toc_info['start_page'],
+        end_page=toc_info['end_page'],
+        children=[],
+    )
+    for chapter in toc_tree:
+        if (
+            toc_chapter.start_page
+            <= chapter.start_page
+            <= toc_chapter.end_page
+        ):
+            chapter.start_page = toc_chapter.end_page + 1
+            if chapter.end_page < chapter.start_page:
+                chapter.end_page = chapter.start_page
+    for index, chapter in enumerate(toc_tree):
+        if chapter.start_page >= toc_chapter.start_page:
+            toc_tree.insert(index, toc_chapter)
+            break
+    else:
+        toc_tree.append(toc_chapter)
+    return toc_chapter
+
+
 class RefinedBreakdown:
     """
     Main class for refined breakdown process.
@@ -189,22 +216,7 @@ class RefinedBreakdown:
             # Insert table_of_contents as a chapter if it exists
             toc_info = book_metadata.get('table_of_contents')
             if toc_info and toc_info.get('start_page') and toc_info.get('end_page'):
-                toc_chapter = TOCNode(
-                    title="Table of Contents",
-                    level=1,
-                    start_page=toc_info['start_page'],
-                    end_page=toc_info['end_page'],
-                    children=[],
-                )
-                # Insert at correct position based on page number
-                inserted = False
-                for i, chapter in enumerate(toc_tree):
-                    if chapter.start_page > toc_chapter.start_page:
-                        toc_tree.insert(i, toc_chapter)
-                        inserted = True
-                        break
-                if not inserted:
-                    toc_tree.append(toc_chapter)
+                toc_chapter = _insert_toc_chapter(toc_tree, toc_info)
                 logger.info(f"Added 'Table of Contents' chapter (p{toc_info['start_page']}-p{toc_info['end_page']})")
 
             # Save TOC tree (both original and working copy)

@@ -148,3 +148,29 @@ def test_chandra_rejects_token_limited_partial_layout(monkeypatch):
         assert "finish_reason='length'" in str(error)
     else:
         raise AssertionError("token-limited Chandra output must not be accepted")
+
+
+def test_chandra_configures_a_bounded_request_timeout(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("pdf2epub.ocr.backends.chandra.OpenAI", FakeOpenAI)
+
+    ChandraClient(
+        {
+            "ocr": {
+                "backends": {
+                    "chandra": {
+                        "base_url": "http://127.0.0.1:8100/v1",
+                        "request_timeout": 90,
+                    }
+                }
+            }
+        }
+    )
+
+    assert captured["timeout"] == 90.0
+    assert captured["max_retries"] == 0

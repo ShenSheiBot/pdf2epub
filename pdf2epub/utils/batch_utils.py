@@ -33,15 +33,17 @@ BATCH_DEFAULTS = {
     },
 }
 
-_VERTEX_CREDENTIAL_PROBES: set[tuple[str, int]] = set()
+_VERTEX_CREDENTIAL_SNAPSHOTS: Dict[str, Dict[str, Any]] = {}
 
 
-def probe_explicit_vertex_credentials() -> Path:
-    """Load and refresh only the JSON credential named by the process.
+def _get_explicit_vertex_credentials():
+    """Return one stable credential snapshot per explicit path and process.
 
     Vertex batch work must not depend on whichever user happens to be active
     in gcloud or in the machine-wide ADC file. The refresh is intentionally
     performed before any batch client can submit work and never logs a token.
+    If another process replaces the JSON during a long-running command, later
+    batch stages keep the credential identity captured by the first stage.
     """
     credential_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if not credential_path:
@@ -58,9 +60,18 @@ def probe_explicit_vertex_credentials() -> Path:
             f"{path}"
         )
 
-    cache_key = (str(path.resolve()), path.stat().st_mtime_ns)
-    if cache_key in _VERTEX_CREDENTIAL_PROBES:
-        return path
+    resolved_path = str(path.resolve())
+    stat = path.stat()
+    signature = (stat.st_mtime_ns, stat.st_size)
+    snapshot = _VERTEX_CREDENTIAL_SNAPSHOTS.get(resolved_path)
+    if snapshot is not None:
+        if signature != snapshot["signature"] and not snapshot["warned"]:
+            logger.warning(
+                "Explicit Vertex credential file changed during this process; "
+                "continuing with the process-scoped credential snapshot"
+            )
+            snapshot["warned"] = True
+        return path, snapshot["credentials"]
 
     try:
         import google.auth
@@ -76,8 +87,18 @@ def probe_explicit_vertex_credentials() -> Path:
             f"Explicit Vertex credential refresh failed for {path}: {exc}"
         ) from exc
 
-    _VERTEX_CREDENTIAL_PROBES.add(cache_key)
+    _VERTEX_CREDENTIAL_SNAPSHOTS[resolved_path] = {
+        "signature": signature,
+        "credentials": credentials,
+        "warned": False,
+    }
     logger.info("Validated explicit JSON credentials for Vertex batch")
+    return path, credentials
+
+
+def probe_explicit_vertex_credentials() -> Path:
+    """Validate and snapshot the process-level Vertex JSON credential."""
+    path, _credentials = _get_explicit_vertex_credentials()
     return path
 
 
@@ -638,7 +659,9 @@ class VertexBatchClient:
             os.environ.setdefault("HTTP_PROXY", proxy)
             logger.info(f"Vertex batch client using proxy: {proxy}")
 
-        probe_explicit_vertex_credentials()
+        self._credential_path, self._credentials = (
+            _get_explicit_vertex_credentials()
+        )
         self.project = project
         self.location = location
         self.model = model
@@ -660,6 +683,7 @@ class VertexBatchClient:
             try:
                 self._client = genai.Client(
                     vertexai=True,
+                    credentials=self._credentials,
                     project=self.project,
                     location=self.location,
                 )
@@ -684,7 +708,10 @@ class VertexBatchClient:
                     "google-cloud-storage is required for Vertex batch mode. "
                     "Install it with: uv add google-cloud-storage"
                 )
-            self._storage_client = storage.Client(project=self.project)
+            self._storage_client = storage.Client(
+                project=self.project,
+                credentials=self._credentials,
+            )
         return self._storage_client
 
     def _get_bucket_name(self) -> str:

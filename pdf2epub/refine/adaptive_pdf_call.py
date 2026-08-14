@@ -14,7 +14,6 @@ import hashlib
 import json
 import os
 import re
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, TypeVar, Union
 
@@ -460,9 +459,6 @@ def _chapter_title_key(title: Any) -> str:
     return re.sub(r"[^\w]+", "", title.casefold(), flags=re.UNICODE)
 
 
-_MERGE_HEADING_PAGE_TOLERANCE = 2
-
-
 # ---------------------------------------------------------------------------
 # Base class for adaptive PDF→LLM calls
 # ---------------------------------------------------------------------------
@@ -623,6 +619,16 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             total_batches,
         )
         return all_issues, actionable
+
+    def can_defer_batch_issues(
+        self,
+        result: Any,
+        issues: List[str],
+        batch_idx: int,
+        total_batches: int,
+    ) -> bool:
+        """Whether downstream recovery can safely handle these batch issues."""
+        return False
 
     def _batch_cache_path(
         self,
@@ -889,15 +895,6 @@ Look at the PDF pages carefully to verify page numbers are correct."""
             return []
         return ["The merged result failed structural validation."]
 
-    def get_merge_evidence_issues(
-        self,
-        merged: Any,
-        original_results: List,
-        batch_pages: Optional[List[List[int]]],
-    ) -> List[str]:
-        """Validate claims that depend on concrete per-batch PDF evidence."""
-        return []
-
     def build_merge_repair_prompt(
         self,
         original_prompt: str,
@@ -1076,13 +1073,6 @@ validator identified as unsupported or overlapping.
                 raise
 
             issues = self.get_merge_validation_issues(merged, results)
-            issues.extend(
-                self.get_merge_evidence_issues(
-                    merged,
-                    results,
-                    batch_pages,
-                )
-            )
             if not issues:
                 logger.info(
                     f"[{self.operation_name}] Merged {len(results)} batches successfully"
@@ -1237,6 +1227,23 @@ validator identified as unsupported or overlapping.
                     logger.info(
                         f"[{self.operation_name}] Batch {batch_idx+1}/{total_batches}: "
                         f"{len(all_issues)} edge issue(s) tolerated"
+                    )
+                    self._save_cached_batch_result(
+                        cache_path,
+                        cache_fingerprint,
+                        result,
+                    )
+                    return result
+
+                if self.can_defer_batch_issues(
+                    result,
+                    actionable_issues,
+                    batch_idx,
+                    total_batches,
+                ):
+                    logger.warning(
+                        f"[{self.operation_name}] Deferring boundary-only "
+                        "issues to downstream OCR boundary verification"
                     )
                     self._save_cached_batch_result(
                         cache_path,
@@ -1726,477 +1733,83 @@ Return a single JSON object:
                         )
         return issues
 
-    def get_merge_validation_issues(self, merged, original_results):
-        # LLM may return a bare list instead of {"chapters": [...]}
-        if isinstance(merged, list):
-            merged_chapters = merged
-        else:
-            merged_chapters = merged.get('chapters', [])
-
-        expected_title_counts: Counter[str] = Counter()
-        allowed_paths: set[Tuple[str, ...]] = set()
-        source_ranges_by_path = defaultdict(list)
-        for r in original_results:
-            chapters = r if isinstance(r, list) else r.get('chapters', [])
-            batch_title_counts = Counter(
-                path[-1]
-                for path, _chapter in _iter_chapter_paths(chapters)
-                if path[-1]
-            )
-            for title_key, count in batch_title_counts.items():
-                expected_title_counts[title_key] = max(
-                    expected_title_counts[title_key],
-                    count,
-                )
-            allowed_paths.update(
-                path
-                for path, _chapter in _iter_chapter_paths(chapters)
-                if all(path)
-            )
-            for path, chapter in _iter_chapter_paths(chapters):
-                start = chapter.get('start_page')
-                end = chapter.get('end_page')
-                if (
-                    all(path)
-                    and isinstance(start, int)
-                    and not isinstance(start, bool)
-                    and isinstance(end, int)
-                    and not isinstance(end, bool)
-                    and start >= 1
-                    and end >= start
-                ):
-                    source_ranges_by_path[path].append((start, end))
-
-        merged_path_nodes = list(_iter_chapter_paths(merged_chapters))
-        merged_title_counts = Counter(
-            path[-1]
-            for path, _chapter in merged_path_nodes
-            if path[-1]
-        )
-        missing_titles = sorted(
-            (
-                title_key,
-                expected_count - merged_title_counts[title_key],
-            )
-            for title_key, expected_count in expected_title_counts.items()
-            if merged_title_counts[title_key] < expected_count
-        )
-
-        def path_has_source_parent_support(path, chapter):
-            if path in allowed_paths:
-                return True
-            if (
-                len(path) < 2
-                or path[-1] not in expected_title_counts
-            ):
-                return False
-            start = chapter.get('start_page')
-            end = chapter.get('end_page')
-            if not (
-                isinstance(start, int)
-                and not isinstance(start, bool)
-                and isinstance(end, int)
-                and not isinstance(end, bool)
-                and end >= start
-            ):
-                return False
-            return any(
-                parent_start <= start and end <= parent_end
-                for parent_start, parent_end
-                in source_ranges_by_path.get(path[:-1], [])
-            )
-
-        unexpected_paths = [
-            path
-            for path, chapter in merged_path_nodes
-            if all(path)
-            and not path_has_source_parent_support(path, chapter)
-        ]
-        structural_issues = validate_chapter_structure(merged_chapters)
-        return [
-            *(
-                [
-                    f"Merge omitted source chapter occurrence(s): "
-                    f"{missing_titles[:10]}"
-                ]
-                if missing_titles
-                else []
-            ),
-            *(
-                [
-                    "Merge placed chapter(s) under unsupported parent path(s): "
-                    + repr(unexpected_paths[:10])
-                ]
-                if unexpected_paths
-                else []
-            ),
-            *structural_issues,
-        ]
-
-    def get_merge_evidence_issues(
+    def can_defer_batch_issues(
         self,
-        merged,
-        original_results,
-        batch_pages,
+        result,
+        issues,
+        batch_idx,
+        total_batches,
     ):
-        if batch_pages is None:
-            return []
-        if len(batch_pages) != len(original_results):
-            return [
-                "Merge batch evidence count does not match source result count"
-            ]
-
-        source_occurrences = defaultdict(list)
-        source_path_evidence = defaultdict(list)
-        for batch_index, (result, observed_pages) in enumerate(
-            zip(original_results, batch_pages)
+        if total_batches != 1 or not issues:
+            return False
+        if not all(
+            issue.startswith("Single-batch ")
+            and issue.endswith(" was not observed")
+            for issue in issues
         ):
-            chapters = result if isinstance(result, list) else result.get(
-                'chapters',
-                [],
-            )
-            observed = set(observed_pages)
-            for node_path, chapter in _iter_chapter_paths(chapters):
-                if not all(node_path):
-                    continue
-                start = chapter.get('start_page')
-                end = chapter.get('end_page')
-                if not (
-                    isinstance(start, int)
-                    and not isinstance(start, bool)
-                    and isinstance(end, int)
-                    and not isinstance(end, bool)
-                    and start >= 1
-                    and end >= start
-                ):
-                    continue
-                evidence_pages = {
-                    page
-                    for page in observed
-                    if start <= page <= end
-                }
-                if not evidence_pages:
-                    # A TOC-derived/global claim wholly outside this batch is
-                    # not physical evidence for an occurrence.
-                    continue
-                occurrence = {
-                    'path': node_path,
-                    'batch_index': batch_index,
-                    'raw_interval': (start, end),
-                    'observed_pages': observed,
-                    'evidence_pages': evidence_pages,
-                    'supported_starts': (
-                        {start} if start in observed else set()
-                    ),
-                    'supported_ends': (
-                        {end} if end in observed else set()
-                    ),
-                }
-                source_occurrences[node_path[-1]].append(occurrence)
-                source_path_evidence[node_path].append(occurrence)
-
-        # Hierarchy is a merge decision, not node identity. Match occurrences
-        # by normalized title and physical overlap, then retain every
-        # source-supported path as evidence for the merged parent choice.
-        # Distinct occurrences with the same title remain separate.
-        components_by_title = {}
-
-        def is_same_physical_occurrence(component, occurrence):
-            if occurrence['path'] in component['paths']:
-                return True
-            if any(
-                abs(component_start - occurrence_start)
-                <= _MERGE_HEADING_PAGE_TOLERANCE
-                for component_start in component['supported_starts']
-                for occurrence_start in occurrence['supported_starts']
-            ) and (
-                component['evidence_pages']
-                & occurrence['evidence_pages']
-            ):
-                return True
-
-            start, end = occurrence['raw_interval']
-            occurrence_length = end - start + 1
-            for other_start, other_end in component['raw_intervals']:
-                overlap = (
-                    min(end, other_end)
-                    - max(start, other_start)
-                    + 1
-                )
-                other_length = other_end - other_start + 1
-                if (
-                    overlap > 0
-                    and overlap * 2
-                    >= max(occurrence_length, other_length)
-                ):
-                    return True
             return False
 
-        for title_key, occurrences in source_occurrences.items():
-            components = []
-            for occurrence in sorted(
-                occurrences,
-                key=lambda item: (
-                    min(item['evidence_pages']),
-                    max(item['evidence_pages']),
-                ),
-            ):
-                overlapping = [
-                    index
-                    for index, component in enumerate(components)
-                    if (
-                        occurrence['batch_index']
-                        not in component['batch_indexes']
-                        and (
-                            component['evidence_pages']
-                            & occurrence['evidence_pages']
-                            or occurrence['raw_interval']
-                            in component['raw_intervals']
-                        )
-                        and is_same_physical_occurrence(
-                            component,
-                            occurrence,
-                        )
-                    )
-                ]
-                if not overlapping:
-                    components.append(
-                        {
-                            'paths': {occurrence['path']},
-                            'batch_indexes': {
-                                occurrence['batch_index']
-                            },
-                            'evidence_pages': set(
-                                occurrence['evidence_pages']
-                            ),
-                            'raw_intervals': {
-                                occurrence['raw_interval']
-                            },
-                            'supported_starts': set(
-                                occurrence['supported_starts']
-                            ),
-                            'supported_ends': set(
-                                occurrence['supported_ends']
-                            ),
-                        }
-                    )
-                    continue
+        observed = getattr(
+            self,
+            '_observed_pages_by_batch',
+            {},
+        ).get(batch_idx, set())
+        if not observed:
+            return False
+        page_min, page_max = min(observed), max(observed)
+        chapters = (
+            result
+            if isinstance(result, list)
+            else result.get('chapters', [])
+        )
+        for _node_path, chapter in _iter_chapter_paths(chapters):
+            for field in ('start_page', 'end_page'):
+                value = chapter.get(field)
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < page_min
+                    or value > page_max
+                ):
+                    return False
+        return True
 
-                primary = components[overlapping[0]]
-                primary['paths'].add(occurrence['path'])
-                primary['batch_indexes'].add(
-                    occurrence['batch_index']
-                )
-                primary['evidence_pages'].update(
-                    occurrence['evidence_pages']
-                )
-                primary['raw_intervals'].add(
-                    occurrence['raw_interval']
-                )
-                primary['supported_starts'].update(
-                    occurrence['supported_starts']
-                )
-                primary['supported_ends'].update(
-                    occurrence['supported_ends']
-                )
-                for index in reversed(overlapping[1:]):
-                    other = components[index]
-                    if not primary['batch_indexes'].isdisjoint(
-                        other['batch_indexes']
-                    ):
-                        # One batch cannot provide two observations of the
-                        # same physical occurrence. Keep ambiguous repeated
-                        # titles separate rather than silently collapsing them.
-                        continue
-                    components.pop(index)
-                    primary['paths'].update(other['paths'])
-                    primary['batch_indexes'].update(
-                        other['batch_indexes']
+    @staticmethod
+    def _single_batch_page_range_issues(result, observed_pages):
+        """Reject impossible bounds while allowing intentionally excluded gaps."""
+        observed = set(observed_pages)
+        if not observed:
+            return ["Single-batch result has no observed PDF page range"]
+        page_min, page_max = min(observed), max(observed)
+        chapters = (
+            result
+            if isinstance(result, list)
+            else result.get('chapters', [])
+        )
+        issues = []
+        for _node_path, chapter in _iter_chapter_paths(chapters):
+            for field in ('start_page', 'end_page'):
+                value = chapter.get(field)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and not page_min <= value <= page_max
+                ):
+                    issues.append(
+                        f"Single-batch {field}={value} for "
+                        f"{chapter.get('title')!r} is outside observed "
+                        f"PDF range {page_min}-{page_max}"
                     )
-                    primary['evidence_pages'].update(
-                        other['evidence_pages']
-                    )
-                    primary['raw_intervals'].update(
-                        other['raw_intervals']
-                    )
-                    primary['supported_starts'].update(
-                        other['supported_starts']
-                    )
-                    primary['supported_ends'].update(
-                        other['supported_ends']
-                    )
-            components_by_title[title_key] = components
+        return issues
 
-        merged_chapters = (
+    def get_merge_validation_issues(self, merged, _original_results):
+        """Validate only deterministic tree-structure invariants."""
+        chapters = (
             merged
             if isinstance(merged, list)
             else merged.get('chapters', [])
         )
-        merged_occurrences = defaultdict(list)
-        merged_nodes = []
-
-        def path_has_observed_parent_support(node, component):
-            if node['path'] in component['paths']:
-                return True
-            parent_path = node['path'][:-1]
-            if not parent_path:
-                return False
-
-            for parent in source_path_evidence.get(parent_path, []):
-                parent_start, parent_end = parent['raw_interval']
-                if (
-                    parent_start <= node['start']
-                    and node['end'] <= parent_end
-                    and all(
-                        page in parent['observed_pages']
-                        for page in range(
-                            node['start'],
-                            node['end'] + 1,
-                        )
-                    )
-                ):
-                    return True
-            return False
-
-        def collect_merged_nodes(chapters, parent_path=()):
-            siblings = []
-            for chapter in chapters:
-                if not isinstance(chapter, dict):
-                    continue
-                title_key = _chapter_title_key(chapter.get('title'))
-                node_path = (*parent_path, title_key)
-                start = chapter.get('start_page')
-                end = chapter.get('end_page')
-                if (
-                    all(node_path)
-                    and isinstance(start, int)
-                    and not isinstance(start, bool)
-                    and isinstance(end, int)
-                    and not isinstance(end, bool)
-                ):
-                    node = {
-                        'path': node_path,
-                        'title_key': title_key,
-                        'start': start,
-                        'end': end,
-                        'title': chapter.get('title', ''),
-                        'derived_end_from': None,
-                    }
-                    siblings.append(node)
-                    merged_nodes.append(node)
-                    merged_occurrences[title_key].append(node)
-
-                children = chapter.get('children', [])
-                if isinstance(children, list):
-                    collect_merged_nodes(children, node_path)
-
-            for node, next_node in zip(siblings, siblings[1:]):
-                next_start_supported = any(
-                    next_node['path'] in component['paths']
-                    and next_node['start']
-                    in component['supported_starts']
-                    for component in components_by_title.get(
-                        next_node['title_key'],
-                        [],
-                    )
-                )
-                if (
-                    next_start_supported
-                    and node['end'] in (
-                        next_node['start'] - 1,
-                        next_node['start'],
-                    )
-                ):
-                    node['derived_end_from'] = next_node['start']
-
-        collect_merged_nodes(merged_chapters)
-
-        issues = []
-        for title_key, components in components_by_title.items():
-            title_nodes = merged_occurrences.get(title_key, [])
-            if len(title_nodes) != len(components):
-                issues.append(
-                    f"Merge has {len(title_nodes)} occurrence(s) for "
-                    f"title {title_key!r}; source evidence has "
-                    f"{len(components)} distinct physical occurrence(s)"
-                )
-                continue
-
-            candidates = []
-            for merged_node in title_nodes:
-                candidates.append(
-                    [
-                        index
-                        for index, component in enumerate(components)
-                        if (
-                            path_has_observed_parent_support(
-                                merged_node,
-                                component,
-                            )
-                            and merged_node['start']
-                            in component['supported_starts']
-                            and (
-                                merged_node['end']
-                                in component['supported_ends']
-                                or (
-                                    merged_node['derived_end_from']
-                                    is not None
-                                    and merged_node['end']
-                                    in component['evidence_pages']
-                                    and merged_node['derived_end_from']
-                                    in component['evidence_pages']
-                                )
-                            )
-                        )
-                    ]
-                )
-            if any(not candidate_set for candidate_set in candidates):
-                issues.append(
-                    f"Merge used an unsupported path or bounds for title "
-                    f"{title_key!r}; each occurrence must match one physical "
-                    "source-evidence component"
-                )
-                continue
-
-            # Bipartite matching prevents two merged nodes from consuming the
-            # same physical source occurrence.
-            matched_component = {}
-
-            def assign(node_index, seen):
-                for component_index in candidates[node_index]:
-                    if component_index in seen:
-                        continue
-                    seen.add(component_index)
-                    previous = matched_component.get(component_index)
-                    if previous is None or assign(previous, seen):
-                        matched_component[component_index] = node_index
-                        return True
-                return False
-
-            if not all(
-                assign(node_index, set())
-                for node_index in range(len(title_nodes))
-            ):
-                issues.append(
-                    f"Merge occurrence mapping is ambiguous or duplicated for "
-                    f"title {title_key!r}"
-                )
-
-        for node in merged_nodes:
-            if not any(
-                path_has_observed_parent_support(node, component)
-                for component in components_by_title.get(
-                    node['title_key'],
-                    [],
-                )
-            ):
-                issues.append(
-                    f"Merge path {node['path']!r} has no source occurrence "
-                    "evidence"
-                )
-            if len(issues) >= 20:
-                return issues
-        return issues
+        return validate_chapter_structure(chapters)
 
     def merge_results(self, results, artifacts_dir=None, batch_pages=None):
         if len(results) == 1:
@@ -2204,13 +1817,18 @@ Return a single JSON object:
                 results[0],
                 results,
             )
-            issues.extend(
-                self.get_merge_evidence_issues(
-                    results[0],
-                    results,
-                    batch_pages,
-                )
-            )
+            if batch_pages is not None:
+                if len(batch_pages) != 1:
+                    issues.append(
+                        "Single-batch evidence count does not match result count"
+                    )
+                else:
+                    issues.extend(
+                        self._single_batch_page_range_issues(
+                            results[0],
+                            batch_pages[0],
+                        )
+                    )
             if issues:
                 raise MergeValidationError(
                     f"[{self.operation_name}] Single-batch result failed "

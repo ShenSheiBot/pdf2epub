@@ -42,6 +42,16 @@ def _update_levels_recursive(chapters: List[Dict], target_level: int) -> None:
             _update_levels_recursive(children, target_level + 1)
 
 
+def _resolve_toc_metadata(toc_location: Optional[Dict], model_value):
+    """Prefer the dedicated TOC detector over analysis of TOC-excluded pages."""
+    if toc_location and toc_location.get('has_toc'):
+        return {
+            'start_page': toc_location['toc_start'],
+            'end_page': toc_location['toc_end'],
+        }
+    return model_value
+
+
 class StructureAnalyzer:
     """
     Analyzes PDF structure and discovers subsections.
@@ -777,7 +787,10 @@ Return ONLY the cleaned text, nothing else.
             'is_vertical_text': result.get('is_vertical_text', False),
             'has_footnotes': result.get('has_footnotes', False),
             'cover_page': result.get('cover_page'),
-            'table_of_contents': result.get('table_of_contents'),
+            'table_of_contents': _resolve_toc_metadata(
+                toc_location,
+                result.get('table_of_contents'),
+            ),
             'back_cover': result.get('back_cover'),
             'book_title': book_title
         }

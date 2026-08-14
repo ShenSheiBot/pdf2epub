@@ -331,6 +331,33 @@ ol li::before {
     font-size: 0.9em;
 }
 
+/* EPUB 2-compatible Japanese ruby fallback. */
+.ruby {
+    display: inline-block;
+    position: relative;
+    line-height: 1.5;
+    text-align: center;
+}
+
+.ruby .rt {
+    display: block;
+    font-size: 0.5em;
+    line-height: 1;
+    white-space: nowrap;
+}
+
+ol.epub-continued-list {
+    counter-reset: epub-list;
+}
+
+ol.epub-continued-list > li {
+    counter-increment: epub-list;
+}
+
+ol.epub-continued-list > li::before {
+    content: counter(epub-list, decimal-leading-zero) ".";
+}
+
 li {
     margin: 0.5em 0;
     line-height: 1.7;

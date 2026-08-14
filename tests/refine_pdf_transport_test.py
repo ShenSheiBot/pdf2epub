@@ -23,6 +23,8 @@ from pdf2epub.refine.pdf_transport import (
     create_pdf_transport,
 )
 from pdf2epub.refine.structure_analyzer import StructureAnalyzer
+from pdf2epub.refine.structure_analyzer import _resolve_toc_metadata
+from pdf2epub.refine.main import _insert_toc_chapter
 from pdf2epub.utils.llm_client import LLMGenerateConfig
 from pdf2epub.refine.toc_tree import TOCNode
 
@@ -1059,7 +1061,7 @@ def test_direct_merge_prompt_carries_observed_page_evidence():
     assert "never override an in-range" in prompt
 
 
-def test_direct_merge_validator_rejects_recursive_omissions_and_inventions():
+def test_direct_merge_validator_only_checks_hard_tree_structure():
     call = DirectAnalysisCall(
         client=object(),
         model="test",
@@ -1067,660 +1069,47 @@ def test_direct_merge_validator_rejects_recursive_omissions_and_inventions():
         learner=PdfPageLimitLearner(),
         book_title="Test",
     )
-    source = [
-        {
-            "chapters": [
-                {
-                    "title": "Part One",
-                    "start_page": 1,
-                    "end_page": 10,
-                    "children": [
-                        {
-                            "title": "Section A",
-                            "start_page": 1,
-                            "end_page": 10,
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Part Two",
-                    "start_page": 11,
-                    "end_page": 20,
-                }
-            ]
-        },
-    ]
-    merged = {
+    source = {
         "chapters": [
             {
-                "title": "Part One",
+                "title": "Source Title",
                 "start_page": 1,
                 "end_page": 10,
-            },
-            {
-                "title": "Invented",
-                "start_page": 900,
-                "end_page": 999,
-            },
+            }
         ]
     }
-
-    issues = call.get_merge_validation_issues(merged, source)
-
-    assert any("omitted" in issue for issue in issues)
-    assert any("invented" in issue for issue in issues)
-
-
-def test_direct_merge_validator_requires_observed_source_page_claims():
-    call = DirectAnalysisCall(
-        client=object(),
-        model="test",
-        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
-        learner=PdfPageLimitLearner(),
-        book_title="Test",
-    )
-    source = [
-        {
-            "chapters": [
-                {
-                    "title": "Chapter",
-                    "start_page": 1,
-                    "end_page": 10,
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Chapter",
-                    "start_page": 1,
-                    "end_page": 10,
-                }
-            ]
-        },
-    ]
-    observed = [list(range(1, 6)), list(range(6, 11))]
-
-    assert call.get_merge_evidence_issues(
-        {
-            "chapters": [
-                {
-                    "title": "Chapter",
-                    "start_page": 1,
-                    "end_page": 10,
-                }
-            ]
-        },
-        source,
-        observed,
-    ) == []
-    assert call.get_merge_evidence_issues(
-        {
-            "chapters": [
-                {
-                    "title": "Chapter",
-                    "start_page": 1,
-                    "end_page": 999,
-                }
-            ]
-        },
-        source,
-        observed,
-    )
-
-
-def test_direct_merge_allows_supported_reparent_and_observed_sibling_cut():
-    call = DirectAnalysisCall(
-        client=object(),
-        model="test",
-        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
-        learner=PdfPageLimitLearner(),
-        book_title="Test",
-    )
-    source = [
-        {
-            "chapters": [
-                {
-                    "title": "Human, All Too Human?",
-                    "start_page": 92,
-                    "end_page": 151,
-                    "children": [
-                        {
-                            "title": "Before 1914",
-                            "start_page": 108,
-                            "end_page": 116,
-                        },
-                        {
-                            "title": "The Contradiction",
-                            "start_page": 138,
-                            "end_page": 141,
-                        },
-                        {
-                            "title": "Never Ask Theory",
-                            "start_page": 144,
-                            "end_page": 147,
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Love of Labour?",
-                    "start_page": 106,
-                    "end_page": 154,
-                    "children": [
-                        {
-                            "title": "Before 1914",
-                            "start_page": 109,
-                            "end_page": 111,
-                        },
-                        {
-                            "title": "What's New",
-                            "start_page": 136,
-                            "end_page": 139,
-                        },
-                        {
-                            "title": "The Contradiction",
-                            "start_page": 139,
-                            "end_page": 142,
-                        }
-                    ],
-                }
-            ]
-        },
-    ]
-    observed = [
-        list(range(4, 152)),
-        list(range(106, 219)),
-    ]
-    merged = {
+    structurally_valid_rewrite = {
         "chapters": [
             {
-                "title": "Human, All Too Human?",
-                "start_page": 92,
-                "end_page": 105,
-                "children": [],
-            },
-            {
-                "title": "Love of Labour?",
-                "start_page": 106,
-                "end_page": 154,
-                "children": [
-                    {
-                        "title": "Before 1914",
-                        "start_page": 109,
-                        "end_page": 111,
-                    },
-                    {
-                        "title": "What's New",
-                        "start_page": 136,
-                        "end_page": 138,
-                    },
-                    {
-                        "title": "The Contradiction",
-                        "start_page": 138,
-                        "end_page": 141,
-                    },
-                    {
-                        "title": "Never Ask Theory",
-                        "start_page": 144,
-                        "end_page": 147,
-                    }
-                ],
-            },
+                "title": "Different Title",
+                "start_page": 2,
+                "end_page": 9,
+            }
         ]
     }
 
-    assert call.get_merge_validation_issues(merged, source) == []
-    assert call.get_merge_evidence_issues(
-        merged,
-        source,
-        observed,
+    assert call.get_merge_validation_issues(
+        structurally_valid_rewrite,
+        [source],
     ) == []
 
-    merged["chapters"][0]["end_page"] = 104
-    assert call.get_merge_evidence_issues(
-        merged,
-        source,
-        observed,
-    )
-
-
-def test_direct_merge_does_not_collapse_same_title_across_parent_paths():
-    call = DirectAnalysisCall(
-        client=object(),
-        model="test",
-        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
-        learner=PdfPageLimitLearner(),
-        book_title="Test",
-    )
-    source = [
-        {
-            "chapters": [
-                {
-                    "title": "Part A",
-                    "start_page": 1,
-                    "end_page": 80,
-                    "children": [
-                        {
-                            "title": "Introduction",
-                            "start_page": 10,
-                            "end_page": 80,
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Part B",
-                    "start_page": 60,
-                    "end_page": 100,
-                    "children": [
-                        {
-                            "title": "Introduction",
-                            "start_page": 60,
-                            "end_page": 70,
-                        }
-                    ],
-                }
-            ]
-        },
-    ]
-    collapsed = {
+    child_escape = {
         "chapters": [
             {
-                "title": "Part A",
-                "start_page": 1,
-                "end_page": 80,
-                "children": [],
-            },
-            {
-                "title": "Part B",
-                "start_page": 60,
-                "end_page": 100,
+                "title": "Parent",
+                "start_page": 5,
+                "end_page": 5,
                 "children": [
                     {
-                        "title": "Introduction",
-                        "start_page": 60,
-                        "end_page": 70,
-                    }
-                ],
-            },
-        ]
-    }
-
-    issues = call.get_merge_evidence_issues(
-        collapsed,
-        source,
-        [list(range(1, 81)), list(range(60, 101))],
-    )
-
-    assert any(
-        "2 distinct physical occurrence(s)" in issue
-        for issue in issues
-    )
-
-
-def test_direct_merge_heading_tolerance_requires_physical_overlap():
-    call = DirectAnalysisCall(
-        client=object(),
-        model="test",
-        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
-        learner=PdfPageLimitLearner(),
-        book_title="Test",
-    )
-    source = [
-        {
-            "chapters": [
-                {
-                    "title": "Part A",
-                    "start_page": 1,
-                    "end_page": 10,
-                    "children": [
-                        {
-                            "title": "Refrain",
-                            "start_page": 10,
-                            "end_page": 10,
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Part B",
-                    "start_page": 12,
-                    "end_page": 20,
-                    "children": [
-                        {
-                            "title": "Refrain",
-                            "start_page": 12,
-                            "end_page": 12,
-                        }
-                    ],
-                }
-            ]
-        },
-    ]
-    collapsed = {
-        "chapters": [
-            {
-                "title": "Part A",
-                "start_page": 1,
-                "end_page": 10,
-                "children": [
-                    {
-                        "title": "Refrain",
-                        "start_page": 10,
-                        "end_page": 10,
-                    }
-                ],
-            },
-            {
-                "title": "Part B",
-                "start_page": 12,
-                "end_page": 20,
-                "children": [],
-            },
-        ]
-    }
-
-    issues = call.get_merge_evidence_issues(
-        collapsed,
-        source,
-        [list(range(1, 11)), list(range(12, 21))],
-    )
-
-    assert any(
-        "2 distinct physical occurrence(s)" in issue
-        for issue in issues
-    )
-
-
-def test_direct_merge_validator_preserves_counts_and_parent_paths():
-    call = DirectAnalysisCall(
-        client=object(),
-        model="test",
-        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
-        learner=PdfPageLimitLearner(),
-        book_title="Test",
-    )
-    source_chapters = [
-        {
-            "title": "Part A",
-            "start_page": 1,
-            "end_page": 10,
-            "children": [
-                {
-                    "title": "Introduction",
-                    "start_page": 1,
-                    "end_page": 5,
-                },
-                {
-                    "title": "Section A",
-                    "start_page": 6,
-                    "end_page": 10,
-                },
-            ],
-        },
-        {
-            "title": "Part B",
-            "start_page": 11,
-            "end_page": 20,
-            "children": [
-                {
-                    "title": "Introduction",
-                    "start_page": 11,
-                    "end_page": 15,
-                },
-                {
-                    "title": "Section B",
-                    "start_page": 16,
-                    "end_page": 20,
-                },
-            ],
-        },
-    ]
-    source = [{"chapters": source_chapters}]
-    missing_duplicate = {
-        "chapters": [
-            source_chapters[0],
-            {
-                **source_chapters[1],
-                "children": [source_chapters[1]["children"][1]],
-            },
-        ]
-    }
-    swapped = {
-        "chapters": [
-            {
-                **source_chapters[0],
-                "children": [
-                    source_chapters[0]["children"][0],
-                    source_chapters[1]["children"][1],
-                ],
-            },
-            {
-                **source_chapters[1],
-                "children": [
-                    source_chapters[1]["children"][0],
-                    source_chapters[0]["children"][1],
-                ],
-            },
-        ]
-    }
-
-    assert any(
-        "omitted" in issue
-        for issue in call.get_merge_validation_issues(
-            missing_duplicate,
-            source,
-        )
-    )
-    assert any(
-        "unsupported parent path" in issue
-        for issue in call.get_merge_validation_issues(swapped, source)
-    )
-
-    split_source = [
-        {"chapters": [source_chapters[0]]},
-        {"chapters": [source_chapters[1]]},
-    ]
-    omitted_split_intro = {
-        "chapters": [
-            source_chapters[0],
-            {
-                **source_chapters[1],
-                "children": [source_chapters[1]["children"][1]],
-            },
-        ]
-    }
-    evidence_issues = call.get_merge_evidence_issues(
-        omitted_split_intro,
-        split_source,
-        [list(range(1, 11)), list(range(11, 21))],
-    )
-    assert any("occurrence" in issue for issue in evidence_issues)
-
-
-def test_direct_merge_occurrences_cannot_collapse_or_mix_bounds():
-    call = DirectAnalysisCall(
-        client=object(),
-        model="test",
-        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
-        learner=PdfPageLimitLearner(),
-        book_title="Test",
-    )
-    source = [
-        {
-            "chapters": [
-                {
-                    "title": "Part",
-                    "start_page": 1,
-                    "end_page": 100,
-                    "children": [
-                        {
-                            "title": "Introduction",
-                            "start_page": 2,
-                            "end_page": 3,
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Part",
-                    "start_page": 51,
-                    "end_page": 150,
-                    "children": [
-                        {
-                            "title": "Introduction",
-                            "start_page": 120,
-                            "end_page": 121,
-                        }
-                    ],
-                }
-            ]
-        },
-    ]
-    observed = [
-        list(range(1, 101)),
-        list(range(51, 151)),
-    ]
-    collapsed = {
-        "chapters": [
-            {
-                "title": "Part",
-                "start_page": 1,
-                "end_page": 150,
-                "children": [
-                    {
-                        "title": "Introduction",
+                        "title": "Child",
                         "start_page": 2,
-                        "end_page": 3,
+                        "end_page": 9,
                     }
                 ],
             }
         ]
     }
-    mixed = {
-        "chapters": [
-            {
-                "title": "Part",
-                "start_page": 1,
-                "end_page": 150,
-                "children": [
-                    {
-                        "title": "Introduction",
-                        "start_page": 2,
-                        "end_page": 121,
-                    },
-                    {
-                        "title": "Introduction",
-                        "start_page": 120,
-                        "end_page": 121,
-                    },
-                ],
-            }
-        ]
-    }
-
-    assert call.get_merge_evidence_issues(
-        collapsed,
-        source,
-        observed,
-    )
-    assert call.get_merge_evidence_issues(
-        mixed,
-        source,
-        observed,
-    )
-
-    unobserved_bridge_source = [
-        source[0],
-        {
-            "chapters": [
-                {
-                    "title": "Part",
-                    "start_page": 51,
-                    "end_page": 150,
-                    "children": [
-                        {
-                            "title": "Introduction",
-                            "start_page": 2,
-                            "end_page": 121,
-                        }
-                    ],
-                }
-            ]
-        },
-    ]
-    bridged = {
-        "chapters": [
-            {
-                "title": "Part",
-                "start_page": 1,
-                "end_page": 150,
-                "children": [
-                    {
-                        "title": "Introduction",
-                        "start_page": 2,
-                        "end_page": 121,
-                    }
-                ],
-            }
-        ]
-    }
-    assert call.get_merge_evidence_issues(
-        bridged,
-        unobserved_bridge_source,
-        observed,
-    )
-
-    parent_only_source = [
-        {
-            "chapters": [
-                {
-                    "title": "Part",
-                    "start_page": 1,
-                    "end_page": 100,
-                }
-            ]
-        },
-        {
-            "chapters": [
-                {
-                    "title": "Part",
-                    "start_page": 51,
-                    "end_page": 150,
-                }
-            ]
-        },
-    ]
-    assert call.get_merge_evidence_issues(
-        {
-            "chapters": [
-                {
-                    "title": "Part",
-                    "start_page": 1,
-                    "end_page": 150,
-                }
-            ]
-        },
-        parent_only_source,
-        observed,
-    ) == []
+    assert call.get_merge_validation_issues(child_escape, [source])
 
 
 def test_direct_single_batch_requires_every_claim_to_be_observed():
@@ -1746,6 +1135,82 @@ def test_direct_single_batch_requires_every_claim_to_be_observed():
             [result],
             batch_pages=[[1, 2, 3]],
         )
+
+
+def test_direct_single_batch_defers_excluded_gap_bounds_to_boundary_repair(
+    monkeypatch,
+    tmp_path,
+):
+    result = {
+        "chapters": [
+            {
+                "title": "Chapter",
+                "start_page": 4,
+                "end_page": 7,
+            }
+        ]
+    }
+    attempts = []
+
+    def fake_agent_loop(**_kwargs):
+        attempts.append(True)
+        return json.dumps(result)
+
+    monkeypatch.setattr(
+        adaptive_pdf_call,
+        "run_agent_loop_sync",
+        fake_agent_loop,
+    )
+    call = DirectAnalysisCall(
+        client=SimpleNamespace(
+            get_default_config=lambda **_kwargs: LLMGenerateConfig(),
+        ),
+        model="test",
+        prepare_pdf=lambda *_args, **_kwargs: b"%PDF-test",
+        learner=PdfPageLimitLearner(),
+        book_title="Test",
+    )
+    monkeypatch.setattr(call, "_get_agent_model", lambda: object())
+
+    observed_pages = [1, 2, 3, 6, 7]
+    assert call.run(tmp_path / "book.pdf", observed_pages) == result
+    assert len(attempts) == 1
+
+
+def test_detected_toc_metadata_overrides_toc_excluded_analysis_guess():
+    assert _resolve_toc_metadata(
+        {"has_toc": True, "toc_start": 4, "toc_end": 5},
+        {"start_page": 5, "end_page": 5},
+    ) == {"start_page": 4, "end_page": 5}
+
+
+def test_toc_is_inserted_before_body_chapter_with_same_start_page():
+    chapters = [
+        TOCNode(
+            title="Preface",
+            level=1,
+            start_page=2,
+            end_page=3,
+        ),
+        TOCNode(
+            title="Body",
+            level=1,
+            start_page=4,
+            end_page=31,
+        ),
+    ]
+
+    _insert_toc_chapter(
+        chapters,
+        {"start_page": 4, "end_page": 5},
+    )
+
+    assert [chapter.title for chapter in chapters] == [
+        "Preface",
+        "Table of Contents",
+        "Body",
+    ]
+    assert chapters[2].start_page == 6
 
 
 def test_structure_validation_rejects_bool_pages_and_child_escape():

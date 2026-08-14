@@ -320,10 +320,19 @@ class ChandraClient:
         self.max_output_tokens = int(backend_config.get("max_output_tokens", 12384))
         self.max_retries = int(backend_config.get("max_retries", ocr_config.get("max_retries", 6)))
         self.initial_backoff = float(backend_config.get("initial_backoff", ocr_config.get("initial_backoff", 2.0)))
+        self.request_timeout = float(backend_config.get("request_timeout", 300.0))
         self.include_headers_footers = bool(backend_config.get("include_headers_footers", False))
         self.dpi = int(backend_config.get("dpi", 192))
         self.min_dimension = int(backend_config.get("min_dimension", 1024))
-        self.client = OpenAI(api_key=backend_config.get("api_key", "EMPTY"), base_url=self.base_url)
+        self.client = OpenAI(
+            api_key=backend_config.get("api_key", "EMPTY"),
+            base_url=self.base_url,
+            timeout=self.request_timeout,
+            # Page-level retries below preserve attempt count, backoff, and
+            # progress semantics.  Layering the SDK's implicit retries on top
+            # would multiply the configured timeout without visibility.
+            max_retries=0,
+        )
 
     def _request(
         self,

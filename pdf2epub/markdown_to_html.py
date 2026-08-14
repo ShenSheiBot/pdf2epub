@@ -19,6 +19,10 @@ from .utils.logging_config import configure_logging
 logger = configure_logging()
 
 FOOTNOTE_SYNTAX_RE = re.compile(r'\[\^(\w+)\](?!:)|^\[\^(\w+)\]:', re.MULTILINE)
+ID_ATTRIBUTE_RE = re.compile(r'(\bid=")([^"]*)(")')
+FRAGMENT_HREF_RE = re.compile(r'(\bhref="[^"]*#)([^"]+)(")')
+OL_TAG_RE = re.compile(r"<ol(?P<attrs>[^>]*)>")
+OL_START_RE = re.compile(r'\sstart="([+-]?\d+)"')
 
 
 def contains_footnote_syntax(markdown_content: str) -> bool:
@@ -87,6 +91,15 @@ blockquote {
 ul, ol {
     margin: 1em 0;
     padding-left: 2em;
+}
+ol.epub-continued-list {
+    list-style: none;
+}
+ol.epub-continued-list > li {
+    counter-increment: epub-list;
+}
+ol.epub-continued-list > li::before {
+    content: counter(epub-list, decimal-leading-zero) ".";
 }
 li {
     margin-bottom: 0.5em;
@@ -204,7 +217,9 @@ def process_ruby_text(markdown_content: str) -> str:
             # Probably not a valid ruby text, return as-is
             return full_match
         
-        return f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
+        # EPUB 2 uses XHTML 1.1, where HTML5 ruby/rt elements are invalid.
+        # Preserve both the base text and reading with styled XHTML spans.
+        return f'<span class="ruby">{kanji}<span class="rt">{reading}</span></span>'
     
     # Apply the replacement
     markdown_content = re.sub(pattern, replace_ruby, markdown_content)
@@ -676,6 +691,87 @@ def convert_markdown_to_html(
     return html
 
 
+def _normalize_epub_xml_id(value: str) -> str:
+    """Return an EPUB 2/XHTML 1.1-compatible XML Name."""
+    normalized = "".join(
+        char if (char.isalnum() or char in "_.-") else "-"
+        for char in value
+    )
+    if not normalized:
+        return "epub-id"
+    if not (normalized[0].isalpha() or normalized[0] == "_"):
+        normalized = f"epub-id-{normalized}"
+    return normalized
+
+
+def _normalize_epub_ids(html: str) -> str:
+    """Normalize IDs and same-document fragment links deterministically."""
+    id_map = {}
+
+    def replace_id(match: re.Match) -> str:
+        original = match.group(2)
+        normalized = _normalize_epub_xml_id(original)
+        id_map[original] = normalized
+        return f'{match.group(1)}{normalized}{match.group(3)}'
+
+    html = ID_ATTRIBUTE_RE.sub(replace_id, html)
+
+    def replace_fragment(match: re.Match) -> str:
+        original = match.group(2)
+        normalized = id_map.get(original, original)
+        return f'{match.group(1)}{normalized}{match.group(3)}'
+
+    return FRAGMENT_HREF_RE.sub(replace_fragment, html)
+
+
+def _normalize_ordered_list_starts(html: str) -> str:
+    """Preserve non-one list numbering without XHTML 1.1's invalid start."""
+
+    def replace_ol(match: re.Match) -> str:
+        attrs = match.group("attrs")
+        start_match = OL_START_RE.search(attrs)
+        if not start_match:
+            return match.group(0)
+
+        counter_value = int(start_match.group(1)) - 1
+        attrs = (
+            attrs[:start_match.start()]
+            + attrs[start_match.end():]
+        )
+
+        class_match = re.search(r'\bclass="([^"]*)"', attrs)
+        if class_match:
+            classes = class_match.group(1).split()
+            if "epub-continued-list" not in classes:
+                classes.append("epub-continued-list")
+            attrs = (
+                attrs[:class_match.start(1)]
+                + " ".join(classes)
+                + attrs[class_match.end(1):]
+            )
+        else:
+            attrs += ' class="epub-continued-list"'
+
+        reset = f"counter-reset: epub-list {counter_value};"
+        style_match = re.search(r'\bstyle="([^"]*)"', attrs)
+        if style_match:
+            style = style_match.group(1).strip()
+            if style and not style.endswith(";"):
+                style += ";"
+            style = f"{style} {reset}".strip()
+            attrs = (
+                attrs[:style_match.start(1)]
+                + style
+                + attrs[style_match.end(1):]
+            )
+        else:
+            attrs += f' style="{reset}"'
+
+        return f"<ol{attrs}>"
+
+    return OL_TAG_RE.sub(replace_ol, html)
+
+
 def post_process_html(html: str) -> str:
     """
     Post-process the HTML to ensure EPUB XHTML 1.1 compatibility.
@@ -700,6 +796,9 @@ def post_process_html(html: str) -> str:
         r'href="#fnref\1"',
         html
     )
+
+    html = _normalize_epub_ids(html)
+    html = _normalize_ordered_list_starts(html)
     
     # Ensure proper XHTML self-closing tags
     html = re.sub(r'<br(?!\s*/)>', '<br />', html)

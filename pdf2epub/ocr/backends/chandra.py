@@ -324,6 +324,25 @@ class ChandraClient:
         self.include_headers_footers = bool(backend_config.get("include_headers_footers", False))
         self.dpi = int(backend_config.get("dpi", 192))
         self.min_dimension = int(backend_config.get("min_dimension", 1024))
+        access_client_id_env = backend_config.get(
+            "access_client_id_env", "CHANDRA_CF_ACCESS_CLIENT_ID"
+        )
+        access_client_secret_env = backend_config.get(
+            "access_client_secret_env", "CHANDRA_CF_ACCESS_CLIENT_SECRET"
+        )
+        access_client_id = os.environ.get(access_client_id_env)
+        access_client_secret = os.environ.get(access_client_secret_env)
+        if bool(access_client_id) != bool(access_client_secret):
+            raise ValueError(
+                "Chandra Cloudflare Access requires both "
+                f"{access_client_id_env} and {access_client_secret_env}"
+            )
+        default_headers = None
+        if access_client_id and access_client_secret:
+            default_headers = {
+                "CF-Access-Client-Id": access_client_id,
+                "CF-Access-Client-Secret": access_client_secret,
+            }
         self.client = OpenAI(
             api_key=backend_config.get("api_key", "EMPTY"),
             base_url=self.base_url,
@@ -332,6 +351,7 @@ class ChandraClient:
             # progress semantics.  Layering the SDK's implicit retries on top
             # would multiply the configured timeout without visibility.
             max_retries=0,
+            default_headers=default_headers,
         )
 
     def _request(

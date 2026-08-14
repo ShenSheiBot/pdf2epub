@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import fitz
+import pytest
 from PIL import Image
 
 from pdf2epub.ocr.artifacts import OCRPageResult
@@ -174,3 +175,48 @@ def test_chandra_configures_a_bounded_request_timeout(monkeypatch):
 
     assert captured["timeout"] == 90.0
     assert captured["max_retries"] == 0
+
+
+def test_chandra_client_passes_cloudflare_access_headers_from_environment(monkeypatch):
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TEST_CHANDRA_ACCESS_ID", "client-id")
+    monkeypatch.setenv("TEST_CHANDRA_ACCESS_SECRET", "client-secret")
+    monkeypatch.setattr("pdf2epub.ocr.backends.chandra.OpenAI", FakeOpenAI)
+
+    ChandraClient({
+        "ocr": {
+            "backends": {
+                "chandra": {
+                    "access_client_id_env": "TEST_CHANDRA_ACCESS_ID",
+                    "access_client_secret_env": "TEST_CHANDRA_ACCESS_SECRET",
+                }
+            }
+        }
+    })
+
+    assert captured["default_headers"] == {
+        "CF-Access-Client-Id": "client-id",
+        "CF-Access-Client-Secret": "client-secret",
+    }
+
+
+def test_chandra_client_rejects_incomplete_cloudflare_access_environment(monkeypatch):
+    monkeypatch.setenv("TEST_CHANDRA_ACCESS_ID", "client-id")
+    monkeypatch.delenv("TEST_CHANDRA_ACCESS_SECRET", raising=False)
+
+    with pytest.raises(ValueError, match="requires both"):
+        ChandraClient({
+            "ocr": {
+                "backends": {
+                    "chandra": {
+                        "access_client_id_env": "TEST_CHANDRA_ACCESS_ID",
+                        "access_client_secret_env": "TEST_CHANDRA_ACCESS_SECRET",
+                    }
+                }
+            }
+        })

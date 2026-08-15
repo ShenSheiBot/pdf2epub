@@ -84,6 +84,7 @@ ocr:
       # base_url: https://chandra.example.com/v1
       # access_client_id_env: CHANDRA_CF_ACCESS_CLIENT_ID
       # access_client_secret_env: CHANDRA_CF_ACCESS_CLIENT_SECRET
+      # Run protected endpoints with: scripts/with_chandra_access uv run pdf2epub ...
 
   # Vision API settings (for 'vision' backend)
   vision:

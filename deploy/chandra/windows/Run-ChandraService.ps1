@@ -189,7 +189,10 @@ if ($existing.Count -gt 0) {
 }
 else {
     if (Test-Path -LiteralPath $TreePath -PathType Leaf) {
-        $recordedTree = @(Get-Content -LiteralPath $TreePath -Raw | ConvertFrom-Json)
+        # Windows PowerShell 5.1 emits a JSON array as one nested pipeline item.
+        # Re-enumerate it so each process record reaches the typed cleanup code.
+        $recordedTree = @((Get-Content -LiteralPath $TreePath -Raw | ConvertFrom-Json) |
+            ForEach-Object { $_ })
         Stop-RecordedProcessTree $recordedTree
     }
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
@@ -286,7 +289,9 @@ catch {
     Write-ServiceLog "RESTART_PENDING reason='$failure' delay_seconds=60"
     try {
         if ($managedTree.Count -eq 0 -and (Test-Path -LiteralPath $TreePath -PathType Leaf)) {
-            $managedTree = @(Get-Content -LiteralPath $TreePath -Raw | ConvertFrom-Json)
+            # Keep the recovery path compatible with Windows PowerShell 5.1 too.
+            $managedTree = @((Get-Content -LiteralPath $TreePath -Raw | ConvertFrom-Json) |
+                ForEach-Object { $_ })
         }
         Stop-RecordedProcessTree $managedTree
         $managed = Get-ChandraProcesses

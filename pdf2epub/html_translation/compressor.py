@@ -121,6 +121,13 @@ class HTMLCompressor:
         if xml_match:
             wrapper['xml_declaration'] = xml_match.group(1)
 
+        # Keep the publication's declared HTML dialect. Reconstructing every
+        # document with a hard-coded doctype can turn a valid EPUB 3 document
+        # into invalid XHTML 1.1 (or vice versa).
+        doctype_match = re.search(r'<!DOCTYPE[^>]*>', html, re.IGNORECASE)
+        if doctype_match:
+            wrapper['doctype'] = doctype_match.group(0)
+
         # Extract html tag attributes
         html_tag = root if root.tag == 'html' else root.find('.//html')
         if html_tag is not None:
@@ -267,6 +274,10 @@ class HTMLCompressor:
         # XML declaration
         if wrapper.get('xml_declaration'):
             parts.append(wrapper['xml_declaration'])
+            parts.append('\n')
+
+        if wrapper.get('doctype'):
+            parts.append(wrapper['doctype'])
             parts.append('\n')
 
         # Opening html tag

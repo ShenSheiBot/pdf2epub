@@ -832,13 +832,74 @@ def build_novel_epub_command(args):
 
 
 def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
-    """Convert translated .txt files to .xhtml, preserving original <head>."""
+    """Restore translated novel text into the original XHTML structure."""
     import html
     import re
     from pathlib import Path
-    from lxml import etree
+
+    from pdf2epub.html_translation.compressor import HTMLCompressor
 
     IMAGE_PATTERN = r'\[Image:\s*([^\]]+)\]'
+
+    def nonempty_lines(text):
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def prepare_structured_line(source_line, translated_line, compressed_line, compressor):
+        """Retain inline tag topology while inserting a plain-text translation."""
+        source_images = re.findall(IMAGE_PATTERN, source_line)
+        translated_images = re.findall(IMAGE_PATTERN, translated_line)
+        if source_images != translated_images:
+            raise ValueError(
+                "Inline image placeholders changed during translation: "
+                f"source={source_images!r}, translated={translated_images!r}"
+            )
+
+        if '<' not in compressed_line:
+            return html.escape(translated_line, quote=False)
+
+        # Novel translation intentionally uses plain text rather than exposing
+        # inline markup to the model. Reuse the compressor's original tag
+        # skeleton, clear only its source-language text nodes, and let
+        # decompress() restore every recorded attribute.
+        fragment = compressor._parse_fragment(compressed_line)
+        for element in fragment.iter():
+            element.text = None
+            if element is not fragment:
+                element.tail = None
+
+        if not source_images:
+            fragment.text = translated_line
+            return compressor._serialize_fragment(fragment)
+
+        image_elements = [
+            element
+            for element in fragment.iter()
+            if element is not fragment
+            and isinstance(element.tag, str)
+            and element.tag.rsplit('}', 1)[-1].lower() in {'img', 'image'}
+        ]
+        if len(image_elements) != len(source_images):
+            raise ValueError(
+                "Cannot align inline image placeholders with original XHTML: "
+                f"placeholders={len(source_images)}, elements={len(image_elements)}"
+            )
+
+        translated_parts = re.split(IMAGE_PATTERN, translated_line)
+        text_parts = translated_parts[::2]
+        fragment.text = text_parts[0]
+        for image_element, trailing_text in zip(image_elements, text_parts[1:]):
+            image_element.tail = trailing_text
+        return compressor._serialize_fragment(fragment)
+
+    css_content = ""
+    for css_item in getattr(parser, 'resources', {}).get('css', []):
+        content = css_item.get('content', b'')
+        if isinstance(content, bytes):
+            content = content.decode('utf-8')
+        css_content += content + "\n"
+
+    compressor = HTMLCompressor()
+    xhtml_dir.mkdir(parents=True, exist_ok=True)
 
     for unit in units:
         if not unit.text_path:
@@ -852,92 +913,62 @@ def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
         if not txt_path.exists():
             continue
 
-        text = txt_path.read_text(encoding='utf-8')
+        if not unit.source_href:
+            raise ValueError(f"Missing source XHTML href for {unit.file_name}")
 
-        # Get original XHTML <head> for CSS/metadata preservation
-        head_content = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>'
-        if unit.source_href:
-            try:
-                raw = parser.get_raw_content(unit.source_href)
-                if isinstance(raw, bytes):
-                    raw = raw.decode('utf-8')
-                # Extract <head>...</head>
-                head_match = re.search(r'<head[^>]*>(.*?)</head>', raw, re.DOTALL | re.IGNORECASE)
-                if head_match:
-                    head_content = head_match.group(1)
-            except Exception:
-                pass
+        raw_xhtml = parser.get_raw_content(unit.source_href)
+        if isinstance(raw_xhtml, bytes):
+            raw_xhtml = raw_xhtml.decode('utf-8')
 
-        # Build image ref → original src mapping from extractor metadata
-        # (image_refs stores basenames; original XHTML may use relative paths)
-        img_src_map = {}
-        if unit.source_href:
-            try:
-                raw_xhtml = parser.get_raw_content(unit.source_href)
-                if isinstance(raw_xhtml, bytes):
-                    raw_xhtml = raw_xhtml.decode('utf-8')
-                for m in re.finditer(r'(?:src|href)=["\']([^"\']*(?:\.jpg|\.jpeg|\.png|\.gif|\.svg))', raw_xhtml, re.IGNORECASE):
-                    original_src = m.group(1)
-                    basename = Path(original_src).name
-                    img_src_map[basename] = original_src
-            except Exception:
-                pass
+        source_text = unit.text_path.read_text(encoding='utf-8')
+        translated_text = txt_path.read_text(encoding='utf-8')
+        source_lines = nonempty_lines(source_text)
+        translated_lines = nonempty_lines(translated_text)
+        if len(source_lines) != len(translated_lines):
+            raise ValueError(
+                f"Novel line count mismatch for {unit.file_name}: "
+                f"source={len(source_lines)}, translated={len(translated_lines)}"
+            )
 
-        def _img_tag(basename):
-            src = img_src_map.get(basename.strip(), basename.strip())
-            return f'<img src="{html.escape(src)}" alt=""/>'
+        compressed_text, mapping = compressor.compress(
+            raw_xhtml,
+            author_css=css_content,
+        )
+        compressed_lines = nonempty_lines(compressed_text)
 
-        # Convert text lines to HTML body
-        body_parts = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
+        aligned_pairs = [
+            (source_line, translated_line)
+            for source_line, translated_line in zip(source_lines, translated_lines)
+            if not re.fullmatch(IMAGE_PATTERN, source_line)
+        ]
+        if len(aligned_pairs) != len(compressed_lines):
+            raise ValueError(
+                f"Novel structure mapping mismatch for {unit.file_name}: "
+                f"translated_units={len(aligned_pairs)}, "
+                f"original_xhtml_units={len(compressed_lines)}"
+            )
 
-            # Full-line image placeholder
-            img_match = re.fullmatch(IMAGE_PATTERN, line)
-            if img_match:
-                body_parts.append(
-                    f'<div class="illustration">'
-                    f'{_img_tag(img_match.group(1))}'
-                    f'</div>'
+        prepared_lines = []
+        for (source_line, translated_line), compressed_line in zip(
+            aligned_pairs,
+            compressed_lines,
+        ):
+            prepared_lines.append(
+                prepare_structured_line(
+                    source_line,
+                    translated_line,
+                    compressed_line,
+                    compressor,
                 )
-            elif re.search(IMAGE_PATTERN, line):
-                # Line contains inline image placeholders mixed with text
-                parts = re.split(f'({IMAGE_PATTERN})', line)
-                html_parts = []
-                i = 0
-                while i < len(parts):
-                    part = parts[i]
-                    inline_match = re.fullmatch(IMAGE_PATTERN, part)
-                    if inline_match:
-                        html_parts.append(_img_tag(inline_match.group(1)))
-                        i += 2  # skip the capture group from split
-                    else:
-                        if part:
-                            html_parts.append(html.escape(part))
-                        i += 1
-                body_parts.append(f'<p>{"".join(html_parts)}</p>')
-            else:
-                body_parts.append(f'<p>{html.escape(line)}</p>')
+            )
 
-        body_html = '\n'.join(body_parts)
+        xhtml = compressor.decompress('\n'.join(prepared_lines), mapping)
 
         # Use the original XHTML filename
         if unit.source_href:
             out_name = Path(unit.source_href).name
         else:
             out_name = f"{unit.file_name}.xhtml"
-
-        xhtml = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
-            '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n'
-            '<html xmlns="http://www.w3.org/1999/xhtml">\n'
-            f'<head>\n{head_content}\n</head>\n'
-            f'<body>\n{body_html}\n</body>\n'
-            '</html>'
-        )
 
         (xhtml_dir / out_name).write_text(xhtml, encoding='utf-8')
 

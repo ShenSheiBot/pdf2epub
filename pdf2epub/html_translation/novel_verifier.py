@@ -43,8 +43,9 @@ D: 译文和原文完全无关
 译文：
 {translated}"""
 
-# Tolerance for line count difference
-LINE_COUNT_TOLERANCE = 5
+# The novel rebuild requires one translated line per source line. Accepting even
+# a one-line shortfall here creates a state that deterministically fails later.
+LINE_COUNT_TOLERANCE = 0
 
 
 def _check_preamble(source_line: str, translated_line: str, llm_client, model_configs) -> str:

@@ -424,11 +424,29 @@ class NovelTranslator:
 
         try:
             for idx, unit in enumerate(units):
-                if idx < state.current_unit_index:
-                    continue
-                if idx in state.completed_units:
-                    skipped_count += 1
-                    continue
+                already_completed = (
+                    idx < state.current_unit_index
+                    or idx in state.completed_units
+                )
+                existing_translation = None
+                if already_completed:
+                    if self.resume and unit.has_content and unit.text_path:
+                        dest = self.translated_dir / unit.text_path.name
+                        if dest.exists():
+                            source_text = unit.text_path.read_text(encoding="utf-8")
+                            candidate = dest.read_text(encoding="utf-8")
+                            src_lines = len([l for l in source_text.splitlines() if l.strip()])
+                            tl_lines = len([l for l in candidate.splitlines() if l.strip()])
+                            if tl_lines < src_lines:
+                                existing_translation = candidate
+                                logger.warning(
+                                    f"  Reopening incomplete completed unit {unit.text_path.name}: "
+                                    f"{tl_lines}/{src_lines} lines; continuing existing translation"
+                                )
+
+                    if existing_translation is None:
+                        skipped_count += 1
+                        continue
 
                 if not unit.has_content or not unit.text_path:
                     if unit.text_path and unit.text_path.exists():
@@ -443,8 +461,12 @@ class NovelTranslator:
                     state.save(self.state_path)
                     continue
 
-                logger.info(f"Translating [{idx + 1}/{len(units)}]: {unit.text_path.name}")
-                chapter_failed = self._translate_chapter(unit)
+                if existing_translation is None:
+                    logger.info(f"Translating [{idx + 1}/{len(units)}]: {unit.text_path.name}")
+                chapter_failed = self._translate_chapter(
+                    unit,
+                    existing_translation=existing_translation,
+                )
                 translated_count += 1
 
                 if chapter_failed:
@@ -478,8 +500,9 @@ class NovelTranslator:
 
                 # Always mark completed — hallucinated chapters save best-effort output
                 # and can be fixed later with --retranslate
-                state.completed_units.append(idx)
-                state.current_unit_index = idx + 1
+                if idx not in state.completed_units:
+                    state.completed_units.append(idx)
+                state.current_unit_index = max(state.current_unit_index, idx + 1)
                 state.save(self.state_path)
 
         except BaseException:
@@ -505,7 +528,11 @@ class NovelTranslator:
 
     # ─── Chapter Translation ───
 
-    def _translate_chapter(self, unit: NovelUnit) -> bool:
+    def _translate_chapter(
+        self,
+        unit: NovelUnit,
+        existing_translation: Optional[str] = None,
+    ) -> bool:
         """Translate a single chapter: recall glossary → translate → extract glossary.
 
         Returns True if the chapter hallucinated (exhausted retries), False if OK.
@@ -530,23 +557,40 @@ class NovelTranslator:
             glossary_prompt = self.glossary_manager.recall(source_text)
 
         # Step 2: Translate
-        translated, exhausted = self._run_translation(unit, source_text, glossary_prompt)
+        translated, exhausted = self._run_translation(
+            unit,
+            source_text,
+            glossary_prompt,
+            existing_translation=existing_translation,
+        )
 
         # Step 3: Repair images (using raw source for correct placeholders)
         translated = repair_images(source_text_raw, translated)
 
-        # Step 4: Save
         dest = self.translated_dir / unit.text_path.name
-        dest.write_text(translated, encoding="utf-8")
-
-        # Step 5: Log line count
         src_lines = len([l for l in source_text.splitlines() if l.strip()])
         tl_lines = len([l for l in translated.splitlines() if l.strip()])
         logger.info(f"  Lines: {src_lines} → {tl_lines} (diff={tl_lines - src_lines:+d})")
 
+        # A resume repair must never replace the recoverable prefix with another
+        # structurally incomplete attempt.
+        if existing_translation is not None and tl_lines != src_lines:
+            logger.warning(
+                f"  Continuation repair remains incomplete for {unit.file_name}: "
+                f"{tl_lines}/{src_lines} lines; preserving existing translation"
+            )
+            return True
+
+        # Step 4: Save fresh translations immediately. Resume repairs are saved
+        # after their glossary entry has been replaced below.
+        if existing_translation is None:
+            dest.write_text(translated, encoding="utf-8")
+
         # Step 6: Extract glossary (cache hit on translation's source prefix)
         if self.glossary_manager:
             chapter_id = unit.text_path.stem
+            if existing_translation is not None:
+                self.glossary_manager.rollback_chapter(chapter_id)
             # Build same system prompt as translation for cache sharing
             system_prompt = NOVEL_TRANSLATE_PROMPT
             if glossary_prompt:
@@ -556,9 +600,18 @@ class NovelTranslator:
                 translation_system_prompt=system_prompt,
             )
 
+        if existing_translation is not None:
+            dest.write_text(translated, encoding="utf-8")
+
         return exhausted
 
-    def _run_translation(self, unit: NovelUnit, source_text: str, glossary_prompt: str) -> tuple:
+    def _run_translation(
+        self,
+        unit: NovelUnit,
+        source_text: str,
+        glossary_prompt: str,
+        existing_translation: Optional[str] = None,
+    ) -> tuple:
         """Run translation with deterministic verification.
 
         Returns (translated_text, exhausted_retries) where exhausted_retries
@@ -637,11 +690,29 @@ class NovelTranslator:
         # Main loop: generate → verify → continue/complete
         translated = None
         for attempt in range(max_retries):
-            # Initial translation
-            raw_output = generate_fn(prefix=None)
-            translated = raw_output
-            init_lines = len([l for l in raw_output.splitlines() if l.strip()])
-            logger.info(f"  Initial translation: {init_lines} lines (attempt {attempt + 1})")
+            if attempt == 0 and existing_translation is not None:
+                translated = existing_translation.strip()
+                conversation_history = [
+                    {"role": "user", "content": f"请翻译：\n{source_text}"},
+                    {"role": "assistant", "content": translated},
+                ]
+                prev_translated_lines = len(
+                    [l for l in translated.splitlines() if l.strip()]
+                )
+                last_cont_output_lines = 0
+                continuation = generate_fn(prefix=translated)
+                if continuation:
+                    translated = translated.rstrip("\n") + "\n" + continuation
+                logger.info(
+                    f"  Resumed existing translation: {prev_translated_lines} + "
+                    f"{last_cont_output_lines} lines"
+                )
+            else:
+                # Initial translation
+                raw_output = generate_fn(prefix=None)
+                translated = raw_output
+                init_lines = len([l for l in raw_output.splitlines() if l.strip()])
+                logger.info(f"  Initial translation: {init_lines} lines (attempt {attempt + 1})")
 
             # Verify + continuation loop
             for cont_round in range(max_continuations + 1):
@@ -665,35 +736,19 @@ class NovelTranslator:
 
                 elif action == "continue":
                     translated = fixed_text
-                    # Switch to chunked translator for remaining lines
-                    from .chunked_translator import translate_remaining
-                    logger.info("  Switching to chunked translator for remaining lines")
-                    remainder, chunk_hall, aligned_pos = translate_remaining(
-                        source_text=source_text,
-                        translated_prefix=translated,
-                        system_prompt=system_prompt,
-                        llm_client=self._get_llm_client(),
-                        model_configs=self._get_model_configs(),
-                        embedding_provider=self._embedding_provider,
-                        embedding_model=self._embedding_model,
-                        position_min_confidence=self._hallucination_threshold,
+                    prefix_lines = len([l for l in translated.splitlines() if l.strip()])
+                    continuation = generate_fn(prefix=translated)
+                    continuation_lines = len(
+                        [l for l in continuation.splitlines() if l.strip()]
                     )
-                    if remainder:
-                        # Truncate prefix to aligned position to avoid overlap.
-                        # The prefix may have more lines than the source position
-                        # if the model split lines or added extra content.
-                        prefix_lines = [l for l in translated.splitlines() if l.strip()]
-                        if len(prefix_lines) > aligned_pos + 1:
-                            logger.info(
-                                f"  Truncating prefix from {len(prefix_lines)} to "
-                                f"{aligned_pos + 1} lines (removing {len(prefix_lines) - aligned_pos - 1} overlap)"
-                            )
-                            translated = "\n".join(prefix_lines[:aligned_pos + 1])
-                        translated = translated.rstrip("\n") + "\n" + remainder
-                    src_n = len([l for l in source_text.splitlines() if l.strip()])
-                    tl_n = len([l for l in translated.splitlines() if l.strip()])
-                    logger.info(f"  Chunked complete: {src_n} source → {tl_n} translated")
-                    return translated, chunk_hall > 0
+                    if continuation:
+                        translated = translated.rstrip("\n") + "\n" + continuation
+                    total_lines = len([l for l in translated.splitlines() if l.strip()])
+                    logger.info(
+                        f"  Continuation {cont_round + 1}: "
+                        f"+{continuation_lines} lines → {total_lines} total "
+                        f"(was {prefix_lines})"
+                    )
 
                 elif action == "retry":
                     logger.warning(f"  Verifier requested retry (attempt {attempt + 1})")

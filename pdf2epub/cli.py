@@ -838,11 +838,50 @@ def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
     from pathlib import Path
 
     from pdf2epub.html_translation.compressor import HTMLCompressor
+    from pdf2epub.html_translation.novel_extractor import NovelExtractor
 
     IMAGE_PATTERN = r'\[Image:\s*([^\]]+)\]'
 
     def nonempty_lines(text):
         return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def normalize_alignment_text(text):
+        return re.sub(r'\s+', '', html.unescape(text))
+
+    def regroup_formatting_lines(aligned_pairs, compressed_lines, extractor):
+        """Collapse XHTML formatting newlines back into compressor-sized units."""
+        grouped_pairs = []
+        pair_idx = 0
+
+        for compressed_line in compressed_lines:
+            wrapped = (
+                '<html xmlns="http://www.w3.org/1999/xhtml">'
+                f'<body><p>{compressed_line}</p></body></html>'
+            )
+            expected_text, _ = extractor._convert_xhtml_to_text(wrapped)
+            expected = normalize_alignment_text(expected_text)
+            source_parts = []
+            translated_parts = []
+            accumulated = ''
+
+            while pair_idx < len(aligned_pairs) and len(accumulated) < len(expected):
+                source_line, translated_line = aligned_pairs[pair_idx]
+                candidate = accumulated + normalize_alignment_text(source_line)
+                if not expected.startswith(candidate):
+                    break
+                source_parts.append(source_line)
+                translated_parts.append(translated_line)
+                accumulated = candidate
+                pair_idx += 1
+
+            if not source_parts or accumulated != expected:
+                return None
+
+            grouped_pairs.append((''.join(source_parts), ''.join(translated_parts)))
+
+        if pair_idx != len(aligned_pairs):
+            return None
+        return grouped_pairs
 
     def prepare_structured_line(source_line, translated_line, compressed_line, compressor):
         """Retain inline tag topology while inserting a plain-text translation."""
@@ -899,6 +938,7 @@ def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
         css_content += content + "\n"
 
     compressor = HTMLCompressor()
+    extractor = NovelExtractor(parser)
     xhtml_dir.mkdir(parents=True, exist_ok=True)
 
     for unit in units:
@@ -942,11 +982,18 @@ def _convert_txt_to_xhtml(units, translated_dir, xhtml_dir, parser):
             if not re.fullmatch(IMAGE_PATTERN, source_line)
         ]
         if len(aligned_pairs) != len(compressed_lines):
-            raise ValueError(
-                f"Novel structure mapping mismatch for {unit.file_name}: "
-                f"translated_units={len(aligned_pairs)}, "
-                f"original_xhtml_units={len(compressed_lines)}"
+            regrouped_pairs = regroup_formatting_lines(
+                aligned_pairs,
+                compressed_lines,
+                extractor,
             )
+            if regrouped_pairs is None:
+                raise ValueError(
+                    f"Novel structure mapping mismatch for {unit.file_name}: "
+                    f"translated_units={len(aligned_pairs)}, "
+                    f"original_xhtml_units={len(compressed_lines)}"
+                )
+            aligned_pairs = regrouped_pairs
 
         prepared_lines = []
         for (source_line, translated_line), compressed_line in zip(

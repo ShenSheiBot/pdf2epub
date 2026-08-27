@@ -94,3 +94,61 @@ def test_novel_xhtml_rebuild_preserves_original_document_structure(
     assert image is not None
     assert image.get("src") == "../image/ill.jpg"
     assert image.get("alt") == "插图"
+
+
+def test_novel_xhtml_rebuild_regroups_inline_source_formatting_lines(
+    tmp_path: Path,
+) -> None:
+    """Formatting newlines inside one paragraph must not become extra XHTML units."""
+    from pdf2epub.html_translation.novel_extractor import NovelExtractor
+
+    original = """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Original</title></head>
+<body><p class="indent">原文前
+<ruby>一<rt>いち</rt></ruby>
+<span><span>中</span></span>尾</p></body>
+</html>
+"""
+    source_dir = tmp_path / "novel_units"
+    translated_dir = tmp_path / "translated_novel"
+    xhtml_dir = tmp_path / "final_xhtml"
+    source_dir.mkdir()
+    translated_dir.mkdir()
+    xhtml_dir.mkdir()
+
+    source_text, _ = NovelExtractor(SimpleNamespace())._convert_xhtml_to_text(original)
+    assert [line for line in source_text.splitlines() if line.strip()] == [
+        "原文前",
+        "一(いち)",
+        "中尾",
+    ]
+
+    source_path = source_dir / "015_p-015.txt"
+    source_path.write_text(source_text, encoding="utf-8")
+    (translated_dir / source_path.name).write_text(
+        "译文前\n译文一\n译文中尾",
+        encoding="utf-8",
+    )
+    unit = SimpleNamespace(
+        text_path=source_path,
+        has_content=True,
+        source_href="item/xhtml/p-015.xhtml",
+        file_name="p-015",
+    )
+
+    _convert_txt_to_xhtml(
+        units=[unit],
+        translated_dir=translated_dir,
+        xhtml_dir=xhtml_dir,
+        parser=_ParserStub(original),
+    )
+
+    root = etree.fromstring((xhtml_dir / "p-015.xhtml").read_bytes())
+    ns = {"x": "http://www.w3.org/1999/xhtml"}
+    paragraph = root.find(".//x:p", ns)
+    assert paragraph is not None
+    assert "".join(paragraph.itertext()) == "译文前译文一译文中尾"
+    assert paragraph.get("class") == "indent"
+    assert paragraph.find("x:ruby", ns) is not None
+    assert paragraph.find("x:span/x:span", ns) is not None

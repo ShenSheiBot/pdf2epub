@@ -723,16 +723,34 @@ Return ONLY the cleaned text, nothing else.
             exclude_toc = set()
             logger.info("No TOC detected, will analyze all pages.")
 
-        # Find best TOC pages for reference (may differ from TocDetectionCall result)
-        toc_reference = None
+        # Find best TOC pages for reference (may differ from TocDetectionCall result).
+        # Persist the cleaned reference before direct analysis: its LLM cleanup is
+        # nondeterministic, and changing it would invalidate every otherwise valid
+        # batch-cache fingerprint after a merge-only failure.
+        toc_reference = state.toc_reference if state else None
+        toc_ref_pages = None
+        if state and len(state.toc_reference_pages) == 2:
+            toc_ref_pages = tuple(state.toc_reference_pages)
+
         if pages_dir:
-            toc_ref_pages = self._find_toc_reference_pages(
-                toc_location, pages_dir, batch_ctx.total_pages
-            )
-            if toc_ref_pages:
-                toc_reference = self._clean_toc_text(
-                    toc_ref_pages[0], toc_ref_pages[1], pages_dir
+            if toc_reference and toc_ref_pages:
+                logger.info(
+                    "Using cached TOC reference from pages "
+                    f"{toc_ref_pages[0]}-{toc_ref_pages[1]}"
                 )
+            else:
+                toc_ref_pages = self._find_toc_reference_pages(
+                    toc_location, pages_dir, batch_ctx.total_pages
+                )
+            if toc_ref_pages:
+                if not toc_reference:
+                    toc_reference = self._clean_toc_text(
+                        toc_ref_pages[0], toc_ref_pages[1], pages_dir
+                    )
+                    if state and toc_reference:
+                        state.toc_reference = toc_reference
+                        state.toc_reference_pages = list(toc_ref_pages)
+                        save_state()
                 # Also exclude reference TOC pages from analysis
                 exclude_toc.update(range(toc_ref_pages[0], toc_ref_pages[1] + 1))
 

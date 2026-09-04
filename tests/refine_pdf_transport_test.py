@@ -2,6 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import fitz
 import httpx
 import pytest
 from openai import APIStatusError, BadRequestError, OpenAI
@@ -25,6 +26,7 @@ from pdf2epub.refine.pdf_transport import (
 from pdf2epub.refine.structure_analyzer import StructureAnalyzer
 from pdf2epub.refine.structure_analyzer import _resolve_toc_metadata
 from pdf2epub.refine.main import _insert_toc_chapter
+from pdf2epub.refine.refiner_state import RefinerState
 from pdf2epub.utils.llm_client import LLMGenerateConfig
 from pdf2epub.refine.toc_tree import TOCNode
 
@@ -274,6 +276,75 @@ def test_toc_auth_or_repair_error_is_not_misclassified_as_missing_toc(monkeypatc
 
     with pytest.raises(RuntimeError, match="401"):
         analyzer.detect_toc_location(tmp_path / "book.pdf", batch_ctx)
+
+
+def test_merge_failure_resume_reuses_persisted_toc_reference(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "book.pdf"
+    document = fitz.open()
+    document.new_page()
+    document.save(pdf_path)
+    document.close()
+
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir()
+    (pages_dir / "page_001.md").write_text("目次\n第一章 1", encoding="utf-8")
+    state_path = tmp_path / "refiner_state.json"
+    cleanup_calls = []
+
+    analyzer = StructureAnalyzer(
+        structure_client=object(),
+        structure_model="test",
+        toc_model="test",
+        analysis_client=object(),
+        analysis_model="test",
+        config={"refine": {"pdf_compression": {"compress_if_exceeds": False}}},
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_find_toc_reference_pages",
+        lambda *_args: (1, 1),
+    )
+
+    def clean_toc(*_args):
+        cleanup_calls.append(True)
+        return "第一章"
+
+    monkeypatch.setattr(analyzer, "_clean_toc_text", clean_toc)
+    monkeypatch.setattr(analyzer, "_check_xref_corrupted", lambda *_args: False)
+    monkeypatch.setattr(
+        analyzer,
+        "_analyze_pdf_directly",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            MergeValidationError("merge failed")
+        ),
+    )
+
+    first_state = RefinerState(
+        toc_location={"has_toc": True, "toc_start": 1, "toc_end": 1}
+    )
+    with pytest.raises(MergeValidationError, match="merge failed"):
+        analyzer.analyze_pdf_structure(
+            pdf_path,
+            "Test",
+            state=first_state,
+            state_path=state_path,
+            pages_dir=pages_dir,
+        )
+
+    resumed_state = RefinerState()
+    assert resumed_state.load(state_path)
+    with pytest.raises(MergeValidationError, match="merge failed"):
+        analyzer.analyze_pdf_structure(
+            pdf_path,
+            "Test",
+            state=resumed_state,
+            state_path=state_path,
+            pages_dir=pages_dir,
+        )
+
+    assert cleanup_calls == [True]
+    assert resumed_state.toc_reference == "第一章"
+    assert resumed_state.toc_reference_pages == [1, 1]
 
 
 @pytest.mark.parametrize(

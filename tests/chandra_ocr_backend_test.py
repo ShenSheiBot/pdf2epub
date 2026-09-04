@@ -6,7 +6,14 @@ import pytest
 from PIL import Image
 
 from pdf2epub.ocr.artifacts import OCRPageResult
-from pdf2epub.ocr.backends.chandra import ChandraClient, layout_to_markdown, materialize_layout
+from pdf2epub.ocr.backends.chandra import (
+    ChandraClient,
+    OCR_LAYOUT_PROMPT,
+    collect_caption_markdown,
+    layout_to_markdown,
+    materialize_layout,
+)
+from pdf2epub.epub.footnotes.scanner import FootnoteScanner
 from pdf2epub.ocr_pages import ocr_full_book_pagewise, save_page_artifacts
 
 
@@ -47,6 +54,172 @@ def test_materializer_preserves_blocks_and_crops_nested_table_images(tmp_path):
     # Blank-page content is not discarded by a hard-coded semantic rule.
     assert "blank white page" in markdown
     assert "<table>" in markdown
+
+
+def test_markdown_excludes_generated_image_descriptions_but_keeps_captions():
+    html = """
+<div data-label="Image"><img src="../images/page_001_img_001.png" alt="generated alt">Generated visible description.</div>
+<div data-label="Caption"><p>Printed caption from the page.</p></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "![](../images/page_001_img_001.png)" in markdown
+    assert "generated alt" not in markdown
+    assert "Generated visible description" not in markdown
+    assert "Printed caption from the page" in markdown
+
+
+def test_chandra_prompt_distinguishes_footnotes_from_ordinary_superscripts():
+    assert '<sup class="footnote-ref">key</sup>' in OCR_LAYOUT_PROMPT
+    assert '<sup class="footnote-def">key</sup>' in OCR_LAYOUT_PROMPT
+    assert "exponents" in OCR_LAYOUT_PROMPT
+
+
+def test_markdown_keeps_inline_math_in_its_paragraph_and_blocks_display_math():
+    html = """
+<div data-label="Text"><p>Calculated under <math>Q = L^\\alpha</math> with <math>\\alpha=.95</math>.</p></div>
+<div data-label="Equation-Block"><math display="block">F \\propto \\log Q</math></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "Calculated under $Q = L^\\alpha$ with $\\alpha=.95$." in markdown
+    assert "\n$Q = L^\\alpha$\n" not in markdown
+    assert "\n\n$$F \\propto \\log Q$$" in markdown
+
+
+def test_markdown_materializes_labelled_footnotes_using_qwen_syntax(tmp_path):
+    html = """
+<div data-label="Text"><p>Claim<sup class="footnote-ref">12</sup> and x<sup>12</sup>.</p></div>
+<div data-label="Footnote"><p><sup class="footnote-def">12</sup> Source with volume<sup>99</sup>.</p></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "Claim[^12]" in markdown
+    assert "x<sup>12</sup>" in markdown
+    assert "[^12]: Source" in markdown
+    assert "volume<sup>99</sup>" in markdown
+
+    markdown_path = tmp_path / "chapter_1.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    scanner = FootnoteScanner()
+    scanner.scan_files([markdown_path])
+    assert len(scanner.references["12"]) == 1
+    assert len(scanner.definitions["12"]) == 1
+
+
+def test_markdown_does_not_invent_definition_for_unlabelled_superscript():
+    html = '<div data-label="Text"><p>x<sup>2</sup> and citation<sup>7</sup>.</p></div>'
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "x<sup>2</sup>" in markdown
+    assert "citation<sup>7</sup>" in markdown
+    assert "[^" not in markdown
+
+
+def test_markdown_materializes_explicit_cross_page_reference_without_local_definition():
+    html = (
+        '<div data-label="Text"><p>See the later note'
+        '<sup class="footnote-ref">7</sup>.</p></div>'
+    )
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "later note[^7]" in markdown
+
+
+def test_markdown_preserves_underscores_in_explicit_footnote_keys(tmp_path):
+    html = """
+<div data-label="Text"><p>Claim<sup class="footnote-ref">note_1</sup>.</p></div>
+<div data-label="Footnote"><p><sup class="footnote-def">note_1</sup> Source.</p></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "Claim[^note_1]" in markdown
+    assert "[^note_1]: Source" in markdown
+    markdown_path = tmp_path / "chapter.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    scanner = FootnoteScanner()
+    scanner.scan_files([markdown_path])
+    assert list(scanner.references) == ["note_1"]
+    assert list(scanner.definitions) == ["note_1"]
+
+
+def test_markdown_combines_legacy_leading_and_explicit_definitions():
+    html = """
+<div data-label="Text"><p>First<sup class="footnote-ref">1</sup>, second<sup class="footnote-ref">2</sup>.</p></div>
+<div data-label="Footnote"><p><sup>1</sup> Legacy first. <sup class="footnote-def">2</sup> Marked second.</p></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "[^1]: Legacy first." in markdown
+    assert "\n\n[^2]: Marked second." in markdown
+
+
+def test_markdown_splits_multiple_definitions_from_one_footnote_block(tmp_path):
+    html = """
+<div data-label="Text"><p>First<sup class="footnote-ref">12</sup>, second<sup class="footnote-ref">13</sup>.</p></div>
+<div data-label="Footnote"><p><sup class="footnote-def">12</sup> First source.<br>Continued. <sup class="footnote-def">13</sup> Second source with edition<sup>2</sup> and XIX<sup>e</sup>.</p></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "First[^12]" in markdown
+    assert "second[^13]" in markdown
+    assert "[^12]: First source. Continued." in markdown
+    assert "\n\n[^13]: Second source" in markdown
+    assert "edition<sup>2</sup>" in markdown
+    assert "XIX<sup>e</sup>" in markdown
+
+    markdown_path = tmp_path / "chapter_1.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    scanner = FootnoteScanner()
+    scanner.scan_files([markdown_path])
+    assert sum(len(values) for values in scanner.references.values()) == 2
+    assert sum(len(values) for values in scanner.definitions.values()) == 2
+
+
+def test_markdown_keeps_multi_paragraph_definition_on_one_scannable_line(tmp_path):
+    html = """
+<div data-label="Text"><p>Claim<sup class="footnote-ref">4</sup>.</p></div>
+<div data-label="Footnote"><p><sup class="footnote-def">4</sup> First paragraph.</p><p>Continuation paragraph.</p></div>
+""".strip()
+
+    markdown = layout_to_markdown(html, include_headers_footers=False)
+
+    assert "[^4]: First paragraph. Continuation paragraph." in markdown
+    markdown_path = tmp_path / "chapter_1.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    scanner = FootnoteScanner()
+    scanner.scan_files([markdown_path])
+    assert scanner.definitions["4"][0].content.endswith("Continuation paragraph.")
+
+
+def test_collect_caption_markdown_reads_exact_sidecar_fragments(tmp_path):
+    (tmp_path / "page_001.ocr.json").write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {
+                        "label": "Caption",
+                        "html": "<p>Figure 1 Printed caption.</p>",
+                    },
+                    {
+                        "label": "Text",
+                        "html": '<div data-label="Text"><p>Body.</p></div>',
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert collect_caption_markdown(tmp_path) == ["Figure 1 Printed caption."]
 
 
 def test_save_page_artifacts_writes_all_views_and_raw_layout(tmp_path):
@@ -118,6 +291,36 @@ def test_pagewise_ocr_marks_progress_only_after_rich_artifacts_exist(tmp_path, m
     stats = json.loads((pages / "page_stats.json").read_text())
     assert stats["1"]["html_file"] == "pages/page_001.html"
     assert stats["1"]["artifact_file"] == "pages/page_001.ocr.json"
+
+
+def test_pagewise_ocr_fails_run_when_a_requested_page_is_missing(
+    tmp_path, monkeypatch
+):
+    pdf_path = tmp_path / "input.pdf"
+    document = fitz.open()
+    document.new_page()
+    document.save(pdf_path)
+    document.close()
+    output_dir = tmp_path / "output"
+
+    def fail_ocr_page(*args, **kwargs):
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr("pdf2epub.ocr_pages.ocr_pdf_page", fail_ocr_page)
+    with pytest.raises(RuntimeError, match="OCR incomplete for 1 requested page"):
+        ocr_full_book_pagewise(
+            pdf_path=pdf_path,
+            output_dir=output_dir,
+            backend="chandra",
+            config={"ocr": {"backends": {"chandra": {}}}},
+            max_workers=1,
+        )
+
+    progress = json.loads(
+        (output_dir / "pages" / "ocr_progress.json").read_text()
+    )
+    assert progress["pages_processed"] == []
+    assert progress["failed_pages"] == [1]
 
 
 def test_chandra_rejects_token_limited_partial_layout(monkeypatch):

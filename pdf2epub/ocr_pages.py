@@ -609,8 +609,18 @@ def ocr_full_book_pagewise(
     total_tokens = sum(stats['tokens'] for stats in page_stats.values())
     avg_tokens = total_tokens / len(page_stats) if page_stats else 0
 
-    logger.success(f"\n=== Page-wise OCR Complete ===")
-    logger.info(f"Total pages processed: {len(progress['pages_processed'])}/{end_page - start_page + 1}")
+    logger.info(f"\n=== Page-wise OCR Summary ===")
+    expected_pages = set(range(start_page, end_page + 1))
+    completed_pages = {
+        page_num
+        for page_num in progress["pages_processed"]
+        if page_num in expected_pages
+        and (pages_dir / f"page_{page_num:03d}.md").is_file()
+    }
+    incomplete_pages = sorted(expected_pages - completed_pages)
+    logger.info(
+        f"Total pages processed: {len(completed_pages)}/{len(expected_pages)}"
+    )
     logger.info(f"Total tokens: {total_tokens}")
     logger.info(f"Average tokens per page: {avg_tokens:.0f}")
 
@@ -619,10 +629,18 @@ def ocr_full_book_pagewise(
     if failed_pages:
         logger.warning(f"Failed pages ({len(failed_pages)}): {sorted(failed_pages)}")
         logger.warning(f"To retry failed pages, run again with --resume flag")
-    else:
+    elif not incomplete_pages:
         logger.success(f"All pages processed successfully!")
 
     logger.info(f"Output directory: {pages_dir}")
+    if incomplete_pages:
+        preview = ", ".join(str(page) for page in incomplete_pages[:20])
+        suffix = "..." if len(incomplete_pages) > 20 else ""
+        raise RuntimeError(
+            f"OCR incomplete for {len(incomplete_pages)} requested page(s): "
+            f"{preview}{suffix}. Progress was retained; rerun with --resume."
+        )
+    logger.success("Page-wise OCR complete")
 
 
 def main():

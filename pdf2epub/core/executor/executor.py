@@ -119,9 +119,10 @@ def handle_split(
         pending: Pending units set (modified in place)
         splitter: Content splitter to use
         max_tokens: Max tokens per part for splitter
-        fallback_chain: Chain to use when the failed unit exhausted its
-            current chain before splitting. This lets a model retry smaller
-            chunks after a truncation failure.
+        fallback_chain: Chain to use when a recoverable content failure exhausted
+            the current chain before splitting. This lets a model retry smaller
+            chunks after validation, parse, truncation, or unclassified content
+            failures.
 
     Returns:
         Tuple of (success, new_depth) - new_depth is the depth of created children
@@ -142,8 +143,9 @@ def handle_split(
     if len(child_contents) <= 1:
         return (False, 0)
 
-    # A truncation failure can remove the only model before splitting. Preserve
-    # that model for smaller children; otherwise they inherit an empty chain.
+    # A recoverable content failure can remove the only model before splitting.
+    # Preserve that model for smaller children; otherwise they inherit an empty
+    # chain and fail without making a request.
     child_chain = list(state.chain)
     if not child_chain and fallback_chain:
         # A recovered split may contain fewer units than the batch threshold.
@@ -1692,7 +1694,12 @@ class Executor:
                     split_threshold,
                     fallback_chain=(
                         [current_entry]
-                        if error_type == ErrorType.TRUNCATION
+                        if error_type in {
+                            ErrorType.VALIDATION,
+                            ErrorType.TRUNCATION,
+                            ErrorType.PARSE_ERROR,
+                            ErrorType.UNKNOWN,
+                        }
                         and current_entry
                         and not state.chain
                         else None

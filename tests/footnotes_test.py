@@ -397,8 +397,8 @@ def test_definition_text_markers_are_not_scanned_as_body_references(
 
     assert "2" not in manager.references
     assert "<em>Styled</em>" in html_files["chapter_1.html"]
-    assert "<math" in html_files["chapter_1.html"]
-    assert "<mfrac>" in html_files["chapter_1.html"]
+    assert "<math" not in html_files["chapter_1.html"]
+    assert r"$\frac{x}{y}$" in html_files["chapter_1.html"]
     assert "&lt;Book&gt;" in html_files["chapter_1.html"]
     assert report["forward_hrefs"] == 1
     assert report["backref_hrefs"] == 1

@@ -132,6 +132,8 @@ LLM。只有候选译文无法编译时才调用 whole-mode repair agent；修�
 - Python 3.11+
 - UV (包管理器)
 - 至少一个OCR后端的API账户
+- 构建含 LaTeX 公式的 PDF EPUB 时，需要包含 `xelatex`、`dvisvgm`、
+  `xeCJK`、`mathtools` 和 Fandol 字体的 TeX Live
 
 ### 安装步骤
 

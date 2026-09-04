@@ -795,6 +795,7 @@ def build_epub(config: BuildEpubConfig) -> Path:
     from .epub.builder import EpubBuilder
     from .epub.converter import ContentConverter
     from .epub.footnotes import FootnoteManager, validate_footnote_graph
+    from .epub.math_renderer import LatexSvgRenderer
 
     logger.info(f"Building EPUB for: {config.book_title}")
     logger.info(f"Source: {'translated' if config.translated else 'polished_markdown'}")
@@ -908,6 +909,7 @@ def build_epub(config: BuildEpubConfig) -> Path:
 
     minimal_config = MinimalConfig(config.book_title, author, language, config.markdown_dir)
     builder = EpubBuilder(minimal_config)
+    math_renderer = LatexSvgRenderer(config.output_dir / "math_svg_cache")
 
     # Create ContentConverter for cleanup operations
     converter = ContentConverter(minimal_config)
@@ -987,7 +989,8 @@ def build_epub(config: BuildEpubConfig) -> Path:
                             language,
                             footnote_manager=footnote_manager,
                             image_mapping=image_mapping,
-                            source_chapter=part_file_stem
+                            source_chapter=part_file_stem,
+                            math_renderer=math_renderer.render,
                         )
 
                         # Add subchapter anchors for TOC navigation
@@ -1030,6 +1033,11 @@ def build_epub(config: BuildEpubConfig) -> Path:
 
     process_chapters(epub_structure)
     logger.info(f"Converted {len(all_html_files)} HTML files")
+    if math_renderer.render_count:
+        logger.info(
+            f"Rendered {math_renderer.render_count} formula(s) as inline SVG "
+            f"({math_renderer.cache_hit_count} cache hit(s))"
+        )
     footnote_report = validate_footnote_graph(generated_html)
     if footnote_report["unlinked_sup_count"]:
         logger.warning(
@@ -1085,7 +1093,8 @@ def markdown_to_html(
     language: str = "en",
     footnote_manager=None,
     image_mapping=None,
-    source_chapter=None
+    source_chapter=None,
+    math_renderer=None,
 ) -> str:
     """
     Convert markdown to XHTML for EPUB.
@@ -1104,7 +1113,8 @@ def markdown_to_html(
         standalone=False,
         image_mapping=image_mapping,
         footnote_manager=footnote_manager,
-        source_chapter=source_chapter
+        source_chapter=source_chapter,
+        math_renderer=math_renderer,
     )
 
     lang_class = f"lang-{language}"

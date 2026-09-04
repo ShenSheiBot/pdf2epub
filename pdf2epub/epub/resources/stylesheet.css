@@ -346,6 +346,34 @@ ol li::before {
     white-space: nowrap;
 }
 
+/* XeLaTeX formulas are embedded as path-only SVG, so they remain readable
+   without reader fonts and inherit light/dark theme text color. */
+.math-display {
+    display: block;
+    max-width: 100%;
+    margin: 1.25em 0;
+    overflow-x: auto;
+    text-align: center;
+}
+
+.math-inline {
+    display: inline-block;
+    max-width: 100%;
+    line-height: 1;
+    text-indent: 0;
+    vertical-align: middle;
+}
+
+.math-svg {
+    fill: currentColor;
+    height: auto;
+    max-width: 100%;
+}
+
+.math-svg-inline {
+    vertical-align: middle;
+}
+
 ol.epub-continued-list {
     counter-reset: epub-list;
 }
@@ -565,6 +593,27 @@ table {
     margin: 2em 0;
     border-spacing: 0;
     border-collapse: separate;
+}
+
+.table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 2em 0;
+}
+
+.table-scroll table {
+    width: 100%;
+    margin: 0;
+}
+
+.table-scroll--wide table {
+    width: auto;
+    min-width: 100%;
+}
+
+.table-scroll--wide th,
+.table-scroll--wide td {
+    white-space: nowrap;
 }
 
 thead {

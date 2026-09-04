@@ -5,9 +5,11 @@ Uses python-markdown library with extensions for footnotes, tables, and other fe
 """
 
 import argparse
+from html import escape as escape_html, unescape as unescape_html
 import re
+import secrets
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 import yaml
 from loguru import logger
 from .utils.logging_config import configure_logging
@@ -23,6 +25,17 @@ ID_ATTRIBUTE_RE = re.compile(r'(\bid=")([^"]*)(")')
 FRAGMENT_HREF_RE = re.compile(r'(\bhref="[^"]*#)([^"]+)(")')
 OL_TAG_RE = re.compile(r"<ol(?P<attrs>[^>]*)>")
 OL_START_RE = re.compile(r'\sstart="([+-]?\d+)"')
+TABLE_RE = re.compile(r'(<table(?:\s[^>]*)?>.*?</table>)', re.DOTALL)
+TABLE_ROW_RE = re.compile(r'<tr(?:\s[^>]*)?>(.*?)</tr>', re.DOTALL)
+TABLE_CELL_RE = re.compile(r'<t[hd](?:\s[^>]*)?>', re.IGNORECASE)
+WIDE_TABLE_COLUMN_THRESHOLD = 8
+FENCED_CODE_RE = re.compile(
+    r"(?ms)^ {0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?"
+    r"^ {0,3}(?P=fence)[ \t]*(?=\n|\Z)"
+)
+INLINE_CODE_RE = re.compile(
+    r"(?s)(?<!`)(?P<ticks>`+)(?!`).*?(?<!`)(?P=ticks)(?!`)"
+)
 
 
 def contains_footnote_syntax(markdown_content: str) -> bool:
@@ -123,10 +136,49 @@ img {
     display: block;
     margin: 1.5em auto;
 }
+.math-display {
+    display: block;
+    max-width: 100%;
+    margin: 1.25em 0;
+    overflow-x: auto;
+    text-align: center;
+}
+.math-inline {
+    display: inline-block;
+    max-width: 100%;
+    line-height: 1;
+    text-indent: 0;
+    vertical-align: middle;
+}
+.math-svg {
+    fill: currentColor;
+    height: auto;
+    max-width: 100%;
+}
+.math-svg-inline {
+    vertical-align: middle;
+}
 table {
     border-collapse: collapse;
     width: 100%;
     margin: 1.5em 0;
+}
+.table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 1.5em 0;
+}
+.table-scroll table {
+    width: 100%;
+    margin: 0;
+}
+.table-scroll--wide table {
+    width: auto;
+    min-width: 100%;
+}
+.table-scroll--wide th,
+.table-scroll--wide td {
+    white-space: nowrap;
 }
 th, td {
     border: 1px solid;
@@ -227,7 +279,13 @@ def process_ruby_text(markdown_content: str) -> str:
     return markdown_content
 
 
-def preprocess_markdown(markdown_content: str, footnote_manager=None, source_chapter: Optional[str] = None, image_mapping: Optional[dict] = None) -> str:
+def preprocess_markdown(
+    markdown_content: str,
+    footnote_manager=None,
+    source_chapter: Optional[str] = None,
+    image_mapping: Optional[dict] = None,
+    math_renderer: Optional[Callable[[str, bool], str]] = None,
+) -> str:
     """
     Pre-process markdown to fix various issues before conversion.
 
@@ -236,7 +294,23 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
         footnote_manager: Optional FootnoteManager for cross-chapter footnote handling
         source_chapter: The source chapter name for footnote linking
         image_mapping: Optional dict mapping original image names to new names
+        math_renderer: Optional callable that renders LaTeX as an SVG fragment
     """
+    # Stash code before any semantic preprocessing. Formula-looking examples in
+    # code are literal source and must reach Python-Markdown unchanged.
+    code_fragments = {}
+    code_token_prefix = f"PDF2EPUBCODE{secrets.token_hex(16)}TOKEN"
+    while code_token_prefix in markdown_content:
+        code_token_prefix = f"PDF2EPUBCODE{secrets.token_hex(16)}TOKEN"
+
+    def stash_code(match):
+        token = f"{code_token_prefix}{len(code_fragments)}END"
+        code_fragments[token] = match.group(0)
+        return token
+
+    markdown_content = FENCED_CODE_RE.sub(stash_code, markdown_content)
+    markdown_content = INLINE_CODE_RE.sub(stash_code, markdown_content)
+
     # First, apply image mapping to markdown images if provided
     if image_mapping:
         for original_name, new_name in image_mapping.items():
@@ -255,11 +329,40 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
 
     # Then, process Japanese ruby text
     markdown_content = process_ruby_text(markdown_content)
-    
-    # Handle markdown italics: *text* -> <em>text</em>
-    # Use negative lookahead/lookbehind to avoid matching bold (**text**)
-    # and to avoid matching asterisks that are part of LaTeX or other constructs
-    markdown_content = re.sub(r'(?<!\*)\*(?!\*)([^\*\n]+?)(?<!\*)\*(?!\*)', r'<em>\1</em>', markdown_content)
+
+    # OCR output can contain lightweight ``<math>LaTeX</math>`` wrappers.
+    def replace_raw_math(match):
+        attributes = match.group("attributes") or ""
+        display = bool(
+            re.search(
+                r"\bdisplay\s*=\s*(?:\"block\"|'block'|block)(?=\s|$)",
+                attributes,
+                flags=re.IGNORECASE,
+            )
+        )
+        content = unescape_html(match.group("content").strip())
+        if not content:
+            return ''
+        tag = "div" if display else "span"
+        css_class = "math-display" if display else "math-inline"
+        if math_renderer:
+            return (
+                f'<{tag} class="{css_class}">'
+                f'{math_renderer(content, display)}'
+                f'</{tag}>'
+            )
+        # Standalone callers can still request HTML without installing TeX.
+        # The EPUB builder always supplies the SVG renderer.
+        # Protect literal asterisks from the Markdown emphasis pass below.
+        escaped = escape_html(content).replace('*', '&#42;')
+        return f'<{tag} class="{css_class}">{escaped}</{tag}>'
+
+    markdown_content = re.sub(
+        r'<math(?P<attributes>\s[^>]*)?>(?P<content>.*?)</math\s*>',
+        replace_raw_math,
+        markdown_content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     
     # Then fix LaTeX-style table footnote markers like ${e}$ 
     # Convert them to superscript letters
@@ -300,12 +403,30 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
     # Handle years in parentheses like $(1983)$
     markdown_content = re.sub(r'\$\((\d{4})\)\$', r'(\1)', markdown_content)
     
-    # Handle escaped dollar signs: $\$ -> placeholder
-    markdown_content = re.sub(r'\$\\\$', '<<<ESCAPED_DOLLAR>>>', markdown_content)
+    # Protect a literal currency sign at the start of inline math without
+    # consuming the opening delimiter.  For example, ``$\$1.1 \times 10^9$``
+    # becomes a protected dollar followed by ``$1.1 \times 10^9$`` so the
+    # numeric expression can still take the normal inline-math path.
+    escaped_dollar_placeholder = 'PDF2EPUBESCAPEDDOLLARTOKEN'
+
+    def protect_currency_math(match):
+        math_body = match.group(1)
+        if not math_body:
+            return escaped_dollar_placeholder
+        return f'{escaped_dollar_placeholder}${math_body}$'
+
+    markdown_content = re.sub(
+        r'\$\\\$([^$\n]*)\$',
+        protect_currency_math,
+        markdown_content,
+    )
 
     # Handle standalone escaped dollar signs: \$ -> placeholder
     # IMPORTANT: Use placeholder to avoid interfering with $...$ LaTeX block matching
-    markdown_content = markdown_content.replace(r'\$', '<<<ESCAPED_DOLLAR>>>')
+    markdown_content = markdown_content.replace(
+        r'\$',
+        escaped_dollar_placeholder,
+    )
 
     # OCR/refine placeholders such as "$$$" mean an unknown page number, not math.
     # Protect them before the $$...$$ display-math pass so they cannot consume
@@ -319,15 +440,13 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
 
     markdown_content = re.sub(r'\${3,}', protect_dollar_run, markdown_content)
 
-    # === DISPLAY MATH: Convert $$...$$ blocks to MathML ===
+    # === DISPLAY MATH ===
     # Process display math BEFORE inline math to avoid conflicts
     from latex2mathml import converter
 
     def process_display_math(match):
         """
-        Convert display math $$...$$ to MathML using latex2mathml.
-
-        Display math is rendered as block-level centered mathematical expressions.
+        Render display math when the EPUB renderer is available.
         """
         latex_code = match.group(1).strip()
 
@@ -335,16 +454,21 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
             # Empty display math block, return placeholder
             return '<div class="math-display"></div>'
 
-        try:
-            # Convert LaTeX to MathML
-            mathml = converter.convert(latex_code)
+        if math_renderer:
+            return (
+                '<div class="math-display">'
+                f'{math_renderer(latex_code, True)}'
+                '</div>'
+            )
 
-            # Wrap in a centered div for display math
-            return f'<div class="math-display" style="text-align: center; margin: 1em 0;">{mathml}</div>'
-        except Exception as e:
-            logger.warning(f"Failed to convert display math to MathML: {latex_code[:50]}... Error: {e}")
-            # Fallback: keep original LaTeX in a styled div
-            return f'<div class="math-display" style="text-align: center; margin: 1em 0; font-style: italic;">$${latex_code}$$</div>'
+        # Do not include ``$$`` in the generated fragment: the subsequent
+        # inline-math pass would otherwise scan the generated HTML again.
+        return (
+            '<div class="math-display" '
+            'style="text-align: center; margin: 1em 0;">'
+            f'<span class="math-latex">{escape_html(latex_code)}</span>'
+            '</div>'
+        )
 
     # Match $$...$$ blocks (multiline, non-greedy)
     # Use DOTALL flag to allow matching across newlines
@@ -417,30 +541,64 @@ def preprocess_markdown(markdown_content: str, footnote_manager=None, source_cha
                 logger.debug(f"Unicode conversion incomplete for: {original_content[:50]}... Trying MathML")
                 raise ValueError("Incomplete conversion, use MathML")
 
-            return result
+            # Python-Markdown runs after this preprocessing step.  Keep math
+            # asterisks as text instead of letting that later parser interpret
+            # two separate formulas as one emphasis span.
+            return result.replace('*', '&#42;')
 
         except Exception as e:
+            if math_renderer:
+                return (
+                    '<span class="math-inline">'
+                    f'{math_renderer(original_content, False)}'
+                    '</span>'
+                )
             # === Fallback to MathML for complex expressions ===
             try:
-                mathml = converter.convert(original_content)
-                logger.debug(f"Using MathML for inline math: {original_content[:50]}...")
-                return f'<span class="math-inline">{mathml}</span>'
+                # Validate that the expression is parseable, but do not emit
+                # MathML into the EPUB 2/XHTML 1.1 output.
+                converter.convert(original_content)
+                logger.debug(
+                    "Using escaped LaTeX fallback for inline math: "
+                    f"{original_content[:50]}..."
+                )
+                return (
+                    '<span class="math-inline">'
+                    f'${escape_html(original_content).replace("*", "&#42;")}$</span>'
+                )
             except Exception as e2:
                 # Last resort: keep original LaTeX with styling
                 logger.warning(f"Failed to convert inline math: {original_content[:50]}... Error: {e2}")
-                return f'<span style="font-style: italic;">${original_content}$</span>'
+                return (
+                    '<span style="font-style: italic;">'
+                    f'${escape_html(original_content).replace("*", "&#42;")}$</span>'
+                )
 
     # Apply the callback to all $...$ blocks (inline only, not across newlines)
     # Use [^$\n]+ to match only within a single line
     markdown_content = re.sub(r'\$([^$\n]+)\$', process_latex_block, markdown_content)
 
+    # Handle Markdown italics only after every formula has become HTML or a
+    # renderer token. Otherwise legitimate TeX such as ``Q^*``,
+    # ``\operatorname*``, and ``align*`` can be paired into an emphasis span.
+    markdown_content = re.sub(
+        r'(?<!\*)\*(?!\*)([^\*\n]+?)(?<!\*)\*(?!\*)',
+        r'<em>\1</em>',
+        markdown_content,
+    )
+
     # Convert placeholders back to actual dollar signs
-    markdown_content = markdown_content.replace('<<<ESCAPED_DOLLAR>>>', '$')
+    markdown_content = markdown_content.replace(escaped_dollar_placeholder, '$')
     for token, dollar_run in dollar_run_placeholders.items():
         markdown_content = markdown_content.replace(token, dollar_run)
 
-    # Now process footnotes
-    return preprocess_footnotes(markdown_content, footnote_manager, source_chapter)
+    # Now process footnotes, then return literal code to the Markdown parser.
+    markdown_content = preprocess_footnotes(
+        markdown_content, footnote_manager, source_chapter
+    )
+    for token, code in code_fragments.items():
+        markdown_content = markdown_content.replace(token, code)
+    return markdown_content
 
 
 def preprocess_footnotes_local(markdown_content: str, footnote_manager, source_chapter: str) -> str:
@@ -604,7 +762,8 @@ def convert_markdown_to_html(
     standalone: bool = True,
     image_mapping: Optional[dict] = None,
     footnote_manager=None,
-    source_chapter: Optional[str] = None
+    source_chapter: Optional[str] = None,
+    math_renderer: Optional[Callable[[str, bool], str]] = None,
 ) -> str:
     """
     Convert markdown content to HTML.
@@ -617,6 +776,7 @@ def convert_markdown_to_html(
         image_mapping: Optional dict mapping original image names to new names
         footnote_manager: Optional FootnoteManager for cross-chapter footnote handling
         source_chapter: The source chapter name (e.g., "chapter_1") for footnote linking
+        math_renderer: Optional callable that renders LaTeX as an SVG fragment
     
     Returns:
         HTML string
@@ -627,8 +787,30 @@ def convert_markdown_to_html(
         logger.error("markdown library not installed. Run: poetry add markdown")
         raise
     
+    # Keep generated SVG outside Python-Markdown. Table parsing, smart quotes,
+    # and nl2br must never escape or mutate a finished formula fragment.
+    math_fragments = {}
+    preprocessing_math_renderer = math_renderer
+    if math_renderer:
+        math_token_prefix = f"PDF2EPUBMATHSVG{secrets.token_hex(16)}TOKEN"
+        while math_token_prefix in markdown_content:
+            math_token_prefix = f"PDF2EPUBMATHSVG{secrets.token_hex(16)}TOKEN"
+
+        def stash_math_fragment(source: str, display: bool) -> str:
+            token = f"{math_token_prefix}{len(math_fragments)}END"
+            math_fragments[token] = math_renderer(source, display)
+            return token
+
+        preprocessing_math_renderer = stash_math_fragment
+
     # Pre-process markdown to fix various issues (including image mapping)
-    markdown_content = preprocess_markdown(markdown_content, footnote_manager, source_chapter, image_mapping)
+    markdown_content = preprocess_markdown(
+        markdown_content,
+        footnote_manager,
+        source_chapter,
+        image_mapping,
+        preprocessing_math_renderer,
+    )
     
     # Configure markdown extensions
     extensions = [
@@ -667,6 +849,8 @@ def convert_markdown_to_html(
 
     # Post-process HTML
     html_body = post_process_html(html_body)
+    for token, svg_fragment in math_fragments.items():
+        html_body = html_body.replace(token, svg_fragment)
 
     if not standalone:
         return html_body
@@ -772,6 +956,26 @@ def _normalize_ordered_list_starts(html: str) -> str:
     return OL_TAG_RE.sub(replace_ol, html)
 
 
+def _wrap_tables_for_scrolling(html: str) -> str:
+    """Wrap tables, enabling no-wrap scrolling only for genuinely wide ones."""
+
+    def replace_table(match: re.Match) -> str:
+        table = match.group(1)
+        column_count = max(
+            (
+                len(TABLE_CELL_RE.findall(row))
+                for row in TABLE_ROW_RE.findall(table)
+            ),
+            default=0,
+        )
+        classes = "table-scroll"
+        if column_count >= WIDE_TABLE_COLUMN_THRESHOLD:
+            classes += " table-scroll--wide"
+        return f'<div class="{classes}">{table}</div>'
+
+    return TABLE_RE.sub(replace_table, html)
+
+
 def post_process_html(html: str) -> str:
     """
     Post-process the HTML to ensure EPUB XHTML 1.1 compatibility.
@@ -799,6 +1003,7 @@ def post_process_html(html: str) -> str:
 
     html = _normalize_epub_ids(html)
     html = _normalize_ordered_list_starts(html)
+    html = _wrap_tables_for_scrolling(html)
     
     # Ensure proper XHTML self-closing tags
     html = re.sub(r'<br(?!\s*/)>', '<br />', html)
@@ -810,9 +1015,6 @@ def post_process_html(html: str) -> str:
     
     # Convert & to &amp; in text (but not in existing entities)
     html = re.sub(r'&(?!(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);)', '&amp;', html)
-    
-    # Ensure all attributes are quoted
-    html = re.sub(r'<(\w+)([^>]*?)(\w+)=([^\s"\'>]+)', r'<\1\2\3="\4"', html)
     
     # Convert common block elements to have proper XHTML structure
     html = re.sub(r'<p>(\s*)</p>', '', html)  # Remove empty paragraphs

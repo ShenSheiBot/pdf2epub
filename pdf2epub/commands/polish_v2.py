@@ -67,6 +67,46 @@ def polish_v2_command(args):
 
     polish_dir.mkdir(parents=True, exist_ok=True)
 
+    if getattr(args, "workspace_agent", False):
+        from ..processors.workspace_polisher import (
+            WorkspacePolishError,
+            run_workspace_polish,
+        )
+
+        workspace_config = config.get("polish", {}).get("workspace_agent", {})
+        model = (
+            getattr(args, "workspace_agent_model", None)
+            or workspace_config.get("model")
+            or "gpt-5.6-terra"
+        )
+        try:
+            from ..ocr.backends.chandra import collect_caption_markdown
+
+            # Sidecars are the durable fact; the active config may have changed
+            # between OCR and a resumed polish.
+            protected_fragments = collect_caption_markdown(output_dir / "pages")
+            logger.info(
+                "[workspace-agent] Protecting "
+                f"{len(protected_fragments)} printed caption blocks"
+            )
+            result = run_workspace_polish(
+                input_dir=input_dir,
+                output_dir=polish_dir,
+                model=model,
+                content_type=getattr(args, "content_type", "auto"),
+                resume=getattr(args, "resume", False),
+                codex_binary=workspace_config.get("codex_binary", "codex"),
+                protected_fragments=protected_fragments,
+            )
+        except (WorkspacePolishError, KeyboardInterrupt) as exc:
+            logger.error(f"Codex workspace polish did not complete: {exc}")
+            return 130 if isinstance(exc, KeyboardInterrupt) else 1
+        logger.info(
+            f"[workspace-agent] Polish completed: "
+            f"{result.completed}/{result.total} files"
+        )
+        return 0
+
     # Load book structure
     book_structure = BookStructure(output_dir)
     book_structure_data = None
@@ -132,9 +172,16 @@ def polish_v2_command(args):
         file_pattern="*.md",
     )
 
-    # Run
+    # Run. Both API/batch and workspace-agent execution use this same stage
+    # lock, so they cannot race on raw/, validated/, or the tracker.
     resume = getattr(args, 'resume', False)
-    result = phase.run(resume=resume)
+    from ..utils.safety import ProcessLockError, exclusive_process_lock
+    try:
+        with exclusive_process_lock(polish_dir / ".polish.lock", "polish"):
+            result = phase.run(resume=resume)
+    except ProcessLockError as exc:
+        logger.error(str(exc))
+        return 1
 
     # Report
     logger.info(f"[v2] Polish completed: {result.completed}/{result.total} succeeded")

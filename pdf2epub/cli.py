@@ -1325,6 +1325,15 @@ RECOMMENDED WORKFLOW / 推荐工作流 (uses toc_tree.json):
         help="Resume from previous progress"
     )
     polish_parser.add_argument(
+        "--workspace-agent",
+        action="store_true",
+        help="Polish the complete Markdown directory in one resumable Codex CLI session"
+    )
+    polish_parser.add_argument(
+        "--workspace-agent-model",
+        help="Codex CLI model for --workspace-agent (default: gpt-5.6-terra)"
+    )
+    polish_parser.add_argument(
         "--max-workers",
         type=int,
         default=None,

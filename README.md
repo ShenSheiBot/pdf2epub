@@ -264,6 +264,16 @@ uv run pdf2epub polish --content-type japanese
 uv run pdf2epub polish --content-type auto
 ```
 
+也可以把整本 Markdown 工作目录交给同一个 Codex 会话统一润色；该模式直接
+使用 Codex CLI 自身已有的配置和进程环境，不把凭证写入本项目配置：
+
+```bash
+uv run pdf2epub polish --workspace-agent --content-type academic
+
+# 中断后恢复同一个会话
+uv run pdf2epub polish --workspace-agent --content-type academic --resume
+```
+
 #### 步骤 4: 生成 EPUB
 ```bash
 uv run pdf2epub build-epub

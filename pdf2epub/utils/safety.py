@@ -2,9 +2,36 @@
 Safety utilities for preventing accidental overwrites and data loss.
 """
 
+import fcntl
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from loguru import logger
+
+
+class ProcessLockError(RuntimeError):
+    """Raised when another process owns an exclusive stage lock."""
+
+
+@contextmanager
+def exclusive_process_lock(path: Path, operation: str) -> Iterator[None]:
+    """Hold a non-blocking, process-wide lock for one output stage."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ProcessLockError(
+                f"Another {operation} process holds {path}"
+            ) from exc
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def extract_pdf_metadata(pdf_path: Path) -> dict:

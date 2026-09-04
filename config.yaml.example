@@ -153,6 +153,14 @@ html_translation:
 polish:
   processing_mode: parallel  # 'parallel' or 'sequential'
 
+  # Optional whole-directory agent executor. The ordinary API/batch route
+  # remains the default; enable this explicitly with `polish --workspace-agent`.
+  # Codex authentication and provider transport stay in the native Codex CLI
+  # configuration and are never copied into this YAML file.
+  workspace_agent:
+    model: gpt-5.6-terra
+    codex_binary: codex
+
   models:
     - provider: gemini
       model: gemini-2.5-flash

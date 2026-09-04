@@ -34,6 +34,10 @@ _MICROTYPE_LINE_RE = re.compile(
     r"(?m)^[ \t]*\\(?:usepackage|RequirePackage)"
     r"(?:\[[^\]\n]*\])?\{microtype\}[^\n]*(?:\n|\Z)"
 )
+_MICROTYPE_SETUP_LINE_RE = re.compile(
+    r"(?m)^[ \t]*\\UseMicrotypeSet"
+    r"(?:\[[^\]\n]*\])?\{[^{}\n]*\}[^\n]*(?:\n|\Z)"
+)
 _CJKUTF8_PACKAGE_LINE_RE = re.compile(
     r"(?m)^[ \t]*\\(?:usepackage|RequirePackage)"
     r"(?:\[[^\]\n]*\])?\{(?:CJK|CJKutf8)\}[^\n]*(?:\n|\Z)"
@@ -198,6 +202,10 @@ def _normalize_xelatex_source(source: str) -> str:
     )
     source = _MICROTYPE_LINE_RE.sub(
         "% Disabled by pdf2epub: legacy Type1 fonts can break microtype in XeLaTeX.\n",
+        source,
+    )
+    source = _MICROTYPE_SETUP_LINE_RE.sub(
+        "% Disabled by pdf2epub together with the microtype package.\n",
         source,
     )
     source = _PDFOUTPUT_LINE_RE.sub(

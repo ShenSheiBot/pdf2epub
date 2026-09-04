@@ -322,6 +322,7 @@ class LLMClient:
         model_configs: Optional[List[Dict]] = None,
         operation_name: str = "LLM generation",
         enable_cache: bool = False,
+        streaming_repetition_max_period: int = 100,
     ) -> str:
         """
         Generate content using configured models with automatic fallback.
@@ -392,7 +393,10 @@ class LLMClient:
                         model=model,
                         max_retries=max_retries,
                         operation_name=operation_name,
-                        client=client
+                        client=client,
+                        streaming_repetition_max_period=(
+                            streaming_repetition_max_period
+                        ),
                     )
                     logger.success(f"Successfully generated with {provider} for {operation_name}")
                     return response
@@ -405,6 +409,9 @@ class LLMClient:
                         operation_name=operation_name,
                         client=client,
                         enable_cache=enable_cache,
+                        streaming_repetition_max_period=(
+                            streaming_repetition_max_period
+                        ),
                     )
                     logger.success(f"Successfully generated with {provider} for {operation_name}")
                     return response
@@ -689,7 +696,8 @@ class LLMClient:
         model: str,
         max_retries: int,
         operation_name: str,
-        client: GeminiClient = None
+        client: GeminiClient = None,
+        streaming_repetition_max_period: int = 100,
     ) -> str:
         """Generate content with Gemini, handling retries internally."""
 
@@ -751,7 +759,10 @@ class LLMClient:
                     model=model,
                     contents=contents,
                     config=config,
-                    operation_name=operation_name
+                    operation_name=operation_name,
+                    streaming_repetition_max_period=(
+                        streaming_repetition_max_period
+                    ),
                 )
             except Exception as e:
                 # Check for safety block
@@ -770,6 +781,7 @@ class LLMClient:
         operation_name: str,
         client: AnthropicClient = None,
         enable_cache: bool = False,
+        streaming_repetition_max_period: int = 100,
     ) -> str:
         """Generate content with Anthropic, handling retries internally."""
 
@@ -800,6 +812,9 @@ class LLMClient:
                     temperature=temperature,
                     operation_name=operation_name,
                     enable_cache=enable_cache,
+                    streaming_repetition_max_period=(
+                        streaming_repetition_max_period
+                    ),
                 )
             except Exception as e:
                 # Check for safety block

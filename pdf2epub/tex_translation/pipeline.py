@@ -245,6 +245,10 @@ class TexTranslationPipeline:
                 ],
                 operation_name=f"Translate TeX {unit.id}",
                 enable_cache=True,
+                # TeX tables legitimately repeat multi-character ``& ... \\\\``
+                # row patterns.  Retain protection against true one-character
+                # runaway loops without truncating valid tabular output.
+                streaming_repetition_max_period=1,
             )
             provider_usage = self._last_provider_usage()
             local_cache_hit = False

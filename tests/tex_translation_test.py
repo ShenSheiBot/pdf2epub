@@ -3,6 +3,7 @@ import json
 import shutil
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,8 +29,10 @@ from pdf2epub.tex_translation.prompts import (
 )
 from pdf2epub.tex_translation.state import TranslationState
 from pdf2epub.utils.network_utils import (
+    AnthropicClient,
     StreamingHallucinationError,
     _detect_streaming_hallucination,
+    is_transient_anthropic_error,
     is_transient_gemini_error,
 )
 
@@ -126,6 +129,47 @@ def test_streaming_guard_ignores_whitespace_but_retries_real_loops():
     assert is_transient_gemini_error(StreamingHallucinationError(loop))
 
 
+def test_tex_streaming_guard_allows_multichar_table_cycles_only():
+    table_cycle = " & value \\\\\n"
+    assert _detect_streaming_hallucination(
+        "prefix" + table_cycle * 40,
+        max_period=1,
+    ) is None
+    single_character_loop = _detect_streaming_hallucination(
+        "prefix" + "-" * 400,
+        max_period=1,
+    )
+    assert single_character_loop is not None
+    assert is_transient_anthropic_error(
+        StreamingHallucinationError(single_character_loop)
+    )
+
+
+def test_anthropic_guard_discards_a_single_character_partial_response():
+    class FakeMessages:
+        @staticmethod
+        def create(**_kwargs):
+            event = SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(text="-" * 20),
+            )
+            return [event] * 20
+
+    client = object.__new__(AnthropicClient)
+    client.client = SimpleNamespace(messages=FakeMessages())
+    client.num_retries = 1
+    client.max_backoff_seconds = 0
+    client.tokenizer = SimpleNamespace(encode=lambda text: list(text))
+
+    with pytest.raises(StreamingHallucinationError):
+        client.generate_content(
+            "prompt",
+            model="test-model",
+            operation_name="test TeX stream",
+            streaming_repetition_max_period=1,
+        )
+
+
 def test_codex_provider_resolves_active_openai_compatible_credentials(
     tmp_path: Path,
 ):
@@ -196,6 +240,7 @@ def test_cjk_injection_is_idempotent():
         "\\documentclass{article}\n"
         "\\usepackage[latin1]{inputenc}\n"
         "\\usepackage{microtype}\n"
+        "\\UseMicrotypeSet[protrusion]{basicmath}\n"
         "\\newtheorem{theorem}{Theorem}\n"
         "\\newtheorem{proposition}[theorem]{Proposition}\n"
         "\\begin{document}Hello\\end{document}\n"
@@ -209,6 +254,7 @@ def test_cjk_injection_is_idempotent():
     assert "\\setCJKmainfont{Arial Unicode MS}" in prepared
     assert "\\usepackage[latin1]{inputenc}" not in prepared
     assert "\\usepackage{microtype}" not in prepared
+    assert "\\UseMicrotypeSet" not in prepared
     assert "legacy Type1 fonts can break microtype" in prepared
     assert "\\renewcommand{\\abstractname}{摘要}" in prepared
     assert "\\patchcmd{\\abstract}{Abstract}{摘要}{}{}" in prepared
@@ -575,6 +621,10 @@ def test_pipeline_commits_compile_clean_units_and_resumes_without_llm(
     first = pipeline.run(source, run_dir=run_dir)
     first_call_count = len(llm.calls)
     assert first_call_count == 2
+    assert all(
+        kwargs["streaming_repetition_max_period"] == 1
+        for _prompt, kwargs in llm.calls
+    )
     assert first.summary["translated"] == 2
     assert first.summary["fallback_original"] == 0
     assert "中文" in (first.project_dir / "main.tex").read_text(encoding="utf-8")

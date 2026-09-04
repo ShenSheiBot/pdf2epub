@@ -212,6 +212,8 @@ def is_transient_gemini_error(exception: Exception) -> bool:
 
 def is_transient_anthropic_error(exception: Exception) -> bool:
     """Check if an Anthropic API error is transient and should be retried."""
+    if isinstance(exception, StreamingHallucinationError):
+        return True
     error_str = str(exception).lower()
 
     # Don't retry content blocks
@@ -267,22 +269,26 @@ def is_transient_openai_error(exception: Exception) -> bool:
 
 
 
-def _detect_streaming_hallucination(text: str) -> Optional[str]:
+def _detect_streaming_hallucination(
+    text: str,
+    *,
+    max_period: int = 100,
+) -> Optional[str]:
     """Check if streaming output shows hallucination patterns.
 
     Returns a reason string if hallucination detected, None otherwise.
     Only detects repetition loops — non-repeating long output is normal.
 
     Uses multi-period detection: checks if the tail of the text contains
-    any repeating pattern with period 1-100 chars, repeated 3+ times.
+    any repeating pattern up to ``max_period`` chars, repeated 3+ times.
     This catches both single-char loops (啊啊啊...) and multi-token
     cycles (啊呀啊呀...) regardless of alignment.
     """
-    if len(text) < 300:
+    if len(text) < 300 or max_period < 1:
         return None
 
     tail = text[-200:]
-    for period in range(1, 101):
+    for period in range(1, min(max_period, 100) + 1):
         if len(tail) < period * 3:
             break
         pat = tail[-period:]
@@ -431,7 +437,8 @@ class GeminiClient:
         model: str,
         contents: Any,
         config: Optional[GenerateContentConfig] = None,
-        operation_name: str = "Gemini API call"
+        operation_name: str = "Gemini API call",
+        streaming_repetition_max_period: int = 100,
     ) -> str:
         """Generate content with streaming and automatic retry."""
         logger.info(f"Streaming from Gemini API for {operation_name}")
@@ -486,7 +493,8 @@ class GeminiClient:
                 # Check every 20 chunks (~600 chars) for early detection
                 if chunk_count % 20 == 0:
                     hallucination_reason = _detect_streaming_hallucination(
-                        aggregated_text
+                        aggregated_text,
+                        max_period=streaming_repetition_max_period,
                     )
                     if hallucination_reason:
                         logger.warning(
@@ -661,6 +669,7 @@ class AnthropicClient:
         operation_name: str = "Anthropic API call",
         json_mode: bool = False,
         enable_cache: bool = False,
+        streaming_repetition_max_period: int = 100,
     ) -> str:
         """Generate content with automatic retry for transient errors.
 
@@ -751,7 +760,10 @@ class AnthropicClient:
 
                         # Hallucination guard (same as Gemini)
                         if chunk_count % 20 == 0:
-                            halt_reason = _detect_streaming_hallucination(response_text)
+                            halt_reason = _detect_streaming_hallucination(
+                                response_text,
+                                max_period=streaming_repetition_max_period,
+                            )
                             if halt_reason:
                                 logger.warning(
                                     f"Hallucination detected for {operation_name}: {halt_reason}. "
@@ -770,6 +782,13 @@ class AnthropicClient:
 
             if halted_early:
                 finish_reason = "HALLUCINATION_HALT"
+                logger.warning(
+                    f"Stream halted early (hallucination) for {operation_name}: "
+                    "discarding the partial response and retrying"
+                )
+                raise StreamingHallucinationError(
+                    f"Streaming hallucination for {operation_name}: {halt_reason}"
+                )
 
             if not response_text:
                 raise ValueError(f"Empty response from Anthropic for {operation_name}")
